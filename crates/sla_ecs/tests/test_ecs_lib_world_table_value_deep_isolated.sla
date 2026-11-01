@@ -1,0 +1,380 @@
+// Isolated deep tests for lib/world_table_value_deep.sla (Batch 386).
+// Mirrors shallow lib/world_table_value.sla's `TableValueWorld<T, R, M>` as a SELF-CONTAINED fixed-cap
+// archetype-table variant (no @import -- archetype + entity location + resource + message + tick
+// all inlined). Concrete typed plugs for TableValueData/Time/Event. Wrapper structs EcsTVRegisterDeep /
+// EcsTVSpawnDeep / EcsTVCompInfoDeep / EcsTVQueryDeep / EcsTVPairQueryMutDeep / EcsTVMessageReadDeep
+// expose scalar accessors (NO tuple-return destructuring in tests).
+// panic codes: 142700 - 142799.
+
+@import "../src/world_table_value_deep.sla"
+
+// ── Test 1: new + register + spawn + archetype_count + entity_count + change_tick (per-register bump). ──
+@test "EcsTVWorldDeep new + register + spawn + component_count + change_tick + archetype_count"() {
+    let w0 = ecs_tv_world_deep_new();
+    if ecs_tv_world_deep_archetype_count(w0) != 1 { panic(142700); };
+    if ecs_tv_world_deep_component_count(w0) != 0 { panic(142701); };
+    if ecs_tv_world_deep_change_tick(w0) != 0 { panic(142702); };
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let info1 = ecs_tv_register_info_deep(r1);
+    if ecs_tv_comp_info_id_deep(info1) != 0 { panic(142703); };
+    if ecs_tv_world_deep_component_count(w1) != 1 { panic(142704); };
+    if ecs_tv_world_deep_change_tick(w1) != 1 { panic(142705); };
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let info2 = ecs_tv_register_info_deep(r2);
+    if ecs_tv_comp_info_id_deep(info2) != 1 { panic(142706); };
+    if ecs_tv_world_deep_component_count(w2) != 2 { panic(142707); };
+    let r3 = ecs_tv_world_deep_register_sparse_set(w2);
+    let w3 = ecs_tv_register_world_deep(r3);
+    let info3 = ecs_tv_register_info_deep(r3);
+    if ecs_tv_comp_info_id_deep(info3) != 2 { panic(142708); };
+    let sp = ecs_tv_world_deep_spawn(w3);
+    let w4 = ecs_tv_spawn_world_deep(sp);
+    let e1 = ecs_tv_spawn_entity_deep(sp);
+    if e1.id != 0 { panic(142709); };
+    if e1.generation != 0 { panic(142710); };
+    if ecs_tv_world_deep_entity_count(w4) != 1 { panic(142711); };
+    if ecs_tv_world_deep_is_alive(w4, e1) != true { panic(142712); };
+    // fresh spawn lives in the empty archetype (arch 0).
+    if ecs_tv_world_deep_entity_archetype_id(w4, e1) != 0 { panic(142713); };
+    if ecs_tv_world_deep_entity_row(w4, e1) != 0 { panic(142714); };
+    if ecs_tv_world_deep_archetype_entity_count(w4, 0) != 1 { panic(142715); };
+}
+
+// ── Test 2 (mirror shallow test 1): stores component values by archetype row + migration. ──
+@test "EcsTVWorldDeep insert stores values by archetype row + migration to distinct archetype"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let health = ecs_tv_register_info_deep(r1);
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let mana = ecs_tv_register_info_deep(r2);
+    let r3 = ecs_tv_world_deep_register_table(w2);
+    let w3 = ecs_tv_register_world_deep(r3);
+    let selected = ecs_tv_register_info_deep(r3);
+    let sp1 = ecs_tv_world_deep_spawn(w3);
+    let w4 = ecs_tv_spawn_world_deep(sp1);
+    let e1 = ecs_tv_spawn_entity_deep(sp1);
+    let sp2 = ecs_tv_world_deep_spawn(w4);
+    let w5 = ecs_tv_spawn_world_deep(sp2);
+    let e2 = ecs_tv_spawn_entity_deep(sp2);
+    let w6 = ecs_tv_world_deep_insert(w5, e1, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(10));
+    let w7 = ecs_tv_world_deep_insert(w6, e1, ecs_tv_comp_info_id_deep(mana), ecs_tv_data_deep_new(4));
+    let w8 = ecs_tv_world_deep_insert(w7, e2, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(8));
+    let w9 = ecs_tv_world_deep_insert(w8, e2, ecs_tv_comp_info_id_deep(mana), ecs_tv_data_deep_new(2));
+    // Both e1 and e2 now have {health, mana} -> same archetype (the new archetype 1 was created on
+    // e1's first insert, then e2 attached to it).
+    let shared = ecs_tv_world_deep_entity_archetype_id(w9, e1);
+    if shared != ecs_tv_world_deep_entity_archetype_id(w9, e2) { panic(142720); };
+    if ecs_tv_world_deep_archetype_entity_count(w9, shared) != 2 { panic(142721); };
+    // e1 occupies row 0 of the shared {health,mana} archetype (inserted first); e2 attaches at row 1.
+    let row_e2_before = ecs_tv_world_deep_entity_row(w9, e2);
+    if row_e2_before != 1 { panic(142722); };
+    // Insert selected into e1. e1 migrates to a new archetype; e2 stays in the {health,mana} arch
+    // (row 0 after e1's row is detached and possibly swap-removed).
+    let w10 = ecs_tv_world_deep_insert(w9, e1, ecs_tv_comp_info_id_deep(selected), ecs_tv_data_deep_new(1));
+    if ecs_tv_world_deep_entity_archetype_id(w10, e1) == ecs_tv_world_deep_entity_archetype_id(w10, e2) { panic(142723); };
+    // e2 should now be at row 0 of the {health, mana} archetype (e1 departed; either last-row swap or
+    // e2 stays at row 0 since e2 was at row 0 and e1 was at row 1).
+    if ecs_tv_world_deep_entity_row(w10, e2) != 0 { panic(142724); };
+    if ecs_tv_data_deep_amount(ecs_tv_world_deep_get(w10, e2, ecs_tv_comp_info_id_deep(health))) != 8 { panic(142725); };
+    if ecs_tv_data_deep_amount(ecs_tv_world_deep_get(w10, e2, ecs_tv_comp_info_id_deep(mana))) != 2 { panic(142726); };
+    if ecs_tv_data_deep_amount(ecs_tv_world_deep_get(w10, e1, ecs_tv_comp_info_id_deep(selected))) != 1 { panic(142727); };
+}
+
+// ── Test 3 (mirror shallow test 2): query_pair_mut_first writeback + changed_since. ──
+@test "EcsTVWorldDeep query_pair_mut_first writeback preserves arch/row + changed_since"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let health = ecs_tv_register_info_deep(r1);
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let mana = ecs_tv_register_info_deep(r2);
+    let sp = ecs_tv_world_deep_spawn(w2);
+    let w3 = ecs_tv_spawn_world_deep(sp);
+    let entity = ecs_tv_spawn_entity_deep(sp);
+    let w4 = ecs_tv_world_deep_insert(w3, entity, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(5));
+    let w5 = ecs_tv_world_deep_insert(w4, entity, ecs_tv_comp_info_id_deep(mana), ecs_tv_data_deep_new(3));
+    let before = ecs_tv_world_deep_change_tick(w5);
+    let group_before = ecs_tv_world_deep_entity_archetype_id(w5, entity);
+    let row_before = ecs_tv_world_deep_entity_row(w5, entity);
+    let w6 = ecs_tv_world_deep_increment_tick(w5);
+    let q = ecs_tv_world_deep_query_pair_mut_first(w6, ecs_tv_comp_info_id_deep(health), ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_pair_query_mut_count(q) != 1 { panic(142740); };
+    let item = ecs_tv_pair_query_mut_at(q, 0);
+    let first_v = ecs_tv_data_deep_amount(ecs_tv_pair_mut_first(item));
+    let second_v = ecs_tv_data_deep_amount(ecs_tv_pair_mut_second(item));
+    let next_val = first_v + second_v;
+    let w7 = ecs_tv_world_deep_pair_write_first(w6, item, ecs_tv_data_deep_new(next_val));
+    if ecs_tv_world_deep_entity_archetype_id(w7, entity) != group_before { panic(142741); };
+    if ecs_tv_world_deep_entity_row(w7, entity) != row_before { panic(142742); };
+    if ecs_tv_data_deep_amount(ecs_tv_world_deep_get(w7, entity, ecs_tv_comp_info_id_deep(health))) != 8 { panic(142743); };
+    if ecs_tv_world_deep_changed_since(w7, entity, ecs_tv_comp_info_id_deep(health), before) != true { panic(142744); };
+    let changed = ecs_tv_world_deep_query_changed(w7, ecs_tv_comp_info_id_deep(health), before);
+    if ecs_tv_query_deep_count(changed) != 1 { panic(142745); };
+}
+
+// ── Test 4 (mirror shallow test 3): remove despawn resources and messages. ──
+@test "EcsTVWorldDeep remove + despawn + resource + message flow"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let health = ecs_tv_register_info_deep(r1);
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let mana = ecs_tv_register_info_deep(r2);
+    let sp1 = ecs_tv_world_deep_spawn(w2);
+    let w3 = ecs_tv_spawn_world_deep(sp1);
+    let e1 = ecs_tv_spawn_entity_deep(sp1);
+    let sp2 = ecs_tv_world_deep_spawn(w3);
+    let w4 = ecs_tv_spawn_world_deep(sp2);
+    let e2 = ecs_tv_spawn_entity_deep(sp2);
+    let w5 = ecs_tv_world_deep_insert(w4, e1, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(5));
+    let w6 = ecs_tv_world_deep_insert(w5, e1, ecs_tv_comp_info_id_deep(mana), ecs_tv_data_deep_new(3));
+    let w7 = ecs_tv_world_deep_insert(w6, e2, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(7));
+    let has_mana = ecs_tv_world_deep_query_with(w7, ecs_tv_comp_info_id_deep(health), ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_query_deep_count(has_mana) != 1 { panic(142760); };
+    if ecs_tv_entity_id_deep(ecs_tv_entity_item_entity(ecs_tv_query_deep_at(has_mana, 0))) != e1.id { panic(142761); };
+    let w8 = ecs_tv_world_deep_remove(w7, e1, ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_world_deep_has(w8, e1, ecs_tv_comp_info_id_deep(mana)) != false { panic(142762); };
+    let health_only = ecs_tv_world_deep_query_without(w8, ecs_tv_comp_info_id_deep(health), ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_query_deep_count(health_only) != 2 { panic(142763); };
+    let w9 = ecs_tv_world_deep_insert_resource(w8, ecs_tv_time_deep_new(6));
+    let w10 = ecs_tv_world_deep_write_message(w9, ecs_tv_event_deep_new(9));
+    let w11 = ecs_tv_world_deep_despawn(w10, e2);
+    let q_all = ecs_tv_world_deep_query(w11, ecs_tv_comp_info_id_deep(health));
+    let time = ecs_tv_world_deep_get_resource(w11);
+    let event = ecs_tv_world_deep_read_message(w11, ecs_tv_event_deep_new(0));
+    if ecs_tv_query_deep_count(q_all) != 1 { panic(142764); };
+    if ecs_tv_world_deep_is_alive(w11, e2) != false { panic(142765); };
+    if ecs_tv_time_deep_tick(time) != 6 { panic(142766); };
+    if ecs_tv_message_read_amount(event) != 9 { panic(142767); };
+    if ecs_tv_message_read_has_value(event) != true { panic(142768); };
+}
+
+// ── Test 5: query variants + added_since + entities excluded on remove. ──
+@test "EcsTVWorldDeep query/query_without/query_with/query_added/query_changed + added_since"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let health = ecs_tv_register_info_deep(r1);
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let mana = ecs_tv_register_info_deep(r2);
+    let sp1 = ecs_tv_world_deep_spawn(w2);
+    let w3 = ecs_tv_spawn_world_deep(sp1);
+    let e1 = ecs_tv_spawn_entity_deep(sp1);
+    let sp2 = ecs_tv_world_deep_spawn(w3);
+    let w4 = ecs_tv_spawn_world_deep(sp2);
+    let e2 = ecs_tv_spawn_entity_deep(sp2);
+    let t_after_register = ecs_tv_world_deep_change_tick(w4);
+    // Insert an explicit increment_tick BEFORE the inserts so they stamp at a change_tick
+    // strictly greater than t_after_register (the deep stamps inserts at the current
+    // change_tick; registers bump it, inserts do NOT -- so without this the added queries
+    // below would degenerate to nothing under the strict > since_tick semantics).
+    let w4a = ecs_tv_world_deep_increment_tick(w4);
+    let w5 = ecs_tv_world_deep_insert(w4a, e1, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(7));
+    let w6 = ecs_tv_world_deep_insert(w5, e1, ecs_tv_comp_info_id_deep(mana), ecs_tv_data_deep_new(2));
+    let w7 = ecs_tv_world_deep_insert(w6, e2, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(9));
+    // query_added_since(0) mirros shallow's recipe (inserts stamp the current change_tick).
+    let added_all = ecs_tv_world_deep_query_added(w7, ecs_tv_comp_info_id_deep(health), 0);
+    if ecs_tv_query_deep_count(added_all) != 2 { panic(142770); };
+    let q_h = ecs_tv_world_deep_query(w7, ecs_tv_comp_info_id_deep(health));
+    if ecs_tv_query_deep_count(q_h) != 2 { panic(142771); };
+    let q_m = ecs_tv_world_deep_query(w7, ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_query_deep_count(q_m) != 1 { panic(142772); };
+    let has_mana = ecs_tv_world_deep_query_with(w7, ecs_tv_comp_info_id_deep(health), ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_query_deep_count(has_mana) != 1 { panic(142773); };
+    let no_mana = ecs_tv_world_deep_query_without(w7, ecs_tv_comp_info_id_deep(health), ecs_tv_comp_info_id_deep(mana));
+    if ecs_tv_query_deep_count(no_mana) != 1 { panic(142774); };
+    if ecs_tv_world_deep_added_since(w7, e2, ecs_tv_comp_info_id_deep(health), 0) != true { panic(142775); };
+    // increment tick then replace e1's health to bump changed but not added.
+    // Capture the pre-replace tick BEFORE the increment so query_changed(since=before_replace)
+    // sees the replace's bumped changed tick (strict > since_tick semantics). Reading the tick
+    // AFTER increment would alias the same by-reference mutation and equal the stamp tick.
+    let before_replace = ecs_tv_world_deep_change_tick(w7);
+    let w8 = ecs_tv_world_deep_increment_tick(w7);
+    let w9 = ecs_tv_world_deep_insert(w8, e1, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(99));
+    let added_after = ecs_tv_world_deep_query_added(w9, ecs_tv_comp_info_id_deep(health), t_after_register);
+    if ecs_tv_query_deep_count(added_after) != 2 { panic(142776); };
+    let changed_after = ecs_tv_world_deep_query_changed(w9, ecs_tv_comp_info_id_deep(health), before_replace);
+    if ecs_tv_query_deep_count(changed_after) != 1 { panic(142777); };
+    if ecs_tv_data_deep_amount(ecs_tv_world_deep_get(w9, e1, ecs_tv_comp_info_id_deep(health))) != 99 { panic(142778); };
+}
+
+// ── Test 6: despawn + generation bump + cap reject + remove only-if-present. ──
+@test "EcsTVWorldDeep despawn + remove no-op-if-absent + cap-4 arch-0 row cap"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let health = ecs_tv_register_info_deep(r1);
+    let sp1 = ecs_tv_world_deep_spawn(w1);
+    let w2 = ecs_tv_spawn_world_deep(sp1);
+    let e1 = ecs_tv_spawn_entity_deep(sp1);
+    let w3 = ecs_tv_world_deep_insert(w2, e1, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(2));
+    // remove an absent component is a no-op.
+    let bogus_cid = 777;
+    let w4 = ecs_tv_world_deep_remove(w3, e1, bogus_cid);
+    if ecs_tv_world_deep_has(w4, e1, ecs_tv_comp_info_id_deep(health)) != true { panic(142780); };
+    let w5 = ecs_tv_world_deep_despawn(w4, e1);
+    if ecs_tv_world_deep_is_alive(w5, e1) != false { panic(142781); };
+    if ecs_tv_world_deep_entity_count(w5) != 0 { panic(142782); };
+    // stale entity id with old generation must remain non-alive.
+    if ecs_tv_world_deep_is_alive(w5, e1) != false { panic(142783); };
+    // despawn a despawned entity is a no-op.
+    let w6 = ecs_tv_world_deep_despawn(w5, e1);
+    if ecs_tv_world_deep_entity_count(w6) != 0 { panic(142784); };
+    // out-of-range ids are not alive.
+    if ecs_tv_world_deep_is_alive(w6, ecs_tv_entity_new(-1, 0)) != false { panic(142785); };
+    if ecs_tv_world_deep_is_alive(w6, ecs_tv_entity_new(99, 0)) != false { panic(142786); };
+    // Spawn cap is ECS_TV_CAP_ROWS_PER_ARCH (=4) for the empty archetype 0, since spawned
+    // entities start in arch 0 (and never gain components in this test). 4 spawns fill arch
+    // 0's rows; the 5th spawn returns id=-1 (silent cap reject).
+    let w7 = _ecs_tv_spawn_n(w6, 4);
+    if ecs_tv_world_deep_entity_count(w7) != 4 { panic(142787); };
+    let s9 = ecs_tv_world_deep_spawn(w7);
+    let w8 = ecs_tv_spawn_world_deep(s9);
+    let e9 = ecs_tv_spawn_entity_deep(s9);
+    if e9.id != -1 { panic(142788); };
+    if ecs_tv_world_deep_is_alive(w8, e9) != false { panic(142789); };
+}
+
+// Recursive spawn helper. The deep already provides allocator bump; we keep it in tests to satisfy
+// the cap-8 entity cap test without an explosion of individual inserts.
+fn _ecs_tv_spawn_n(w0: EcsTVWorldDeep, count: i32) -> EcsTVWorldDeep {
+    if count <= 0 { return w0; };
+    let sp = ecs_tv_world_deep_spawn(w0);
+    let w1 = ecs_tv_spawn_world_deep(sp);
+    return _ecs_tv_spawn_n(w1, count - 1);
+}
+
+// ── Test 7: resource added/changed since. ──
+@test "EcsTVWorldDeep resource added/changed_since + replace preserves added tick"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    // capture before AT the tick JUST before the first resource insert. Shallow mirrors: before is
+    // the change_tick AT the moment BEFORE the write that produces added+changed ticks. Adapting to
+    // this deep: we capture before at the STARTING change_tick (i.e., BEFORE the inserts stamp ticks
+    // past it). Use the pre-insert tick; the insert stamps at the current change_tick which is BEFORE's
+    // own value, so the test must capture `before = 0` strictly less than later insert ticks via
+    // increment_tick before insert_resource.
+    let before = ecs_tv_world_deep_change_tick(w1);
+    let w1a = ecs_tv_world_deep_increment_tick(w1);
+    let w2 = ecs_tv_world_deep_insert_resource(w1a, ecs_tv_time_deep_new(4));
+    if ecs_tv_world_deep_resource_added_since(w2, before) != true { panic(142790); };
+    if ecs_tv_world_deep_resource_changed_since(w2, before) != true { panic(142791); };
+    // increment tick then replace the resource. The resource should be changed since
+    // post-insert-tick BIT NOT added_since (the first insert already established added; replace only
+    // bumps changed).
+    let w3 = ecs_tv_world_deep_increment_tick(w2);
+    // The first insert_resource stamped res_added_tick = res_changed_tick = before + 1 (the
+    // change_tick value it stamped at was `before` AFTER the increment_tick above). Compute
+    // t_after_insert arithmetically instead of re-reading change_tick(w2): SA passes structs
+    // by reference, so change_tick(w2) would now alias the just-bumped post-increment value
+    // and wrongly equal the upcoming second insert's stamp tick.
+    let t_after_insert = before + 1;
+    let w4 = ecs_tv_world_deep_insert_resource(w3, ecs_tv_time_deep_new(6));
+    if ecs_tv_world_deep_resource_added_since(w4, t_after_insert) != false { panic(142792); };
+    if ecs_tv_world_deep_resource_changed_since(w4, t_after_insert) != true { panic(142793); };
+    if ecs_tv_time_deep_tick(ecs_tv_world_deep_get_resource(w4)) != 6 { panic(142794); };
+}
+
+// ── Test 8: spawn attaches to empty archetype; insert + detach back to empty archetype. ──
+@test "EcsTVWorldDeep remove returns entity to arch 0 (empty archetype)"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let health = ecs_tv_register_info_deep(r1);
+    let sp = ecs_tv_world_deep_spawn(w1);
+    let w2 = ecs_tv_spawn_world_deep(sp);
+    let e1 = ecs_tv_spawn_entity_deep(sp);
+    if ecs_tv_world_deep_entity_archetype_id(w2, e1) != 0 { panic(142800); };
+    let w3 = ecs_tv_world_deep_insert(w2, e1, ecs_tv_comp_info_id_deep(health), ecs_tv_data_deep_new(1));
+    if ecs_tv_world_deep_entity_archetype_id(w3, e1) == 0 { panic(142801); };
+    if ecs_tv_world_deep_has(w3, e1, ecs_tv_comp_info_id_deep(health)) != true { panic(142802); };
+    let w4 = ecs_tv_world_deep_remove(w3, e1, ecs_tv_comp_info_id_deep(health));
+    if ecs_tv_world_deep_entity_archetype_id(w4, e1) != 0 { panic(142803); };
+    if ecs_tv_world_deep_has(w4, e1, ecs_tv_comp_info_id_deep(health)) != false { panic(142804); };
+    if ecs_tv_world_deep_archetype_entity_count(w4, 0) != 1 { panic(142805); };
+}
+
+// ── Test 9: query_pair_mut_first + pair_write_first forks across multiple entities. ──
+@test "EcsTVWorldDeep pair mut writes back the first-component value via insert path"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let pos = ecs_tv_register_info_deep(r1);
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let vel = ecs_tv_register_info_deep(r2);
+    let sp1 = ecs_tv_world_deep_spawn(w2);
+    let w3 = ecs_tv_spawn_world_deep(sp1);
+    let e1 = ecs_tv_spawn_entity_deep(sp1);
+    let sp2 = ecs_tv_world_deep_spawn(w3);
+    let w4 = ecs_tv_spawn_world_deep(sp2);
+    let e2 = ecs_tv_spawn_entity_deep(sp2);
+    let w5 = ecs_tv_world_deep_insert(w4, e1, ecs_tv_comp_info_id_deep(pos), ecs_tv_data_deep_new(2));
+    let w6 = ecs_tv_world_deep_insert(w5, e1, ecs_tv_comp_info_id_deep(vel), ecs_tv_data_deep_new(5));
+    let w7 = ecs_tv_world_deep_insert(w6, e2, ecs_tv_comp_info_id_deep(pos), ecs_tv_data_deep_new(3));
+    let w8 = ecs_tv_world_deep_insert(w7, e2, ecs_tv_comp_info_id_deep(vel), ecs_tv_data_deep_new(7));
+    let q = ecs_tv_world_deep_query_pair_mut_first(w8, ecs_tv_comp_info_id_deep(pos), ecs_tv_comp_info_id_deep(vel));
+    if ecs_tv_pair_query_mut_count(q) != 2 { panic(142810); };
+    // take the first pair and write back pos = first + second. The matching entity's pos
+    // should equal pos+vel and the second entity's pos should be unchanged.
+    let pair0 = ecs_tv_pair_query_mut_at(q, 0);
+    let p0_eid = ecs_tv_pair_mut_entity(pair0);
+    let new_pos = ecs_tv_data_deep_new(ecs_tv_data_deep_amount(ecs_tv_pair_mut_first(pair0)) + ecs_tv_data_deep_amount(ecs_tv_pair_mut_second(pair0)));
+    let w9 = ecs_tv_world_deep_pair_write_first(w8, pair0, new_pos);
+    let stored_first = ecs_tv_world_deep_get(w9, p0_eid, ecs_tv_comp_info_id_deep(pos));
+    // The total sum was pos+vel; we cannot precompute the order of pair_capture here -- but the
+    // pair's entity was the lower id (e1.id=0) and pos was 2 + vel 5 = 7.
+    if ecs_tv_data_deep_amount(stored_first) != 7 { panic(142811); };
+    // Verify ALL entities with pos have a non-trivial pos value now.
+    let q_final_pos = ecs_tv_world_deep_query(w9, ecs_tv_comp_info_id_deep(pos));
+    if ecs_tv_query_deep_count(q_final_pos) != 2 { panic(142812); };
+}
+
+// ── Test 10: cap-4 archetype cap silent reject + cap-4 component-per-arch silent reject. ──
+@test "EcsTVWorldDeep cap-4 arch silent reject on insert + cap-4 column cap"() {
+    let w0 = ecs_tv_world_deep_new();
+    let r1 = ecs_tv_world_deep_register_table(w0);
+    let w1 = ecs_tv_register_world_deep(r1);
+    let c0 = ecs_tv_register_info_deep(r1);
+    let r2 = ecs_tv_world_deep_register_table(w1);
+    let w2 = ecs_tv_register_world_deep(r2);
+    let c1 = ecs_tv_register_info_deep(r2);
+    let r3 = ecs_tv_world_deep_register_table(w2);
+    let w3 = ecs_tv_register_world_deep(r3);
+    let c2 = ecs_tv_register_info_deep(r3);
+    let r4 = ecs_tv_world_deep_register_table(w3);
+    let w4 = ecs_tv_register_world_deep(r4);
+    let c3 = ecs_tv_register_info_deep(r4);
+    // 5th register: cap-4 column cap reject silent (ComponentInfo.id = -1).
+    let r5 = ecs_tv_world_deep_register_table(w4);
+    let w5 = ecs_tv_register_world_deep(r5);
+    let c4 = ecs_tv_register_info_deep(r5);
+    if ecs_tv_comp_info_id_deep(c4) != -1 { panic(142830); };
+    if ecs_tv_world_deep_component_count(w5) != 4 { panic(142831); };
+    // spawn an entity, and try to insert 5 distinct components. The 5th insert should not yield a 5th
+    // archetype with comp id c4 (it doesn't exist), but inserting the fifth comp still happens at
+    // id=-1 which we never registered -- the test asserts has() stays false. We just use the
+    // 4 legitimate c0..c3 component ids.
+    let sp = ecs_tv_world_deep_spawn(w5);
+    let w6 = ecs_tv_spawn_world_deep(sp);
+    let e1 = ecs_tv_spawn_entity_deep(sp);
+    let w7 = ecs_tv_world_deep_insert(w6, e1, ecs_tv_comp_info_id_deep(c0), ecs_tv_data_deep_new(1));
+    let w8 = ecs_tv_world_deep_insert(w7, e1, ecs_tv_comp_info_id_deep(c1), ecs_tv_data_deep_new(2));
+    let w9 = ecs_tv_world_deep_insert(w8, e1, ecs_tv_comp_info_id_deep(c2), ecs_tv_data_deep_new(3));
+    let w10 = ecs_tv_world_deep_insert(w9, e1, ecs_tv_comp_info_id_deep(c3), ecs_tv_data_deep_new(4));
+    // Archetype count is capped at ECS_TV_CAP_ARCH (=4): arch 0 (empty) + arches 1,2,3 hold
+    // the {c0}, {c0,c1}, {c0,c1,c2} signatures. The 5th component c3 cannot create a 5th arch --
+    // _ecs_tv_create_arch_for_sig rejects silently when arch_count >= 4. So the c3 insert is
+    // silently dropped: e1 stays in arch 3 ({c0,c1,c2}) and never gains c3.
+    if ecs_tv_world_deep_archetype_count(w10) != 4 { panic(142832); };
+    if ecs_tv_world_deep_has(w10, e1, ecs_tv_comp_info_id_deep(c3)) != false { panic(142833); };
+    if ecs_tv_data_deep_amount(ecs_tv_world_deep_get(w10, e1, ecs_tv_comp_info_id_deep(c2))) != 3 { panic(142834); };
+}

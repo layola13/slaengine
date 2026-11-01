@@ -1,0 +1,122 @@
+@import "../src/relationship_hooks_deep.sla"
+
+// Batch 234: relationship hooks deep (src/relationship/mod.rs).
+// panic codes: 112800 – 112999.
+
+@test "hook_mode_constants"() {
+    if ecs_rh_run() != 0 { panic(112800); };
+    if ecs_rh_skip() != 1 { panic(112801); };
+    if ecs_rh_run_if_not_linked() != 2 { panic(112802); };
+}
+
+@test "on_insert_builds_target_collection"() {
+    let k = ecs_rh_kind_new(1, false, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_insert(w, 11, 1, ECS_RH_RUN);
+    if ecs_rh_entity_has_rel(w, 10) != true { panic(112810); };
+    if ecs_rh_entity_rel_target(w, 10) != 1 { panic(112811); };
+    if ecs_rh_entity_has_target_comp(w, 1) != true { panic(112812); };
+    if ecs_rh_entity_sources_len(w, 1) != 2 { panic(112813); };
+    if ecs_rh_entity_sources_contains(w, 1, 11) != true { panic(112814); };
+}
+
+@test "self_ref_rejected_unless_allowed"() {
+    let k = ecs_rh_kind_new(1, false, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 5, 5, ECS_RH_RUN);
+    if ecs_rh_world_self_ref_rejects(w) != 1 { panic(112820); };
+    if ecs_rh_entity_has_rel(w, 5) != false { panic(112821); };
+    let k2 = ecs_rh_kind_new(2, false, true, false);
+    let w2 = ecs_rh_world_new(k2);
+    w2 = ecs_rh_on_insert(w2, 5, 5, ECS_RH_RUN);
+    if ecs_rh_entity_has_rel(w2, 5) != true { panic(112822); };
+    if ecs_rh_entity_sources_contains(w2, 5, 5) != true { panic(112823); };
+}
+
+@test "skip_and_run_if_not_linked"() {
+    let k = ecs_rh_kind_new(1, true, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 2, 1, ECS_RH_SKIP);
+    if ecs_rh_world_hooks_skipped(w) != 1 { panic(112830); };
+    if ecs_rh_entity_has_rel(w, 2) != false { panic(112831); };
+    // RunIfNotLinked with linked_spawn true => skip
+    w = ecs_rh_on_insert(w, 3, 1, ECS_RH_RUN_IF_NOT_LINKED);
+    if ecs_rh_world_hooks_skipped(w) != 2 { panic(112832); };
+    // unlinked kind allows RunIfNotLinked
+    let k2 = ecs_rh_kind_new(1, false, false, false);
+    let w2 = ecs_rh_world_new(k2);
+    w2 = ecs_rh_on_insert(w2, 3, 1, ECS_RH_RUN_IF_NOT_LINKED);
+    if ecs_rh_entity_has_rel(w2, 3) != true { panic(112833); };
+}
+
+@test "on_remove_empties_and_pending_flush"() {
+    let k = ecs_rh_kind_new(1, false, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_remove_rel(w, 10, ECS_RH_RUN);
+    if ecs_rh_entity_has_rel(w, 10) != false { panic(112840); };
+    if ecs_rh_entity_sources_len(w, 1) != 0 { panic(112841); };
+    if ecs_rh_world_pending_n(w) != 1 { panic(112842); };
+    // still has target until flush
+    if ecs_rh_entity_has_target_comp(w, 1) != true { panic(112843); };
+    w = ecs_rh_flush_pending(w);
+    if ecs_rh_entity_has_target_comp(w, 1) != false { panic(112844); };
+    if ecs_rh_world_pending_n(w) != 0 { panic(112845); };
+}
+
+@test "pending_not_removed_if_refilled"() {
+    let k = ecs_rh_kind_new(1, false, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_remove_rel(w, 10, ECS_RH_RUN);
+    // re-insert before flush
+    w = ecs_rh_on_insert(w, 11, 1, ECS_RH_RUN);
+    w = ecs_rh_flush_pending(w);
+    if ecs_rh_entity_has_target_comp(w, 1) != true { panic(112850); };
+    if ecs_rh_entity_sources_contains(w, 1, 11) != true { panic(112851); };
+}
+
+@test "one_to_one_replaces_previous"() {
+    let k = ecs_rh_kind_new(1, false, false, true);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_insert(w, 11, 1, ECS_RH_RUN);
+    if ecs_rh_entity_sources_len(w, 1) != 1 { panic(112860); };
+    if ecs_rh_entity_sources_contains(w, 1, 11) != true { panic(112861); };
+    if ecs_rh_entity_has_rel(w, 10) != false { panic(112862); };
+    if ecs_rh_entity_has_rel(w, 11) != true { panic(112863); };
+}
+
+@test "linked_spawn_on_discard_despawns_sources"() {
+    let k = ecs_rh_kind_new(1, true, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_insert(w, 11, 1, ECS_RH_RUN);
+    w = ecs_rh_on_discard_target(w, 1, ECS_RH_RUN);
+    if ecs_rh_world_despawned_linked(w) != 2 { panic(112870); };
+    if ecs_rh_entity_alive(w, 10) != false { panic(112871); };
+    if ecs_rh_entity_alive(w, 11) != false { panic(112872); };
+    if ecs_rh_entity_has_target_comp(w, 1) != false { panic(112873); };
+}
+
+@test "discard_skip_modes"() {
+    let k = ecs_rh_kind_new(1, true, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_discard_target(w, 1, ECS_RH_SKIP);
+    if ecs_rh_world_hooks_skipped(w) != 1 { panic(112880); };
+    if ecs_rh_entity_alive(w, 10) != true { panic(112881); };
+    w = ecs_rh_on_discard_target(w, 1, ECS_RH_RUN_IF_NOT_LINKED);
+    if ecs_rh_world_hooks_skipped(w) != 2 { panic(112882); };
+}
+
+@test "unlinked_discard_does_not_despawn"() {
+    let k = ecs_rh_kind_new(1, false, false, false);
+    let w = ecs_rh_world_new(k);
+    w = ecs_rh_on_insert(w, 10, 1, ECS_RH_RUN);
+    w = ecs_rh_on_discard_target(w, 1, ECS_RH_RUN);
+    if ecs_rh_world_despawned_linked(w) != 0 { panic(112890); };
+    if ecs_rh_entity_alive(w, 10) != true { panic(112891); };
+    if ecs_rh_entity_has_target_comp(w, 1) != false { panic(112892); };
+}

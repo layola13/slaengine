@@ -1,0 +1,250 @@
+@import "../src/event_trigger_deep.sla"
+
+// Batch 206: Event trigger deep (src/event/trigger.rs).
+
+@test "global_trigger_runs_all_global_observers"() {
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 100);
+    obs = ecs_etr_add_global(obs, 101);
+    // entity-scoped should be ignored by GlobalTrigger
+    obs = ecs_etr_add_entity_obs(obs, 5, 200);
+    let event = ecs_etr_event_new(42, 5);
+    let ctx = ecs_etr_ctx_new(7, 0);
+    let r = ecs_etr_global_trigger(obs, event, ctx);
+    if ecs_etr_result_log_len(r) != 2 { panic(107200); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_GLOBAL) != 2 { panic(107201); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_ENTITY) != 0 { panic(107202); };
+    if ecs_etr_result_trigger_id(r) != 1 { panic(107203); };
+    let inv0 = ecs_etr_result_log_at(r, 0);
+    if ecs_etr_invoke_observer_id(inv0) != 100 { panic(107204); };
+}
+
+@test "entity_trigger_global_then_entity_scoped"() {
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 1);
+    obs = ecs_etr_add_entity_obs(obs, 10, 2);
+    obs = ecs_etr_add_entity_obs(obs, 11, 3); // different entity — not run
+    let event = ecs_etr_event_new(9, 10);
+    let r = ecs_etr_entity_trigger(obs, event, ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_log_len(r) != 2 { panic(107210); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_GLOBAL) != 1 { panic(107211); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_ENTITY) != 1 { panic(107212); };
+    let inv1 = ecs_etr_result_log_at(r, 1);
+    if ecs_etr_invoke_observer_id(inv1) != 2 { panic(107213); };
+    if ecs_etr_invoke_target(inv1) != 10 { panic(107214); };
+}
+
+@test "entity_trigger_no_entity_observers"() {
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 50);
+    let event = ecs_etr_event_new(1, 99);
+    let r = ecs_etr_entity_trigger(obs, event, ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_log_len(r) != 1 { panic(107220); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_ENTITY) != 0 { panic(107221); };
+}
+
+@test "propagate_auto_walks_parent_chain"() {
+    // child 1 -> parent 2 -> grandparent 3
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    w = ecs_etr_world_spawn(w, 2);
+    w = ecs_etr_world_spawn(w, 3);
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    w = ecs_etr_world_set_parent(w, 2, 3);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 7);
+    let event = ecs_etr_event_new(100, 1);
+    let r = ecs_etr_propagate_default(w, obs, event, ecs_etr_ctx_new(1, 0));
+    // hops: 0 at 1, 1 at 2, 2 at 3 => 3 hops index max 2, hops field = 2
+    if ecs_etr_result_hops(r) != 2 { panic(107230); };
+    if ecs_etr_result_original(r) != 1 { panic(107231); };
+    if ecs_etr_result_event_target(r) != 3 { panic(107232); };
+    // 3 hops * 1 global each = 3
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_GLOBAL) != 3 { panic(107233); };
+    if ecs_etr_result_log_len(r) != 3 { panic(107234); };
+    let inv2 = ecs_etr_result_log_at(r, 2);
+    if ecs_etr_invoke_target(inv2) != 3 { panic(107235); };
+    if ecs_etr_invoke_hop(inv2) != 2 { panic(107236); };
+}
+
+@test "propagate_manual_stays_on_original"() {
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    w = ecs_etr_world_spawn(w, 2);
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 1);
+    let event = ecs_etr_event_new(5, 1);
+    let r = ecs_etr_propagate_manual(w, obs, event, ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_hops(r) != 0 { panic(107240); };
+    if ecs_etr_result_event_target(r) != 1 { panic(107241); };
+    if ecs_etr_result_log_len(r) != 1 { panic(107242); };
+}
+
+@test "propagate_stop_after_first_hop"() {
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    w = ecs_etr_world_spawn(w, 2);
+    w = ecs_etr_world_spawn(w, 3);
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    w = ecs_etr_world_set_parent(w, 2, 3);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 9);
+    let event = ecs_etr_event_new(1, 1);
+    // stop_after_hop=0 means after hop 0 disable further propagation
+    let r = ecs_etr_propagate_trigger(w, obs, event, ecs_etr_ctx_new(1, 0), true, 0);
+    if ecs_etr_result_hops(r) != 0 { panic(107250); };
+    if ecs_etr_result_log_len(r) != 1 { panic(107251); };
+    if ecs_etr_result_event_target(r) != 1 { panic(107252); };
+}
+
+@test "propagate_stop_after_hop_one"() {
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    w = ecs_etr_world_spawn(w, 2);
+    w = ecs_etr_world_spawn(w, 3);
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    w = ecs_etr_world_set_parent(w, 2, 3);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 1);
+    let event = ecs_etr_event_new(1, 1);
+    let r = ecs_etr_propagate_trigger(w, obs, event, ecs_etr_ctx_new(1, 0), true, 1);
+    // hop0 + hop1 then stop => hops=1, 2 invocations
+    if ecs_etr_result_hops(r) != 1 { panic(107260); };
+    if ecs_etr_result_log_len(r) != 2 { panic(107261); };
+    if ecs_etr_result_event_target(r) != 2 { panic(107262); };
+}
+
+@test "propagate_missing_parent_stops"() {
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    // parent 2 not spawned
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 1);
+    let r = ecs_etr_propagate_default(w, obs, ecs_etr_event_new(1, 1), ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_hops(r) != 0 { panic(107270); };
+    if ecs_etr_result_log_len(r) != 1 { panic(107271); };
+}
+
+@test "entity_components_runs_component_observers"() {
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 1);
+    obs = ecs_etr_add_comp_global(obs, 10, 20);
+    obs = ecs_etr_add_comp_global(obs, 11, 21); // other component
+    obs = ecs_etr_add_entity_comp(obs, 5, 10, 30);
+    obs = ecs_etr_add_entity_comp(obs, 6, 10, 31); // other entity
+    let comps = ecs_etr_components_new();
+    comps = ecs_etr_components_push(comps, 10);
+    let event = ecs_etr_event_new(7, 5);
+    let r = ecs_etr_entity_components_trigger(obs, event, ecs_etr_ctx_new(1, 0), comps);
+    // global(1) + comp_global(20) + entity_comp(30) = 3
+    if ecs_etr_result_log_len(r) != 3 { panic(107280); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_GLOBAL) != 1 { panic(107281); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_COMP_GLOBAL) != 1 { panic(107282); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_ENTITY_COMP) != 1 { panic(107283); };
+    let inv2 = ecs_etr_result_log_at(r, 2);
+    if ecs_etr_invoke_observer_id(inv2) != 30 { panic(107284); };
+    if ecs_etr_invoke_component(inv2) != 10 { panic(107285); };
+}
+
+@test "entity_components_multiple_components"() {
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_comp_global(obs, 1, 100);
+    obs = ecs_etr_add_comp_global(obs, 2, 200);
+    let comps = ecs_etr_components_new();
+    comps = ecs_etr_components_push(comps, 1);
+    comps = ecs_etr_components_push(comps, 2);
+    let r = ecs_etr_entity_components_trigger(
+        obs,
+        ecs_etr_event_new(0, 9),
+        ecs_etr_ctx_new(1, 0),
+        comps
+    );
+    // no global obs, two comp globals
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_COMP_GLOBAL) != 2 { panic(107290); };
+    if ecs_etr_result_log_len(r) != 2 { panic(107291); };
+}
+
+@test "new_archetype_contains_helper"() {
+    let comps = ecs_etr_components_new();
+    if ecs_etr_new_archetype_contains(comps, 1) != false { panic(107300); };
+    // mask bit0 for component_id 1, bit1 for id 2 => mask = 1 + 2 = 3
+    comps = ecs_etr_components_set_new_archetype(comps, 3);
+    if ecs_etr_components_has_new_archetype(comps) != true { panic(107301); };
+    if ecs_etr_new_archetype_contains(comps, 1) != true { panic(107302); };
+    if ecs_etr_new_archetype_contains(comps, 2) != true { panic(107303); };
+    if ecs_etr_new_archetype_contains(comps, 3) != false { panic(107304); };
+}
+
+@test "entity_scoped_at_each_propagation_hop"() {
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    w = ecs_etr_world_spawn(w, 2);
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_entity_obs(obs, 1, 11);
+    obs = ecs_etr_add_entity_obs(obs, 2, 22);
+    let r = ecs_etr_propagate_default(w, obs, ecs_etr_event_new(0, 1), ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_ENTITY) != 2 { panic(107310); };
+    let a = ecs_etr_result_log_at(r, 0);
+    let b = ecs_etr_result_log_at(r, 1);
+    if ecs_etr_invoke_observer_id(a) != 11 { panic(107311); };
+    if ecs_etr_invoke_observer_id(b) != 22 { panic(107312); };
+}
+
+@test "trigger_id_increments_per_entity_internal"() {
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 1);
+    let r = ecs_etr_entity_trigger(obs, ecs_etr_event_new(0, 1), ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_trigger_id(r) != 1 { panic(107320); };
+    // second trigger continues from returned observers
+    let r2 = ecs_etr_entity_trigger(r.observers, ecs_etr_event_new(0, 1), ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_trigger_id(r2) != 2 { panic(107321); };
+}
+
+@test "on_set_propagate_flag"() {
+    let obs = ecs_etr_observers_new();
+    let r = ecs_etr_entity_trigger(obs, ecs_etr_event_new(0, 1), ecs_etr_ctx_new(1, 0));
+    if ecs_etr_result_propagate(r) != false { panic(107330); };
+    r = ecs_etr_on_set_propagate(r, true);
+    if ecs_etr_result_propagate(r) != true { panic(107331); };
+}
+
+@test "kind_constants"() {
+    if ecs_etr_kind_global() != 0 { panic(107340); };
+    if ecs_etr_kind_entity() != 1 { panic(107341); };
+    if ecs_etr_kind_propagate() != 2 { panic(107342); };
+    if ecs_etr_kind_entity_components() != 3 { panic(107343); };
+}
+
+@test "world_has_and_spawn"() {
+    let w = ecs_etr_world_new();
+    if ecs_etr_world_has(w, 1) != false { panic(107350); };
+    w = ecs_etr_world_spawn(w, 1);
+    if ecs_etr_world_has(w, 1) != true { panic(107351); };
+}
+
+@test "components_push_len"() {
+    let c = ecs_etr_components_new();
+    c = ecs_etr_components_push(c, 3);
+    c = ecs_etr_components_push(c, 4);
+    if ecs_etr_components_len(c) != 2 { panic(107360); };
+    if ecs_etr_components_at(c, 1) != 4 { panic(107361); };
+}
+
+@test "propagate_with_entity_and_global_mix"() {
+    let w = ecs_etr_world_new();
+    w = ecs_etr_world_spawn(w, 1);
+    w = ecs_etr_world_spawn(w, 2);
+    w = ecs_etr_world_set_parent(w, 1, 2);
+    let obs = ecs_etr_observers_new();
+    obs = ecs_etr_add_global(obs, 100);
+    obs = ecs_etr_add_entity_obs(obs, 1, 10);
+    obs = ecs_etr_add_entity_obs(obs, 2, 20);
+    let r = ecs_etr_propagate_default(w, obs, ecs_etr_event_new(5, 1), ecs_etr_ctx_new(1, 0));
+    // hop0: global+entity(1); hop1: global+entity(2) = 4
+    if ecs_etr_result_log_len(r) != 4 { panic(107370); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_GLOBAL) != 2 { panic(107371); };
+    if ecs_etr_result_count_scope(r, ECS_ETR_SCOPE_ENTITY) != 2 { panic(107372); };
+}

@@ -1,0 +1,81 @@
+// Minimal unified facade core test: spawn/insert/get/query/resource/message
+// without pulling in the schedule/commands stack, so the generated SA stays
+// small enough for the SA backend test compiler.
+@import "../src/world_table_erased.sla"
+@import "../src/box_drop.sla"
+
+const CORE_POS: i32 = 9101;
+const CORE_VEL: i32 = 9102;
+
+struct CorePos { x: i32, y: i32 }
+struct CoreVel { dx: i32, dy: i32 }
+struct CoreTime { tick: i32 }
+struct CoreEvent { amount: i32 }
+
+fn core_time_default() -> CoreTime { return CoreTime { tick: 0 }; }
+fn core_event_default() -> CoreEvent { return CoreEvent { amount: 0 }; }
+
+@test "ecs unified core facade spawn insert query resource message"() {
+    let w0 = table_erased_world_new<CoreTime, CoreEvent>(core_time_default(), core_event_default());
+    let (w1, pos_info) = table_erased_world_register_table<CoreTime, CoreEvent>(w0, CORE_POS, ecs_box_drop<CorePos>);
+    let (w2, vel_info) = table_erased_world_register_table<CoreTime, CoreEvent>(w1, CORE_VEL, ecs_box_drop<CoreVel>);
+
+    let (w3, hero) = table_erased_world_spawn<CoreTime, CoreEvent>(w2);
+    let w4 = table_erased_world_insert_auto<CorePos, CoreTime, CoreEvent>(w3, hero, CORE_POS, CorePos { x: 0, y: 0 });
+    let w5 = table_erased_world_insert_auto<CoreVel, CoreTime, CoreEvent>(w4, hero, CORE_VEL, CoreVel { dx: 5, dy: 2 });
+
+    let (w6, foe) = table_erased_world_spawn<CoreTime, CoreEvent>(w5);
+    let w7 = table_erased_world_insert_auto<CorePos, CoreTime, CoreEvent>(w6, foe, CORE_POS, CorePos { x: 10, y: 10 });
+
+    // query positions
+    let positions = table_erased_world_query_auto<CorePos, CoreTime, CoreEvent>(w7, CORE_POS);
+    if len(positions.items) != 2 { panic(21001); };
+
+    // get hero position by entity
+    let hero_pos = table_erased_world_get_auto<CorePos, CoreTime, CoreEvent>(w7, hero, CORE_POS);
+    if hero_pos.x != 0 { panic(21002); };
+    if hero_pos.y != 0 { panic(21003); };
+
+    // get hero velocity and apply movement
+    let hero_vel = table_erased_world_get_auto<CoreVel, CoreTime, CoreEvent>(w7, hero, CORE_VEL);
+    let moved = CorePos { x: hero_pos.x + hero_vel.dx, y: hero_pos.y + hero_vel.dy };
+    let w8 = table_erased_world_insert_auto<CorePos, CoreTime, CoreEvent>(w7, hero, CORE_POS, moved);
+
+    let hero_pos2 = table_erased_world_get_auto<CorePos, CoreTime, CoreEvent>(w8, hero, CORE_POS);
+    if hero_pos2.x != 5 { panic(21004); };
+    if hero_pos2.y != 2 { panic(21005); };
+
+    // has / remove
+    if table_erased_world_has_type<CoreTime, CoreEvent>(w8, hero, CORE_VEL) != true { panic(21006); };
+    let w9 = table_erased_world_remove_auto<CoreTime, CoreEvent>(w8, hero, CORE_VEL);
+    if table_erased_world_has_type<CoreTime, CoreEvent>(w9, hero, CORE_VEL) != false { panic(21007); };
+
+    // resource
+    if table_erased_world_has_resource<CoreTime, CoreEvent>(w9) != false { panic(21008); };
+    let w10 = table_erased_world_insert_resource<CoreTime, CoreEvent>(w9, CoreTime { tick: 42 });
+    if table_erased_world_has_resource<CoreTime, CoreEvent>(w10) != true { panic(21009); };
+    let t = table_erased_world_get_resource<CoreTime, CoreEvent>(w10);
+    if t.tick != 42 { panic(21010); };
+
+    // message
+    let w11 = table_erased_world_write_message<CoreTime, CoreEvent>(w10, CoreEvent { amount: 7 });
+    if table_erased_world_messages_len<CoreTime, CoreEvent>(w11) != 1 { panic(21011); };
+    let read = table_erased_world_read_message<CoreTime, CoreEvent>(w11, message_reader_new(), core_event_default());
+    if read.has_value != true { panic(21012); };
+    if read.value.amount != 7 { panic(21013); };
+
+    // change detection: capture last_run, advance the tick, then mutate so the
+    // new changed_tick is greater than last_run. Bevy records changed_tick at
+    // the change_tick in effect when the mutation happens.
+    let last_run = w11.registry.change_tick;
+    let w12 = table_erased_world_increment_tick<CoreTime, CoreEvent>(w11);
+    // hero's Pos was added at tick 0; after advancing the tick it is no longer
+    // "added since last_run" (last_run >= added_tick), but not yet changed.
+    if table_erased_world_added_since_auto<CoreTime, CoreEvent>(w12, hero, CORE_POS, last_run) != false { panic(21014); };
+    if table_erased_world_changed_since_auto<CoreTime, CoreEvent>(w12, hero, CORE_POS, last_run) != false { panic(21015); };
+    // Mutate Pos after the tick advance; now changed_tick > last_run.
+    let w13 = table_erased_world_insert_auto<CorePos, CoreTime, CoreEvent>(w12, hero, CORE_POS, CorePos { x: 9, y: 9 });
+    if table_erased_world_changed_since_auto<CoreTime, CoreEvent>(w13, hero, CORE_POS, last_run) != true { panic(21016); };
+    let final_pos = table_erased_world_get_auto<CorePos, CoreTime, CoreEvent>(w13, hero, CORE_POS);
+    if final_pos.x != 9 { panic(21017); };
+}

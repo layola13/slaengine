@@ -1,0 +1,452 @@
+// SystemParamBuilder + Schedule Executor (single-threaded + multi-threaded) +
+// SystemSchedule + ApplyDeferred + ComponentDescriptor full construction.
+// Bevy system/builder.rs + schedule/executor/mod.rs + single_threaded.rs + multi_threaded.rs.
+
+// --- SystemParamBuilder ---
+struct EcsParamBuilder {
+    kind: i32,  // 0=of, 1=resource, 2=resource_mut, 3=local, 4=query, 5=query_filtered
+    type_id: i32,
+    filter_type_id: i32,
+}
+
+fn pb_of(type_id: i32) -> EcsParamBuilder { return EcsParamBuilder { kind: 0, type_id: type_id, filter_type_id: 0 }; }
+fn pb_resource(type_id: i32) -> EcsParamBuilder { return EcsParamBuilder { kind: 1, type_id: type_id, filter_type_id: 0 }; }
+fn pb_resource_mut(type_id: i32) -> EcsParamBuilder { return EcsParamBuilder { kind: 2, type_id: type_id, filter_type_id: 0 }; }
+fn pb_local(type_id: i32) -> EcsParamBuilder { return EcsParamBuilder { kind: 3, type_id: type_id, filter_type_id: 0 }; }
+fn pb_query(type_id: i32) -> EcsParamBuilder { return EcsParamBuilder { kind: 4, type_id: type_id, filter_type_id: 0 }; }
+fn pb_query_filtered(type_id: i32, filter_type_id: i32) -> EcsParamBuilder { return EcsParamBuilder { kind: 5, type_id: type_id, filter_type_id: filter_type_id }; }
+
+fn pb_kind(b: EcsParamBuilder) -> i32 { return b.kind; }
+fn pb_type_id(b: EcsParamBuilder) -> i32 { return b.type_id; }
+fn pb_filter_type_id(b: EcsParamBuilder) -> i32 { return b.filter_type_id; }
+
+// --- ParamSetBuilder ---
+struct EcsParamSetBuilder {
+    builders: Vec<EcsParamBuilder>,
+}
+
+fn psb_new() -> EcsParamSetBuilder {
+    return EcsParamSetBuilder { builders: Vec::new() };
+}
+
+fn psb_add(b: EcsParamSetBuilder, pb: EcsParamBuilder) -> EcsParamSetBuilder {
+    b.builders.push(pb);
+    return b;
+}
+
+fn psb_len(b: EcsParamSetBuilder) -> i64 { return len(b.builders) as i64; }
+
+// --- LocalBuilder ---
+struct EcsLocalBuilder {
+    initial_value: i32,
+}
+
+fn local_builder_new(value: i32) -> EcsLocalBuilder { return EcsLocalBuilder { initial_value: value }; }
+fn local_builder_value(b: EcsLocalBuilder) -> i32 { return b.initial_value; }
+
+// --- OptionBuilder / ResultBuilder / IfBuilder ---
+struct EcsOptionBuilder { inner: EcsParamBuilder, }
+fn option_builder_new(pb: EcsParamBuilder) -> EcsOptionBuilder { return EcsOptionBuilder { inner: pb }; }
+fn option_builder_kind(b: EcsOptionBuilder) -> i32 { return b.inner.kind; }
+
+struct EcsResultBuilder { inner: EcsParamBuilder, }
+fn result_builder_new(pb: EcsParamBuilder) -> EcsResultBuilder { return EcsResultBuilder { inner: pb }; }
+fn result_builder_kind(b: EcsResultBuilder) -> i32 { return b.inner.kind; }
+
+struct EcsIfBuilder { inner: EcsParamBuilder, condition: bool, }
+fn if_builder_new(pb: EcsParamBuilder, cond: bool) -> EcsIfBuilder { return EcsIfBuilder { inner: pb, condition: cond }; }
+fn if_builder_condition(b: EcsIfBuilder) -> bool { return b.condition; }
+
+// --- DynParamBuilder ---
+struct EcsDynParamBuilder {
+    type_id: i32,
+}
+
+fn dyn_param_builder_new(type_id: i32) -> EcsDynParamBuilder { return EcsDynParamBuilder { type_id: type_id }; }
+fn dyn_param_builder_type_id(b: EcsDynParamBuilder) -> i32 { return b.type_id; }
+
+// --- SystemSchedule ---
+struct EcsSystemSchedule {
+    system_ids: Vec<i32>,
+    set_ids: Vec<i32>,
+    system_order: Vec<i32>,
+    deferred_count: i32,
+}
+
+fn system_schedule_new() -> EcsSystemSchedule {
+    return EcsSystemSchedule {
+        system_ids: Vec::new(), set_ids: Vec::new(),
+        system_order: Vec::new(), deferred_count: 0,
+    };
+}
+
+fn system_schedule_add_system(s: EcsSystemSchedule, id: i32) -> EcsSystemSchedule {
+    s.system_ids.push(id);
+    return s;
+}
+
+fn system_schedule_add_set(s: EcsSystemSchedule, id: i32) -> EcsSystemSchedule {
+    s.set_ids.push(id);
+    return s;
+}
+
+fn system_schedule_set_order(s: EcsSystemSchedule, order: Vec<i32>) -> EcsSystemSchedule {
+    s.system_order = order;
+    return s;
+}
+
+fn system_schedule_system_count(s: EcsSystemSchedule) -> i64 { return len(s.system_ids) as i64; }
+fn system_schedule_set_count(s: EcsSystemSchedule) -> i64 { return len(s.set_ids) as i64; }
+
+// --- ApplyDeferred marker ---
+struct EcsApplyDeferred {}
+
+fn apply_deferred_new() -> EcsApplyDeferred { return EcsApplyDeferred {}; }
+
+// --- SingleThreadedExecutor ---
+struct EcsSingleThreadedExecutor {
+    evaluated_sets: Vec<bool>,
+    completed_systems: Vec<bool>,
+    unapplied_systems: Vec<bool>,
+    apply_final_deferred: bool,
+}
+
+fn single_threaded_executor_new() -> EcsSingleThreadedExecutor {
+    return EcsSingleThreadedExecutor {
+        evaluated_sets: Vec::new(), completed_systems: Vec::new(),
+        unapplied_systems: Vec::new(), apply_final_deferred: true,
+    };
+}
+
+fn ste_init(exec: EcsSingleThreadedExecutor, schedule: EcsSystemSchedule) -> EcsSingleThreadedExecutor {
+    let sys_count = system_schedule_system_count(schedule) as i64;
+    let set_count = system_schedule_set_count(schedule) as i64;
+    let i: i64 = 0;
+    while i < sys_count {
+        exec.completed_systems.push(false);
+        exec.unapplied_systems.push(false);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    while j < set_count {
+        exec.evaluated_sets.push(false);
+        j = j + 1;
+    }
+    return exec;
+}
+
+fn ste_run(exec: EcsSingleThreadedExecutor, schedule: EcsSystemSchedule) -> (EcsSingleThreadedExecutor, i32) {
+    let order = schedule.system_order;
+    let (e, rc) = ste_run_rec(exec, order, 0, 0);
+    if e.apply_final_deferred {
+        return (ste_apply_deferred(e), rc);
+    };
+    return (e, rc);
+}
+
+fn ste_run_rec(e: EcsSingleThreadedExecutor, order: Vec<i32>, i: i64, rc: i32) -> (EcsSingleThreadedExecutor, i32) {
+    if i >= (len(order) as i64) { return (e, rc); };
+    let sys_id = order[i];
+    e.completed_systems[sys_id] = true;
+    e.unapplied_systems[sys_id] = true;
+    return ste_run_rec(e, order, i + 1, rc + 1);
+}
+
+fn ste_apply_deferred(e: EcsSingleThreadedExecutor) -> EcsSingleThreadedExecutor {
+    return ste_apply_deferred_rec(e, 0);
+}
+
+fn ste_apply_deferred_rec(e: EcsSingleThreadedExecutor, i: i64) -> EcsSingleThreadedExecutor {
+    if i >= (len(e.unapplied_systems) as i64) { return e; };
+    e.unapplied_systems[i] = false;
+    return ste_apply_deferred_rec(e, i + 1);
+}
+
+fn ste_set_apply_final_deferred(exec: EcsSingleThreadedExecutor, value: bool) -> EcsSingleThreadedExecutor {
+    exec.apply_final_deferred = value;
+    return exec;
+}
+
+fn ste_completed_count(exec: EcsSingleThreadedExecutor) -> i64 {
+    return ste_completed_count_rec(exec, 0, 0);
+}
+
+fn ste_completed_count_rec(exec: EcsSingleThreadedExecutor, i: i64, count: i64) -> i64 {
+    if i >= (len(exec.completed_systems) as i64) { return count; };
+    if exec.completed_systems[i] { return ste_completed_count_rec(exec, i + 1, count + 1); };
+    return ste_completed_count_rec(exec, i + 1, count);
+}
+
+fn ste_unapplied_count(exec: EcsSingleThreadedExecutor) -> i64 {
+    return ste_unapplied_count_rec(exec, 0, 0);
+}
+
+fn ste_unapplied_count_rec(exec: EcsSingleThreadedExecutor, i: i64, count: i64) -> i64 {
+    if i >= (len(exec.unapplied_systems) as i64) { return count; };
+    if exec.unapplied_systems[i] { return ste_unapplied_count_rec(exec, i + 1, count + 1); };
+    return ste_unapplied_count_rec(exec, i + 1, count);
+}
+
+// --- MultiThreadedExecutor ---
+struct EcsMultiThreadedExecutor {
+    thread_count: i32,
+    max_safe_systems: i32,
+    apply_final_deferred: bool,
+}
+
+fn multi_threaded_executor_new() -> EcsMultiThreadedExecutor {
+    return EcsMultiThreadedExecutor { thread_count: 1, max_safe_systems: 0, apply_final_deferred: true };
+}
+
+fn mte_set_thread_count(exec: EcsMultiThreadedExecutor, count: i32) -> EcsMultiThreadedExecutor {
+    exec.thread_count = count;
+    return exec;
+}
+
+fn mte_thread_count(exec: EcsMultiThreadedExecutor) -> i32 { return exec.thread_count; }
+
+fn mte_run(exec: EcsMultiThreadedExecutor, schedule: EcsSystemSchedule) -> (EcsMultiThreadedExecutor, i32) {
+    // Simulate parallel: count systems, distribute across threads
+    let sys_count = system_schedule_system_count(schedule) as i32;
+    return (exec, sys_count);
+}
+
+fn mte_set_apply_final_deferred(exec: EcsMultiThreadedExecutor, value: bool) -> EcsMultiThreadedExecutor {
+    exec.apply_final_deferred = value;
+    return exec;
+}
+
+// --- ComponentDescriptor full construction ---
+struct EcsComponentDescriptorFull {
+    name: Vec<i32>,
+    storage_type: i32,
+    is_mutable: bool,
+    is_send_and_sync: bool,
+    type_id: i32,
+    requires_drop: bool,
+    layout_align: i64,
+    layout_size: i64,
+}
+
+fn descriptor_full_new(name: Vec<i32>, storage_type: i32, is_mutable: bool, type_id: i32) -> EcsComponentDescriptorFull {
+    return EcsComponentDescriptorFull {
+        name: name, storage_type: storage_type, is_mutable: is_mutable,
+        is_send_and_sync: true, type_id: type_id, requires_drop: false,
+        layout_align: 4, layout_size: 4,
+    };
+}
+
+fn descriptor_full_set_drop(d: EcsComponentDescriptorFull) -> EcsComponentDescriptorFull {
+    d.requires_drop = true;
+    return d;
+}
+
+fn descriptor_full_set_layout(d: EcsComponentDescriptorFull, align: i64, size: i64) -> EcsComponentDescriptorFull {
+    d.layout_align = align;
+    d.layout_size = size;
+    return d;
+}
+
+fn descriptor_full_set_non_send(d: EcsComponentDescriptorFull) -> EcsComponentDescriptorFull {
+    d.is_send_and_sync = false;
+    return d;
+}
+
+fn descriptor_full_set_immutable(d: EcsComponentDescriptorFull) -> EcsComponentDescriptorFull {
+    d.is_mutable = false;
+    return d;
+}
+
+fn descriptor_full_requires_drop(d: EcsComponentDescriptorFull) -> bool { return d.requires_drop; }
+fn descriptor_full_layout_align(d: EcsComponentDescriptorFull) -> i64 { return d.layout_align; }
+fn descriptor_full_layout_size(d: EcsComponentDescriptorFull) -> i64 { return d.layout_size; }
+fn descriptor_full_is_send_and_sync(d: EcsComponentDescriptorFull) -> bool { return d.is_send_and_sync; }
+
+const T_A: i32 = 20001;
+const T_B: i32 = 20002;
+const T_FILTER: i32 = 20003;
+
+@test "param_builder of"() {
+    let pb = pb_of(T_A);
+    if pb_kind(pb) != 0 { panic(20001); };
+    if pb_type_id(pb) != T_A { panic(20002); };
+}
+
+@test "param_builder resource"() {
+    let pb = pb_resource(T_A);
+    if pb_kind(pb) != 1 { panic(20003); };
+}
+
+@test "param_builder resource_mut"() {
+    let pb = pb_resource_mut(T_A);
+    if pb_kind(pb) != 2 { panic(20004); };
+}
+
+@test "param_builder local"() {
+    let pb = pb_local(T_A);
+    if pb_kind(pb) != 3 { panic(20005); };
+}
+
+@test "param_builder query"() {
+    let pb = pb_query(T_A);
+    if pb_kind(pb) != 4 { panic(20006); };
+}
+
+@test "param_builder query_filtered"() {
+    let pb = pb_query_filtered(T_A, T_FILTER);
+    if pb_kind(pb) != 5 { panic(20007); };
+    if pb_filter_type_id(pb) != T_FILTER { panic(20008); };
+}
+
+@test "param_set_builder add and len"() {
+    let psb = psb_new();
+    let psb2 = psb_add(psb, pb_resource(T_A));
+    let psb3 = psb_add(psb2, pb_query(T_B));
+    if psb_len(psb3) != 2 { panic(20009); };
+}
+
+@test "local_builder value"() {
+    let lb = local_builder_new(42);
+    if local_builder_value(lb) != 42 { panic(20010); };
+}
+
+@test "option_builder wraps inner"() {
+    let ob = option_builder_new(pb_resource(T_A));
+    if option_builder_kind(ob) != 1 { panic(20011); };
+}
+
+@test "result_builder wraps inner"() {
+    let rb = result_builder_new(pb_query(T_A));
+    if result_builder_kind(rb) != 4 { panic(20012); };
+}
+
+@test "if_builder condition"() {
+    let ib = if_builder_new(pb_resource(T_A), true);
+    if if_builder_condition(ib) != true { panic(20013); };
+}
+
+@test "dyn_param_builder type_id"() {
+    let dpb = dyn_param_builder_new(T_A);
+    if dyn_param_builder_type_id(dpb) != T_A { panic(20014); };
+}
+
+@test "system_schedule add_system and add_set"() {
+    let s = system_schedule_new();
+    let s2 = system_schedule_add_system(s, 1);
+    let s3 = system_schedule_add_set(s2, 10);
+    if system_schedule_system_count(s3) != 1 { panic(20015); };
+    if system_schedule_set_count(s3) != 1 { panic(20016); };
+}
+
+@test "system_schedule set_order"() {
+    let s = system_schedule_new();
+    let order: Vec<i32> = Vec::new();
+    order.push(2);
+    order.push(0);
+    order.push(1);
+    let s2 = system_schedule_set_order(s, order);
+    if len(s2.system_order) != 3 { panic(20017); };
+}
+
+@test "apply_deferred marker"() {
+    let _ad = apply_deferred_new();
+}
+
+@test "single_threaded_executor init"() {
+    let exec = single_threaded_executor_new();
+    let sched = system_schedule_new();
+    let sched2 = system_schedule_add_system(sched, 0);
+    let sched3 = system_schedule_add_system(sched2, 1);
+    let exec2 = ste_init(exec, sched3);
+    if len(exec2.completed_systems) != 2 { panic(20018); };
+    if len(exec2.evaluated_sets) != 0 { panic(20019); };
+}
+
+@test "single_threaded_executor run"() {
+    let exec = single_threaded_executor_new();
+    let sched = system_schedule_new();
+    let sched2 = system_schedule_add_system(sched, 0);
+    let sched3 = system_schedule_add_system(sched2, 1);
+    let sched4 = system_schedule_add_set(sched3, 10);
+    let order: Vec<i32> = Vec::new();
+    order.push(0);
+    order.push(1);
+    let sched5 = system_schedule_set_order(sched4, order);
+    let exec2 = ste_init(exec, sched5);
+    let (exec3, run_count) = ste_run(exec2, sched5);
+    if run_count != 2 { panic(20020); };
+    if ste_completed_count(exec3) != 2 { panic(20021); };
+}
+
+@test "single_threaded_executor apply_final_deferred clears unapplied"() {
+    let exec = single_threaded_executor_new();
+    let sched = system_schedule_new();
+    let sched2 = system_schedule_add_system(sched, 0);
+    let order: Vec<i32> = Vec::new();
+    order.push(0);
+    let sched3 = system_schedule_set_order(sched2, order);
+    let exec2 = ste_init(exec, sched3);
+    let (exec3, _) = ste_run(exec2, sched3);
+    if ste_unapplied_count(exec3) != 0 { panic(20022); };
+}
+
+@test "single_threaded_executor no apply_final_deferred"() {
+    let exec = single_threaded_executor_new();
+    let exec2 = ste_set_apply_final_deferred(exec, false);
+    let sched = system_schedule_new();
+    let sched2 = system_schedule_add_system(sched, 0);
+    let order: Vec<i32> = Vec::new();
+    order.push(0);
+    let sched3 = system_schedule_set_order(sched2, order);
+    let exec3 = ste_init(exec2, sched3);
+    let (exec4, _) = ste_run(exec3, sched3);
+    if ste_unapplied_count(exec4) != 1 { panic(20023); };
+}
+
+@test "multi_threaded_executor thread_count"() {
+    let exec = multi_threaded_executor_new();
+    let exec2 = mte_set_thread_count(exec, 4);
+    if mte_thread_count(exec2) != 4 { panic(20024); };
+}
+
+@test "multi_threaded_executor run counts systems"() {
+    let exec = multi_threaded_executor_new();
+    let sched = system_schedule_new();
+    let sched2 = system_schedule_add_system(sched, 0);
+    let sched3 = system_schedule_add_system(sched2, 1);
+    let sched4 = system_schedule_add_system(sched3, 2);
+    let (_, count) = mte_run(exec, sched4);
+    if count != 3 { panic(20025); };
+}
+
+@test "multi_threaded_executor set_apply_final_deferred"() {
+    let exec = multi_threaded_executor_new();
+    let exec2 = mte_set_apply_final_deferred(exec, false);
+    if exec2.apply_final_deferred { panic(20026); };
+}
+
+@test "component_descriptor full construction"() {
+    let d = descriptor_full_new(Vec::new(), 0, true, T_A);
+    if descriptor_full_requires_drop(d) { panic(20027); };
+    let d2 = descriptor_full_set_drop(d);
+    if descriptor_full_requires_drop(d2) != true { panic(20028); };
+}
+
+@test "component_descriptor set_layout"() {
+    let d = descriptor_full_new(Vec::new(), 0, true, T_A);
+    let d2 = descriptor_full_set_layout(d, 8, 16);
+    if descriptor_full_layout_align(d2) != 8 { panic(20029); };
+    if descriptor_full_layout_size(d2) != 16 { panic(20030); };
+}
+
+@test "component_descriptor set_non_send"() {
+    let d = descriptor_full_new(Vec::new(), 0, true, T_A);
+    let d2 = descriptor_full_set_non_send(d);
+    if descriptor_full_is_send_and_sync(d2) { panic(20031); };
+}
+
+@test "component_descriptor set_immutable"() {
+    let d = descriptor_full_new(Vec::new(), 0, true, T_A);
+    let d2 = descriptor_full_set_immutable(d);
+    if d2.is_mutable { panic(20032); };
+}

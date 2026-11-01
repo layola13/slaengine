@@ -1,0 +1,213 @@
+// Isolated deep tests for lib/relationship_query_iter_deep.sla (Batch 378).
+// Mirror shallow lib/relationship_query_iter.sla on cap-8 parents × cap-4 children parallel-array
+// adjacency (EcsRelQueryDeep) and cap-8 child→parent map (EcsAncestorWalkerDeep). Recursion in
+// iter_descendants / iter_ancestors / root_ancestor rewritten as iterative fixed-step loops
+// (SLA lattice forbids recursive futures under per-batch UseAfterMove rules). No tuple-return
+// callsites — related / parent_of return wrapper structs exposed via scalar accessors (Batch 373
+// observation: `let (a,b) = tuple_fn()` corrupts prior assertions on SA). No `let m = fn(m, ...)`
+// chained rebinding — sequential names.
+// panic codes: 141600 - 141799.
+
+@import "../src/relationship_query_iter_deep.sla"
+
+@test "EcsRelQueryDeep add_child + find + slot_count"() {
+    let r0 = ecs_rel_query_deep_new();
+    if ecs_relationship_query_deep_slot_count(r0) != 0 { panic(141600); };
+    // Add child entity 11 → parent 1.
+    let r1 = ecs_rel_query_deep_add_child(r0, 1, 11);
+    if ecs_relationship_query_deep_slot_count(r1) != 1 { panic(141601); };
+    if ecs_rel_query_deep_find(r1, 1) != 0 { panic(141602); };
+    if ecs_rel_query_deep_find(r1, 999) != -1 { panic(141603); };
+    // Add a second child 12 → parent 1 (same slot — cnt should be 2).
+    let r2 = ecs_rel_query_deep_add_child(r1, 1, 12);
+    if ecs_relationship_query_deep_slot_count(r2) != 1 { panic(141604); };
+    let src = ecs_relationship_query_deep_sources(r2, 1);
+    if ecs_rq_iter_deep_len(src) != 2 { panic(141605); };
+    if ecs_rq_iter_deep_at(src, 0) != 11 { panic(141606); };
+    if ecs_rq_iter_deep_at(src, 1) != 12 { panic(141607); };
+    // Add a child to another parent 2 — creates a new slot.
+    let r3 = ecs_rel_query_deep_add_child(r2, 2, 21);
+    if ecs_relationship_query_deep_slot_count(r3) != 2 { panic(141608); };
+    if ecs_rel_query_deep_find(r3, 2) != 1 { panic(141609); };
+}
+
+@test "related returns first child + parent_or scalar"() {
+    let r0 = ecs_rel_query_deep_new();
+    // No slots maned: related on parent 1 should return found=false.
+    let e0 = ecs_relationshir_query_deep_related(r0, 1);
+    if ecs_rq_related_deep_found(e0) != false { panic(141610); };
+    // One child for parent 1: related returns child 11.
+    let r1 = ecs_rel_query_deep_add_child(r0, 1, 11);
+    let e1 = ecs_relationshir_query_deep_related(r1, 1);
+    if ecs_rq_related_deep_found(e1) != true { panic(141611); };
+    if ecs_rq_related_deep_value(e1) != 11 { panic(141612); };
+    // Add a second child 12 — related still returns the FIRST (11).
+    let r2 = ecs_rel_query_deep_add_child(r1, 1, 12);
+    let e2 = ecs_relationshir_query_deep_related(r2, 1);
+    if ecs_rq_related_deep_value(e2) != 11 { panic(141613); };
+    // Asking related on an entity that has no children (parent 999) → found=false.
+    let e3 = ecs_relationshir_query_deep_related(r2, 999);
+    if ecs_rq_related_deep_found(e3) != false { panic(141614); };
+}
+
+@test "relationship_sources returns children (slot order preserved)"() {
+    let r0 = ecs_rel_query_deep_new();
+    let r1 = ecs_rel_query_deep_add_child(r0, 1, 11);
+    let r2 = ecs_rel_query_deep_add_child(r1, 1, 12);
+    let r3 = ecs_rel_query_deep_add_child(r2, 1, 13);
+    let src = ecs_relationship_query_deep_sources(r3, 1);
+    if ecs_rq_iter_deep_len(src) != 3 { panic(141620); };
+    if ecs_rq_iter_deep_at(src, 0) != 11 { panic(141621); };
+    if ecs_rq_iter_deep_at(src, 1) != 12 { panic(141622); };
+    if ecs_rq_iter_deep_at(src, 2) != 13 { panic(141623); };
+    // Nonexistent parent returns an empty buffer.
+    let src_bad = ecs_relationship_query_deep_sources(r3, 999);
+    if ecs_rq_iter_deep_len(src_bad) != 0 { panic(141624); };
+}
+
+@test "EcsAncestorWalkerDeep set_parent + parent_of + parent_of_or"() {
+    let w0 = ecs_ancestor_walker_deep_new();
+    if ecs_ancestor_walker_deep_pair_count(w0) != 0 { panic(141630); };
+    let w1 = ecs_ancestor_walker_deep_set_parent(w0, 2, 1);
+    let w2 = ecs_ancestor_walker_deep_set_parent(w1, 3, 2);
+    let w3 = ecs_ancestor_walker_deep_set_parent(w2, 4, 3);
+    if ecs_ancestor_walker_deep_pair_count(w3) != 3 { panic(141631); };
+    // parent_of(2) = 1.
+    let p2 = ecs_ancestor_walker_deep_parent_of(w3, 2);
+    if ecs_rq_parent_deep_found(p2) != true { panic(141632); };
+    if ecs_rq_parent_deep_value(p2) != 1 { panic(141633); };
+    // parent_of_or(4) = 3 directly.
+    let po4 = ecs_ancestor_walker_deep_parent_of_or(w3, 4);
+    if po4 != 3 { panic(141634); };
+    // parent_of_or(999) = -1 (no such child).
+    let po_bad = ecs_ancestor_walker_deep_parent_of_or(w3, 999);
+    if po_bad != -1 { panic(141635); };
+    // parent_of(999) wrapper → found=false, value 0.
+    let p_bad = ecs_ancestor_walker_deep_parent_of(w3, 999);
+    if ecs_rq_parent_deep_found(p_bad) != false { panic(141636); };
+}
+
+@test "root_ancestor iterative walk-up"() {
+    // Build chain 4 → 3 → 2 → 1 (child, parent) ; root of 4 should be 1.
+    let w0 = ecs_ancestor_walker_deep_new();
+    let w1 = ecs_ancestor_walker_deep_set_parent(w0, 2, 1);
+    let w2 = ecs_ancestor_walker_deep_set_parent(w1, 3, 2);
+    let w3 = ecs_ancestor_walker_deep_set_parent(w2, 4, 3);
+    if ecs_ancestor_walker_deep_root_ancestor(w3, 4) != 1 { panic(141640); };
+    // root_ancestor of an entity with no parent UUID = itself.
+    if ecs_ancestor_walker_deep_root_ancestor(w3, 999) != 999 { panic(141641); };
+    // root at the end of chain (1) returns 1.
+    if ecs_ancestor_walker_deep_root_ancestor(w3, 1) != 1 { panic(141642); };
+    // Two-step from 3 returns 1.
+    if ecs_ancestor_walker_deep_root_ancestor(w3, 3) != 1 { panic(141643); };
+}
+
+@test "iter_ancestors + iter_ancestors_count + iter_ancestors_first iterative"() {
+    // Chain 5 → 4 → 3 → 2 → 1.
+    let w0 = ecs_ancestor_walker_deep_new();
+    let w1 = ecs_ancestor_walker_deep_set_parent(w0, 2, 1);
+    let w2 = ecs_ancestor_walker_deep_set_parent(w1, 3, 2);
+    let w3 = ecs_ancestor_walker_deep_set_parent(w2, 4, 3);
+    let w4 = ecs_ancestor_walker_deep_set_parent(w3, 5, 4);
+    // iter_ancestors(5) = [4, 3, 2, 1].
+    let acc = ecs_ancestor_walker_deep_iter_ancestors(w4, 5);
+    if ecs_rq_iter_deep_len(acc) != 4 { panic(141650); };
+    if ecs_rq_iter_deep_at(acc, 0) != 4 { panic(141651); };
+    if ecs_rq_iter_deep_at(acc, 1) != 3 { panic(141652); };
+    if ecs_rq_iter_deep_at(acc, 2) != 2 { panic(141653); };
+    if ecs_rq_iter_deep_at(acc, 3) != 1 { panic(141654); };
+    // count of ancestors from 5 is 4.
+    if ecs_ancestor_walker_deep_iter_ancestors_count(w4, 5) != 4 { panic(141655); };
+    // count from root (1) is 0.
+    if ecs_ancestor_walker_deep_iter_ancestors_count(w4, 1) != 0 { panic(141656); };
+    // first ancestor of 5 is 4.
+    if ecs_ancestor_walker_deep_iter_ancestors_first(w4, 5) != 4 { panic(141657); };
+    // first ancestor of an entity with no parent is -1.
+    if ecs_ancestor_walker_deep_iter_ancestors_first(w4, 999) != -1 { panic(141658); };
+}
+
+@test "iter_siblings same-parent excluding self"() {
+    let r0 = ecs_rel_query_deep_new();
+    let r1 = ecs_rel_query_deep_add_child(r0, 1, 11);
+    let r2 = ecs_rel_query_deep_add_child(r1, 1, 12);
+    let r3 = ecs_rel_query_deep_add_child(r2, 1, 13);
+    // Siblings of 11 (parent 1) should be [12, 13] (slots 1,2 — self excluded).
+    let sib = ecs_relationship_query_deep_iter_siblings(r3, 1, 11);
+    if ecs_rq_iter_deep_len(sib) != 2 { panic(141660); };
+    if ecs_rq_iter_deep_at(sib, 0) != 12 { panic(141661); };
+    if ecs_rq_iter_deep_at(sib, 1) != 13 { panic(141662); };
+    // Siblings of 12 — [11, 13].
+    let sib2 = ecs_relationship_query_deep_iter_siblings(r3, 1, 12);
+    if ecs_rq_iter_deep_len(sib2) != 2 { panic(141663); };
+    if ecs_rq_iter_deep_at(sib2, 0) != 11 { panic(141664); };
+    if ecs_rq_iter_deep_at(sib2, 1) != 13 { panic(141665); };
+    // Siblings of a foreign parent (999) → empty.
+    let sib_bad = ecs_relationship_query_deep_iter_siblings(r3, 999, 11);
+    if ecs_rq_iter_deep_len(sib_bad) != 0 { panic(141666); };
+}
+
+@test "iter_descendants DFS preorder matches shallow recursion"() {
+    // Build trien:
+    //   1 → 11, 12
+    //   11 → 111, 112
+    //   12 → 121
+    // expected DFS order: 11, 111, 112, 12, 121 (children-of-1 in slot order; the shallow
+    // rec on children[0]=11 pushes 11 first then its descendants 111/112, then 12 + 121).
+    let r0 = ecs_rel_query_deep_new();
+    let r1 = ecs_rel_query_deep_add_child(r0, 1, 11);
+    let r2 = ecs_rel_query_deep_add_child(r1, 1, 12);
+    let r3 = ecs_rel_query_deep_add_child(r2, 11, 111);
+    let r4 = ecs_rel_query_deep_add_child(r3, 11, 112);
+    let r5 = ecs_rel_query_deep_add_child(r4, 12, 121);
+    let d = ecs_relationship_query_deep_iter_descendants(r5, 1);
+    if ecs_rq_iter_deep_len(d) != 5 { panic(141670); };
+    if ecs_rq_iter_deep_at(d, 0) != 11 { panic(141671); };
+    if ecs_rq_iter_deep_at(d, 1) != 111 { panic(141672); };
+    if ecs_rq_iter_deep_at(d, 2) != 112 { panic(141673); };
+    if ecs_rq_iter_deep_at(d, 3) != 12 { panic(141674); };
+    if ecs_rq_iter_deep_at(d, 4) != 121 { panic(141675); };
+    // Descendants of 11 are [111, 112].
+    let d11 = ecs_relationship_query_deep_iter_descendants(r5, 11);
+    if ecs_rq_iter_deep_len(d11) != 2 { panic(141676); };
+    if ecs_rq_iter_deep_at(d11, 0) != 111 { panic(141677); };
+    if ecs_rq_iter_deep_at(d11, 1) != 112 { panic(141678); };
+    // Descendants of a leaf (112) → empty.
+    let d_leaf = ecs_relationship_query_deep_iter_descendants(r5, 112);
+    if ecs_rq_iter_deep_len(d_leaf) != 0 { panic(141679); };
+}
+
+@test "iter_descendants on nonexistent parent returns empty + larger tree ladder"() {
+    let r0 = ecs_rel_query_deep_new();
+    let d_bad = ecs_relationship_query_deep_iter_descendants(r0, 999);
+    if ecs_rq_iter_deep_len(d_bad) != 0 { panic(141680); };
+    // Ladder: 1 → 2 → 3 (chain), descendants of 1 should be [2, 3].
+    let r1 = ecs_rel_query_deep_add_child(r0, 1, 2);
+    let r2 = ecs_rel_query_deep_add_child(r1, 2, 3);
+    let d1 = ecs_relationship_query_deep_iter_descendants(r2, 1);
+    if ecs_rq_iter_deep_len(d1) != 2 { panic(141681); };
+    if ecs_rq_iter_deep_at(d1, 0) != 2 { panic(141682); };
+    if ecs_rq_iter_deep_at(d1, 1) != 3 { panic(141683); };
+}
+
+@test "EcsRqStackDeep push/pop direct"() {
+    // Push a few values, pop them and confirm LIFO order.
+    let s0 = _ecs_rq_stack_deep_empty();
+    let s1 = _ecs_rq_stack_deep_push(s0, 100);
+    let s2 = _ecs_rq_stack_deep_push(s1, 200);
+    let s3 = _ecs_rq_stack_deep_push(s2, 300);
+    if s3.sz != 3 { panic(141690); };
+    let p0 = _ecs_rq_stack_deep_pop(s3);
+    if ecs_rq_stack_pop_ok(p0) != true { panic(141691); };
+    if ecs_rq_stack_pop_value(p0) != 300 { panic(141692); };
+    let s4 = ecs_rq_stack_pop_new_stack(p0);
+    if s4.sz != 2 { panic(141693); };
+    let p1 = _ecs_rq_stack_deep_pop(s4);
+    if ecs_rq_stack_pop_value(p1) != 200 { panic(141694); };
+    let s5 = ecs_rq_stack_pop_new_stack(p1);
+    let p2 = _ecs_rq_stack_deep_pop(s5);
+    if ecs_rq_stack_pop_value(p2) != 100 { panic(141695); };
+    let s6 = ecs_rq_stack_pop_new_stack(p2);
+    if s6.sz != 0 { panic(141696); };
+    let p3 = _ecs_rq_stack_deep_pop(s6);
+    if ecs_rq_stack_pop_ok(p3) != false { panic(141697); };
+}

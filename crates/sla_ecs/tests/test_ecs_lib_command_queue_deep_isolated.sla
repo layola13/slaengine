@@ -1,0 +1,260 @@
+@import "../src/command_queue_deep.sla"
+
+// Batch 191 tests for CommandQueue deep: push/apply/append, panic recovery,
+// silent drop warning, SystemBuffer, nested push/flush.
+
+@test "new_defaults_and_silent"() {
+    let q = ecs_cq_deep_new(7);
+    if ecs_cq_deep_is_empty(q) != true { panic(103600); };
+    if ecs_cq_deep_len(q) != 0 { panic(103601); };
+    if ecs_cq_deep_warn_on_unapplied(q) != true { panic(103602); };
+    if ecs_cq_deep_caller_id(q) != 7 { panic(103603); };
+    let s = ecs_cq_deep_silent(3);
+    if ecs_cq_deep_warn_on_unapplied(s) != false { panic(103604); };
+    if ecs_cq_deep_caller_id(s) != 3 { panic(103605); };
+}
+
+@test "push_and_len_cursor"() {
+    let q = ecs_cq_deep_default();
+    q = ecs_cq_deep_push(q, 10);
+    q = ecs_cq_deep_push(q, 20);
+    if ecs_cq_deep_is_empty(q) != false { panic(103610); };
+    if ecs_cq_deep_len(q) != 2 { panic(103611); };
+    if ecs_cq_deep_buffer_len(q) != 2 { panic(103612); };
+    if ecs_cq_deep_cursor(q) != 0 { panic(103613); };
+    if ecs_cq_deep_unapplied_at(q, 0) != 10 { panic(103614); };
+    if ecs_cq_deep_unapplied_at(q, 1) != 20 { panic(103615); };
+}
+
+@test "apply_clears_and_logs"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push(q, 2);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_is_empty(q) != true { panic(103620); };
+    if ecs_cq_deep_applied_count(q) != 2 { panic(103621); };
+    if ecs_cq_deep_apply_log_len(q) != 2 { panic(103622); };
+    if ecs_cq_deep_applied_at(q, 0) != 1 { panic(103623); };
+    if ecs_cq_deep_applied_at(q, 1) != 2 { panic(103624); };
+    if ecs_cq_deep_world_flush_count(q) != 1 { panic(103625); };
+    // second apply is no-op
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_applied_count(q) != 2 { panic(103626); };
+    if ecs_cq_deep_world_flush_count(q) != 2 { panic(103627); };
+}
+
+@test "append_moves_other"() {
+    let a = ecs_cq_deep_new(1);
+    let b = ecs_cq_deep_new(2);
+    a = ecs_cq_deep_push(a, 5);
+    b = ecs_cq_deep_push(b, 6);
+    b = ecs_cq_deep_push(b, 7);
+    let p = ecs_cq_deep_append(a, b);
+    a = p.0;
+    b = p.1;
+    if ecs_cq_deep_len(a) != 3 { panic(103630); };
+    if ecs_cq_deep_is_empty(b) != true { panic(103631); };
+    if ecs_cq_deep_unapplied_at(a, 0) != 5 { panic(103632); };
+    if ecs_cq_deep_unapplied_at(a, 2) != 7 { panic(103633); };
+}
+
+@test "silence_drop_warning"() {
+    let q = ecs_cq_deep_new(1);
+    if ecs_cq_deep_warn_on_unapplied(q) != true { panic(103640); };
+    q = ecs_cq_deep_silence_drop_warning(q);
+    if ecs_cq_deep_warn_on_unapplied(q) != false { panic(103641); };
+}
+
+@test "drop_warns_when_unapplied"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 9);
+    q = ecs_cq_deep_drop(q);
+    if ecs_cq_deep_drop_warning_count(q) != 1 { panic(103650); };
+    if ecs_cq_deep_is_empty(q) != true { panic(103651); };
+    if ecs_cq_deep_applied_count(q) != 0 { panic(103652); }; // dropped, not applied
+}
+
+@test "drop_silent_no_warning"() {
+    let q = ecs_cq_deep_silent(1);
+    q = ecs_cq_deep_push(q, 9);
+    q = ecs_cq_deep_drop(q);
+    if ecs_cq_deep_drop_warning_count(q) != 0 { panic(103660); };
+    if ecs_cq_deep_is_empty(q) != true { panic(103661); };
+}
+
+@test "get_raw_token_and_empty"() {
+    let q = ecs_cq_deep_new(4);
+    let r = ecs_cq_deep_get_raw(q);
+    q = r.0;
+    if r.1 != 1004 { panic(103670); };
+    if ecs_cq_deep_raw_is_empty(q) != true { panic(103671); };
+    q = ecs_cq_deep_push(q, 1);
+    if ecs_cq_deep_raw_is_empty(q) != false { panic(103672); };
+}
+
+@test "panic_recovers_remaining"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push_panic(q, 99);
+    q = ecs_cq_deep_push(q, 2);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_last_panicked(q) != true { panic(103680); };
+    if ecs_cq_deep_last_error(q) != ECS_CQ_ERR_PANIC { panic(103681); };
+    // panic itself not applied; remaining restored
+    if ecs_cq_deep_len(q) != 1 { panic(103682); };
+    if ecs_cq_deep_unapplied_at(q, 0) != 2 { panic(103683); };
+    if ecs_cq_deep_applied_count(q) != 0 { panic(103684); };
+    // can push more after panic and apply all
+    q = ecs_cq_deep_push(q, 3);
+    q = ecs_cq_deep_push(q, 4);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_last_panicked(q) != false { panic(103685); };
+    if ecs_cq_deep_applied_count(q) != 3 { panic(103686); };
+    if ecs_cq_deep_applied_at(q, 0) != 2 { panic(103687); };
+    if ecs_cq_deep_applied_at(q, 2) != 4 { panic(103688); };
+}
+
+@test "panic_after_prefix_applies_prefix"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push_panic(q, 0);
+    q = ecs_cq_deep_push(q, 3);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_applied_count(q) != 1 { panic(103690); };
+    if ecs_cq_deep_applied_at(q, 0) != 1 { panic(103691); };
+    if ecs_cq_deep_len(q) != 1 { panic(103692); };
+    if ecs_cq_deep_unapplied_at(q, 0) != 3 { panic(103693); };
+}
+
+@test "nested_push_during_apply"() {
+    // Same-queue nested push without flush: Bevy apply_or_drop_queued ends with
+    // set_len(start), so commands appended beyond the original stop window are dropped.
+    // Nested work is only retained when an explicit nested flush runs inside the window.
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push_nested(q, 50);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_applied_at(q, 0) != 1 { panic(103700); };
+    if ecs_cq_deep_applied_count(q) != 1 { panic(103701); };
+    if ecs_cq_deep_is_empty(q) != true { panic(103702); };
+}
+
+@test "system_buffer_apply"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 8);
+    q = ecs_cq_deep_system_buffer_apply(q);
+    if ecs_cq_deep_applied_count(q) != 1 { panic(103710); };
+    if ecs_cq_deep_is_empty(q) != true { panic(103711); };
+}
+
+@test "system_buffer_queue_appends_to_world"() {
+    let sys = ecs_cq_deep_new(1);
+    let world = ecs_cq_deep_new(2);
+    sys = ecs_cq_deep_push(sys, 11);
+    sys = ecs_cq_deep_push(sys, 12);
+    let p = ecs_cq_deep_system_buffer_queue(sys, world);
+    sys = p.0;
+    world = p.1;
+    if ecs_cq_deep_is_empty(sys) != true { panic(103720); };
+    if ecs_cq_deep_len(world) != 2 { panic(103721); };
+    if ecs_cq_deep_unapplied_at(world, 0) != 11 { panic(103722); };
+    if ecs_cq_deep_unapplied_at(world, 1) != 12 { panic(103723); };
+}
+
+@test "capacity_full_error"() {
+    let q = ecs_cq_deep_new(1);
+    let i: i32 = 0;
+    while i < 8 {
+        q = ecs_cq_deep_push(q, i as i64);
+        i = i + 1;
+    }
+    if ecs_cq_deep_last_error(q) != ECS_CQ_ERR_OK { panic(103730); };
+    q = ecs_cq_deep_push(q, 99);
+    if ecs_cq_deep_last_error(q) != ECS_CQ_ERR_FULL { panic(103731); };
+    if ecs_cq_deep_len(q) != 8 { panic(103732); };
+}
+
+@test "apply_or_drop_without_world_discards"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 4);
+    q = ecs_cq_deep_push(q, 5);
+    q = ecs_cq_deep_apply_or_drop_queued(q, false);
+    if ecs_cq_deep_is_empty(q) != true { panic(103740); };
+    if ecs_cq_deep_applied_count(q) != 0 { panic(103741); };
+}
+
+@test "nested_flush_applies_queued_tail"() {
+    // [1, NESTED_PUSH(2), NESTED_FLUSH, 3]
+    // While applying 1..flush window, nested push adds 2 at end; flush applies it; then 3.
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push_nested(q, 2);
+    q = ecs_cq_deep_push_nested_flush(q);
+    q = ecs_cq_deep_push(q, 3);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_last_panicked(q) != false { panic(103750); };
+    if ecs_cq_deep_applied_count(q) != 3 { panic(103751); };
+    if ecs_cq_deep_applied_at(q, 0) != 1 { panic(103752); };
+    if ecs_cq_deep_applied_at(q, 1) != 2 { panic(103753); };
+    if ecs_cq_deep_applied_at(q, 2) != 3 { panic(103754); };
+}
+
+@test "nested_flush_panic_restores_order"() {
+    // 1, nested_push(2), panic, nested_push(3) via pushes before flush? Simpler:
+    // 1, panic, 4  and separately ensure recovery order
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push_panic(q, 0);
+    q = ecs_cq_deep_push(q, 4);
+    q = ecs_cq_deep_push(q, 5);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_applied_at(q, 0) != 1 { panic(103760); };
+    if ecs_cq_deep_len(q) != 2 { panic(103761); };
+    if ecs_cq_deep_unapplied_at(q, 0) != 4 { panic(103762); };
+    if ecs_cq_deep_unapplied_at(q, 1) != 5 { panic(103763); };
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_applied_count(q) != 3 { panic(103764); };
+}
+
+@test "empty_drop_no_warning"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_drop(q);
+    if ecs_cq_deep_drop_warning_count(q) != 0 { panic(103770); };
+}
+
+@test "default_equals_warn_true"() {
+    let q = ecs_cq_deep_default();
+    if ecs_cq_deep_warn_on_unapplied(q) != true { panic(103780); };
+    if ecs_cq_deep_caller_id(q) != 0 { panic(103781); };
+}
+
+@test "lifecycle_push_apply_append_drop"() {
+    let q = ecs_cq_deep_new(9);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push(q, 2);
+    q = ecs_cq_deep_apply(q);
+    let other = ecs_cq_deep_push(ecs_cq_deep_new(1), 3);
+    let p = ecs_cq_deep_append(q, other);
+    q = p.0;
+    if ecs_cq_deep_len(q) != 1 { panic(103790); };
+    q = ecs_cq_deep_silence_drop_warning(q);
+    q = ecs_cq_deep_drop(q);
+    if ecs_cq_deep_drop_warning_count(q) != 0 { panic(103791); };
+    if ecs_cq_deep_applied_count(q) != 2 { panic(103792); };
+}
+
+@test "recovery_len_cleared_after_top_restore"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push_panic(q, 1);
+    q = ecs_cq_deep_push(q, 2);
+    q = ecs_cq_deep_apply(q);
+    if ecs_cq_deep_recovery_len(q) != 0 { panic(103800); };
+    if ecs_cq_deep_len(q) != 1 { panic(103801); };
+}
+
+@test "kinds_of_unapplied"() {
+    let q = ecs_cq_deep_new(1);
+    q = ecs_cq_deep_push(q, 1);
+    q = ecs_cq_deep_push_panic(q, 2);
+    if ecs_cq_deep_unapplied_kind_at(q, 0) != ECS_CQ_KIND_NORMAL { panic(103810); };
+    if ecs_cq_deep_unapplied_kind_at(q, 1) != ECS_CQ_KIND_PANIC { panic(103811); };
+}

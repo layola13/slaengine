@@ -1,0 +1,108 @@
+// Isolated deep tests for lib/schedule_executor_deep.sla (Batch 356).
+// panic codes: 137200 - 137399.
+
+@import "../src/schedule_executor_deep.sla"
+
+@test "Executor kind single vs multi"() {
+    let es = ecs_executor_single_threaded();
+    if ecs_executor_kind(es) != ECS_EXEC_SINGLE_DEEP { panic(137200); };
+    if ecs_executor_is_multi_threaded(es) != false { panic(137201); };
+    let em = ecs_executor_multi_threaded();
+    if ecs_executor_kind(em) != ECS_EXEC_MULTI_DEEP { panic(137202); };
+    if ecs_executor_is_multi_threaded(em) != true { panic(137203); };
+}
+
+@test "Executor initial state has zero counters"() {
+    let e = ecs_executor_single_threaded();
+    if ecs_executor_applied_count(e) != 0 { panic(137210); };
+    if ecs_executor_skipped_count(e) != 0 { panic(137211); };
+    if ecs_executor_next_to_run(e) != 0 { panic(137212); };
+    if ecs_executor_iteration_count(e) != 0 { panic(137213); };
+    if ecs_executor_has_apply_deferred(e) != false { panic(137214); };
+}
+
+@test "Executor set_up seeds queue and resets counters"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 5);
+    if ecs_executor_iteration_count(e1) != 5 { panic(137220); };
+    if ecs_executor_next_to_run(e1) != 0 { panic(137221); };
+    if ecs_executor_applied_count(e1) != 0 { panic(137222); };
+    let s0 = ecs_executor_queue_at(e1, 0);
+    if ecs_exec_system_id(s0) != 0 { panic(137223); };
+    let s4 = ecs_executor_queue_at(e1, 4);
+    if ecs_exec_system_id(s4) != 4 { panic(137224); };
+}
+
+@test "Executor set_up caps iteration count at 8"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 99);
+    if ecs_executor_iteration_count(e1) != ECS_EXEC_QUEUE_CAP_DEEP { panic(137230); };
+}
+
+@test "Executor run_system advances and counts applied"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 3);
+    let e2 = ecs_executor_run_system(e1, 0);
+    if ecs_executor_applied_count(e2) != 1 { panic(137240); };
+    if ecs_executor_next_to_run(e2) != 1 { panic(137241); };
+    let s0 = ecs_executor_queue_at(e2, 0);
+    if ecs_exec_system_run(s0) != 1 { panic(137242); };
+    if ecs_exec_system_skipped(s0) != 0 { panic(137243); };
+    let e3 = ecs_executor_run_system(e2, 1);
+    if ecs_executor_applied_count(e3) != 2 { panic(137244); };
+}
+
+@test "Executor skip_system marks skipped at next_to_run"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 3);
+    let e2 = ecs_executor_skip_system(e1);
+    if ecs_executor_skipped_count(e2) != 1 { panic(137250); };
+    if ecs_executor_next_to_run(e2) != 1 { panic(137251); };
+    let s0 = ecs_executor_queue_at(e2, 0);
+    if ecs_exec_system_skipped(s0) != 1 { panic(137252); };
+    if ecs_exec_system_run(s0) != 0 { panic(137253); };
+}
+
+@test "Executor apply_deferred toggle only sets true"() {
+    let e0 = ecs_executor_single_threaded();
+    if ecs_executor_has_apply_deferred(e0) != false { panic(137260); };
+    let e1 = ecs_executor_apply_deferred(e0);
+    if ecs_executor_has_apply_deferred(e1) != true { panic(137261); };
+}
+
+@test "Executor finish sets next_to_run to iteration_count"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 4);
+    let e2 = ecs_executor_run_system(e1, 0);
+    let e3 = ecs_executor_run_system(e2, 1);
+    let e4 = ecs_executor_finish(e3);
+    if ecs_executor_next_to_run(e4) != 4 { panic(137270); };
+}
+
+@test "Executor run past last system clamps next_to_run"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 2);
+    let e2 = ecs_executor_run_system(e1, 0);
+    let e3 = ecs_executor_run_system(e2, 1);
+    if ecs_executor_next_to_run(e3) != 2 { panic(137280); };
+    // Running past indexing 2 -> clamp to iteration_count(2)
+    let e4 = ecs_executor_run_system(e3, 2);
+    if ecs_executor_next_to_run(e4) != 2 { panic(137281); };
+    if ecs_executor_applied_count(e4) != 3 { panic(137282); };
+    if ecs_executor_is_finished(e4) != true { panic(137283); };
+}
+
+@test "Executor is_finished true after running all queued"() {
+    let e0 = ecs_executor_single_threaded();
+    let e1 = ecs_executor_set_up(e0, 8);
+    let i: i32 = 0;
+    let e = e1;
+    while i < 8 {
+        e = ecs_executor_run_system(e, i);
+        i = i + 1;
+    }
+    if ecs_executor_applied_count(e) != 8 { panic(137290); };
+    if ecs_executor_next_to_run(e) != 8 { panic(137291); };
+    if ecs_executor_is_finished(e) != true { panic(137292); };
+    if ecs_executor_skipped_count(e) != 0 { panic(137293); };
+}

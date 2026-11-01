@@ -1,0 +1,153 @@
+@import "../src/message_update_deep.sla"
+
+// Batch 210: Message update deep (src/message/update.rs).
+
+@test "registry_defaults_always"() {
+    let r = ecs_mu_registry_default();
+    if ecs_mu_registry_should_update(r) != ECS_MU_ALWAYS { panic(108000); };
+    if ecs_mu_registry_len(r) != 0 { panic(108001); };
+}
+
+@test "condition_none_registry_true"() {
+    let r = ecs_mu_registry_new();
+    if ecs_mu_message_update_condition(false, r) != true { panic(108010); };
+}
+
+@test "condition_always_true"() {
+    let r = ecs_mu_registry_new();
+    if ecs_mu_message_update_condition(true, r) != true { panic(108020); };
+}
+
+@test "condition_waiting_false"() {
+    let r = ecs_mu_registry_new();
+    r = ecs_mu_registry_set_should(r, ECS_MU_WAITING);
+    if ecs_mu_message_update_condition(true, r) != false { panic(108030); };
+}
+
+@test "condition_ready_true"() {
+    let r = ecs_mu_registry_new();
+    r = ecs_mu_registry_set_should(r, ECS_MU_READY);
+    if ecs_mu_message_update_condition(true, r) != true { panic(108040); };
+}
+
+@test "signal_sets_ready"() {
+    let r = ecs_mu_registry_new();
+    r = ecs_mu_enable_fixed_update_mode(r);
+    if ecs_mu_registry_should_update(r) != ECS_MU_WAITING { panic(108050); };
+    let sig = ecs_mu_signal_message_update_system(true, r);
+    if sig.0 != true { panic(108051); };
+    if ecs_mu_registry_should_update(sig.1) != ECS_MU_READY { panic(108052); };
+}
+
+@test "signal_absent_registry_noop"() {
+    let r = ecs_mu_registry_new();
+    let sig = ecs_mu_signal_message_update_system(false, r);
+    if sig.0 != false { panic(108060); };
+    if ecs_mu_registry_should_update(sig.1) != ECS_MU_ALWAYS { panic(108061); };
+}
+
+@test "update_system_always_stays_always"() {
+    let s = ecs_mu_system_new();
+    let r = ecs_mu_registry_new();
+    let out = ecs_mu_message_update_system(s, r, 5);
+    s = out.0;
+    r = out.1;
+    if ecs_mu_registry_should_update(r) != ECS_MU_ALWAYS { panic(108070); };
+    if ecs_mu_system_last_tick(s) != 5 { panic(108071); };
+    if ecs_mu_system_ran_count(s) != 1 { panic(108072); };
+    if ecs_mu_registry_run_calls(r) != 1 { panic(108073); };
+}
+
+@test "update_system_ready_becomes_waiting"() {
+    let s = ecs_mu_system_new();
+    let r = ecs_mu_registry_set_should(ecs_mu_registry_new(), ECS_MU_READY);
+    let out = ecs_mu_message_update_system(s, r, 3);
+    if ecs_mu_registry_should_update(out.1) != ECS_MU_WAITING { panic(108080); };
+}
+
+@test "run_updates_clears_buffers"() {
+    let r = ecs_mu_registry_new();
+    let reg = ecs_mu_registry_register(r);
+    r = reg.0;
+    let idx = reg.1;
+    r = ecs_mu_registry_write(r, idx, 4);
+    if ecs_mu_registry_buf_len(r, idx) != 4 { panic(108090); };
+    r = ecs_mu_registry_run_updates(r, 0);
+    if ecs_mu_registry_buf_len(r, idx) != 0 { panic(108091); };
+    if ecs_mu_registry_buf_updates(r, idx) != 1 { panic(108092); };
+}
+
+@test "run_updates_all_registered"() {
+    let r = ecs_mu_registry_new();
+    let a = ecs_mu_registry_register(r);
+    r = a.0;
+    let b = ecs_mu_registry_register(r);
+    r = b.0;
+    r = ecs_mu_registry_write(r, a.1, 2);
+    r = ecs_mu_registry_write(r, b.1, 3);
+    r = ecs_mu_registry_run_updates(r, 1);
+    if ecs_mu_registry_buf_updates(r, 0) != 1 { panic(108100); };
+    if ecs_mu_registry_buf_updates(r, 1) != 1 { panic(108101); };
+    if ecs_mu_registry_buf_len(r, 0) != 0 { panic(108102); };
+}
+
+@test "frame_always_runs_each_frame"() {
+    let s = ecs_mu_system_new();
+    let r = ecs_mu_registry_new();
+    let f1 = ecs_mu_frame_always(s, r, 1);
+    s = f1.0; r = f1.1;
+    if f1.2 != true { panic(108110); };
+    let f2 = ecs_mu_frame_always(s, r, 2);
+    s = f2.0; r = f2.1;
+    if f2.2 != true { panic(108111); };
+    if ecs_mu_system_ran_count(s) != 2 { panic(108112); };
+}
+
+@test "frame_fixed_waits_for_signal"() {
+    let s = ecs_mu_system_new();
+    let r = ecs_mu_enable_fixed_update_mode(ecs_mu_registry_new());
+    // no signal: condition false
+    let f0 = ecs_mu_frame_fixed(s, r, 1, false);
+    s = f0.0; r = f0.1;
+    if f0.2 != false { panic(108120); };
+    if ecs_mu_system_ran_count(s) != 0 { panic(108121); };
+    // signal then update
+    let f1 = ecs_mu_frame_fixed(s, r, 2, true);
+    s = f1.0; r = f1.1;
+    if f1.2 != true { panic(108122); };
+    if ecs_mu_registry_should_update(r) != ECS_MU_WAITING { panic(108123); };
+    // next frame without signal: blocked
+    let f2 = ecs_mu_frame_fixed(s, r, 3, false);
+    if f2.2 != false { panic(108124); };
+    if ecs_mu_system_ran_count(f2.0) != 1 { panic(108125); };
+}
+
+@test "messages_update_dual_buffer"() {
+    let m = ecs_mu_messages_new();
+    m = ecs_mu_messages_write(m, 3);
+    if ecs_mu_messages_len(m) != 3 { panic(108130); };
+    m = ecs_mu_messages_update(m);
+    if ecs_mu_messages_update_count(m) != 1 { panic(108131); };
+    // after update, previous period holds 3, current empty => len 3
+    if ecs_mu_messages_len(m) != 3 { panic(108132); };
+    m = ecs_mu_messages_update(m);
+    // previous dropped, current empty
+    if ecs_mu_messages_len(m) != 0 { panic(108133); };
+}
+
+@test "systems_set_id"() {
+    if ecs_mu_systems_set_id() != 88001 { panic(108140); };
+}
+
+@test "register_capacity"() {
+    let r = ecs_mu_registry_new();
+    let i: i32 = 0;
+    while i < 8 {
+        let reg = ecs_mu_registry_register(r);
+        r = reg.0;
+        if reg.1 != i { panic(108150); };
+        i = i + 1;
+    }
+    let full = ecs_mu_registry_register(r);
+    if full.1 != (0 - 1) { panic(108151); };
+}

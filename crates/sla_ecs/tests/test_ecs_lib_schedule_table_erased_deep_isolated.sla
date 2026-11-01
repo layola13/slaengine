@@ -1,0 +1,140 @@
+// Isolated deep tests for lib/schedule_table_erased_deep.sla (Batch 399).
+// Mirrors erased base schedule: access metadata, conditions, auto-batch, planned run, explicit ordering.
+// panic codes: 144300 - 144399 (Batch 399 band; previous Batch 398 used 144200-144272).
+
+@import "../src/schedule_table_erased_deep.sla"
+
+fn mv_acc() -> EcsSceAccess {
+    let a0 = ecs_sce_access_none();
+    let a1 = ecs_sce_access_write_component(a0, 1);
+    return ecs_sce_access_read_component(a1, 2);
+}
+
+@test "EcsSceSchedule runs non-conflicting systems in one batch"() {
+    let w0 = ecs_sce_world_new(4, 6, 0);
+    let move_access = mv_acc();
+    let db_access0 = ecs_sce_access_none();
+    let db_access = ecs_sce_access_write_component(db_access0, 3);
+    let evt_access0 = ecs_sce_access_none();
+    let evt_access = ecs_sce_access_write_messages(evt_access0);
+    let s0 = ecs_sce_schedule_default();
+    let s1 = ecs_sce_schedule_add_system(s0, ECS_SCE_SYS_MOVE, move_access);
+    let s2 = ecs_sce_schedule_add_system(s1, ECS_SCE_SYS_DOUBLE, db_access);
+    let s3 = ecs_sce_schedule_add_system(s2, ECS_SCE_SYS_SET_EVENT, evt_access);
+    if ecs_sce_schedule_conflict_count(s3) != 0 { panic(144300); };
+    if ecs_sce_schedule_batch_count(s3) != 1 { panic(144301); };
+    if ecs_sce_schedule_max_parallel_width(s3) != 3 { panic(144302); };
+    let w1 = ecs_sce_schedule_run(s3, w0);
+    if ecs_sce_world_change_tick(w1) != 2 { panic(144303); };
+    if ecs_sce_world_pos_x(w1) != 20 { panic(144304); };
+    if ecs_sce_world_event_amount(w1) != 1 { panic(144305); };
+}
+
+@test "EcsSceSchedule records component conflicts and batches"() {
+    let read_a0 = ecs_sce_access_none();
+    let read_a = ecs_sce_access_read_component(read_a0, 1);
+    let write_a0 = ecs_sce_access_none();
+    let write_a = ecs_sce_access_write_component(write_a0, 1);
+    let plain0 = ecs_sce_access_none();
+    let plain = ecs_sce_access_write_messages(plain0);
+    let s0 = ecs_sce_schedule_default();
+    let s1 = ecs_sce_schedule_add_system(s0, ECS_SCE_SYS_MOVE, read_a);
+    let s2 = ecs_sce_schedule_add_system(s1, ECS_SCE_SYS_DOUBLE, write_a);
+    let s3 = ecs_sce_schedule_add_system(s2, ECS_SCE_SYS_SET_EVENT, plain);
+    if ecs_sce_schedule_conflict_count(s3) != 1 { panic(144320); };
+    if ecs_sce_schedule_batch_count(s3) != 2 { panic(144321); };
+    if ecs_sce_schedule_system_batch(s3, 0) != 0 { panic(144322); };
+    if ecs_sce_schedule_system_batch(s3, 1) != 1 { panic(144323); };
+    if ecs_sce_schedule_system_batch(s3, 2) != 0 { panic(144324); };
+    if ecs_sce_schedule_batch_width(s3, 0) != 2 { panic(144325); };
+    if ecs_sce_schedule_max_parallel_width(s3) != 2 { panic(144326); };
+}
+
+@test "EcsSceSchedule planned run honors batch ordering"() {
+    let w0 = ecs_sce_world_new(1, 0, 0);
+    let set_access0 = ecs_sce_access_none();
+    let set_access = ecs_sce_access_write_component(set_access0, 1);
+    let double_access0 = ecs_sce_access_none();
+    let double_access = ecs_sce_access_read_component(double_access0, 1);
+    let s0 = ecs_sce_schedule_default();
+    let s1 = ecs_sce_schedule_add_system(s0, ECS_SCE_SYS_SET_EVENT, set_access);
+    let s2 = ecs_sce_schedule_add_system(s1, ECS_SCE_SYS_DOUBLE, double_access);
+    if ecs_sce_schedule_batch_count(s2) != 2 { panic(144340); };
+    let w1 = ecs_sce_schedule_run_planned(s2, w0);
+    if ecs_sce_world_pos_x(w1) != 2 { panic(144341); };
+    if ecs_sce_world_event_amount(w1) != 1 { panic(144342); };
+}
+
+@test "EcsSceSchedule system conditions skip systems"() {
+    let w0 = ecs_sce_world_new(3, 4, 0);
+    let move_access = mv_acc();
+    let false_conds0 = ecs_sce_conditions_default();
+    let false_conds = ecs_sce_conditions_add(false_conds0, ECS_SCE_COND_FALSE);
+    let always_conds0 = ecs_sce_conditions_default();
+    let always_conds = ecs_sce_conditions_add(always_conds0, ECS_SCE_COND_ALWAYS);
+    let s0 = ecs_sce_schedule_default();
+    let s1 = ecs_sce_schedule_add_system_run_if(s0, ECS_SCE_SYS_MOVE, move_access, false_conds);
+    let s2 = ecs_sce_schedule_add_system_run_if(s1, ECS_SCE_SYS_SET_EVENT, ecs_sce_access_none(), always_conds);
+    let w1 = ecs_sce_schedule_run(s2, w0);
+    if ecs_sce_world_pos_x(w1) != 3 { panic(144360); };
+    if ecs_sce_world_event_amount(w1) != 1 { panic(144361); };
+}
+
+@test "EcsSceSchedule schedule conditions skip all systems"() {
+    let w0 = ecs_sce_world_new(3, 4, 0);
+    let move_access = mv_acc();
+    let s0 = ecs_sce_schedule_default();
+    let s1 = ecs_sce_schedule_add_system(s0, ECS_SCE_SYS_MOVE, move_access);
+    let s2 = ecs_sce_schedule_run_if(s1, ECS_SCE_COND_TICK_AT_LEAST_THREE);
+    let w1 = ecs_sce_schedule_run(s2, w0);
+    if ecs_sce_schedule_cond_count(s2) != 1 { panic(144370); };
+    if ecs_sce_world_change_tick(w1) != 2 { panic(144371); };
+    if ecs_sce_world_pos_x(w1) != 3 { panic(144372); };
+    let w2 = ecs_sce_schedule_run(s2, w1);
+    if ecs_sce_world_pos_x(w2) != 7 { panic(144373); };
+}
+
+@test "EcsSceSchedule chain before after in_set explicit ordering"() {
+    let w0 = ecs_sce_world_new(1, 0, 0);
+    let set_access = ecs_sce_access_write_component(ecs_sce_access_none(), 1);
+    let double_access = ecs_sce_access_read_component(ecs_sce_access_none(), 1);
+    let plain_access = ecs_sce_access_none();
+    let conds = ecs_sce_conditions_default();
+    let s0 = ecs_sce_schedule_default();
+    let s1 = ecs_sce_schedule_chain(s0, ECS_SCE_SYS_SET_EVENT, set_access, conds);
+    let s2 = ecs_sce_schedule_chain(s1, ECS_SCE_SYS_DOUBLE, double_access, conds);
+    if ecs_sce_schedule_batch_count(s2) != 2 { panic(144380); };
+    if ecs_sce_schedule_system_batch(s2, 0) != 0 { panic(144381); };
+    if ecs_sce_schedule_system_batch(s2, 1) != 1 { panic(144382); };
+    let w1 = ecs_sce_schedule_run_planned(s2, w0);
+    if ecs_sce_world_pos_x(w1) != 2 { panic(144383); };
+    let s3 = ecs_sce_schedule_before(s2, ECS_SCE_SYS_INCREMENT_TICK, plain_access, conds, 1);
+    if ecs_sce_schedule_system_batch(s3, 2) != 0 { panic(144384); };
+    let s4 = ecs_sce_schedule_after(s3, ECS_SCE_SYS_SET_EVENT, plain_access, conds, 1);
+    if ecs_sce_schedule_system_batch(s4, 3) != 2 { panic(144385); };
+    let s5 = ecs_sce_schedule_in_set(s4, ECS_SCE_SYS_MOVE, mv_acc(), conds, 5);
+    if ecs_sce_schedule_system_batch(s5, 4) != 5 { panic(144386); };
+    if ecs_sce_schedule_batch_count(s5) != 6 { panic(144387); };
+}
+
+@test "EcsSceSchedule cap and resource message conflicts"() {
+    let rr0 = ecs_sce_access_none();
+    let rr = ecs_sce_access_read_resource(rr0);
+    let wr0 = ecs_sce_access_none();
+    let wr = ecs_sce_access_write_resource(wr0);
+    let rm0 = ecs_sce_access_none();
+    let rm = ecs_sce_access_read_messages(rm0);
+    let wm0 = ecs_sce_access_none();
+    let wm = ecs_sce_access_write_messages(wm0);
+    let plain = ecs_sce_access_none();
+    if ecs_sce_access_conflicts(rr, wr) != true { panic(144390); };
+    if ecs_sce_access_conflicts(rm, wm) != true { panic(144391); };
+    if ecs_sce_access_conflicts(rr, wm) != false { panic(144392); };
+    let s = ecs_sce_schedule_default();
+    let i: i32 = 0;
+    while i < 8 {
+        s = ecs_sce_schedule_add_system(s, ECS_SCE_SYS_SET_EVENT, plain);
+        i = i + 1;
+    }
+    if ecs_sce_schedule_kind_at(s, 8) != -1 { panic(144395); };
+}

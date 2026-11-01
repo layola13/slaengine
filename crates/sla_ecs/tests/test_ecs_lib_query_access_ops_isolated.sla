@@ -1,0 +1,281 @@
+@import "../src/query_access_ops.sla"
+
+// Isolated tests for lib/query_access_ops.sla — query/access.rs gaps (ComponentIdSet union/intersection/is_disjoint/is_clear + AccessConflicts + Access get_conflicts/extend/intersection/union/remove_conflicting_access + FilteredAccess matches_everything/nothing/extend_access/get_conflicts/is_disjoint). Bevy reference: src/query/access.rs (gaps not in lib/query_access.sla).
+
+@test "cset_new_empty"() {
+    let s = ecs_cset_new();
+    if !ecs_cset_is_empty(s) { panic(91495); };
+    if ecs_cset_len(s) != 0 { panic(91496); };
+}
+
+@test "cset_insert_contains"() {
+    let s = ecs_cset_new();
+    let s2 = ecs_cset_insert(s, 5);
+    if !ecs_cset_contains(s2, 5) { panic(91497); };
+    if ecs_cset_contains(s2, 6) { panic(91498); };
+    if ecs_cset_len(s2) != 1 { panic(91499); };
+}
+
+@test "cset_insert_dedups"() {
+    let s = ecs_cset_new();
+    let s2 = ecs_cset_insert(s, 5);
+    let s3 = ecs_cset_insert(s2, 5);
+    let s4 = ecs_cset_insert(s3, 7);
+    if ecs_cset_len(s4) != 2 { panic(91500); };
+}
+
+@test "cset_union"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1); a = ecs_cset_insert(a, 2);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 2); b = ecs_cset_insert(b, 3);
+    let u = ecs_cset_union(a, b);
+    if ecs_cset_len(u) != 3 { panic(91501); };
+    if !ecs_cset_contains(u, 1) { panic(91502); };
+    if !ecs_cset_contains(u, 3) { panic(91503); };
+}
+
+@test "cset_intersection"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1); a = ecs_cset_insert(a, 2); a = ecs_cset_insert(a, 3);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 2); b = ecs_cset_insert(b, 3); b = ecs_cset_insert(b, 4);
+    let i = ecs_cset_intersection(a, b);
+    if ecs_cset_len(i) != 2 { panic(91504); };
+    if !ecs_cset_contains(i, 2) { panic(91505); };
+    if !ecs_cset_contains(i, 3) { panic(91506); };
+    if ecs_cset_contains(i, 1) { panic(91507); };
+}
+
+@test "cset_difference"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1); a = ecs_cset_insert(a, 2); a = ecs_cset_insert(a, 3);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 2);
+    let d = ecs_cset_difference(a, b);
+    if ecs_cset_len(d) != 2 { panic(91508); };
+    if !ecs_cset_contains(d, 1) { panic(91509); };
+    if !ecs_cset_contains(d, 3) { panic(91510); };
+}
+
+@test "cset_union_with_mutates"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 2); b = ecs_cset_insert(b, 3);
+    let u = ecs_cset_union_with(a, b);
+    if ecs_cset_len(u) != 3 { panic(91511); };
+}
+
+@test "cset_intersect_with_mutates"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1); a = ecs_cset_insert(a, 2); a = ecs_cset_insert(a, 3);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 2);
+    let i = ecs_cset_intersect_with(a, b);
+    if ecs_cset_len(i) != 1 { panic(91512); };
+    if !ecs_cset_contains(i, 2) { panic(91513); };
+}
+
+@test "cset_is_disjoint"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1); a = ecs_cset_insert(a, 2);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 3); b = ecs_cset_insert(b, 4);
+    if !ecs_cset_is_disjoint(a, b) { panic(91514); };
+    let c = ecs_cset_new();
+    c = ecs_cset_insert(c, 2);
+    if ecs_cset_is_disjoint(a, c) { panic(91515); };
+}
+
+@test "cset_is_subset"() {
+    let a = ecs_cset_new();
+    a = ecs_cset_insert(a, 1); a = ecs_cset_insert(a, 2);
+    let b = ecs_cset_new();
+    b = ecs_cset_insert(b, 1); b = ecs_cset_insert(b, 2); b = ecs_cset_insert(b, 3);
+    if !ecs_cset_is_subset(a, b) { panic(91516); };
+    if ecs_cset_is_subset(b, a) { panic(91517); };
+}
+
+@test "cset_at_out_of_bounds_returns_neg_one"() {
+    let s = ecs_cset_new();
+    s = ecs_cset_insert(s, 5);
+    if ecs_cset_at(s, -1) != -1 { panic(91518); };
+    if ecs_cset_at(s, 99) != -1 { panic(91519); };
+    if ecs_cset_at(s, 0) != 5 { panic(91520); };
+}
+
+@test "cset_inverted_unique"() {
+    let s = ecs_cset_inverted();
+    // empty inverted set contains every id
+    if !ecs_cset_contains(s, 999) { panic(91521); };
+    if ecs_cset_is_clear(s) { panic(91522); };
+}
+
+@test "access_conflicts_all_kind"() {
+    let c = ecs_access_conflicts_all();
+    if !ecs_access_conflicts_is_all(c) { panic(91523); };
+    if ecs_access_conflicts_is_empty(c) { panic(91524); };
+    if ecs_access_conflicts_count(c) != -1 { panic(91525); };
+}
+
+@test "access_conflicts_individual_empty"() {
+    let c = ecs_access_conflicts_individual_empty();
+    if ecs_access_conflicts_is_all(c) { panic(91526); };
+    if !ecs_access_conflicts_is_empty(c) { panic(91527); };
+}
+
+@test "access_conflicts_add_individual_extends_ids"() {
+    let a = ecs_access_conflicts_individual_empty();
+    let other_ids = Vec::new();
+    other_ids.push(3); other_ids.push(7);
+    let b = ecs_access_conflicts_individual(other_ids);
+    let merged = ecs_access_conflicts_add(a, b);
+    if ecs_access_conflicts_count(merged) != 2 { panic(91529); };
+    if ecs_access_conflicts_at(merged, 0) == -1 { panic(91530); };
+}
+
+@test "access_conflicts_add_all_wins"() {
+    let other_ids = Vec::new();
+    other_ids.push(3); other_ids.push(7);
+    let a = ecs_access_conflicts_individual(other_ids);
+    let b = ecs_access_conflicts_all();
+    let merged = ecs_access_conflicts_add(a, b);
+    if !ecs_access_conflicts_is_all(merged) { panic(91559); };
+}
+
+@test "access_conflicts_at"() {
+    let ids = Vec::new();
+    ids.push(3); ids.push(7);
+    let c = ecs_access_conflicts_individual(ids);
+    if ecs_access_conflicts_at(c, 0) != 3 { panic(91531); };
+    if ecs_access_conflicts_at(c, 1) != 7 { panic(91532); };
+    if ecs_access_conflicts_at(c, 2) != -1 { panic(91533); };
+}
+
+@test "access_ops_get_conflicts_write_vs_read"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_write(a, 5);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_read(b, 5);
+    let c = ecs_access_ops_get_conflicts(a, b);
+    if ecs_access_conflicts_is_empty(c) { panic(91534); };
+    if ecs_access_conflicts_at(c, 0) != 5 { panic(91535); };
+}
+
+@test "access_ops_get_conflicts_disjoint_no_conflict"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_read(a, 1); a = ecs_access_ops_add_write(a, 2);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_read(b, 3); b = ecs_access_ops_add_write(b, 4);
+    let c = ecs_access_ops_get_conflicts(a, b);
+    if !ecs_access_conflicts_is_empty(c) { panic(91536); };
+}
+
+@test "access_ops_get_conflicts_write_vs_write"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_write(a, 5);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_write(b, 5);
+    let c = ecs_access_ops_get_conflicts(a, b);
+    if ecs_access_conflicts_count(c) != 1 { panic(91537); };
+}
+
+@test "access_ops_extend_unions"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_read(a, 1); a = ecs_access_ops_add_write(a, 2);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_read(b, 3); b = ecs_access_ops_add_write(b, 4);
+    let u = ecs_access_ops_extend(a, b);
+    if ecs_access_ops_reads_count(u) != 2 { panic(91538); };
+    if ecs_access_ops_writes_count(u) != 2 { panic(91539); };
+}
+
+@test "access_ops_intersection"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_read(a, 1); a = ecs_access_ops_add_read(a, 2);
+    a = ecs_access_ops_add_write(a, 10); a = ecs_access_ops_add_write(a, 20);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_read(b, 2); b = ecs_access_ops_add_read(b, 3);
+    b = ecs_access_ops_add_write(b, 20); b = ecs_access_ops_add_write(b, 30);
+    let i = ecs_access_ops_intersection(a, b);
+    let ir = ecs_access_ops_intersection_reads(i);
+    let iw = ecs_access_ops_intersection_writes(i);
+    if ecs_cset_len(ir) != 1 { panic(91540); };
+    if !ecs_cset_contains(ir, 2) { panic(91541); };
+    if ecs_cset_len(iw) != 1 { panic(91542); };
+    if !ecs_cset_contains(iw, 20) { panic(91543); };
+}
+
+@test "access_ops_union_matches_extend"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_read(a, 1);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_write(b, 2);
+    let u = ecs_access_ops_union(a, b);
+    if ecs_access_ops_reads_count(u) != 1 { panic(91544); };
+    if ecs_access_ops_writes_count(u) != 1 { panic(91545); };
+}
+
+@test "access_ops_remove_conflicting_access_drops_reads-written-by-other"() {
+    let a = ecs_access_ops_new();
+    a = ecs_access_ops_add_read(a, 1); a = ecs_access_ops_add_read(a, 2);
+    a = ecs_access_ops_add_write(a, 10);
+    let b = ecs_access_ops_new();
+    b = ecs_access_ops_add_write(b, 1); b = ecs_access_ops_add_write(b, 10);
+    let r = ecs_access_ops_remove_conflicting_access(a, b);
+    // reads: 1 written by other -> dropped; 2 retained
+    if ecs_access_ops_reads_count(r) != 1 { panic(91546); };
+    if ecs_access_ops_read_at(r, 0) != 2 { panic(91547); };
+    // writes: 10 read-or-written by other -> dropped
+    if ecs_access_ops_writes_count(r) != 0 { panic(91548); };
+}
+
+@test "filtered_access_matches_everything"() {
+    let fa = ecs_filtered_access_matches_everything();
+    if !ecs_filtered_access_is_matching_everything(fa) { panic(91549); };
+    if ecs_filtered_access_filter_set_count(fa) != 1 { panic(91550); };
+}
+
+@test "filtered_access_matches_nothing"() {
+    let fa = ecs_filtered_access_matches_nothing();
+    if !ecs_filtered_access_is_matching_nothing(fa) { panic(91551); };
+    if ecs_filtered_access_filter_set_count(fa) != 0 { panic(91552); };
+}
+
+@test "filtered_access_get_conflicts"() {
+    let a = ecs_filtered_access_new();
+    a = ecs_filtered_access_add_write(a, 5);
+    let b = ecs_filtered_access_new();
+    b = ecs_filtered_access_add_read(b, 5);
+    let c = ecs_filtered_access_get_conflicts(a, b);
+    if ecs_access_conflicts_is_empty(c) { panic(91553); };
+    if ecs_access_conflicts_at(c, 0) != 5 { panic(91554); };
+}
+
+@test "filtered_access_extend_access_merges"() {
+    let a = ecs_filtered_access_new();
+    a = ecs_filtered_access_add_read(a, 1);
+    let b = ecs_filtered_access_new();
+    b = ecs_filtered_access_add_write(b, 2);
+    let m = ecs_filtered_access_extend_access(a, b);
+    let acc = ecs_filtered_access_access(m);
+    if ecs_access_ops_reads_count(acc) != 1 { panic(91555); };
+    if ecs_access_ops_writes_count(acc) != 1 { panic(91556); };
+}
+
+@test "filtered_access_is_disjoint_disjoint_paths"() {
+    let a = ecs_filtered_access_new();
+    a = ecs_filtered_access_add_read(a, 1); a = ecs_filtered_access_add_write(a, 2);
+    let b = ecs_filtered_access_new();
+    b = ecs_filtered_access_add_read(b, 3); b = ecs_filtered_access_add_write(b, 4);
+    if !ecs_filtered_access_is_disjoint(a, b) { panic(91557); };
+}
+
+@test "filtered_access_is_disjoint_shared_read_not_disjoint"() {
+    let a = ecs_filtered_access_new();
+    a = ecs_filtered_access_add_read(a, 1);
+    let b = ecs_filtered_access_new();
+    b = ecs_filtered_access_add_read(b, 1);
+    if ecs_filtered_access_is_disjoint(a, b) { panic(91558); };
+}

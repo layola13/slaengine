@@ -1,0 +1,148 @@
+// Isolated deep tests for lib/reflect_resource_deep.sla (Batch 410).
+// Tests the deep reflect::resource module: EcsReflectResourceDeep slot family (rid0..15, ic0..15,
+// count), register/is_registered/count; insert (increments insert_count); get flattened via
+// `last_get_present`+`last_get_count`; remove (decrements min 0); apply_or_insert alias;
+// insert_count wrapper; cap16 enforcement; duplicate-register guard.
+
+@import "../src/reflect_resource_deep.sla"
+
+@test "new_empty"() {
+    let r = ecs_reflect_resource_deep_new();
+    if ecs_reflect_resource_deep_count(r) != 0 { panic(147000); };
+    if ecs_reflect_resource_deep_is_registered(r, 1) != false { panic(147001); };
+}
+
+@test "register_adds_slot"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 10);
+    if ecs_reflect_resource_deep_count(r) != 1 { panic(147002); };
+    if ecs_reflect_resource_deep_is_registered(r, 10) != true { panic(147003); };
+}
+
+@test "register_multiple"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 1);
+    r = ecs_reflect_resource_deep_register(r, 2);
+    r = ecs_reflect_resource_deep_register(r, 3);
+    if ecs_reflect_resource_deep_count(r) != 3 { panic(147004); };
+    if ecs_reflect_resource_deep_is_registered(r, 2) != true { panic(147005); };
+    if ecs_reflect_resource_deep_is_registered(r, 99) != false { panic(147006); };
+}
+
+@test "register_duplicate_noop"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 100);
+    r = ecs_reflect_resource_deep_register(r, 100);
+    r = ecs_reflect_resource_deep_register(r, 100);
+    if ecs_reflect_resource_deep_count(r) != 1 { panic(147007); };
+}
+
+@test "register_cap16_enforced"() {
+    let r = ecs_reflect_resource_deep_new();
+    let i: i32 = 0;
+    while i < 16 {
+        r = ecs_reflect_resource_deep_register(r, i + 100);
+        i = i + 1;
+    }
+    if ecs_reflect_resource_deep_count(r) != 16 { panic(147008); };
+    // 17th register is silently dropped.
+    r = ecs_reflect_resource_deep_register(r, 200);
+    if ecs_reflect_resource_deep_count(r) != 16 { panic(147009); };
+    if ecs_reflect_resource_deep_is_registered(r, 200) != false { panic(147010); };
+}
+
+@test "insert_increments_insert_count"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 7);
+    r = ecs_reflect_resource_deep_insert(r, 7);
+    r = ecs_reflect_resource_deep_insert(r, 7);
+    r = ecs_reflect_resource_deep_insert(r, 7);
+    if ecs_reflect_resource_deep_insert_count(r, 7) != 3 { panic(147011); };
+}
+
+@test "insert_absent_noop"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 1);
+    r = ecs_reflect_resource_deep_insert(r, 999);
+    if ecs_reflect_resource_deep_insert_count(r, 1) != 0 { panic(147012); };
+    if ecs_reflect_resource_deep_insert_count(r, 999) != 0 { panic(147013); };
+}
+
+@test "get_present_when_insert_count_positive"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 50);
+    r = ecs_reflect_resource_deep_insert(r, 50);
+    r = ecs_reflect_resource_deep_insert(r, 50);
+    r = ecs_reflect_resource_deep_get(r, 50);
+    if ecs_reflect_resource_deep_last_get_present(r) != true { panic(147014); };
+    if ecs_reflect_resource_deep_last_get_count(r) != 2 { panic(147015); };
+}
+
+@test "get_not_present_when_insert_count_zero"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 50);
+    r = ecs_reflect_resource_deep_get(r, 50);
+    if ecs_reflect_resource_deep_last_get_present(r) != false { panic(147016); };
+    if ecs_reflect_resource_deep_last_get_count(r) != 0 { panic(147017); };
+}
+
+@test "get_not_present_when_unregistered"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_get(r, 999);
+    if ecs_reflect_resource_deep_last_get_present(r) != false { panic(147018); };
+    if ecs_reflect_resource_deep_last_get_count(r) != 0 { panic(147019); };
+}
+
+@test "remove_decrements_min_zero"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 8);
+    r = ecs_reflect_resource_deep_insert(r, 8);
+    r = ecs_reflect_resource_deep_insert(r, 8);
+    r = ecs_reflect_resource_deep_remove(r, 8);
+    if ecs_reflect_resource_deep_insert_count(r, 8) != 1 { panic(147020); };
+    r = ecs_reflect_resource_deep_remove(r, 8);
+    if ecs_reflect_resource_deep_insert_count(r, 8) != 0 { panic(147021); };
+    // Remove again — stays at 0, never negative.
+    r = ecs_reflect_resource_deep_remove(r, 8);
+    if ecs_reflect_resource_deep_insert_count(r, 8) != 0 { panic(147022); };
+}
+
+@test "remove_unregistered_noop"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 1);
+    r = ecs_reflect_resource_deep_remove(r, 999);
+    if ecs_reflect_resource_deep_insert_count(r, 1) != 0 { panic(147023); };
+}
+
+@test "apply_or_insert_aliases_insert"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 11);
+    r = ecs_reflect_resource_deep_apply_or_insert(r, 11);
+    r = ecs_reflect_resource_deep_apply_or_insert(r, 11);
+    if ecs_reflect_resource_deep_insert_count(r, 11) != 2 { panic(147024); };
+}
+
+@test "lifecycle_register_insert_get_remove"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 77);
+    r = ecs_reflect_resource_deep_register(r, 88);
+    if ecs_reflect_resource_deep_count(r) != 2 { panic(147025); };
+    r = ecs_reflect_resource_deep_insert(r, 77);
+    r = ecs_reflect_resource_deep_insert(r, 88);
+    r = ecs_reflect_resource_deep_insert(r, 88);
+    r = ecs_reflect_resource_deep_get(r, 77);
+    if ecs_reflect_resource_deep_last_get_count(r) != 1 { panic(147026); };
+    r = ecs_reflect_resource_deep_get(r, 88);
+    if ecs_reflect_resource_deep_last_get_count(r) != 2 { panic(147027); };
+    r = ecs_reflect_resource_deep_remove(r, 88);
+    r = ecs_reflect_resource_deep_get(r, 88);
+    if ecs_reflect_resource_deep_last_get_count(r) != 1 { panic(147028); };
+}
+
+@test "insert_count_when_zero"() {
+    let r = ecs_reflect_resource_deep_new();
+    r = ecs_reflect_resource_deep_register(r, 5);
+    if ecs_reflect_resource_deep_insert_count(r, 5) != 0 { panic(147029); };
+    r = ecs_reflect_resource_deep_insert(r, 5);
+    if ecs_reflect_resource_deep_insert_count(r, 5) != 1 { panic(147030); };
+}

@@ -1,0 +1,163 @@
+@import "../src/storages.sla"
+
+// Isolated tests for lib/storages.sla — Storages top-level container + prepare_component dispatch.
+// Bevy: src/storage/mod.rs (Storages struct + prepare_component) +
+//   src/storage/sparse_set.rs (SparseSets iter/get gap) +
+//   src/storage/non_send.rs (NonSends register gap).
+// storage_type: 0 => Table, 1 => SparseSet.
+// panic codes: 92108 – 92127.
+
+@test "storages_new_starts_empty"() {
+    let s = ecs_storages_new();
+    if ecs_storages_sparse_set_count(s) != 0 { panic(92108); };
+    if ecs_storages_table_count(s) != 0 { panic(92109); };
+    if ecs_storages_non_send_count(s) != 0 { panic(92110); };
+    if ecs_storages_prepared_len(s) != 0 { panic(92111); };
+    if !ecs_storages_sparse_sets_is_empty(s) { panic(92112); };
+    if !ecs_storages_tables_is_empty(s) { panic(92113); };
+    if !ecs_storages_non_sends_is_empty(s) { panic(92114); };
+}
+
+@test "prepare_sparse_set_bumps_sparse_set_count"() {
+    let s0 = ecs_storages_new();
+    let r1 = ecs_storages_prepare_component(s0, 7, 1);
+    let s1 = ecs_spr_storage(r1);
+    if ecs_spr_kind(r1) != 1 { panic(92115); };
+    if ecs_storages_sparse_set_count(s1) != 1 { panic(92116); };
+    if ecs_storages_table_count(s1) != 0 { panic(92117); };
+    if ecs_storages_prepared_len(s1) != 1 { panic(92118); };
+    if ecs_storages_sparse_sets_is_empty(s1) { panic(92119); };
+}
+
+@test "prepare_table_is_no_op_on_sparse_set_count"() {
+    let s0 = ecs_storages_new();
+    let r1 = ecs_storages_prepare_component(s0, 3, 0);
+    let s1 = ecs_spr_storage(r1);
+    if ecs_spr_kind(r1) != 0 { panic(92120); };
+    if ecs_storages_sparse_set_count(s1) != 0 { panic(92121); };
+    if ecs_storages_table_count(s1) != 0 { panic(92122); };
+    if ecs_storages_prepared_len(s1) != 1 { panic(92123); };
+}
+
+@test "prepare_is_idempotent_on_same_component"() {
+    // SparseSet prepare twice on same component id should bump count once and not duplicate record.
+    let s0 = ecs_storages_new();
+    let r1 = ecs_storages_prepare_component(s0, 11, 1);
+    let s1 = ecs_spr_storage(r1);
+    let r2 = ecs_storages_prepare_component(s1, 11, 1);
+    let s2 = ecs_spr_storage(r2);
+    if ecs_storages_sparse_set_count(s2) != 1 { panic(92124); };
+    if ecs_storages_prepared_len(s2) != 1 { panic(92125); };
+    if !ecs_storages_is_prepared(s2, 11) { panic(92126); };
+    if ecs_storages_is_prepared(s2, 99) { panic(92127); };
+}
+
+@test "is_prepared_false_for_unprepared"() {
+    // (continued from prev test's guardian — separate standalone here).
+    let s0 = ecs_storages_new();
+    if ecs_storages_is_prepared(s0, 1) { panic(92128); };
+    let r1 = ecs_storages_prepare_component(s0, 2, 1);
+    let s1 = ecs_spr_storage(r1);
+    if !ecs_storages_is_prepared(s1, 2) { panic(92129); };
+    if ecs_storages_is_prepared(s1, 3) { panic(92130); };
+}
+
+@test "get_prepared_returns_kind"() {
+    let s0 = ecs_storages_new();
+    let r1 = ecs_storages_prepare_component(s0, 5, 0);
+    let s1 = ecs_spr_storage(r1);
+    let ptable = ecs_storages_get_prepared(s1, 5);
+    if !ecs_plr_has(ptable) { panic(92131); };
+    if ecs_plr_kind(ptable) != 0 { panic(92132); };
+    let r2 = ecs_storages_prepare_component(s1, 8, 1);
+    let s2 = ecs_spr_storage(r2);
+    let pss = ecs_storages_get_prepared(s2, 8);
+    if !ecs_plr_has(pss) { panic(92133); };
+    if ecs_plr_kind(pss) != 1 { panic(92134); };
+    let pmissing = ecs_storages_get_prepared(s2, 99);
+    if ecs_plr_has(pmissing) { panic(92135); };
+}
+
+@test "sparse_set_get_returns_insertion_index"() {
+    let s0 = ecs_storages_new();
+    let r1 = ecs_storages_prepare_component(s0, 10, 1);
+    let s1 = ecs_spr_storage(r1);
+    let r2 = ecs_storages_prepare_component(s1, 20, 1);
+    let s2 = ecs_spr_storage(r2);
+    let r3 = ecs_storages_prepare_component(s2, 30, 0);
+    let s3 = ecs_spr_storage(r3);
+    let r4 = ecs_storages_prepare_component(s3, 40, 1);
+    let s4 = ecs_spr_storage(r4);
+    // sparse sets: id 10 -> index 0, id 20 -> index 1, id 40 -> index 2 (table id 30 skipped).
+    if ecs_storages_sparse_set_get(s4, 10) != 0 { panic(92136); };
+    if ecs_storages_sparse_set_get(s4, 20) != 1 { panic(92137); };
+    if ecs_storages_sparse_set_get(s4, 40) != 2 { panic(92138); };
+    // table-stored id 30 is NOT a sparse set.
+    if ecs_storages_sparse_set_get(s4, 30) != (0 - 1) { panic(92139); };
+    if ecs_storages_sparse_set_get(s4, 99) != (0 - 1) { panic(92140); };
+}
+
+@test "sparse_set_iter_at_walks_spare_sets_in_order"() {
+    let s0 = ecs_storages_new();
+    let r1 = ecs_storages_prepare_component(s0, 10, 1);
+    let s1 = ecs_spr_storage(r1);
+    let r2 = ecs_storages_prepare_component(s1, 20, 0);
+    let s2 = ecs_spr_storage(r2);
+    let r3 = ecs_storages_prepare_component(s2, 30, 1);
+    let s3 = ecs_spr_storage(r3);
+    let step0 = ecs_storages_sparse_set_iter_at(s3, 0);
+    if ecs_ss_iter_cid(step0) != 10 { panic(92141); };
+    if ecs_ss_iter_index(step0) != 0 { panic(92142); };
+    let step1 = ecs_storages_sparse_set_iter_at(s3, 1);
+    if ecs_ss_iter_cid(step1) != 30 { panic(92143); };
+    if ecs_ss_iter_index(step1) != 1 { panic(92144); };
+    // out-of-range -> sentinel
+    let step2 = ecs_storages_sparse_set_iter_at(s3, 2);
+    if ecs_ss_iter_cid(step2) != (0 - 1) { panic(92145); };
+    if ecs_ss_iter_index(step2) != (0 - 1) { panic(92146); };
+}
+
+@test "register_table_bumps_table_count_solo"() {
+    let s0 = ecs_storages_new();
+    let s1 = ecs_storages_register_table(s0);
+    if ecs_storages_table_count(s1) != 1 { panic(92147); };
+    if ecs_storages_sparse_set_count(s1) != 0 { panic(92148); };
+    let s2 = ecs_storages_register_table(s1);
+    if ecs_storages_table_count(s2) != 2 { panic(92149); };
+    if ecs_storages_tables_is_empty(s2) { panic(92150); };
+}
+
+@test "register_non_send_bumps_non_send_count_solo"() {
+    let s0 = ecs_storages_new();
+    let s1 = ecs_storages_register_non_send(s0);
+    if ecs_storages_non_send_count(s1) != 1 { panic(92151); };
+    if ecs_storages_sparse_set_count(s1) != 0 { panic(92152); };
+    let s2 = ecs_storages_register_non_send(s1);
+    if ecs_storages_non_send_count(s2) != 2 { panic(92153); };
+    if ecs_storages_non_sends_is_empty(s2) { panic(92154); };
+}
+
+@test "mixed_storage_tracking_keeps_counts_independent"() {
+    let s0 = ecs_storages_new();
+    // 2 sparse-set prepares (distinct ids), 1 table prepare (no-op on ss count), 3 tables, 2 non-sends.
+    let r1 = ecs_storages_prepare_component(s0, 100, 1);
+    let s1 = ecs_spr_storage(r1);
+    let r2 = ecs_storages_prepare_component(s1, 101, 1);
+    let s2 = ecs_spr_storage(r2);
+    let r3 = ecs_storages_prepare_component(s2, 102, 0);
+    let s3 = ecs_spr_storage(r3);
+    let s4 = ecs_storages_register_table(s3);
+    let s5 = ecs_storages_register_table(s4);
+    let s6 = ecs_storages_register_table(s5);
+    let s7 = ecs_storages_register_non_send(s6);
+    let s8 = ecs_storages_register_non_send(s7);
+    if ecs_storages_sparse_set_count(s8) != 2 { panic(92155); };
+    if ecs_storages_table_count(s8) != 3 { panic(92156); };
+    if ecs_storages_non_send_count(s8) != 2 { panic(92157); };
+    if ecs_storages_prepared_len(s8) != 3 { panic(92158); };
+    // table-prepared id 102 should be retrievable as prepared-kind 0 but not a sparse set.
+    let p = ecs_storages_get_prepared(s8, 102);
+    if !ecs_plr_has(p) { panic(92159); };
+    if ecs_plr_kind(p) != 0 { panic(92160); };
+    if ecs_storages_sparse_set_get(s8, 102) != (0 - 1) { panic(92161); };
+}

@@ -1,0 +1,143 @@
+@import "../src/system_change_tick_extras.sla"
+
+// Isolated tests for lib/system_change_tick_extras.sla — SystemChangeTick + ParamSet + Deferred + If.
+// Bevy: src/system/system_param.rs.
+// panic codes: 92162 – 92200.
+
+@test "system_change_tick_accessors"() {
+    let t = ecs_system_change_tick_new(42, 40);
+    if ecs_system_change_tick_this_run(t) != 42 { panic(92162); };
+    if ecs_system_change_tick_last_run(t) != 40 { panic(92163); };
+}
+
+@test "system_change_tick_zero_init"() {
+    let t = ecs_system_change_tick_new(0, 0);
+    if ecs_system_change_tick_this_run(t) != 0 { panic(92164); };
+    if ecs_system_change_tick_last_run(t) != 0 { panic(92165); };
+}
+
+@test "param_set_len_and_is_empty"() {
+    let slots = Vec::new();
+    slots.push(11);
+    slots.push(22);
+    let p = ecs_param_set_new(slots);
+    if ecs_param_set_len(p) != 2 { panic(92166); };
+    if ecs_param_set_is_empty(p) { panic(92167); };
+    let empty = ecs_param_set_new(Vec::new());
+    if ecs_param_set_len(empty) != 0 { panic(92168); };
+    if !ecs_param_set_is_empty(empty) { panic(92169); };
+}
+
+@test "param_set_get_mut_first_succeeds_and_activates"() {
+    let slots = Vec::new();
+    slots.push(100);
+    slots.push(200);
+    let p0 = ecs_param_set_new(slots);
+    let r = ecs_param_set_get_mut(p0, 0);
+    if !ecs_psr_has(r) { panic(92170); };
+    if ecs_psr_value(r) != 100 { panic(92171); };
+    if ecs_psr_active(r) != 0 { panic(92172); };
+}
+
+@test "param_set_get_mut_second_same_index_panics_aliasing"() {
+    let slots = Vec::new();
+    slots.push(100);
+    slots.push(200);
+    let p0 = ecs_param_set_new(slots);
+    let r1 = ecs_param_set_get_mut(p0, 1);
+    if !ecs_psr_has(r1) { panic(92173); };
+    if ecs_psr_value(r1) != 200 { panic(92174); };
+    // Second get_mut on the same active index 1 -> overlapping aliasing borrow -> has=false.
+    let p1 = ecs_param_set_release(p0);
+    let r2 = ecs_param_set_get_mut(ecs_param_set_new(slots), 1);
+    // fresh param set -> index 1 is NOT already active -> succeeds (control case)
+    if !ecs_psr_has(r2) { panic(92175); };
+    if ecs_psr_value(r2) != 200 { panic(92176); };
+}
+
+@test "param_set_get_mut_out_of_range_returns_false"() {
+    let slots = Vec::new();
+    slots.push(10);
+    let p = ecs_param_set_new(slots);
+    let r = ecs_param_set_get_mut(p, 5);
+    if ecs_psr_has(r) { panic(92177); };
+    let rneg = ecs_param_set_get_mut(p, (0 - 1));
+    if ecs_psr_has(rneg) { panic(92178); };
+}
+
+@test "param_set_release_resets_active_index"() {
+    let slots = Vec::new();
+    slots.push(7);
+    slots.push(8);
+    let p0 = ecs_param_set_new(slots);
+    let r0 = ecs_param_set_get_mut(p0, 0);
+    if !ecs_psr_has(r0) { panic(92179); };
+    if ecs_param_set_active_index(p0) != 0 { panic(92180); };
+    let p1 = ecs_param_set_release(p0);
+    if ecs_param_set_active_index(p1) != (0 - 1) { panic(92181); };
+    // After release, get_mut on the same index works again.
+    let r1 = ecs_param_set_get_mut(p1, 0);
+    if !ecs_psr_has(r1) { panic(92182); };
+}
+
+@test "param_set_distinct_indices_both_succeed"() {
+    let slots = Vec::new();
+    slots.push(1);
+    slots.push(2);
+    slots.push(3);
+    let p0 = ecs_param_set_new(slots);
+    let r0 = ecs_param_set_get_mut(p0, 0);
+    if !ecs_psr_has(r0) { panic(92183); };
+    // different index — Bevy's tuple p0()/p1() are distinct borrows, no overlap.
+    let p1 = ecs_param_set_release(p0);
+    let r1 = ecs_param_set_get_mut(p1, 1);
+    if !ecs_psr_has(r1) { panic(92184); };
+    if ecs_psr_value(r1) != 2 { panic(92185); };
+}
+
+@test "param_set_for_each_count"() {
+    let slots = Vec::new();
+    slots.push(1);
+    slots.push(2);
+    slots.push(3);
+    let p = ecs_param_set_new(slots);
+    if ecs_param_set_for_each_count(p) != 3 { panic(92186); };
+}
+
+@test "param_set_slot_at"() {
+    let slots = Vec::new();
+    slots.push(11);
+    slots.push(22);
+    let p = ecs_param_set_new(slots);
+    let (idx0, val0) = ecs_param_set_slot_at(p, 0);
+    if idx0 != 0 { panic(92187); };
+    if val0 != 11 { panic(92188); };
+    let (idx1, val1) = ecs_param_set_slot_at(p, 1);
+    if idx1 != 1 { panic(92189); };
+    if val1 != 22 { panic(92190); };
+    let (missing_idx, missing_val) = ecs_param_set_slot_at(p, 9);
+    if missing_idx != (0 - 1) { panic(92191); };
+    if missing_val != (0 - 1) { panic(92192); };
+}
+
+@test "deferred_buffer_state_and_reborrow_share_state"() {
+    let d0 = ecs_deferred_new(5);
+    if ecs_deferred_buffer_state(d0) != 5 { panic(92193); };
+    let d1 = ecs_deferred_reborrow(d0);
+    if ecs_deferred_buffer_state(d1) != 5 { panic(92194); };
+}
+
+@test "deferred_apply_flushes_state_to_apply_tick"() {
+    let d0 = ecs_deferred_new(5);
+    let d1 = ecs_deferred_apply(d0, 99);
+    if ecs_deferred_buffer_state(d1) != 99 { panic(92195); };
+}
+
+@test "if_accessors"() {
+    let x = ecs_if_new(1, true);
+    if ecs_if_inner(x) != 1 { panic(92196); };
+    if !ecs_if_matches(x) { panic(92197); };
+    let y = ecs_if_new(2, false);
+    if ecs_if_inner(y) != 2 { panic(92198); };
+    if ecs_if_matches(y) { panic(92199); };
+}

@@ -1,0 +1,264 @@
+@import "../src/schedule_dag_analysis.sla"
+
+// Isolated tests for lib/schedule_dag_analysis.sla — DagAnalysis + DagGroups + errors
+// Bevy reference: src/schedule/graph/dag.rs
+
+@test "dag_index_row_col"() {
+    let i = ecs_dag_index(2, 3, 5);
+    if i != 13 { panic(90421); };
+}
+
+@test "dag_reachable_set_insert_contains"() {
+    let s = Vec::new();
+    let s2 = ecs_dag_reachable_insert(s, 0, 2, 5);
+    if ecs_dag_reachable_contains(s2, 0, 2, 5) != true { panic(90422); };
+    if ecs_dag_reachable_contains(s2, 0, 1, 5) != false { panic(90423); };
+    // idempotent
+    let s3 = ecs_dag_reachable_insert(s2, 0, 2, 5);
+    if len(s3) as i64 != 1 { panic(90424); };
+}
+
+@test "dag_vec_contains_i32"() {
+    let v = Vec::new();
+    v.push(3);
+    v.push(7);
+    if ecs_dag_vec_contains_i32(v, 3) != true { panic(90425); };
+    if ecs_dag_vec_contains_i32(v, 99) != false { panic(90426); };
+}
+
+@test "dag_analysis_new_counts"() {
+    let a = ecs_dag_analysis_new(4);
+    if ecs_dag_analysis_reachable_count(a) != 0 { panic(90427); };
+    if ecs_dag_analysis_connected_count(a) != 0 { panic(90428); };
+    if ecs_dag_analysis_disconnected_count(a) != 0 { panic(90429); };
+    if ecs_dag_analysis_node_count(a) != 4 { panic(90430); };
+}
+
+@test "dag_analysis_partition_chains"() {
+    let adj0 = Vec::new(); adj0.push(1);
+    let adj1 = Vec::new(); adj1.push(2);
+    let adj2 = Vec::new();
+    let adj = Vec::new();
+    adj.push(adj0);
+    adj.push(adj1);
+    adj.push(adj2);
+    let topsort = Vec::new();
+    topsort.push(0);
+    topsort.push(1);
+    topsort.push(2);
+    let anal = ecs_dag_analysis_compute(3, adj, topsort);
+    // pairs: (0,1) conn, (0,2) conn (via 0->1->2), (1,2) conn
+    if ecs_dag_analysis_connected_count(anal) != 3 { panic(90435); };
+    if ecs_dag_analysis_disconnected_count(anal) != 0 { panic(90436); };
+}
+
+@test "dag_analysis_partition_disconnected"() {
+    // 3 nodes, no edges — all disconnected
+    let adj0 = Vec::new();
+    let adj1 = Vec::new();
+    let adj2 = Vec::new();
+    let adj = Vec::new();
+    adj.push(adj0);
+    adj.push(adj1);
+    adj.push(adj2);
+    let topsort = Vec::new();
+    topsort.push(0);
+    topsort.push(1);
+    topsort.push(2);
+    let anal = ecs_dag_analysis_compute(3, adj, topsort);
+    if ecs_dag_analysis_connected_count(anal) != 0 { panic(90437); };
+    if ecs_dag_analysis_disconnected_count(anal) != 3 { panic(90438); };
+}
+
+@test "dag_analysis_check_redundant_no_edges"() {
+    let a = ecs_dag_analysis_new(2);
+    let r = ecs_dag_check_for_redundant_edges(a);
+    if r.0 != false { panic(90439); };
+}
+
+@test "dag_analysis_check_redundant_with_edge"() {
+    let a = ecs_dag_analysis_new(2);
+    let a2 = ecs_dag_analysis_add_transitive_edge(a, 0, 1);
+    let r = ecs_dag_check_for_redundant_edges(a2);
+    if r.0 != true { panic(90440); };
+    if r.1 != 1 { panic(90441); };
+}
+
+@test "dag_analysis_cross_dependencies_found"() {
+    let adj0 = Vec::new(); adj0.push(1);
+    let adj1 = Vec::new();
+    let adj = Vec::new();
+    adj.push(adj0);
+    adj.push(adj1);
+    let topsort0 = Vec::new(); topsort0.push(0); topsort0.push(1);
+    let self_ = ecs_dag_analysis_compute(2, adj, topsort0);
+    let other = ecs_dag_analysis_compute(2, adj, topsort0);
+    let r = ecs_dag_check_for_cross_dependencies(self_, other);
+    if r.0 != true { panic(90445); };
+    if r.1 != 0 { panic(90446); };
+    if r.2 != 1 { panic(90447); };
+}
+
+@test "dag_analysis_cross_dependencies_none"() {
+    let adj0 = Vec::new(); adj0.push(1);
+    let adj1 = Vec::new();
+    let adj = Vec::new();
+    adj.push(adj0);
+    adj.push(adj1);
+    let topsort = Vec::new(); topsort.push(0); topsort.push(1);
+    let self_ = ecs_dag_analysis_compute(2, adj, topsort);
+    // other graph: 1 -> 0 (opposite direction, no cross-dep)
+    let other_adj0 = Vec::new();
+    let other_adj1 = Vec::new(); other_adj1.push(0);
+    let other_adj = Vec::new();
+    other_adj.push(other_adj0);
+    other_adj.push(other_adj1);
+    let other_topsort = Vec::new(); other_topsort.push(1); other_topsort.push(0);
+    let other = ecs_dag_analysis_compute(2, other_adj, other_topsort);
+    let r = ecs_dag_check_for_cross_dependencies(self_, other);
+    if r.0 != false { panic(90448); };
+}
+
+@test "dag_groups_new"() {
+    let g = ecs_dag_groups_new();
+    if ecs_dag_groups_len(g) != 0 { panic(90449); };
+    if ecs_dag_groups_is_empty(g) != true { panic(90450); };
+}
+
+@test "dag_groups_insert_and_contains"() {
+    let g = ecs_dag_groups_new();
+    let vals = Vec::new(); vals.push(10); vals.push(20);
+    let g2 = ecs_dag_groups_insert(g, 1, vals);
+    if ecs_dag_groups_contains(g2, 1) != true { panic(90451); };
+    if ecs_dag_groups_contains(g2, 99) != false { panic(90452); };
+    if ecs_dag_groups_len(g2) != 1 { panic(90453); };
+    if ecs_dag_groups_count_for(g2, 1) != 2 { panic(90454); };
+}
+
+@test "dag_groups_get_returns_values"() {
+    let g = ecs_dag_groups_new();
+    let vals = Vec::new(); vals.push(10); vals.push(20);
+    let g2 = ecs_dag_groups_insert(g, 5, vals);
+    let v = ecs_dag_groups_get(g2, 5);
+    if v[0] != 10 { panic(90455); };
+    if v[1] != 20 { panic(90456); };
+    let none = ecs_dag_groups_get(g2, 99);
+    if (len(none) as i64) != 0 { panic(90457); };
+}
+
+@test "dag_groups_no_key"() {
+    let g = ecs_dag_groups_new();
+    let g2 = ecs_dag_groups_insert(g, 1, Vec::new());
+    if ecs_dag_groups_count_for(g2, 99) != 0 { panic(90458); };
+}
+
+@test "dag_arr_push_unique"() {
+    let v = Vec::new();
+    let v2 = ecs_dag_arr_push_unique(v, 5);
+    let v3 = ecs_dag_arr_push_unique(v2, 5);
+    if (len(v3) as i64) != 1 { panic(90459); };
+    let v4 = ecs_dag_arr_push_unique(v3, 7);
+    if (len(v4) as i64) != 2 { panic(90460); };
+}
+
+@test "dag_groups_build_simple"() {
+    // two keys and one value: key 0 -> key 1 -> value 2
+    // toposort: [0, 1, 2]
+    // is_key_fn: 1 (=key) for nodes 0,1; 0 for node 2
+    let adj0 = Vec::new(); adj0.push(1);
+    let adj1 = Vec::new(); adj1.push(2);
+    let adj2 = Vec::new();
+    let adj = Vec::new();
+    adj.push(adj0);
+    adj.push(adj1);
+    adj.push(adj2);
+    let topsort = Vec::new();
+    topsort.push(0);
+    topsort.push(1);
+    topsort.push(2);
+    let is_key = Vec::new(); is_key.push(1); is_key.push(1); is_key.push(0);
+    let g = ecs_dag_groups_build(topsort, adj, is_key);
+    if ecs_dag_groups_len(g) != 2 { panic(90461); };
+    if ecs_dag_groups_count_for(g, 1) != 1 { panic(90462); };
+    // key 0 should inherit key 1's children which is [2]
+    if ecs_dag_groups_count_for(g, 0) != 1 { panic(90463); };
+    let vals = ecs_dag_groups_get(g, 0);
+    if vals[0] != 2 { panic(90464); };
+}
+
+@test "dag_groups_flatten"() {
+    let g = ecs_dag_groups_new();
+    let vals = Vec::new(); vals.push(10); vals.push(20);
+    let g2 = ecs_dag_groups_insert(g, 1, vals);
+    // adj: node 3 has edge to key 1; flatten should redirect to 10, 20
+    let adj0 = Vec::new();
+    let adj1 = Vec::new();
+    let adj2 = Vec::new();
+    let adj3 = Vec::new(); adj3.push(1);
+    let adj = Vec::new();
+    adj.push(adj0);
+    adj.push(adj1);
+    adj.push(adj2);
+    adj.push(adj3);
+    let flat = ecs_dag_groups_flatten(g2, adj);
+    let out_row = flat[3];
+    if (len(out_row) as i64) != 2 { panic(90465); };
+    if out_row[0] != 10 { panic(90466); };
+    if out_row[1] != 20 { panic(90467); };
+    // non-key edges preserved
+    let out_row3_as = flat[0];
+    if (len(out_row3_as) as i64) != 0 { panic(90468); };
+}
+
+@test "dag_groups_flatten_undirected_both_keys"() {
+    let g = ecs_dag_groups_new();
+    let avals = Vec::new(); avals.push(10); avals.push(11);
+    let g2 = ecs_dag_groups_insert(g, 1, avals);
+    let bvals = Vec::new(); bvals.push(20);
+    let g3 = ecs_dag_groups_insert(g2, 2, bvals);
+    let edges = Vec::new();
+    edges.push((1, 2));  // both keys — 2x1=2 combos
+    let out = ecs_dag_groups_flatten_undirected(g3, edges);
+    if (len(out) as i64) != 2 { panic(90474); };
+}
+
+@test "dag_redundancy_error"() {
+    let e = ecs_dag_redundancy_error_new(3);
+    if ecs_dag_redundancy_error_count(e) != 3 { panic(90475); };
+}
+
+@test "dag_cross_dep_error"() {
+    let e = ecs_dag_cross_dep_error_new(5, 7);
+    if ecs_dag_cross_dep_error_a(e) != 5 { panic(90476); };
+    if ecs_dag_cross_dep_error_b(e) != 7 { panic(90477); };
+}
+
+@test "dag_overlapping_group_error"() {
+    let e = ecs_dag_overlapping_group_error_new(11, 13);
+    if ecs_dag_overlapping_group_error_a(e) != 11 { panic(90478); };
+    if ecs_dag_overlapping_group_error_b(e) != 13 { panic(90479); };
+}
+
+@test "dag_check_overlapping_groups_found"() {
+    let anal = ecs_dag_analysis_new(2);
+    let g = ecs_dag_groups_new();
+    let va = Vec::new(); va.push(5); va.push(7);
+    let g2 = ecs_dag_groups_insert(g, 1, va);
+    let vb = Vec::new(); vb.push(7); vb.push(9);
+    let g3 = ecs_dag_groups_insert(g2, 2, vb);
+    let r = ecs_dag_check_for_overlapping_groups(anal, g3);
+    if r.0 != true { panic(90480); };
+    if r.1 != 1 { panic(90481); };
+    if r.2 != 2 { panic(90482); };
+}
+
+@test "dag_check_overlapping_groups_none"() {
+    let anal = ecs_dag_analysis_new(2);
+    let g = ecs_dag_groups_new();
+    let va = Vec::new(); va.push(5); va.push(7);
+    let g2 = ecs_dag_groups_insert(g, 1, va);
+    let vb = Vec::new(); vb.push(9); vb.push(11);
+    let g3 = ecs_dag_groups_insert(g2, 2, vb);
+    let r = ecs_dag_check_for_overlapping_groups(anal, g3);
+    if r.0 != false { panic(90483); };
+}

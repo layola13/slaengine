@@ -1,0 +1,398 @@
+// Isolated test: Bevy ECS entity_disabling + Intern/Interned + Name/HashedStr +
+// relationship_query iterators parity.
+// Mirrors src/entity_disabling.rs + src/intern.rs + src/name.rs + src/relationship/relationship_query.rs
+
+// === Entity Disabling (src/entity_disabling.rs) ===
+// DefaultQueryFilters: global filter that excludes disabled entities from queries
+struct DefaultQueryFilters {
+    disabling_components: Vec<i32>,
+}
+
+fn dqf_new() -> DefaultQueryFilters { return DefaultQueryFilters { disabling_components: Vec::new() }; }
+
+fn dqf_register(dqf: DefaultQueryFilters, cid: i32) -> DefaultQueryFilters {
+    if vec_contains(dqf.disabling_components, cid) != true { dqf.disabling_components.push(cid); };
+    return dqf;
+}
+
+fn dqf_is_disabled(dqf: DefaultQueryFilters, cid: i32) -> bool {
+    return vec_contains(dqf.disabling_components, cid);
+}
+
+fn dqf_count(dqf: DefaultQueryFilters) -> i64 { return len(dqf.disabling_components) as i64; }
+
+// Simulated entity with components
+struct TestEntity {
+    eid: i64,
+    components: Vec<i32>,
+}
+
+fn te_new(eid: i64) -> TestEntity { return TestEntity { eid: eid, components: Vec::new() }; }
+fn te_add(te: TestEntity, cid: i32) -> TestEntity { te.components.push(cid); return te; }
+fn te_has(te: TestEntity, cid: i32) -> bool { return vec_contains(te.components, cid); }
+
+// Query simulation: returns entities matching a required component, respecting default filters
+fn query_with_filter(world: Vec<TestEntity>, required: i32, dqf: DefaultQueryFilters, explicitly_mention: i32) -> Vec<TestEntity> {
+    let result: Vec<TestEntity> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(world) as i64;
+    while i < cnt {
+        let e = world[i];
+        if te_has(e, required) != true { i = i + 1; continue; };
+        // Check disabling: entity is filtered out if it has a disabling component NOT explicitly mentioned
+        let j: i64 = 0;
+        let dcnt = len(dqf.disabling_components) as i64;
+        let is_disabled = false;
+        while j < dcnt {
+            let dc = dqf.disabling_components[j];
+            if te_has(e, dc) {
+                if dc != explicitly_mention { is_disabled = true; };
+            };
+            j = j + 1;
+        }
+        if is_disabled != true { result.push(e); };
+        i = i + 1;
+    }
+    return result;
+}
+
+const DISABLED_CID: i32 = 99001;
+
+// === Intern / Interned (src/intern.rs) ===
+struct InternEntry {
+    id: i32,
+    value: i64,
+}
+
+struct Interner {
+    entries: Vec<InternEntry>,
+    next_id: i32,
+}
+
+fn interner_new() -> Interner { return Interner { entries: Vec::new(), next_id: 0 }; }
+
+fn interner_intern(it: Interner, value: i64) -> (Interner, i32) {
+    let i: i64 = 0;
+    let cnt = len(it.entries) as i64;
+    while i < cnt {
+        if it.entries[i].value == value { return (it, it.entries[i].id); };
+        i = i + 1;
+    }
+    let id = it.next_id;
+    it.entries.push(InternEntry { id: id, value: value });
+    it.next_id = id + 1;
+    return (it, id);
+}
+
+fn interner_count(it: Interner) -> i64 { return len(it.entries) as i64; }
+
+// Interned is just an id reference
+struct Interned { id: i32 }
+
+fn interned_new(id: i32) -> Interned { return Interned { id: id }; }
+fn interned_id(i: Interned) -> i32 { return i.id; }
+
+// === Name / HashedStr (src/name.rs) ===
+struct HashedStr {
+    value: i64,
+    hash: i64,
+}
+
+fn hashed_str_new(value: i64) -> HashedStr {
+    let h = value * 2654435761;
+    h = h ^ (h >> 32);
+    return HashedStr { value: value, hash: h };
+}
+
+fn hashed_str_value(hs: HashedStr) -> i64 { return hs.value; }
+fn hashed_str_hash(hs: HashedStr) -> i64 { return hs.hash; }
+
+struct Name {
+    inner: HashedStr,
+}
+
+fn name_new(value: i64) -> Name { return Name { inner: hashed_str_new(value) }; }
+fn name_set(n: Name, value: i64) -> Name { n.inner = hashed_str_new(value); return n; }
+fn name_as_str(n: Name) -> i64 { return hashed_str_value(n.inner); }
+fn name_pre_hash(n: Name) -> i64 { return hashed_str_hash(n.inner); }
+
+// Name mutate: apply function to the value
+fn name_mutate(n: Name, f: i64) -> Name { return name_set(n, f); }
+
+// === Relationship Query Iterators (src/relationship/relationship_query.rs) ===
+// Simulated hierarchy: parent → children
+struct RelEdge { parent: i64, child: i64 }
+
+fn rel_iter_descendants(edges: Vec<RelEdge>, entity: i64) -> Vec<i64> {
+    let r = rel_descendants_with_edges(edges, entity);
+    return r.1;
+}
+
+// Internal: returns (edges, descendants) so callers can reuse edges
+fn rel_descendants_with_edges(edges: Vec<RelEdge>, entity: i64) -> (Vec<RelEdge>, Vec<i64>) {
+    let result: Vec<i64> = Vec::new();
+    let queue: Vec<i64> = Vec::new();
+    queue.push(entity);
+    return rel_bfs_step(edges, queue, result, 0);
+}
+
+fn rel_bfs_step(edges: Vec<RelEdge>, queue: Vec<i64>, result: Vec<i64>, qi: i64) -> (Vec<RelEdge>, Vec<i64>) {
+    if qi >= (len(queue) as i64) { return (edges, result); };
+    let node = queue[qi];
+    let scan = rel_bfs_scan(edges, queue, result, node, 0);
+    let e2 = scan.0;
+    let q2 = scan.1;
+    let r2 = scan.2;
+    return rel_bfs_step(e2, q2, r2, qi + 1);
+}
+
+fn rel_bfs_scan(edges: Vec<RelEdge>, queue: Vec<i64>, result: Vec<i64>, node: i64, ei: i64) -> (Vec<RelEdge>, Vec<i64>, Vec<i64>) {
+    if ei >= (len(edges) as i64) { return (edges, queue, result); };
+    if edges[ei].parent == node {
+        let child = edges[ei].child;
+        if vec_contains_i64(result, child) != true {
+            result.push(child);
+            queue.push(child);
+        };
+    };
+    return rel_bfs_scan(edges, queue, result, node, ei + 1);
+}
+
+fn rel_iter_ancestors(edges: Vec<RelEdge>, entity: i64) -> Vec<i64> {
+    let result: Vec<i64> = Vec::new();
+    return rel_ancestors_rec(edges, entity, result);
+}
+
+fn rel_ancestors_rec(edges: Vec<RelEdge>, entity: i64, result: Vec<i64>) -> Vec<i64> {
+    let i: i64 = 0;
+    let cnt = len(edges) as i64;
+    while i < cnt {
+        if edges[i].child == entity {
+            let parent = edges[i].parent;
+            if vec_contains(result, parent) != true { result.push(parent); };
+            return rel_ancestors_rec(edges, parent, result);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+fn rel_root_ancestor(edges: Vec<RelEdge>, entity: i64) -> i64 {
+    let ancestors = rel_iter_ancestors(edges, entity);
+    let cnt = len(ancestors) as i64;
+    if cnt == 0 { return entity; };
+    return ancestors[cnt - 1];
+}
+
+fn rel_iter_siblings(edges: Vec<RelEdge>, entity: i64) -> Vec<i64> {
+    // Find parent of entity, then find all children of that parent (excluding entity)
+    let parent = rel_parent(edges, entity);
+    let result: Vec<i64> = Vec::new();
+    if parent < 0 { return result; };
+    let i: i64 = 0;
+    let cnt = len(edges) as i64;
+    while i < cnt {
+        if edges[i].parent == parent {
+            if edges[i].child != entity {
+                if vec_contains(result, edges[i].child) != true { result.push(edges[i].child); };
+            };
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+fn rel_parent(edges: Vec<RelEdge>, entity: i64) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(edges) as i64;
+    while i < cnt {
+        if edges[i].child == entity { return edges[i].parent; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn rel_iter_leaves(edges: Vec<RelEdge>, entity: i64) -> Vec<i64> {
+    let r = rel_descendants_with_edges(edges, entity);
+    let e2 = r.0;
+    let descendants = r.1;
+    return rel_leaves_filter(e2, descendants, Vec::new(), 0);
+}
+
+fn rel_leaves_filter(edges: Vec<RelEdge>, descendants: Vec<i64>, result: Vec<i64>, idx: i64) -> Vec<i64> {
+    if idx >= (len(descendants) as i64) { return result; };
+    let d = descendants[idx];
+    let has_child = rel_has_child(edges, d, 0);
+    if has_child != true { result.push(d); };
+    return rel_leaves_filter(edges, descendants, result, idx + 1);
+}
+
+fn rel_has_child(edges: Vec<RelEdge>, node: i64, ei: i64) -> bool {
+    if ei >= (len(edges) as i64) { return false; };
+    if edges[ei].parent == node { return true; };
+    return rel_has_child(edges, node, ei + 1);
+}
+
+fn vec_contains(v: Vec<i32>, x: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(v) as i64;
+    while i < cnt { if v[i] == x { return true; }; i = i + 1; }
+    return false;
+}
+
+fn vec_contains_i64(v: Vec<i64>, x: i64) -> bool {
+    let i: i64 = 0;
+    let cnt = len(v) as i64;
+    while i < cnt { if v[i] == x { return true; }; i = i + 1; }
+    return false;
+}
+
+// === Tests ===
+
+@test "default query filters register"() {
+    let dqf = dqf_register(dqf_new(), DISABLED_CID);
+    if dqf_count(dqf) != 1 { panic(25001); };
+    if dqf_is_disabled(dqf, DISABLED_CID) != true { panic(25002); };
+}
+
+@test "entity disabling excludes from query"() {
+    let dqf = dqf_register(dqf_new(), DISABLED_CID);
+    let world: Vec<TestEntity> = Vec::new();
+    world.push(te_add(te_add(te_new(1), 100), DISABLED_CID));
+    world.push(te_add(te_new(2), 100));
+    let result = query_with_filter(world, 100, dqf, -1);
+    if len(result) as i64 != 1 { panic(25003); };
+}
+
+@test "entity disabling with explicit mention includes"() {
+    let dqf = dqf_register(dqf_new(), DISABLED_CID);
+    let world: Vec<TestEntity> = Vec::new();
+    world.push(te_add(te_add(te_new(1), 100), DISABLED_CID));
+    let result = query_with_filter(world, 100, dqf, DISABLED_CID);
+    if len(result) as i64 != 1 { panic(25004); };
+}
+
+@test "entity disabling no filter sees all"() {
+    let dqf = dqf_new();
+    let world: Vec<TestEntity> = Vec::new();
+    world.push(te_add(te_add(te_new(1), 100), DISABLED_CID));
+    world.push(te_add(te_new(2), 100));
+    let result = query_with_filter(world, 100, dqf, -1);
+    if len(result) as i64 != 2 { panic(25005); };
+}
+
+@test "entity disabling multiple components"() {
+    let dqf = dqf_register(dqf_register(dqf_new(), DISABLED_CID), 99002);
+    let world: Vec<TestEntity> = Vec::new();
+    world.push(te_add(te_add(te_add(te_new(1), 100), DISABLED_CID), 99002));
+    world.push(te_add(te_add(te_new(2), 100), DISABLED_CID));
+    let result = query_with_filter(world, 100, dqf, -1);
+    if len(result) as i64 != 0 { panic(25006); };
+}
+
+@test "interner intern new"() {
+    let r = interner_intern(interner_new(), 42);
+    if interner_count(r.0) != 1 { panic(25007); };
+    if r.1 != 0 { panic(25008); };
+}
+
+@test "interner intern dedup"() {
+    let r1 = interner_intern(interner_new(), 42);
+    let r2 = interner_intern(r1.0, 42);
+    if interner_count(r2.0) != 1 { panic(25009); };
+    if r2.1 != 0 { panic(25010); };
+}
+
+@test "interner intern distinct"() {
+    let r1 = interner_intern(interner_new(), 42);
+    let r2 = interner_intern(r1.0, 99);
+    if interner_count(r2.0) != 2 { panic(25011); };
+    if r2.1 != 1 { panic(25012); };
+}
+
+@test "interned id"() {
+    let i = interned_new(5);
+    if interned_id(i) != 5 { panic(25013); };
+}
+
+@test "name new"() {
+    let n = name_new(42);
+    if name_as_str(n) != 42 { panic(25014); };
+}
+
+@test "name set"() {
+    let n = name_set(name_new(1), 99);
+    if name_as_str(n) != 99 { panic(25015); };
+}
+
+@test "name pre_hash deterministic"() {
+    let n1 = name_new(42);
+    let n2 = name_new(42);
+    if name_pre_hash(n1) != name_pre_hash(n2) { panic(25016); };
+}
+
+@test "name mutate"() {
+    let n = name_mutate(name_new(1), 77);
+    if name_as_str(n) != 77 { panic(25017); };
+}
+
+@test "rel descendants linear"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 0, child: 1 });
+    edges.push(RelEdge { parent: 1, child: 2 });
+    let d = rel_iter_descendants(edges, 0);
+    if len(d) as i64 != 2 { panic(25018); };
+}
+
+@test "rel descendants branch"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 0, child: 1 });
+    edges.push(RelEdge { parent: 0, child: 2 });
+    let d = rel_iter_descendants(edges, 0);
+    if len(d) as i64 != 2 { panic(25019); };
+}
+
+@test "rel ancestors"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 0, child: 1 });
+    edges.push(RelEdge { parent: 1, child: 2 });
+    let a = rel_iter_ancestors(edges, 2);
+    if len(a) as i64 != 2 { panic(25020); };
+}
+
+@test "rel root ancestor"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 0, child: 1 });
+    edges.push(RelEdge { parent: 1, child: 2 });
+    if rel_root_ancestor(edges, 2) != 0 { panic(25021); };
+}
+
+@test "rel root ancestor self if no parent"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    if rel_root_ancestor(edges, 5) != 5 { panic(25022); };
+}
+
+@test "rel siblings"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 0, child: 1 });
+    edges.push(RelEdge { parent: 0, child: 2 });
+    edges.push(RelEdge { parent: 0, child: 3 });
+    let s = rel_iter_siblings(edges, 1);
+    if len(s) as i64 != 2 { panic(25023); };
+}
+
+@test "rel leaves"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 0, child: 1 });
+    edges.push(RelEdge { parent: 1, child: 2 });
+    edges.push(RelEdge { parent: 1, child: 3 });
+    let l = rel_iter_leaves(edges, 0);
+    if len(l) as i64 != 2 { panic(25024); };
+}
+
+@test "rel parent lookup"() {
+    let edges: Vec<RelEdge> = Vec::new();
+    edges.push(RelEdge { parent: 5, child: 3 });
+    if rel_parent(edges, 3) != 5 { panic(25025); };
+    if rel_parent(edges, 99) != -1 { panic(25026); };
+}

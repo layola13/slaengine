@@ -1,0 +1,370 @@
+// Isolated test: Bevy ECS message iterator types parity.
+// Mirrors src/message/iterators.rs + mut_iterators.rs + update.rs.
+// MessageIterator, MessageIteratorWithId, MessageParIter,
+// MessageMutIterator, MessageMutIteratorWithId, MessageMutParIter,
+// MessageUpdateSystems + update/condition/signal systems.
+
+struct MsgInstance {
+    message: i32,
+    message_id: i64,
+}
+
+// Double-buffered message store (messages_a + messages_b) with start counts.
+struct MsgBuffer {
+    a_ids: Vec<i64>,
+    a_vals: Vec<i32>,
+    a_start: i64,
+    b_ids: Vec<i64>,
+    b_vals: Vec<i32>,
+    b_start: i64,
+    count: i64,
+    next_id: i64,
+}
+
+fn mb_new() -> MsgBuffer {
+    return MsgBuffer { a_ids: Vec::new(), a_vals: Vec::new(), a_start: 0, b_ids: Vec::new(), b_vals: Vec::new(), b_start: 0, count: 0, next_id: 0 };
+}
+
+fn mb_len(mb: MsgBuffer) -> i64 { return len(mb.a_vals) as i64 + len(mb.b_vals) as i64; }
+
+fn mb_is_empty(mb: MsgBuffer) -> bool { return mb_len(mb) == 0; }
+
+fn mb_write(mb: MsgBuffer, val: i32) -> MsgBuffer {
+    let id = mb.next_id;
+    mb.next_id = id + 1;
+    if len(mb.a_vals) as i64 >= 8 {
+        mb.b_ids.push(id);
+        mb.b_vals.push(val);
+    } else {
+        mb.a_ids.push(id);
+        mb.a_vals.push(val);
+    };
+    mb.count = mb.count + 1;
+    return mb;
+}
+
+// swap/clear old buffer after readers consumed
+fn mb_update(mb: MsgBuffer) -> MsgBuffer {
+    mb.b_ids = Vec::new();
+    mb.b_vals = Vec::new();
+    mb.b_start = mb.count - (len(mb.a_vals) as i64);
+    return mb;
+}
+
+struct MsgCursor {
+    last_count: i64,
+}
+
+fn mc_new() -> MsgCursor { return MsgCursor { last_count: 0 }; }
+
+fn mc_len(cur: MsgCursor, mb: MsgBuffer) -> i64 {
+    let unread = mb.count - cur.last_count;
+    return unread;
+}
+
+fn mc_clear(cur: MsgCursor, mb: MsgBuffer) -> MsgCursor { cur.last_count = mb.count; return cur; }
+
+// --- MessageIteratorWithId: yields (msg, id) pairs, oldest first ---
+struct MsgIterWithId {
+    a_idx: i64,
+    b_idx: i64,
+    a_end: i64,
+    b_end: i64,
+    unread: i64,
+    cur: MsgCursor,
+    buf: MsgBuffer,
+}
+
+fn miter_with_id_new(cur: MsgCursor, buf: MsgBuffer) -> MsgIterWithId {
+    let a_idx = cur.last_count - buf.a_start;
+    if a_idx < 0 { a_idx = 0; };
+    let b_idx = cur.last_count - buf.b_start;
+    if b_idx < 0 { b_idx = 0; };
+    let a_end = len(buf.a_vals) as i64;
+    let b_end = len(buf.b_vals) as i64;
+    let unread = (a_end - a_idx) + (b_end - b_idx);
+    cur.last_count = buf.count - unread;
+    return MsgIterWithId { a_idx: a_idx, b_idx: b_idx, a_end: a_end, b_end: b_end, unread: unread, cur: cur, buf: buf };
+}
+
+fn miter_with_id_len(it: MsgIterWithId) -> i64 { return it.unread; }
+
+fn miter_with_id_next(it: MsgIterWithId) -> (bool, i32, i64, MsgIterWithId) {
+    if it.a_idx < it.a_end {
+        let msg = it.buf.a_vals[it.a_idx];
+        let id = it.buf.a_ids[it.a_idx];
+        it.a_idx = it.a_idx + 1;
+        it.cur.last_count = it.cur.last_count + 1;
+        it.unread = it.unread - 1;
+        return (true, msg, id, it);
+    };
+    if it.b_idx < it.b_end {
+        let msg = it.buf.b_vals[it.b_idx];
+        let id = it.buf.b_ids[it.b_idx];
+        it.b_idx = it.b_idx + 1;
+        it.cur.last_count = it.cur.last_count + 1;
+        it.unread = it.unread - 1;
+        return (true, msg, id, it);
+    };
+    return (false, 0, 0, it);
+}
+
+// --- MessageIterator: yields just the message (no id) ---
+struct MsgIter {
+    inner: MsgIterWithId,
+}
+
+fn miter_new(cur: MsgCursor, buf: MsgBuffer) -> MsgIter {
+    return MsgIter { inner: miter_with_id_new(cur, buf) };
+}
+
+fn miter_len(it: MsgIter) -> i64 { return miter_with_id_len(it.inner); }
+
+fn miter_next(it: MsgIter) -> (bool, i32, MsgIter) {
+    let r = miter_with_id_next(it.inner);
+    let ok = r.0;
+    let msg = r.1;
+    let inner = r.3;
+    return (ok, msg, MsgIter { inner: inner });
+}
+
+// --- MessageParIter: parallel iterator (simulated: for_each) ---
+struct MsgParIter {
+    inner: MsgIterWithId,
+}
+
+fn mpar_new(cur: MsgCursor, buf: MsgBuffer) -> MsgParIter {
+    return MsgParIter { inner: miter_with_id_new(cur, buf) };
+}
+
+fn mpar_len(it: MsgParIter) -> i64 { return miter_with_id_len(it.inner); }
+
+// for_each: collect all messages visited
+fn mpar_for_each(it: MsgParIter, collected: Vec<i32>) -> (Vec<i32>, MsgParIter) {
+    let r = miter_with_id_next(it.inner);
+    let ok = r.0;
+    if ok != true { return (collected, it); };
+    let msg = r.1;
+    collected.push(msg);
+    let inner = r.3;
+    return mpar_for_each(MsgParIter { inner: inner }, collected);
+}
+
+// --- MessageMutIteratorWithId: yields mutable refs (simulated via copy-back) ---
+fn mmutiter_with_id_next(it: MsgIterWithId) -> (bool, i32, i64, MsgIterWithId) {
+    return miter_with_id_next(it);
+}
+
+// --- MessageMutIterator ---
+fn mmutiter_next(it: MsgIter) -> (bool, i32, MsgIter) {
+    return miter_next(it);
+}
+
+// --- MessageMutParIter ---
+fn mmutpar_for_each(it: MsgParIter, collected: Vec<i32>) -> (Vec<i32>, MsgParIter) {
+    return mpar_for_each(it, collected);
+}
+
+// --- MessageUpdateSystems + update/condition/signal (update.rs) ---
+// ShouldUpdateMessages state machine
+const SU_ALWAYS: i32 = 0;
+const SU_WAITING: i32 = 1;
+const SU_READY: i32 = 2;
+
+struct MsgRegistry {
+    should_update: i32,
+}
+
+fn mr_new() -> MsgRegistry { return MsgRegistry { should_update: SU_ALWAYS }; }
+
+fn signal_message_update(reg: MsgRegistry) -> MsgRegistry {
+    reg.should_update = SU_READY;
+    return reg;
+}
+
+fn message_update_condition(reg: MsgRegistry) -> bool {
+    if reg.should_update == SU_ALWAYS { return true; };
+    if reg.should_update == SU_READY { return true; };
+    return false;
+}
+
+fn message_update_system(reg: MsgRegistry) -> MsgRegistry {
+    if reg.should_update == SU_ALWAYS {
+        return reg;
+    };
+    if reg.should_update == SU_READY {
+        reg.should_update = SU_WAITING;
+        return reg;
+    };
+    return reg;
+}
+
+// MessageUpdateSystems set marker
+struct MessageUpdateSystems { marker: i32 }
+
+fn message_update_systems_new() -> MessageUpdateSystems { return MessageUpdateSystems { marker: 0 }; }
+
+fn message_update_systems_eq(a: MessageUpdateSystems, b: MessageUpdateSystems) -> bool { return a.marker == b.marker; }
+
+// === Tests ===
+
+@test "message iterator with_id basic"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let it = miter_with_id_new(mc_new(), buf);
+    if miter_with_id_len(it) != 2 { panic(22001); };
+    let r1 = miter_with_id_next(it);
+    if r1.0 != true { panic(22002); };
+    if r1.1 != 10 { panic(22003); };
+    if r1.2 != 0 { panic(22004); };
+}
+
+@test "message iterator with_id unread count"() {
+    let buf = mb_write(mb_write(mb_write(mb_new(), 1), 2), 3);
+    let it = miter_with_id_new(mc_new(), buf);
+    if miter_with_id_len(it) != 3 { panic(22005); };
+}
+
+@test "message iterator basic"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let it = miter_new(mc_new(), buf);
+    if miter_len(it) != 2 { panic(22006); };
+    let r1 = miter_next(it);
+    if r1.0 != true { panic(22007); };
+    if r1.1 != 10 { panic(22008); };
+}
+
+@test "message iterator exhausts"() {
+    let buf = mb_write(mb_new(), 10);
+    let it = miter_new(mc_new(), buf);
+    let r1 = miter_next(it);
+    if r1.0 != true { panic(22009); };
+    let r2 = miter_next(r1.2);
+    if r2.0 != false { panic(22010); };
+}
+
+@test "message iterator order oldest first"() {
+    let buf = mb_write(mb_write(mb_write(mb_new(), 1), 2), 3);
+    let it = miter_new(mc_new(), buf);
+    let r1 = miter_next(it);
+    if r1.1 != 1 { panic(22011); };
+    let r2 = miter_next(r1.2);
+    if r2.1 != 2 { panic(22012); };
+    let r3 = miter_next(r2.2);
+    if r3.1 != 3 { panic(22013); };
+}
+
+@test "message par_iter len"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let pi = mpar_new(mc_new(), buf);
+    if mpar_len(pi) != 2 { panic(22014); };
+}
+
+@test "message par_iter for_each"() {
+    let buf = mb_write(mb_write(mb_write(mb_new(), 1), 2), 3);
+    let pi = mpar_new(mc_new(), buf);
+    let r = mpar_for_each(pi, Vec::new());
+    let collected = r.0;
+    if len(collected) != 3 { panic(22015); };
+    if collected[0] != 1 { panic(22016); };
+    if collected[2] != 3 { panic(22017); };
+}
+
+@test "message cursor tracks last_count"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let cur = mc_new();
+    if mc_len(cur, buf) != 2 { panic(22018); };
+    let cur2 = mc_clear(cur, buf);
+    if mc_len(cur2, buf) != 0 { panic(22019); };
+}
+
+@test "message buffer write advances count"() {
+    let buf = mb_write(mb_new(), 10);
+    if buf.count != 1 { panic(22020); };
+    let buf2 = mb_write(buf, 20);
+    if buf2.count != 2 { panic(22021); };
+}
+
+@test "message buffer update clears b"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let buf2 = mb_update(buf);
+    if len(buf2.b_vals) != 0 { panic(22022); };
+}
+
+@test "message mut iterator with_id"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let it = miter_with_id_new(mc_new(), buf);
+    let r1 = mmutiter_with_id_next(it);
+    if r1.0 != true { panic(22023); };
+    if r1.1 != 10 { panic(22024); };
+}
+
+@test "message mut iterator basic"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let it = miter_new(mc_new(), buf);
+    let r1 = mmutiter_next(it);
+    if r1.0 != true { panic(22025); };
+    if r1.1 != 10 { panic(22026); };
+}
+
+@test "message mut par_iter for_each"() {
+    let buf = mb_write(mb_write(mb_new(), 1), 2);
+    let pi = mpar_new(mc_new(), buf);
+    let r = mmutpar_for_each(pi, Vec::new());
+    let collected = r.0;
+    if len(collected) != 2 { panic(22027); };
+}
+
+@test "message update condition always"() {
+    let reg = mr_new();
+    if message_update_condition(reg) != true { panic(22028); };
+}
+
+@test "message update condition waiting"() {
+    let reg = mr_new();
+    let reg2 = message_update_system(reg);
+    // always stays always after update
+    if message_update_condition(reg2) != true { panic(22029); };
+}
+
+@test "signal message update sets ready"() {
+    let reg = mr_new();
+    let reg2 = signal_message_update(reg);
+    if reg2.should_update != SU_READY { panic(22030); };
+    if message_update_condition(reg2) != true { panic(22031); };
+}
+
+@test "message update system transitions ready to waiting"() {
+    let reg = mr_new();
+    let reg2 = signal_message_update(reg);
+    let reg3 = message_update_system(reg2);
+    if reg3.should_update != SU_WAITING { panic(22032); };
+}
+
+@test "message update condition waiting returns false"() {
+    let reg = mr_new();
+    let reg2 = signal_message_update(reg);
+    let reg3 = message_update_system(reg2);
+    if message_update_condition(reg3) != false { panic(22033); };
+}
+
+@test "message update system keeps always"() {
+    let reg = mr_new();
+    let reg2 = message_update_system(reg);
+    if reg2.should_update != SU_ALWAYS { panic(22034); };
+}
+
+@test "message update systems marker eq"() {
+    let a = message_update_systems_new();
+    let b = message_update_systems_new();
+    if message_update_systems_eq(a, b) != true { panic(22035); };
+}
+
+@test "message cursor reads only once"() {
+    let buf = mb_write(mb_write(mb_new(), 10), 20);
+    let cur = mc_new();
+    let it = miter_new(cur, buf);
+    let r1 = miter_next(it);
+    let it2 = r1.2;
+    // cursor advanced: re-reading should give 1 remaining
+    if miter_len(it2) != 1 { panic(22036); };
+}

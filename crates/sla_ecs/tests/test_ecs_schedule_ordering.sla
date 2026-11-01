@@ -1,0 +1,45 @@
+// Verification tests for explicit schedule ordering (chain/before/after/in_set).
+@import "../src/ecs_world.sla"
+
+// Each system appends a distinct value to the resource counter so order is observable.
+fn sys_a(world: TableErasedWorld<i32, i32>) -> TableErasedWorld<i32, i32> {
+    let r = ecs_world_get_resource<i32, i32>(world);
+    return ecs_world_insert_resource<i32, i32>(world, r * 10 + 1);
+}
+fn sys_b(world: TableErasedWorld<i32, i32>) -> TableErasedWorld<i32, i32> {
+    let r = ecs_world_get_resource<i32, i32>(world);
+    return ecs_world_insert_resource<i32, i32>(world, r * 10 + 2);
+}
+fn sys_c(world: TableErasedWorld<i32, i32>) -> TableErasedWorld<i32, i32> {
+    let r = ecs_world_get_resource<i32, i32>(world);
+    return ecs_world_insert_resource<i32, i32>(world, r * 10 + 3);
+}
+
+fn acc_none() -> TableErasedSystemAccess {
+    return table_erased_system_access_none();
+}
+
+@test "chain orders systems sequentially"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 0);
+    let s0 = ecs_world_schedule_default<i32, i32>();
+    let s1 = ecs_world_schedule_chain<i32, i32>(s0, sys_a, acc_none());
+    let s2 = ecs_world_schedule_chain<i32, i32>(s1, sys_b, acc_none());
+    let s3 = ecs_world_schedule_chain<i32, i32>(s2, sys_c, acc_none());
+    let w2 = table_erased_schedule_run_planned<i32, i32>(s3, w1);
+    let r = ecs_world_get_resource<i32, i32>(w2);
+    // 0 ->1 ->12 ->123
+    if r != 123 { panic(29001); };
+}
+
+@test "in set groups into same batch"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 0);
+    let s0 = ecs_world_schedule_default<i32, i32>();
+    let s1 = ecs_world_schedule_in_set<i32, i32>(s0, sys_a, acc_none(), 0);
+    let s2 = ecs_world_schedule_in_set<i32, i32>(s1, sys_b, acc_none(), 0);
+    let w2 = table_erased_schedule_run_planned<i32, i32>(s2, w1);
+    let r = ecs_world_get_resource<i32, i32>(w2);
+    // both in batch 0: a then b (insertion order within batch) -> 0->1->12
+    if r != 12 { panic(29002); };
+}

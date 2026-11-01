@@ -1,0 +1,193 @@
+// Isolated deep tests for lib/schedule_dag_analysis_deep.sla (Batch 373).
+// Iterative closure calculator + partition + transitive edges + cross-dep checks + DagGroups +
+// error structs; mirrors shallow src/schedule/graph/dag.rs without recursion.
+// panic codes: 140600 - 140799.
+
+@import "../src/schedule_dag_analysis_deep.sla"
+
+@test "DagAnalysis new empty and counts zero"() {
+    let d = ecs_dag_analysis_deep_new(3);
+    if ecs_dag_analysis_node_count(d) != 3 { panic(140600); };
+    if ecs_dag_analysis_edge_count(d) != 0 { panic(140601); };
+    if ecs_dag_analysis_reachable_count(d) != 0 { panic(140602); };
+    if ecs_dag_analysis_connected_count(d) != 0 { panic(140603); };
+    if ecs_dag_analysis_disconnected_count(d) != 0 { panic(140604); };
+    if ecs_dag_analysis_transitive_edges_count(d) != 0 { panic(140605); };
+    if ecs_dag_analysis_reduction_edges_count(d) != 0 { panic(140606); };
+    // reach matrix empty initially.
+    if ecs_dag_reach_at(d, 0, 1) != 0 { panic(140607); };
+}
+
+@test "add_edge stores successor via adjacency cap-4 and counts edge_count"() {
+    let d0 = ecs_dag_analysis_deep_new(8);
+    let d1 = ecs_dag_add_edge(d0, 0, 1);
+    let d2 = ecs_dag_add_edge(d1, 0, 2);
+    let d3 = ecs_dag_add_edge(d2, 0, 3);
+    let d4 = ecs_dag_add_edge(d3, 0, 4);
+    if ecs_dag_analysis_edge_count(d4) != 4 { panic(140610); };
+    // adjacency by (node, slot) for node 0: [1, 2, 3, 4] (full cap-4 row).
+    if ecs_dag_adj_at(d4, 0, 0) != 1 { panic(140611); };
+    if ecs_dag_adj_at(d4, 0, 1) != 2 { panic(140612); };
+    if ecs_dag_adj_at(d4, 0, 2) != 3 { panic(140613); };
+    if ecs_dag_adj_at(d4, 0, 3) != 4 { panic(140614); };
+    if ecs_dag_adj_count(d4, 0) != 4 { panic(140615); };
+    // sanity on the rejected 5th-successor slot index for the row in isolation (slot=4 -> 0).
+    if ecs_dag_adj_at(d4, 0, 4) != 0 { panic(140617); };
+    // adjacency cap-4 reject: a 5th successor of node 0 must be dropped (cnt stays 4, edge_count
+    // unchanged). dst=5 is a valid node id (< 8) — the rejection must come solely from cap-4,
+    // NOT from the destination being out of range. Previous test used new(4) + dst=7 which added
+    // as the 4th successor (dst<8 valid) and broke the cap-reject assertion.
+    let d5 = ecs_dag_add_edge(d4, 0, 5);
+    if ecs_dag_adj_count(d5, 0) != 4 { panic(140618); };
+    if ecs_dag_analysis_edge_count(d5) != 4 { panic(140619); };
+    // the dropped dst (slot index 4) must not be written anywhere on the full row.
+    if ecs_dag_adj_at(d5, 0, 4) != 0 { panic(140614); };
+}
+
+@test "compute_closure marks reach matrix reflexively and transitive chain"() {
+    // 0 -> 1 -> 2 over cap-3 nodes. Closure: reach[0][0].reach[0][1].reach[0][2] should all be 1.
+    let d0 = ecs_dag_analysis_deep_new(3);
+    let d1 = ecs_dag_add_edge(d0, 0, 1);
+    let d2 = ecs_dag_add_edge(d1, 1, 2);
+    let d3 = ecs_dag_compute_closure(d2);
+    if ecs_dag_is_reachable(d3, 0, 0) != true { panic(140620); };
+    if ecs_dag_is_reachable(d3, 0, 1) != true { panic(140621); };
+    if ecs_dag_is_reachable(d3, 0, 2) != true { panic(140622); };
+    if ecs_dag_is_reachable(d3, 1, 2) != true { panic(140623); };
+    if ecs_dag_is_reachable(d3, 1, 0) != false { panic(140624); };
+    if ecs_dag_is_reachable(d3, 2, 0) != false { panic(140625); };
+    // reachable_count counts bits set (including reflexive): 3 reflexive + 0->1, 1->2, 0->2 = 6.
+    if ecs_dag_analysis_reachable_count(d3) != 6 { panic(140626); };
+}
+
+@test "closure reaches non-adjacent nodes through transitivity (diamond)"() {
+    // diamond: 0->1, 0->2, 1->3, 2->3. reach[0][3]=1 via either path.
+    let d0 = ecs_dag_analysis_deep_new(4);
+    let d1 = ecs_dag_add_edge(d0, 0, 1);
+    let d2 = ecs_dag_add_edge(d1, 0, 2);
+    let d3 = ecs_dag_add_edge(d2, 1, 3);
+    let d4 = ecs_dag_add_edge(d3, 2, 3);
+    let d5 = ecs_dag_compute_closure(d4);
+    if ecs_dag_is_reachable(d5, 0, 3) != true { panic(140630); };
+    if ecs_dag_is_reachable(d5, 0, 2) != true { panic(140631); };
+    if ecs_dag_is_reachable(d5, 1, 3) != true { panic(140632); };
+    if ecs_dag_is_reachable(d5, 3, 0) != false { panic(140633); };
+    if ecs_dag_is_reachable(d5, 3, 1) != false { panic(140634); };
+    if ecs_dag_is_reachable(d5, 2, 1) != false { panic(140635); };
+}
+
+@test "partition splits reachable vs disconnected pairs in cap-4 lists"() {
+    // chain 0->1, 1->2 over cap-3 nodes. Reachable: (0,1),(0,2),(1,2). Disconnected: (1,0),(2,0),(2,1).
+    // partition walks i<j pairs only, storing 3 reachable pairs (cap-4 list).
+    let d0 = ecs_dag_analysis_deep_new(3);
+    let d1 = ecs_dag_add_edge(d0, 0, 1);
+    let d2 = ecs_dag_add_edge(d1, 1, 2);
+    let d3 = ecs_dag_compute_closure(d2);
+    let d4 = ecs_dag_partition(d3);
+    if ecs_dag_analysis_connected_count(d4) != 3 { panic(140640); };
+    if ecs_dag_analysis_disconnected_count(d4) != 0 { panic(140641); };
+    // Verify the reachable pairs stored are (0,1),(0,2),(1,2) — partition walks i<j so these
+    // all appear in reachable_pairs (and no disconnected since every i<j pair is reachable).
+    if ecs_dag_reachable_pair_a_at(d4, 0) != 0 { panic(140642); };
+    if ecs_dag_reachable_pair_b_at(d4, 0) != 1 { panic(140643); };
+    if ecs_dag_reachable_pair_a_at(d4, 1) != 0 { panic(140644); };
+    if ecs_dag_reachable_pair_b_at(d4, 1) != 2 { panic(140645); };
+    if ecs_dag_reachable_pair_a_at(d4, 2) != 1 { panic(140646); };
+    if ecs_dag_reachable_pair_b_at(d4, 2) != 2 { panic(140647); };
+    // disconnected empty (none).
+    if ecs_dag_disconnected_pair_a_at(d4, 0) != 0 { panic(140648); };
+}
+
+@test "partition emits disconnected pairs when no path between i and j"() {
+    // nodes {0, 1, 2}; edges only 0->1 — pair (0,2) reachable, (1,2) disconnected, (0,1)
+    // reachable. walk i<j: (0,1) reachable, (0,2) NOT reachable, (1,2) NOT reachable.
+    let d0 = ecs_dag_analysis_deep_new(3);
+    let d1 = ecs_dag_add_edge(d0, 0, 1);
+    let d2 = ecs_dag_compute_closure(d1);
+    let d3 = ecs_dag_partition(d2);
+    if ecs_dag_analysis_connected_count(d3) != 1 { panic(140650); };
+    if ecs_dag_analysis_disconnected_count(d3) != 2 { panic(140651); };
+    if ecs_dag_reachable_pair_a_at(d3, 0) != 0 { panic(140652); };
+    if ecs_dag_reachable_pair_b_at(d3, 0) != 1 { panic(140653); };
+    if ecs_dag_disconnected_pair_a_at(d3, 0) != 0 { panic(140654); };
+    if ecs_dag_disconnected_pair_b_at(d3, 0) != 2 { panic(140655); };
+    if ecs_dag_disconnected_pair_a_at(d3, 1) != 1 { panic(140656); };
+    if ecs_dag_disconnected_pair_b_at(d3, 1) != 2 { panic(140657); };
+}
+
+@test "add_transitive_edge and check_for_redundant_edges / record_transitive_edge"() {
+    let d0 = ecs_dag_analysis_deep_new(3);
+    let d1 = ecs_dag_add_edge(d0, 0, 1);
+    let d2 = ecs_dag_add_edge(d1, 1, 2);
+    let d3 = ecs_dag_compute_closure(d2);
+    // Initially redundant check = false (transitive_edges list empty). Use scalar split form
+    // (the let (a, b) = ... tuple destructure triggers an SA/default-backend register-reassignment
+    // issue that retroactively corrupts earlier assertions referencing the struct). See Batch 373
+    // notes in progress.md.
+    if ecs_dag_check_redundant_found(d3) != false { panic(140660); };
+    if ecs_dag_check_redundant_count(d3) != 0 { panic(140661); };
+    // Add an explicit transitive edge 0->2 (which is also reachable via 0->1->2).
+    let d4 = ecs_dag_record_transitive_edge(d3, 0, 2);
+    if ecs_dag_analysis_transitive_edges_count(d4) != 1 { panic(140662); };
+    if ecs_dag_check_redundant_found(d4) != true { panic(140663); };
+    if ecs_dag_check_redundant_count(d4) != 1 { panic(140664); };
+    if ecs_dag_transitive_edge_a_at(d4, 0) != 0 { panic(140665); };
+    if ecs_dag_transitive_edge_b_at(d4, 0) != 2 { panic(140666); };
+    // record_transitive_edge rejects an edge that isn't already reachable (e.g. 2->0).
+    let d5 = ecs_dag_record_transitive_edge(d4, 2, 0);
+    if ecs_dag_analysis_transitive_edges_count(d5) != 1 { panic(140667); };
+    // Add an explicit manual transitive edge (forces count up).
+    let d6 = ecs_dag_analysis_add_transitive_edge(d5, 5, 6);
+    if ecs_dag_analysis_transitive_edges_count(d6) != 2 { panic(140668); };
+}
+
+@test "check_for_cross_dependencies detects shared reachable pairs between two analyses"() {
+    // self_d: 0->1 (partition emits (0,1) reachable).
+    let sa = ecs_dag_partition(ecs_dag_compute_closure(ecs_dag_add_edge(ecs_dag_analysis_deep_new(3), 0, 1)));
+    // other_d: 0->1 too -> (0,1) reachable in other — cross-dep (true, 0, 1). Scalar split form
+    // (tuple destructure is register-fragile on SA — see Batch 373 notes).
+    let ob = ecs_dag_partition(ecs_dag_compute_closure(ecs_dag_add_edge(ecs_dag_analysis_deep_new(3), 0, 1)));
+    if ecs_dag_check_cross_found(sa, ob) != true { panic(140670); };
+    if ecs_dag_check_cross_a(sa, ob) != 0 { panic(140671); };
+    if ecs_dag_check_cross_b(sa, ob) != 1 { panic(140672); };
+    // disjoint graphs: self has 0->1; other has 1->2. self_pair (0,1) not reachable in other.
+    let ob2 = ecs_dag_partition(ecs_dag_compute_closure(ecs_dag_add_edge(ecs_dag_analysis_deep_new(3), 1, 2)));
+    if ecs_dag_check_cross_found(sa, ob2) != false { panic(140673); };
+}
+
+@test "DagGroups insert/get/len and overlapping-groups detection"() {
+    let g0 = ecs_dag_groups_deep_new();
+    let g1 = ecs_dag_groups_deep_insert(g0, 10, 1, 2, 0, 0, 2);
+    if ecs_dag_groups_deep_len(g1) != 1 { panic(140680); };
+    if ecs_dag_groups_deep_key_index(g1, 10) != 0 { panic(140681); };
+    if ecs_dag_groups_deep_get_count(g1, 10) != 2 { panic(140682); };
+    let g2 = ecs_dag_groups_deep_insert(g1, 20, 2, 3, 0, 0, 2);
+    if ecs_dag_groups_deep_len(g2) != 2 { panic(140683); };
+    if ecs_dag_groups_deep_key_index(g2, 20) != 1 { panic(140684); };
+    let g3 = ecs_dag_groups_deep_insert(g2, 30, 4, 5, 0, 0, 2);
+    let g4 = ecs_dag_groups_deep_insert(g3, 40, 6, 7, 0, 0, 2);
+    if ecs_dag_groups_deep_len(g4) != 4 { panic(140685); };
+    // 5th group rejected by cap-4.
+    let g5 = ecs_dag_groups_deep_insert(g4, 50, 8, 9, 0, 0, 2);
+    if ecs_dag_groups_deep_len(g5) != 4 { panic(140686); };
+    // Check overlapping: groups 10 and 20 both list 2 -> overlapping (true, 10, 20). Scalar
+    // split form (tuple destructure is register-fragile on SA — see Batch 373 notes).
+    if ecs_dag_groups_deep_overlap_found(g5) != true { panic(140687); };
+    if ecs_dag_groups_deep_overlap_key_a(g5) != 10 { panic(140688); };
+    if ecs_dag_groups_deep_overlap_key_b(g5) != 20 { panic(140689); };
+    // Disjoint groups: append a fresh groups struct with no overlapping children.
+    let g6 = ecs_dag_groups_deep_insert(ecs_dag_groups_deep_new(), 1, 100, 0, 0, 0, 1);
+    let g7 = ecs_dag_groups_deep_insert(g6, 2, 200, 0, 0, 0, 1);
+    if ecs_dag_groups_deep_overlap_found(g7) != false { panic(140690); };
+}
+
+@test "error structs construct + accessor"() {
+    let red = ecs_dag_redundancy_error_deep_new(3);
+    if ecs_dag_redundancy_error_deep_count(red) != 3 { panic(140700); };
+    let cross = ecs_dag_cross_dep_error_deep_new(7, 4);
+    if ecs_dag_cross_dep_error_deep_a(cross) != 7 { panic(140701); };
+    if ecs_dag_cross_dep_error_deep_b(cross) != 4 { panic(140702); };
+    let overlap = ecs_dag_overlapping_group_error_deep_new(11, 22);
+    if ecs_dag_overlapping_group_error_deep_a(overlap) != 11 { panic(140703); };
+    if ecs_dag_overlapping_group_error_deep_b(overlap) != 22 { panic(140704); };
+}

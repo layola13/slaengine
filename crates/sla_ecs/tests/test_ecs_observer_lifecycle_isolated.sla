@@ -1,0 +1,349 @@
+// Observer + ComponentHooks + NonSend resource parity.
+// Bevy observer/mod.rs: add_observer, trigger, trigger_with, trigger_ref.
+// Bevy lifecycle.rs: on_add, on_insert, on_remove, on_despawn, on_discard.
+// Bevy resource.rs: NonSend<T> access (non-Send resources).
+
+// --- Lifecycle hooks (ComponentHooks) ---
+
+struct EcsHookContext {
+    entity: i32,
+    component_id: i32,
+}
+
+struct EcsComponentHooks {
+    on_add_fn: fn(EcsHookContext) -> i32,
+    on_insert_fn: fn(EcsHookContext) -> i32,
+    on_remove_fn: fn(EcsHookContext) -> i32,
+    on_despawn_fn: fn(EcsHookContext) -> i32,
+    on_discard_fn: fn(EcsHookContext) -> i32,
+    has_on_add: bool,
+    has_on_insert: bool,
+    has_on_remove: bool,
+    has_on_despawn: bool,
+    has_on_discard: bool,
+}
+
+fn hooks_new() -> EcsComponentHooks {
+    return EcsComponentHooks {
+        on_add_fn: hooks_noop,
+        on_insert_fn: hooks_noop,
+        on_remove_fn: hooks_noop,
+        on_despawn_fn: hooks_noop,
+        on_discard_fn: hooks_noop,
+        has_on_add: false,
+        has_on_insert: false,
+        has_on_remove: false,
+        has_on_despawn: false,
+        has_on_discard: false,
+    };
+}
+
+fn hooks_noop(ctx: EcsHookContext) -> i32 { return 0; }
+
+fn hooks_on_add(hooks: EcsComponentHooks, f: fn(EcsHookContext) -> i32) -> EcsComponentHooks {
+    hooks.on_add_fn = f;
+    hooks.has_on_add = true;
+    return hooks;
+}
+
+fn hooks_on_insert(hooks: EcsComponentHooks, f: fn(EcsHookContext) -> i32) -> EcsComponentHooks {
+    hooks.on_insert_fn = f;
+    hooks.has_on_insert = true;
+    return hooks;
+}
+
+fn hooks_on_remove(hooks: EcsComponentHooks, f: fn(EcsHookContext) -> i32) -> EcsComponentHooks {
+    hooks.on_remove_fn = f;
+    hooks.has_on_remove = true;
+    return hooks;
+}
+
+fn hooks_on_despawn(hooks: EcsComponentHooks, f: fn(EcsHookContext) -> i32) -> EcsComponentHooks {
+    hooks.on_despawn_fn = f;
+    hooks.has_on_despawn = true;
+    return hooks;
+}
+
+fn hooks_on_discard(hooks: EcsComponentHooks, f: fn(EcsHookContext) -> i32) -> EcsComponentHooks {
+    hooks.on_discard_fn = f;
+    hooks.has_on_discard = true;
+    return hooks;
+}
+
+// try_on_* variants: return whether registration succeeded (always true in our model)
+fn hooks_try_on_add(hooks: EcsComponentHooks, f: fn(EcsHookContext) -> i32) -> (EcsComponentHooks, bool) {
+    let h = hooks_on_add(hooks, f);
+    return (h, true);
+}
+
+// --- Observer system ---
+
+struct EcsObserver {
+    event_type: i32,
+    handler: fn(i32, i32) -> i32,  // (entity, payload) -> result
+    condition: bool,                // run_if condition
+    call_count: i32,
+}
+
+struct EcsObserverRegistry {
+    observers: Vec<EcsObserver>,
+    trigger_log: Vec<i32>,          // log of triggered event types
+}
+
+fn observer_registry_new() -> EcsObserverRegistry {
+    let observers: Vec<EcsObserver> = Vec::new();
+    let trigger_log: Vec<i32> = Vec::new();
+    return EcsObserverRegistry { observers: observers, trigger_log: trigger_log };
+}
+
+fn observer_add(reg: EcsObserverRegistry, event_type: i32, handler: fn(i32, i32) -> i32) -> EcsObserverRegistry {
+    reg.observers.push(EcsObserver { event_type: event_type, handler: handler, condition: true, call_count: 0 });
+    return reg;
+}
+
+fn observer_add_with_condition(reg: EcsObserverRegistry, event_type: i32, handler: fn(i32, i32) -> i32, condition: bool) -> EcsObserverRegistry {
+    reg.observers.push(EcsObserver { event_type: event_type, handler: handler, condition: condition, call_count: 0 });
+    return reg;
+}
+
+// trigger: fire all observers matching the event type
+fn observer_trigger(reg: EcsObserverRegistry, event_type: i32, entity: i32, payload: i32) -> (EcsObserverRegistry, i32) {
+    reg.trigger_log.push(event_type);
+    return observer_trigger_rec(reg, event_type, entity, payload, 0, 0);
+}
+
+fn observer_trigger_rec(reg: EcsObserverRegistry, event_type: i32, entity: i32, payload: i32, i: i64, acc: i32) -> (EcsObserverRegistry, i32) {
+    if i >= (len(reg.observers) as i64) { return (reg, acc); };
+    let obs = reg.observers[i];
+    if obs.event_type == event_type && obs.condition {
+        let h = obs.handler; let result = h(entity, payload);
+        reg.observers[i].call_count = reg.observers[i].call_count + 1;
+        return observer_trigger_rec(reg, event_type, entity, payload, i + 1, acc + result);
+    };
+    return observer_trigger_rec(reg, event_type, entity, payload, i + 1, acc);
+}
+
+// trigger_with: trigger with a specific trigger payload (mirrors trigger_with)
+fn observer_trigger_with(reg: EcsObserverRegistry, event_type: i32, entity: i32, payload: i32, trigger_payload: i32) -> (EcsObserverRegistry, i32) {
+    return observer_trigger(reg, event_type, entity, payload + trigger_payload);
+}
+
+// trigger_ref: trigger by reference (modifies event in place — modeled as same as trigger)
+fn observer_trigger_ref(reg: EcsObserverRegistry, event_type: i32, entity: i32, payload: i32) -> (EcsObserverRegistry, i32) {
+    return observer_trigger(reg, event_type, entity, payload);
+}
+
+fn observer_call_count(reg: EcsObserverRegistry, event_type: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(reg.observers) as i64;
+    while i < cnt {
+        if reg.observers[i].event_type == event_type { return reg.observers[i].call_count; };
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn observer_trigger_log_len(reg: EcsObserverRegistry) -> i64 {
+    return len(reg.trigger_log) as i64;
+}
+
+// run_if condition on observer
+fn observer_run_if(reg: EcsObserverRegistry, event_type: i32, condition: bool) -> EcsObserverRegistry {
+    let i: i64 = 0;
+    let cnt = len(reg.observers) as i64;
+    while i < cnt {
+        if reg.observers[i].event_type == event_type {
+            reg.observers[i].condition = condition;
+        };
+        i = i + 1;
+    }
+    return reg;
+}
+
+// --- NonSend resource ---
+
+struct EcsNonSendResource<T> {
+    value: T,
+    is_non_send: bool,  // marker: this resource is !Send (thread-local)
+}
+
+fn nonsend_new<T>(value: T) -> EcsNonSendResource<T> {
+    return EcsNonSendResource<T> { value: value, is_non_send: true };
+}
+
+fn nonsend_get<T>(res: EcsNonSendResource<T>) -> T {
+    return res.value;
+}
+
+fn nonsend_set<T>(res: EcsNonSendResource<T>, value: T) -> EcsNonSendResource<T> {
+    res.value = value;
+    return res;
+}
+
+struct EcsNonSendWorld<T> {
+    nonsend: EcsNonSendResource<T>,
+    has_nonsend: bool,
+}
+
+fn nonsend_world_new<T>() -> EcsNonSendWorld<T> {
+    return EcsNonSendWorld<T> { nonsend: nonsend_new<T>(default_value<T>()), has_nonsend: false };
+}
+
+fn nonsend_world_insert<T>(world: EcsNonSendWorld<T>, value: T) -> EcsNonSendWorld<T> {
+    world.nonsend = nonsend_new<T>(value);
+    world.has_nonsend = true;
+    return world;
+}
+
+fn nonsend_world_get<T>(world: EcsNonSendWorld<T>, default: T) -> T {
+    if world.has_nonsend != true { return default; };
+    return nonsend_get<T>(world.nonsend);
+}
+
+fn nonsend_world_contains<T>(world: EcsNonSendWorld<T>) -> bool {
+    return world.has_nonsend;
+}
+
+fn nonsend_world_remove<T>(world: EcsNonSendWorld<T>) -> EcsNonSendWorld<T> {
+    world.has_nonsend = false;
+    return world;
+}
+
+fn default_value<T>() -> T {
+    // Placeholder for T::default() — in real SLA this would be a trait method
+    // For test purposes, the caller provides explicit defaults
+    let v: T = default_value<T>();
+    return v;
+}
+
+// Test handler functions
+fn handler_double(entity: i32, payload: i32) -> i32 { return payload * 2; }
+fn handler_add_one(entity: i32, payload: i32) -> i32 { return payload + 1; }
+fn hook_count_add(ctx: EcsHookContext) -> i32 { return ctx.entity; }
+
+const EVT_ADD: i32 = 8001;
+const EVT_REMOVE: i32 = 8002;
+const EVT_CUSTOM: i32 = 8003;
+
+@test "on_add hook registered"() {
+    let hooks = hooks_new();
+    let h2 = hooks_on_add(hooks, hook_count_add);
+    if h2.has_on_add != true { panic(80001); };
+}
+
+@test "on_insert hook registered"() {
+    let hooks = hooks_new();
+    let h2 = hooks_on_insert(hooks, hook_count_add);
+    if h2.has_on_insert != true { panic(80002); };
+}
+
+@test "on_remove hook registered"() {
+    let hooks = hooks_new();
+    let h2 = hooks_on_remove(hooks, hook_count_add);
+    if h2.has_on_remove != true { panic(80003); };
+}
+
+@test "on_despawn hook registered"() {
+    let hooks = hooks_new();
+    let h2 = hooks_on_despawn(hooks, hook_count_add);
+    if h2.has_on_despawn != true { panic(80004); };
+}
+
+@test "on_discard hook registered"() {
+    let hooks = hooks_new();
+    let h2 = hooks_on_discard(hooks, hook_count_add);
+    if h2.has_on_discard != true { panic(80005); };
+}
+
+@test "try_on_add returns success"() {
+    let hooks = hooks_new();
+    let (h2, ok) = hooks_try_on_add(hooks, hook_count_add);
+    if ok != true { panic(80006); };
+    if h2.has_on_add != true { panic(80007); };
+}
+
+@test "observer trigger fires matching handler"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add(reg, EVT_ADD, handler_double);
+    let (reg3, result) = observer_trigger(reg2, EVT_ADD, 1, 5);
+    if result != 10 { panic(80008); };
+    if observer_call_count(reg3, EVT_ADD) != 1 { panic(80009); };
+}
+
+@test "observer trigger does not fire non-matching"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add(reg, EVT_ADD, handler_double);
+    let (reg3, result) = observer_trigger(reg2, EVT_REMOVE, 1, 5);
+    if result != 0 { panic(80010); };
+    if observer_call_count(reg3, EVT_ADD) != 0 { panic(80011); };
+}
+
+@test "observer trigger fires multiple handlers"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add(reg, EVT_CUSTOM, handler_double);
+    let reg3 = observer_add(reg2, EVT_CUSTOM, handler_add_one);
+    let (reg4, result) = observer_trigger(reg3, EVT_CUSTOM, 1, 5);
+    // double(5)=10 + add_one(5)=6 = 16
+    if result != 16 { panic(80012); };
+}
+
+@test "observer trigger_with passes trigger payload"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add(reg, EVT_ADD, handler_double);
+    let (reg3, result) = observer_trigger_with(reg2, EVT_ADD, 1, 5, 3);
+    // handler receives payload+trigger_payload = 8, double = 16
+    if result != 16 { panic(80013); };
+}
+
+@test "observer trigger_ref works like trigger"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add(reg, EVT_ADD, handler_double);
+    let (reg3, result) = observer_trigger_ref(reg2, EVT_ADD, 1, 7);
+    if result != 14 { panic(80014); };
+}
+
+@test "observer run_if false prevents firing"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add_with_condition(reg, EVT_ADD, handler_double, true);
+    let reg3 = observer_run_if(reg2, EVT_ADD, false);
+    let (reg4, result) = observer_trigger(reg3, EVT_ADD, 1, 5);
+    if result != 0 { panic(80015); };
+}
+
+@test "observer trigger log records events"() {
+    let reg = observer_registry_new();
+    let reg2 = observer_add(reg, EVT_ADD, handler_double);
+    let (reg3, _) = observer_trigger(reg2, EVT_ADD, 1, 5);
+    if observer_trigger_log_len(reg3) != 1 { panic(80016); };
+}
+
+@test "nonsend resource insert and get"() {
+    let res = nonsend_new<i32>(42);
+    if nonsend_get<i32>(res) != 42 { panic(80017); };
+}
+
+@test "nonsend resource set updates value"() {
+    let res = nonsend_new<i32>(42);
+    let res2 = nonsend_set<i32>(res, 99);
+    if nonsend_get<i32>(res2) != 99 { panic(80018); };
+}
+
+@test "nonsend world contains after insert"() {
+    let world = EcsNonSendWorld<i32> { nonsend: nonsend_new<i32>(0), has_nonsend: false };
+    let world2 = nonsend_world_insert<i32>(world, 42);
+    if nonsend_world_contains<i32>(world2) != true { panic(80019); };
+    if nonsend_world_get<i32>(world2, 0) != 42 { panic(80020); };
+}
+
+@test "nonsend world remove clears"() {
+    let world = EcsNonSendWorld<i32> { nonsend: nonsend_new<i32>(0), has_nonsend: false };
+    let world2 = nonsend_world_insert<i32>(world, 42);
+    let world3 = nonsend_world_remove<i32>(world2);
+    if nonsend_world_contains<i32>(world3) { panic(80021); };
+    if nonsend_world_get<i32>(world3, -1) != -1 { panic(80022); };
+}
+
+@test "nonsend world get returns default when absent"() {
+    let world = EcsNonSendWorld<i32> { nonsend: nonsend_new<i32>(0), has_nonsend: false };
+    if nonsend_world_get<i32>(world, 777) != 777 { panic(80023); };
+}

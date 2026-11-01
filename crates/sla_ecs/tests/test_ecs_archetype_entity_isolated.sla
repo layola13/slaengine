@@ -1,0 +1,470 @@
+// Archetype + Entity allocator + Edges + Storage parity.
+// Bevy archetype.rs: ArchetypeId, Archetype (id, table_id, entities, components,
+// component_count, contains, edges, entity_table_row, len, is_empty, has_*_hook).
+// Bevy entity/mod.rs: Entities (alloc, free, clear, contains, contains_spawned,
+// get_spawned, resolve_from_index, is_index_spawned).
+// Bevy storage: Table + SparseSet (storage_type, component_id, row count).
+
+struct EcsEntity {
+    index: i32,
+    generation: i32,
+}
+
+fn entity_new(index: i32, generation: i32) -> EcsEntity {
+    return EcsEntity { index: index, generation: generation };
+}
+
+fn entity_index(e: EcsEntity) -> i32 { return e.index; }
+fn entity_generation(e: EcsEntity) -> i32 { return e.generation; }
+
+// --- Entity Allocator (Bevy Entities) ---
+struct EcsEntities {
+    generations: Vec<i32>,
+    len: i32,
+    free_indices: Vec<i32>,
+}
+
+fn entities_new() -> EcsEntities {
+    let generations: Vec<i32> = Vec::new();
+    let free_indices: Vec<i32> = Vec::new();
+    return EcsEntities { generations: generations, len: 0, free_indices: free_indices };
+}
+
+fn entities_alloc(ents: EcsEntities) -> (EcsEntities, EcsEntity) {
+    if len(ents.free_indices) > 0 {
+        let idx = ents.free_indices[len(ents.free_indices) - 1];
+        ents.free_indices.pop();
+        let gen = ents.generations[idx];
+        ents.len = ents.len + 1;
+        return (ents, entity_new(idx, gen));
+    };
+    let idx = len(ents.generations) as i32;
+    ents.generations.push(1);
+    ents.len = ents.len + 1;
+    return (ents, entity_new(idx, 1));
+}
+
+fn entities_free(ents: EcsEntities, e: EcsEntity) -> EcsEntities {
+    if e.index >= 0 && e.index < (len(ents.generations) as i32) {
+        if ents.generations[e.index] == e.generation {
+            ents.generations[e.index] = ents.generations[e.index] + 1;
+            ents.free_indices.push(e.index);
+            ents.len = ents.len - 1;
+        };
+    };
+    return ents;
+}
+
+fn entities_contains(ents: EcsEntities, e: EcsEntity) -> bool {
+    if e.index < 0 || e.index >= (len(ents.generations) as i32) { return false; };
+    return ents.generations[e.index] == e.generation;
+}
+
+fn entities_len(ents: EcsEntities) -> i32 { return ents.len; }
+
+fn entities_clear(ents: EcsEntities) -> EcsEntities {
+    return entities_new();
+}
+
+fn entities_resolve_from_index(ents: EcsEntities, index: i32) -> EcsEntity {
+    if index < 0 || index >= (len(ents.generations) as i32) {
+        return entity_new(-1, 0);
+    };
+    return entity_new(index, ents.generations[index]);
+}
+
+fn entities_is_index_spawned(ents: EcsEntities, index: i32) -> bool {
+    if index < 0 || index >= (len(ents.generations) as i32) { return false; };
+    // Check if index is in free list
+    let i: i64 = 0;
+    let cnt = len(ents.free_indices) as i64;
+    while i < cnt {
+        if ents.free_indices[i] == index { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn entities_free_count(ents: EcsEntities) -> i64 { return len(ents.free_indices) as i64; }
+
+// --- Archetype (Bevy Archetype) ---
+struct EcsArchetype {
+    id: i32,
+    table_id: i32,
+    entities: Vec<i32>,          // entity indices in this archetype
+    components: Vec<i32>,        // component ids in this archetype
+    sparse_components: Vec<i32>, // sparse-set component ids
+    has_add_hook: bool,
+    has_insert_hook: bool,
+    has_remove_hook: bool,
+    has_despawn_hook: bool,
+}
+
+fn archetype_new(id: i32, table_id: i32, components: Vec<i32>) -> EcsArchetype {
+    return EcsArchetype {
+        id: id, table_id: table_id, entities: Vec::new(),
+        components: components, sparse_components: Vec::new(),
+        has_add_hook: false, has_insert_hook: false,
+        has_remove_hook: false, has_despawn_hook: false,
+    };
+}
+
+fn archetype_id(a: EcsArchetype) -> i32 { return a.id; }
+fn archetype_table_id(a: EcsArchetype) -> i32 { return a.table_id; }
+fn archetype_entity_count(a: EcsArchetype) -> i64 { return len(a.entities) as i64; }
+fn archetype_component_count(a: EcsArchetype) -> i64 { return len(a.components) as i64; }
+fn archetype_is_empty(a: EcsArchetype) -> bool { return len(a.entities) == 0; }
+
+fn archetype_contains(a: EcsArchetype, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(a.components) as i64;
+    while i < cnt {
+        if a.components[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn archetype_add_entity(a: EcsArchetype, entity_idx: i32) -> EcsArchetype {
+    a.entities.push(entity_idx);
+    return a;
+}
+
+fn archetype_remove_entity(a: EcsArchetype, entity_idx: i32) -> EcsArchetype {
+    let i: i64 = 0;
+    let cnt = len(a.entities) as i64;
+    while i < cnt {
+        if a.entities[i] == entity_idx {
+            a.entities.remove(i);
+            return a;
+        };
+        i = i + 1;
+    }
+    return a;
+}
+
+fn archetype_set_add_hook(a: EcsArchetype) -> EcsArchetype { a.has_add_hook = true; return a; }
+fn archetype_set_insert_hook(a: EcsArchetype) -> EcsArchetype { a.has_insert_hook = true; return a; }
+fn archetype_set_remove_hook(a: EcsArchetype) -> EcsArchetype { a.has_remove_hook = true; return a; }
+fn archetype_set_despawn_hook(a: EcsArchetype) -> EcsArchetype { a.has_despawn_hook = true; return a; }
+
+// --- Edges: archetype transitions on component insert/remove ---
+struct EcsArchetypeEdge {
+    bundle_id: i32,
+    target_archetype_id: i32,
+    kind: i32,  // 0=insert, 1=remove
+}
+
+struct EcsArchetypeEdges {
+    edges: Vec<EcsArchetypeEdge>,
+}
+
+fn edges_new() -> EcsArchetypeEdges {
+    return EcsArchetypeEdges { edges: Vec::new() };
+}
+
+fn edges_add_insert(edges: EcsArchetypeEdges, bundle_id: i32, target: i32) -> EcsArchetypeEdges {
+    edges.edges.push(EcsArchetypeEdge { bundle_id: bundle_id, target_archetype_id: target, kind: 0 });
+    return edges;
+}
+
+fn edges_add_remove(edges: EcsArchetypeEdges, bundle_id: i32, target: i32) -> EcsArchetypeEdges {
+    edges.edges.push(EcsArchetypeEdge { bundle_id: bundle_id, target_archetype_id: target, kind: 1 });
+    return edges;
+}
+
+fn edges_get_after_insert(edges: EcsArchetypeEdges, bundle_id: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(edges.edges) as i64;
+    while i < cnt {
+        if edges.edges[i].bundle_id == bundle_id && edges.edges[i].kind == 0 {
+            return edges.edges[i].target_archetype_id;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn edges_get_after_remove(edges: EcsArchetypeEdges, bundle_id: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(edges.edges) as i64;
+    while i < cnt {
+        if edges.edges[i].bundle_id == bundle_id && edges.edges[i].kind == 1 {
+            return edges.edges[i].target_archetype_id;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn edges_count(edges: EcsArchetypeEdges) -> i64 { return len(edges.edges) as i64; }
+
+// --- Archetypes registry (Bevy Archetypes) ---
+struct EcsArchetypes {
+    archetypes: Vec<EcsArchetype>,
+}
+
+fn archetypes_new() -> EcsArchetypes {
+    let archetypes: Vec<EcsArchetype> = Vec::new();
+    return EcsArchetypes { archetypes: archetypes };
+}
+
+fn archetypes_len(archetypes: EcsArchetypes) -> i64 { return len(archetypes.archetypes) as i64; }
+
+fn archetypes_get(archetypes: EcsArchetypes, id: i32) -> EcsArchetype {
+    let i: i64 = 0;
+    let cnt = len(archetypes.archetypes) as i64;
+    while i < cnt {
+        if archetypes.archetypes[i].id == id { return archetypes.archetypes[i]; };
+        i = i + 1;
+    }
+    return archetype_new(-1, -1, Vec::new());
+}
+
+fn archetypes_register(archetypes: EcsArchetypes, a: EcsArchetype) -> EcsArchetypes {
+    archetypes.archetypes.push(a);
+    return archetypes;
+}
+
+// --- Storage types ---
+const STORAGE_TABLE: i32 = 0;
+const STORAGE_SPARSE: i32 = 1;
+
+struct EcsTableColumn {
+    component_id: i32,
+    row_count: i32,
+}
+
+struct EcsTable {
+    id: i32,
+    columns: Vec<EcsTableColumn>,
+}
+
+fn table_new(id: i32) -> EcsTable {
+    return EcsTable { id: id, columns: Vec::new() };
+}
+
+fn table_add_column(table: EcsTable, component_id: i32) -> EcsTable {
+    table.columns.push(EcsTableColumn { component_id: component_id, row_count: 0 });
+    return table;
+}
+
+fn table_column_count(table: EcsTable) -> i64 { return len(table.columns) as i64; }
+
+fn table_add_row(table: EcsTable) -> EcsTable {
+    let i: i64 = 0;
+    let cnt = len(table.columns) as i64;
+    while i < cnt {
+        table.columns[i].row_count = table.columns[i].row_count + 1;
+        i = i + 1;
+    }
+    return table;
+}
+
+fn table_row_count(table: EcsTable) -> i32 {
+    if len(table.columns) == 0 { return 0; };
+    return table.columns[0].row_count;
+}
+
+struct EcsSparseSet {
+    component_id: i32,
+    entities: Vec<i32>,
+}
+
+fn sparse_set_new(component_id: i32) -> EcsSparseSet {
+    return EcsSparseSet { component_id: component_id, entities: Vec::new() };
+}
+
+fn sparse_set_insert(ss: EcsSparseSet, entity_idx: i32) -> EcsSparseSet {
+    ss.entities.push(entity_idx);
+    return ss;
+}
+
+fn sparse_set_contains(ss: EcsSparseSet, entity_idx: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(ss.entities) as i64;
+    while i < cnt {
+        if ss.entities[i] == entity_idx { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn sparse_set_remove(ss: EcsSparseSet, entity_idx: i32) -> EcsSparseSet {
+    let i: i64 = 0;
+    let cnt = len(ss.entities) as i64;
+    while i < cnt {
+        if ss.entities[i] == entity_idx {
+            ss.entities.remove(i);
+            return ss;
+        };
+        i = i + 1;
+    }
+    return ss;
+}
+
+fn sparse_set_len(ss: EcsSparseSet) -> i64 { return len(ss.entities) as i64; }
+
+const COMP_POS: i32 = 12001;
+const COMP_VEL: i32 = 12002;
+
+@test "entity alloc returns increasing indices"() {
+    let ents = entities_new();
+    let (ents2, e1) = entities_alloc(ents);
+    let (ents3, e2) = entities_alloc(ents2);
+    if e1.index != 0 { panic(12001); };
+    if e2.index != 1 { panic(12002); };
+    if entities_len(ents3) != 2 { panic(12003); };
+}
+
+@test "entity free recycles index with new generation"() {
+    let ents = entities_new();
+    let (ents2, e1) = entities_alloc(ents);
+    let ents3 = entities_free(ents2, e1);
+    if entities_len(ents3) != 0 { panic(12004); };
+    // Allocating again should reuse index 0 with generation 2
+    let (ents4, e2) = entities_alloc(ents3);
+    if e2.index != 0 { panic(12005); };
+    if e2.generation != 2 { panic(12006); };
+}
+
+@test "entity contains returns true for live"() {
+    let ents = entities_new();
+    let (ents2, e1) = entities_alloc(ents);
+    if entities_contains(ents2, e1) != true { panic(12007); };
+}
+
+@test "entity contains returns false for freed"() {
+    let ents = entities_new();
+    let (ents2, e1) = entities_alloc(ents);
+    let ents3 = entities_free(ents2, e1);
+    if entities_contains(ents3, e1) { panic(12008); };
+}
+
+@test "entity resolve_from_index"() {
+    let ents = entities_new();
+    let (ents2, _) = entities_alloc(ents);
+    let e = entities_resolve_from_index(ents2, 0);
+    if e.index != 0 { panic(12009); };
+    if e.generation != 1 { panic(12010); };
+}
+
+@test "entity is_index_spawned"() {
+    let ents = entities_new();
+    let (ents2, e1) = entities_alloc(ents);
+    if entities_is_index_spawned(ents2, 0) != true { panic(12011); };
+    let ents3 = entities_free(ents2, e1);
+    if entities_is_index_spawned(ents3, 0) { panic(12012); };
+}
+
+@test "entity clear resets"() {
+    let ents = entities_new();
+    let (ents2, _) = entities_alloc(ents);
+    let ents3 = entities_clear(ents2);
+    if entities_len(ents3) != 0 { panic(12013); };
+}
+
+@test "entity free_count tracks recycled"() {
+    let ents = entities_new();
+    let (ents2, e1) = entities_alloc(ents);
+    let (ents3, e2) = entities_alloc(ents2);
+    let ents4 = entities_free(ents3, e1);
+    if entities_free_count(ents4) != 1 { panic(12014); };
+}
+
+@test "archetype id and table_id"() {
+    let comps: Vec<i32> = Vec::new();
+    comps.push(COMP_POS);
+    let a = archetype_new(5, 10, comps);
+    if archetype_id(a) != 5 { panic(12015); };
+    if archetype_table_id(a) != 10 { panic(12016); };
+}
+
+@test "archetype component_count and contains"() {
+    let comps: Vec<i32> = Vec::new();
+    comps.push(COMP_POS);
+    comps.push(COMP_VEL);
+    let a = archetype_new(1, 1, comps);
+    if archetype_component_count(a) != 2 { panic(12017); };
+    if archetype_contains(a, COMP_POS) != true { panic(12018); };
+    if archetype_contains(a, 99999) { panic(12019); };
+}
+
+@test "archetype add and remove entity"() {
+    let a = archetype_new(1, 1, Vec::new());
+    let a2 = archetype_add_entity(a, 42);
+    if archetype_entity_count(a2) != 1 { panic(12020); };
+    if archetype_is_empty(a2) { panic(12021); };
+    let a3 = archetype_remove_entity(a2, 42);
+    if archetype_entity_count(a3) != 0 { panic(12022); };
+    if archetype_is_empty(a3) != true { panic(12023); };
+}
+
+@test "archetype hooks"() {
+    let a = archetype_new(1, 1, Vec::new());
+    let a2 = archetype_set_add_hook(a);
+    let a3 = archetype_set_insert_hook(a2);
+    let a4 = archetype_set_remove_hook(a3);
+    let a5 = archetype_set_despawn_hook(a4);
+    if a5.has_add_hook != true { panic(12024); };
+    if a5.has_insert_hook != true { panic(12025); };
+    if a5.has_remove_hook != true { panic(12026); };
+    if a5.has_despawn_hook != true { panic(12027); };
+}
+
+@test "edges add and get after insert"() {
+    let edges = edges_new();
+    let edges2 = edges_add_insert(edges, 100, 5);
+    if edges_get_after_insert(edges2, 100) != 5 { panic(12028); };
+}
+
+@test "edges add and get after remove"() {
+    let edges = edges_new();
+    let edges2 = edges_add_remove(edges, 100, 3);
+    if edges_get_after_remove(edges2, 100) != 3 { panic(12029); };
+}
+
+@test "edges returns -1 for unknown bundle"() {
+    let edges = edges_new();
+    if edges_get_after_insert(edges, 999) != -1 { panic(12030); };
+}
+
+@test "edges count"() {
+    let edges = edges_new();
+    let edges2 = edges_add_insert(edges, 1, 2);
+    let edges3 = edges_add_remove(edges2, 3, 4);
+    if edges_count(edges3) != 2 { panic(12031); };
+}
+
+@test "archetypes registry register and get"() {
+    let archetypes = archetypes_new();
+    let a = archetype_new(7, 3, Vec::new());
+    let archetypes2 = archetypes_register(archetypes, a);
+    if archetypes_len(archetypes2) != 1 { panic(12032); };
+    let retrieved = archetypes_get(archetypes2, 7);
+    if retrieved.id != 7 { panic(12033); };
+}
+
+@test "table add column and row"() {
+    let t = table_new(1);
+    let t2 = table_add_column(t, COMP_POS);
+    let t3 = table_add_row(t2);
+    if table_column_count(t3) != 1 { panic(12034); };
+    if table_row_count(t3) != 1 { panic(12035); };
+}
+
+@test "sparse set insert and contains"() {
+    let ss = sparse_set_new(COMP_VEL);
+    let ss2 = sparse_set_insert(ss, 5);
+    if sparse_set_contains(ss2, 5) != true { panic(12036); };
+    if sparse_set_len(ss2) != 1 { panic(12037); };
+}
+
+@test "sparse set remove"() {
+    let ss = sparse_set_new(COMP_VEL);
+    let ss2 = sparse_set_insert(ss, 5);
+    let ss3 = sparse_set_insert(ss2, 6);
+    let ss4 = sparse_set_remove(ss3, 5);
+    if sparse_set_contains(ss4, 5) { panic(12038); };
+    if sparse_set_len(ss4) != 1 { panic(12039); };
+}

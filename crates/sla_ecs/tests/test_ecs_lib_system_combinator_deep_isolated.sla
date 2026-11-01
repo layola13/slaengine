@@ -1,0 +1,229 @@
+@import "../src/system_combinator_deep.sla"
+
+// Batch 182 tests for CombinatorSystem/PipeSystem lifecycle + Failed/Skipped handling.
+
+@test "run_result_kinds"() {
+    let ok = ecs_run_ok(7);
+    if ecs_run_is_ok(ok) != true { panic(100800); };
+    if ecs_run_value(ok) != 7 { panic(100801); };
+    let f = ecs_run_failed(42);
+    if ecs_run_is_failed(f) != true { panic(100802); };
+    if ecs_run_fail_code(f) != 42 { panic(100803); };
+    let s = ecs_run_skipped();
+    if ecs_run_is_skipped(s) != true { panic(100804); };
+}
+
+@test "flags_or_exclusive"() {
+    if ecs_sys_flags_or(ECS_SYS_FLAG_EXCLUSIVE, ECS_SYS_FLAG_DEFERRED) != 3 { panic(100810); };
+    if ecs_sys_flags_has_exclusive(ecs_sys_flags_or(0, ECS_SYS_FLAG_EXCLUSIVE)) != true { panic(100811); };
+}
+
+@test "access_set_extend_and_fallback"() {
+    let a = ecs_inner_system_new(1, 10, 0, true);
+    a = ecs_inner_system_add_read(a, 5);
+    let b = ecs_inner_system_new(2, 20, 0, true);
+    b = ecs_inner_system_add_write(b, 6);
+    b = ecs_inner_system_add_read(b, 5);
+    let acc = ecs_access_set_deep_from_inner(a);
+    acc = ecs_access_set_deep_extend(acc, ecs_access_set_deep_from_inner(b));
+    acc = ecs_access_set_deep_add_fallback_handler_read(acc);
+    if ecs_access_set_deep_read_count(acc) != 1 { panic(100820); };
+    if ecs_access_set_deep_write_count(acc) != 1 { panic(100821); };
+    if ecs_access_set_deep_has_fallback_handler_read(acc) != true { panic(100822); };
+}
+
+@test "intercept_failed_calls_handler_and_replaces"() {
+    let h = ecs_error_handler_new();
+    let r = ecs_combinator_intercept_run(ecs_run_failed(9), 100, h);
+    if ecs_run_is_failed(r.0) != true { panic(100830); };
+    if ecs_run_fail_code(r.0) != -1 { panic(100831); };
+    if ecs_error_handler_count(r.1) != 1 { panic(100832); };
+    if ecs_error_handler_last_name(r.1) != 100 { panic(100833); };
+}
+
+@test "intercept_skipped_and_ok_passthrough"() {
+    let h = ecs_error_handler_new();
+    let r1 = ecs_combinator_intercept_run(ecs_run_skipped(), 1, h);
+    if ecs_run_is_skipped(r1.0) != true { panic(100840); };
+    if ecs_error_handler_count(r1.1) != 0 { panic(100841); };
+    let r2 = ecs_combinator_intercept_run(ecs_run_ok(3), 1, r1.1);
+    if ecs_run_is_ok(r2.0) != true { panic(100842); };
+    if ecs_run_value(r2.0) != 3 { panic(100843); };
+}
+
+@test "and_then_runs_b_only_when_a_truthy_ok"() {
+    let h = ecs_error_handler_new();
+    let e = ecs_combinator_combine(ECS_COMBINE_AND_THEN, 1, 2, ecs_run_ok(0), ecs_run_ok(5), h);
+    if ecs_combine_eval_b_ran(e) != false { panic(100850); };
+    if ecs_run_value(ecs_combine_eval_result(e)) != 0 { panic(100851); };
+    let e2 = ecs_combinator_combine(ECS_COMBINE_AND_THEN, 1, 2, ecs_run_ok(1), ecs_run_ok(5), h);
+    if ecs_combine_eval_b_ran(e2) != true { panic(100852); };
+    if ecs_run_value(ecs_combine_eval_result(e2)) != 5 { panic(100853); };
+}
+
+@test "and_then_failed_a_does_not_run_b"() {
+    let h = ecs_error_handler_new();
+    let e = ecs_combinator_combine(ECS_COMBINE_AND_THEN, 11, 22, ecs_run_failed(3), ecs_run_ok(9), h);
+    if ecs_combine_eval_b_ran(e) != false { panic(100860); };
+    if ecs_run_is_failed(ecs_combine_eval_result(e)) != true { panic(100861); };
+    if ecs_error_handler_count(ecs_combine_eval_handler(e)) != 1 { panic(100862); };
+}
+
+@test "or_else_runs_b_when_a_false_or_failed"() {
+    let h = ecs_error_handler_new();
+    let e = ecs_combinator_combine(ECS_COMBINE_OR_ELSE, 1, 2, ecs_run_ok(0), ecs_run_ok(8), h);
+    if ecs_combine_eval_b_ran(e) != true { panic(100870); };
+    if ecs_run_value(ecs_combine_eval_result(e)) != 8 { panic(100871); };
+    let e2 = ecs_combinator_combine(ECS_COMBINE_OR_ELSE, 1, 2, ecs_run_ok(1), ecs_run_ok(8), h);
+    if ecs_combine_eval_b_ran(e2) != false { panic(100872); };
+    if ecs_run_value(ecs_combine_eval_result(e2)) != 1 { panic(100873); };
+}
+
+@test "map_sum_and_xor_always_run_both"() {
+    let h = ecs_error_handler_new();
+    let e = ecs_combinator_combine(ECS_COMBINE_MAP_SUM, 1, 2, ecs_run_ok(3), ecs_run_ok(4), h);
+    if ecs_combine_eval_b_ran(e) != true { panic(100880); };
+    if ecs_run_value(ecs_combine_eval_result(e)) != 7 { panic(100881); };
+    let e2 = ecs_combinator_combine(ECS_COMBINE_XOR, 1, 2, ecs_run_ok(1), ecs_run_ok(0), h);
+    if ecs_run_value(ecs_combine_eval_result(e2)) != 1 { panic(100882); };
+    let e3 = ecs_combinator_combine(ECS_COMBINE_XOR, 1, 2, ecs_run_ok(1), ecs_run_ok(1), h);
+    if ecs_run_value(ecs_combine_eval_result(e3)) != 0 { panic(100883); };
+}
+
+@test "combinator_system_flags_or"() {
+    let a = ecs_inner_system_new(1, 10, ECS_SYS_FLAG_EXCLUSIVE, false);
+    let b = ecs_inner_system_new(2, 20, ECS_SYS_FLAG_DEFERRED, true);
+    let c = ecs_combinator_system_deep_new(ECS_COMBINE_MAP_SUM, a, b, 99);
+    if ecs_combinator_system_deep_flags(c) != 3 { panic(100890); };
+    if ecs_combinator_system_deep_is_read_only(c) != false { panic(100891); };
+}
+
+@test "combinator_system_initialize_merges_access_and_fallback"() {
+    let a = ecs_inner_system_add_read(ecs_inner_system_new(1, 10, 0, true), 1);
+    let b = ecs_inner_system_add_write(ecs_inner_system_new(2, 20, 0, true), 2);
+    let c = ecs_combinator_system_deep_new(ECS_COMBINE_AND_THEN, a, b, 5);
+    if ecs_combinator_system_deep_access_initialized(c) != false { panic(100900); };
+    c = ecs_combinator_system_deep_initialize(c);
+    if ecs_combinator_system_deep_access_initialized(c) != true { panic(100901); };
+    let acc = ecs_combinator_system_deep_access(c);
+    if ecs_access_set_deep_has_fallback_handler_read(acc) != true { panic(100902); };
+    if ecs_access_set_deep_write_count(acc) != 1 { panic(100903); };
+    if ecs_combinator_assert_no_self_conflict(c) != true { panic(100904); };
+}
+
+@test "combinator_apply_and_queue_deferred_both"() {
+    let a = ecs_inner_system_new(1, 1, 0, true);
+    let b = ecs_inner_system_new(2, 2, 0, true);
+    let c = ecs_combinator_system_deep_new(ECS_COMBINE_MAP_SUM, a, b, 0);
+    c = ecs_combinator_system_deep_queue_deferred(c, 2, 3);
+    if ecs_inner_system_deferred_count(c.a) != 2 { panic(100910); };
+    if ecs_inner_system_deferred_count(c.b) != 3 { panic(100911); };
+    c = ecs_combinator_system_deep_apply_deferred(c);
+    if ecs_inner_system_deferred_count(c.a) != 0 { panic(100912); };
+    if ecs_inner_system_deferred_count(c.b) != 0 { panic(100913); };
+}
+
+@test "combinator_default_sets_merge_and_last_run"() {
+    let a = ecs_inner_system_add_default_set(ecs_inner_system_new(1, 1, 0, true), 10);
+    a = ecs_inner_system_add_default_set(a, 11);
+    let b = ecs_inner_system_add_default_set(ecs_inner_system_new(2, 2, 0, true), 20);
+    let c = ecs_combinator_system_deep_new(ECS_COMBINE_MAP_SUM, a, b, 0);
+    let sets = ecs_combinator_system_deep_default_system_sets(c);
+    if len(sets) != 3 { panic(100920); };
+    if sets[0] != 10 { panic(100921); };
+    if sets[2] != 20 { panic(100922); };
+    c = ecs_combinator_system_deep_set_last_run(c, 55);
+    if ecs_combinator_system_deep_get_last_run(c) != 55 { panic(100923); };
+    if ecs_inner_system_last_run(c.b) != 55 { panic(100924); };
+}
+
+@test "combinator_clone_requires_reinitialize"() {
+    let a = ecs_inner_system_new(1, 1, 0, true);
+    let b = ecs_inner_system_new(2, 2, 0, true);
+    let c = ecs_combinator_system_deep_initialize(ecs_combinator_system_deep_new(ECS_COMBINE_MAP_SUM, a, b, 0));
+    if ecs_combinator_system_deep_access_initialized(c) != true { panic(100930); };
+    let cl = ecs_combinator_system_deep_clone(c);
+    // Bevy: cloned instance must be re-initialized before it can run.
+    if ecs_combinator_system_deep_access_initialized(cl) != false { panic(100931); };
+    let cl2 = ecs_combinator_system_deep_initialize(cl);
+    if ecs_combinator_system_deep_access_initialized(cl2) != true { panic(100932); };
+}
+
+@test "pipe_system_run_ok_feeds_b"() {
+    let a = ecs_inner_system_new(1, 1, 0, true);
+    let b = ecs_inner_system_new(2, 2, 0, true);
+    let p = ecs_pipe_system_deep_new(a, b, 9);
+    let r = ecs_pipe_system_deep_run(p, ecs_run_ok(42), ecs_run_ok(7));
+    let e = r.1;
+    if ecs_pipe_eval_a_ran(e) != true { panic(100940); };
+    if ecs_pipe_eval_b_ran(e) != true { panic(100941); };
+    if ecs_pipe_eval_piped_value(e) != 42 { panic(100942); };
+    if ecs_run_value(ecs_pipe_eval_result(e)) != 7 { panic(100943); };
+}
+
+@test "pipe_system_run_failed_skips_b"() {
+    let a = ecs_inner_system_new(1, 1, 0, true);
+    let b = ecs_inner_system_new(2, 2, 0, true);
+    let p = ecs_pipe_system_deep_new(a, b, 9);
+    let r = ecs_pipe_system_deep_run(p, ecs_run_failed(1), ecs_run_ok(7));
+    let e = r.1;
+    if ecs_pipe_eval_b_ran(e) != false { panic(100950); };
+    if ecs_run_is_failed(ecs_pipe_eval_result(e)) != true { panic(100951); };
+    if ecs_pipe_eval_piped_value(e) != 0 { panic(100952); };
+}
+
+@test "pipe_system_run_skipped_skips_b"() {
+    let a = ecs_inner_system_new(1, 1, 0, true);
+    let b = ecs_inner_system_new(2, 2, 0, true);
+    let p = ecs_pipe_system_deep_new(a, b, 9);
+    let r = ecs_pipe_system_deep_run(p, ecs_run_skipped(), ecs_run_ok(7));
+    if ecs_pipe_eval_b_ran(r.1) != false { panic(100960); };
+    if ecs_run_is_skipped(ecs_pipe_eval_result(r.1)) != true { panic(100961); };
+}
+
+@test "pipe_system_initialize_no_fallback_handler_read"() {
+    let a = ecs_inner_system_add_read(ecs_inner_system_new(1, 1, 0, true), 3);
+    let b = ecs_inner_system_add_read(ecs_inner_system_new(2, 2, 0, true), 4);
+    let p = ecs_pipe_system_deep_new(a, b, ecs_into_pipe_system_deep_name(1, 2));
+    p = ecs_pipe_system_deep_initialize(p);
+    if ecs_pipe_system_deep_access_initialized(p) != true { panic(100970); };
+    let acc = ecs_pipe_system_deep_access(p);
+    if ecs_access_set_deep_has_fallback_handler_read(acc) != false { panic(100971); };
+    if ecs_access_set_deep_read_count(acc) != 2 { panic(100972); };
+}
+
+@test "pipe_system_flags_sets_last_run_exclusive_allowed"() {
+    let a = ecs_inner_system_add_default_set(ecs_inner_system_new(1, 1, ECS_SYS_FLAG_EXCLUSIVE, false), 9);
+    let b = ecs_inner_system_add_default_set(ecs_inner_system_new(2, 2, 0, true), 8);
+    let p = ecs_pipe_system_deep_new(a, b, 0);
+    if ecs_sys_flags_has_exclusive(ecs_pipe_system_deep_flags(p)) != true { panic(100980); };
+    if ecs_pipe_system_deep_allows_exclusive(p) != true { panic(100981); };
+    let sets = ecs_pipe_system_deep_default_system_sets(p);
+    if len(sets) != 2 { panic(100982); };
+    p = ecs_pipe_system_deep_set_last_run(p, 12);
+    if ecs_pipe_system_deep_get_last_run(p) != 12 { panic(100983); };
+    if ecs_pipe_system_deep_is_read_only(p) != false { panic(100984); };
+}
+
+@test "pipe_apply_deferred_both"() {
+    let a = ecs_inner_system_new(1, 1, 0, true);
+    let b = ecs_inner_system_new(2, 2, 0, true);
+    let p = ecs_pipe_system_deep_new(a, b, 0);
+    p = ecs_pipe_system_deep_queue_deferred(p, 1, 1);
+    p = ecs_pipe_system_deep_apply_deferred(p);
+    if ecs_inner_system_deferred_count(p.a) != 0 { panic(100990); };
+    if ecs_inner_system_deferred_count(p.b) != 0 { panic(100991); };
+}
+
+@test "combinator_run_wrapper"() {
+    let a = ecs_inner_system_new(1, 10, 0, true);
+    let b = ecs_inner_system_new(2, 20, 0, true);
+    let c = ecs_combinator_system_deep_new(ECS_COMBINE_MAP_SUM, a, b, 0);
+    let h = ecs_error_handler_new();
+    let r = ecs_combinator_system_deep_run(c, ecs_run_ok(2), ecs_run_ok(3), h);
+    if ecs_run_value(ecs_combine_eval_result(r.1)) != 5 { panic(101000); };
+}
+
+@test "into_pipe_name_composite"() {
+    if ecs_into_pipe_system_deep_name(3, 4) != 300004 { panic(101010); };
+}

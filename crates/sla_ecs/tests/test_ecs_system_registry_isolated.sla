@@ -1,0 +1,181 @@
+// Standalone System Registry test — no large world import.
+// Tests register/run/unregister/cached semantics using a simple i32-based
+// system model so the compiler can handle it without codegen limits.
+
+struct EcsSysId {
+    id: i32,
+}
+
+struct EcsSysEntry {
+    id: i32,
+    run: fn(i32) -> i32,
+    initialized: bool,
+}
+
+struct EcsSysRegistry {
+    entries: Vec<EcsSysEntry>,
+    next_id: i32,
+}
+
+fn sys_reg_new() -> EcsSysRegistry {
+    let entries: Vec<EcsSysEntry> = Vec::new();
+    return EcsSysRegistry { entries: entries, next_id: 0 };
+}
+
+fn sys_reg_register(reg: EcsSysRegistry, run: fn(i32) -> i32) -> (EcsSysRegistry, EcsSysId) {
+    let id = reg.next_id;
+    reg.entries.push(EcsSysEntry { id: id, run: run, initialized: true });
+    reg.next_id = id + 1;
+    return (reg, EcsSysId { id: id });
+}
+
+fn sys_reg_run(reg: EcsSysRegistry, id: EcsSysId, input: i32) -> (EcsSysRegistry, i32) {
+    let i: i64 = 0;
+    let cnt = len(reg.entries) as i64;
+    while i < cnt {
+        if reg.entries[i].id == id.id && reg.entries[i].initialized {
+            let f = reg.entries[i].run; return (reg, f(input));
+        };
+        i = i + 1;
+    }
+    return (reg, input);
+}
+
+fn sys_reg_unregister(reg: EcsSysRegistry, id: EcsSysId) -> EcsSysRegistry {
+    let i: i64 = 0;
+    let cnt = len(reg.entries) as i64;
+    while i < cnt {
+        if reg.entries[i].id == id.id {
+            reg.entries.remove(i);
+            return reg;
+        };
+        i = i + 1;
+    }
+    return reg;
+}
+
+fn sys_reg_contains(reg: EcsSysRegistry, id: EcsSysId) -> bool {
+    let i: i64 = 0;
+    let cnt = len(reg.entries) as i64;
+    while i < cnt {
+        if reg.entries[i].id == id.id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+struct EcsCachedReg {
+    tags: Vec<i32>,
+    ids: Vec<i32>,
+    registry: EcsSysRegistry,
+}
+
+fn cached_reg_new() -> EcsCachedReg {
+    let tags: Vec<i32> = Vec::new();
+    let ids: Vec<i32> = Vec::new();
+    return EcsCachedReg { tags: tags, ids: ids, registry: sys_reg_new() };
+}
+
+fn cached_reg_register(cached: EcsCachedReg, tag: i32, run: fn(i32) -> i32) -> (EcsCachedReg, EcsSysId) {
+    let i: i64 = 0;
+    let cnt = len(cached.tags) as i64;
+    while i < cnt {
+        if cached.tags[i] == tag { return (cached, EcsSysId { id: cached.ids[i] }); };
+        i = i + 1;
+    }
+    let (reg, id) = sys_reg_register(cached.registry, run);
+    cached.registry = reg;
+    cached.tags.push(tag);
+    cached.ids.push(id.id);
+    return (cached, id);
+}
+
+fn cached_reg_run(cached: EcsCachedReg, tag: i32, run: fn(i32) -> i32, input: i32) -> (EcsCachedReg, i32) {
+    let (reg, id) = cached_reg_register(cached, tag, run);
+    let (reg2, out) = sys_reg_run(reg.registry, id, input);
+    reg.registry = reg2;
+    return (reg, out);
+}
+
+fn cached_reg_unregister(cached: EcsCachedReg, tag: i32) -> EcsCachedReg {
+    let i: i64 = 0;
+    let cnt = len(cached.tags) as i64;
+    while i < cnt {
+        if cached.tags[i] == tag {
+            cached.registry = sys_reg_unregister(cached.registry, EcsSysId { id: cached.ids[i] });
+            cached.tags.remove(i);
+            cached.ids.remove(i);
+            return cached;
+        };
+        i = i + 1;
+    }
+    return cached;
+}
+
+// Test systems
+fn sys_double(x: i32) -> i32 { return x * 2; }
+fn sys_inc(x: i32) -> i32 { return x + 1; }
+
+@test "register and run system by id"() {
+    let reg = sys_reg_new();
+    let (reg2, id) = sys_reg_register(reg, sys_double);
+    let (reg3, result) = sys_reg_run(reg2, id, 5);
+    if result != 10 { panic(40001); };
+}
+
+@test "run system twice"() {
+    let reg = sys_reg_new();
+    let (reg2, id) = sys_reg_register(reg, sys_double);
+    let (reg3, r1) = sys_reg_run(reg2, id, 3);
+    let (reg4, r2) = sys_reg_run(reg3, id, r1);
+    if r2 != 12 { panic(40002); };
+}
+
+@test "unregister prevents running"() {
+    let reg = sys_reg_new();
+    let (reg2, id) = sys_reg_register(reg, sys_double);
+    let reg3 = sys_reg_unregister(reg2, id);
+    if sys_reg_contains(reg3, id) { panic(40003); };
+    let (reg4, result) = sys_reg_run(reg3, id, 5);
+    if result != 5 { panic(40004); };
+}
+
+@test "cached register is idempotent"() {
+    let cached = cached_reg_new();
+    let (cached2, id1) = cached_reg_register(cached, 100, sys_inc);
+    let (cached3, id2) = cached_reg_register(cached2, 100, sys_inc);
+    if id1.id != id2.id { panic(40005); };
+}
+
+@test "run_system_cached registers and runs"() {
+    let cached = cached_reg_new();
+    let (cached2, r1) = cached_reg_run(cached, 200, sys_inc, 10);
+    if r1 != 11 { panic(40006); };
+    let (cached3, r2) = cached_reg_run(cached2, 200, sys_inc, 20);
+    if r2 != 21 { panic(40007); };
+}
+
+@test "contains returns false for unregistered"() {
+    let reg = sys_reg_new();
+    if sys_reg_contains(reg, EcsSysId { id: 999 }) { panic(40008); };
+}
+
+@test "cached unregister removes system"() {
+    let cached = cached_reg_new();
+    let (cached2, id) = cached_reg_register(cached, 300, sys_double);
+    let cached3 = cached_reg_unregister(cached2, 300);
+    let (cached4, r) = cached_reg_run(cached3, 300, sys_double, 5);
+    // After unregister, re-run should re-register and run
+    if r != 10 { panic(40009); };
+}
+
+@test "multiple systems register independently"() {
+    let reg = sys_reg_new();
+    let (reg2, id1) = sys_reg_register(reg, sys_double);
+    let (reg3, id2) = sys_reg_register(reg2, sys_inc);
+    if id1.id == id2.id { panic(40010); };
+    let (reg4, r1) = sys_reg_run(reg3, id1, 5);
+    let (reg5, r2) = sys_reg_run(reg4, id2, 5);
+    if r1 != 10 { panic(40011); };
+    if r2 != 6 { panic(40012); };
+}

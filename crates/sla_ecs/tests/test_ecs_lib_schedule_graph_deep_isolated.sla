@@ -1,0 +1,302 @@
+@import "../src/schedule_graph_deep.sla"
+
+// Batch 181 tests for deepened ScheduleGraph process_configs / transitive / systems_in_set.
+
+@test "graph_new_defaults"() {
+    let g = ecs_schedule_graph_deep_new();
+    if ecs_schedule_graph_deep_is_changed(g) != false { panic(100600); };
+    if ecs_schedule_graph_deep_system_count(g) != 0 { panic(100601); };
+    if ecs_schedule_graph_deep_set_count(g) != 0 { panic(100602); };
+    if ecs_schedule_graph_deep_anonymous_sets(g) != 0 { panic(100603); };
+}
+
+@test "insert_system_and_set_marks_changed"() {
+    let g = ecs_schedule_graph_deep_new();
+    let r = ecs_schedule_graph_deep_insert_system(g, 10);
+    g = r.0;
+    if ecs_schedule_graph_deep_is_changed(g) != true { panic(100610); };
+    if ecs_schedule_graph_deep_system_count(g) != 1 { panic(100611); };
+    let r2 = ecs_schedule_graph_deep_insert_set(g, 5, false);
+    g = r2.0;
+    if ecs_schedule_graph_deep_set_count(g) != 1 { panic(100612); };
+    // same set_id reuses key
+    let r3 = ecs_schedule_graph_deep_insert_set(g, 5, false);
+    if r3.1 != r2.1 { panic(100613); };
+    if ecs_schedule_graph_deep_set_count(r3.0) != 1 { panic(100614); };
+}
+
+@test "create_anonymous_set_increments_and_inserts"() {
+    let g = ecs_schedule_graph_deep_new();
+    let a1 = ecs_schedule_graph_deep_create_anonymous_set(g);
+    g = a1.0;
+    if ecs_schedule_graph_deep_anonymous_sets(g) != 1 { panic(100620); };
+    if ecs_schedule_graph_deep_set_count(g) != 1 { panic(100621); };
+    let a2 = ecs_schedule_graph_deep_create_anonymous_set(g);
+    g = a2.0;
+    if ecs_schedule_graph_deep_anonymous_sets(g) != 2 { panic(100622); };
+    if ecs_schedule_graph_deep_set_count(g) != 2 { panic(100623); };
+}
+
+@test "create_anonymous_set_keys_distinct"() {
+    let g = ecs_schedule_graph_deep_new();
+    let a1 = ecs_schedule_graph_deep_create_anonymous_set(g);
+    g = a1.0;
+    let a2 = ecs_schedule_graph_deep_create_anonymous_set(g);
+    g = a2.0;
+    if a1.1 == a2.1 { panic(100630); };
+    if ecs_schedule_graph_deep_anonymous_sets(g) != 2 { panic(100631); };
+}
+
+@test "add_system_inner_hierarchy_and_deps"() {
+    let g = ecs_schedule_graph_deep_new();
+    let s = ecs_schedule_graph_deep_insert_set(g, 100, false);
+    g = s.0;
+    let set_key = s.1;
+    let hierarchy: Vec<i64> = Vec::new();
+    hierarchy.push(set_key);
+    let before: Vec<EcsSgNode> = Vec::new();
+    // target system placeholder key 99 not inserted — edge still recorded
+    before.push(ecs_sg_node_system(99));
+    let after: Vec<EcsSgNode> = Vec::new();
+    let amb: Vec<EcsSgNode> = Vec::new();
+    let r = ecs_schedule_graph_deep_add_system_inner(g, 1, hierarchy, before, after, amb, false);
+    g = r.0;
+    let sys = ecs_sg_node_system(r.1);
+    let setn = ecs_sg_node_set(set_key);
+    if ecs_schedule_graph_deep_has_hierarchy_edge(g, setn, sys) != true { panic(100640); };
+    if ecs_schedule_graph_deep_has_dependency_edge(g, sys, ecs_sg_node_system(99)) != true { panic(100641); };
+}
+
+@test "add_system_inner_after_and_ambiguous"() {
+    let g = ecs_schedule_graph_deep_new();
+    let after: Vec<EcsSgNode> = Vec::new();
+    after.push(ecs_sg_node_system(50));
+    let amb: Vec<EcsSgNode> = Vec::new();
+    amb.push(ecs_sg_node_system(60));
+    let r = ecs_schedule_graph_deep_add_system_inner(g, 2, Vec::new(), Vec::new(), after, amb, true);
+    g = r.0;
+    let sys = ecs_sg_node_system(r.1);
+    if ecs_schedule_graph_deep_has_dependency_edge(g, ecs_sg_node_system(50), sys) != true { panic(100650); };
+    if ecs_sg_undirected_contains(g.ambiguous_with, sys, ecs_sg_node_system(60)) != true { panic(100651); };
+    if ecs_schedule_graph_deep_is_ambiguous_with_all(g, sys) != true { panic(100652); };
+}
+
+@test "apply_collective_conditions_single_no_anonymous"() {
+    let g = ecs_schedule_graph_deep_new();
+    let keys: Vec<i64> = Vec::new();
+    keys.push(0);
+    let is_sys: Vec<bool> = Vec::new();
+    is_sys.push(true);
+    let r = ecs_schedule_graph_deep_apply_collective_conditions(g, keys, is_sys, 2);
+    if r.1 != -1 { panic(100660); };
+    if r.2 != true { panic(100661); };
+    if ecs_schedule_graph_deep_anonymous_sets(r.0) != 0 { panic(100662); };
+}
+
+@test "apply_collective_conditions_multi_creates_anonymous_set"() {
+    let g = ecs_schedule_graph_deep_new();
+    let ins1 = ecs_schedule_graph_deep_insert_system(g, 1);
+    g = ins1.0;
+    let ins2 = ecs_schedule_graph_deep_insert_system(g, 2);
+    g = ins2.0;
+    let keys: Vec<i64> = Vec::new();
+    keys.push(ins1.1);
+    keys.push(ins2.1);
+    let is_sys: Vec<bool> = Vec::new();
+    is_sys.push(true);
+    is_sys.push(true);
+    let r = ecs_schedule_graph_deep_apply_collective_conditions(g, keys, is_sys, 3);
+    g = r.0;
+    if r.2 != false { panic(100670); };
+    if r.1 < 0 { panic(100671); };
+    if ecs_schedule_graph_deep_anonymous_sets(g) != 1 { panic(100672); };
+    if ecs_schedule_graph_deep_set_condition_count(g, r.1) != 3 { panic(100673); };
+    let setn = ecs_sg_node_set(r.1);
+    if ecs_schedule_graph_deep_has_hierarchy_edge(g, setn, ecs_sg_node_system(ins1.1)) != true { panic(100674); };
+    if ecs_schedule_graph_deep_has_hierarchy_edge(g, setn, ecs_sg_node_system(ins2.1)) != true { panic(100675); };
+}
+
+@test "process_system_list_unchained_no_deps"() {
+    let g = ecs_schedule_graph_deep_new();
+    let ids: Vec<i64> = Vec::new();
+    ids.push(1);
+    ids.push(2);
+    ids.push(3);
+    let r = ecs_schedule_graph_deep_process_system_list(g, ids, false, false);
+    g = r.0;
+    let res = r.1;
+    if ecs_process_configs_result_node_count(res) != 3 { panic(100680); };
+    if ecs_schedule_graph_deep_dependency_edge_count(g) != 0 { panic(100681); };
+    // unchained with multiple configs: densely_chained false unless each is densely chained AND len==1 rule
+    // start densely_chained = false || false = false; still &= true each => false
+    if ecs_process_configs_result_densely_chained(res) != false { panic(100682); };
+}
+
+@test "process_system_list_chained_adds_linear_deps"() {
+    let g = ecs_schedule_graph_deep_new();
+    let ids: Vec<i64> = Vec::new();
+    ids.push(10);
+    ids.push(20);
+    ids.push(30);
+    let r = ecs_schedule_graph_deep_process_system_list(g, ids, true, false);
+    g = r.0;
+    // three systems, each densely chained single => chain edges 0->1 and 1->2 only (last of prev to first of cur)
+    if ecs_schedule_graph_deep_dependency_edge_count(g) != 2 { panic(100690); };
+    if ecs_schedule_graph_deep_pass_dep_count(g) != 2 { panic(100691); };
+    let res = r.1;
+    if ecs_process_configs_result_node_count(res) != 3 { panic(100692); };
+    if ecs_process_configs_result_densely_chained(res) != true { panic(100693); };
+}
+
+@test "process_system_list_chained_ignore_deferred_counts_pass"() {
+    let g = ecs_schedule_graph_deep_new();
+    let ids: Vec<i64> = Vec::new();
+    ids.push(1);
+    ids.push(2);
+    let r = ecs_schedule_graph_deep_process_system_list(g, ids, true, true);
+    g = r.0;
+    if g.pass_ignore_deferred_count != 1 { panic(100700); };
+    if ecs_schedule_graph_deep_pass_dep_count(g) != 1 { panic(100701); };
+}
+
+@test "chain_process_results_densely_chained_uses_endpoints_only"() {
+    // previous group has 2 nodes densely_chained=true => only last previous chains
+    // current group has 2 nodes densely_chained=true => only first current chains
+    let g = ecs_schedule_graph_deep_new();
+    let a = ecs_schedule_graph_deep_insert_system(g, 1);
+    g = a.0;
+    let b = ecs_schedule_graph_deep_insert_system(g, 2);
+    g = b.0;
+    let c = ecs_schedule_graph_deep_insert_system(g, 3);
+    g = c.0;
+    let d = ecs_schedule_graph_deep_insert_system(g, 4);
+    g = d.0;
+    let nodes1: Vec<EcsSgNode> = Vec::new();
+    nodes1.push(ecs_sg_node_system(a.1));
+    nodes1.push(ecs_sg_node_system(b.1));
+    let nodes2: Vec<EcsSgNode> = Vec::new();
+    nodes2.push(ecs_sg_node_system(c.1));
+    nodes2.push(ecs_sg_node_system(d.1));
+    let results: Vec<EcsProcessConfigsResult> = Vec::new();
+    results.push(ecs_process_configs_result_from_nodes(nodes1, true));
+    results.push(ecs_process_configs_result_from_nodes(nodes2, true));
+    let r = ecs_schedule_graph_deep_chain_process_results(g, results, true, false, true);
+    g = r.0;
+    // only b -> c
+    if ecs_schedule_graph_deep_dependency_edge_count(g) != 1 { panic(100710); };
+    if ecs_schedule_graph_deep_has_dependency_edge(g, ecs_sg_node_system(b.1), ecs_sg_node_system(c.1)) != true { panic(100711); };
+    if ecs_schedule_graph_deep_has_dependency_edge(g, ecs_sg_node_system(a.1), ecs_sg_node_system(c.1)) != false { panic(100712); };
+}
+
+@test "chain_process_results_not_dense_uses_all_nodes"() {
+    let g = ecs_schedule_graph_deep_new();
+    let a = ecs_schedule_graph_deep_insert_system(g, 1);
+    g = a.0;
+    let b = ecs_schedule_graph_deep_insert_system(g, 2);
+    g = b.0;
+    let c = ecs_schedule_graph_deep_insert_system(g, 3);
+    g = c.0;
+    let d = ecs_schedule_graph_deep_insert_system(g, 4);
+    g = d.0;
+    let nodes1: Vec<EcsSgNode> = Vec::new();
+    nodes1.push(ecs_sg_node_system(a.1));
+    nodes1.push(ecs_sg_node_system(b.1));
+    let nodes2: Vec<EcsSgNode> = Vec::new();
+    nodes2.push(ecs_sg_node_system(c.1));
+    nodes2.push(ecs_sg_node_system(d.1));
+    let results: Vec<EcsProcessConfigsResult> = Vec::new();
+    results.push(ecs_process_configs_result_from_nodes(nodes1, false));
+    results.push(ecs_process_configs_result_from_nodes(nodes2, false));
+    let r = ecs_schedule_graph_deep_chain_process_results(g, results, true, false, true);
+    g = r.0;
+    // 2 prev * 2 cur = 4 edges
+    if ecs_schedule_graph_deep_dependency_edge_count(g) != 4 { panic(100720); };
+}
+
+@test "transitive_hierarchy_and_dependency_bridging"() {
+    // A -> X -> B on hierarchy and dependency; bridging X adds A -> B
+    let g = ecs_schedule_graph_deep_new();
+    let a = ecs_sg_node_system(1);
+    let x = ecs_sg_node_system(2);
+    let b = ecs_sg_node_system(3);
+    g.hierarchy = ecs_sg_edge_store_add(g.hierarchy, a, x);
+    g.hierarchy = ecs_sg_edge_store_add(g.hierarchy, x, b);
+    g.dependency = ecs_sg_edge_store_add(g.dependency, a, x);
+    g.dependency = ecs_sg_edge_store_add(g.dependency, x, b);
+    g = ecs_schedule_graph_deep_add_edges_for_transitive_dependencies(g, x);
+    if ecs_schedule_graph_deep_has_hierarchy_edge(g, a, b) != true { panic(100730); };
+    if ecs_schedule_graph_deep_has_dependency_edge(g, a, b) != true { panic(100731); };
+}
+
+@test "systems_in_set_uninitialized_when_changed"() {
+    let g = ecs_schedule_graph_deep_new();
+    let s = ecs_schedule_graph_deep_insert_set(g, 7, false);
+    g = s.0;
+    // insert_set marks changed
+    let r = ecs_schedule_graph_deep_systems_in_set(g, 7);
+    if r.0 != ECS_SG_ERR_UNINITIALIZED { panic(100740); };
+}
+
+@test "systems_in_set_not_found_and_ok"() {
+    let g = ecs_schedule_graph_deep_new();
+    let s = ecs_schedule_graph_deep_insert_set(g, 7, false);
+    g = s.0;
+    let sys = ecs_schedule_graph_deep_insert_system(g, 100);
+    g = sys.0;
+    g = ecs_schedule_graph_deep_register_system_in_set(g, s.1, sys.1);
+    g = ecs_schedule_graph_deep_clear_changed(g);
+    let miss = ecs_schedule_graph_deep_systems_in_set(g, 999);
+    if miss.0 != ECS_SG_ERR_SET_NOT_FOUND { panic(100750); };
+    let ok = ecs_schedule_graph_deep_systems_in_set(g, 7);
+    if ok.0 != ECS_SG_ERR_OK { panic(100751); };
+    if len(ok.1) != 1 { panic(100752); };
+    if ok.1[0] != sys.1 { panic(100753); };
+}
+
+@test "edge_store_remove_and_neighbors"() {
+    let e = ecs_sg_edge_store_new();
+    let a = ecs_sg_node_system(1);
+    let b = ecs_sg_node_system(2);
+    let c = ecs_sg_node_system(3);
+    e = ecs_sg_edge_store_add(e, a, b);
+    e = ecs_sg_edge_store_add(e, a, c);
+    let outs = ecs_sg_edge_store_neighbors_out(e, a);
+    if len(outs) != 2 { panic(100760); };
+    let ins = ecs_sg_edge_store_neighbors_in(e, b);
+    if len(ins) != 1 { panic(100761); };
+    let rm = ecs_sg_edge_store_remove(e, a, b);
+    e = rm.0;
+    if rm.1 != true { panic(100762); };
+    if ecs_sg_edge_store_contains(e, a, b) != false { panic(100763); };
+    if ecs_sg_edge_store_len(e) != 1 { panic(100764); };
+}
+
+@test "undirected_ambiguous_with_symmetric"() {
+    let u = ecs_sg_undirected_new();
+    let a = ecs_sg_node_system(1);
+    let b = ecs_sg_node_system(2);
+    u = ecs_sg_undirected_add(u, a, b);
+    if ecs_sg_undirected_contains(u, b, a) != true { panic(100770); };
+    if ecs_sg_undirected_len(u) != 1 { panic(100771); };
+    // dedup
+    u = ecs_sg_undirected_add(u, b, a);
+    if ecs_sg_undirected_len(u) != 1 { panic(100772); };
+}
+
+@test "process_configs_result_append_and_accessors"() {
+    let n1 = ecs_process_configs_result_single(ecs_sg_node_system(1));
+    let n2 = ecs_process_configs_result_single(ecs_sg_node_system(2));
+    let m = ecs_process_configs_result_append(n1, n2);
+    if ecs_process_configs_result_node_count(m) != 2 { panic(100780); };
+    if ecs_process_configs_result_node_at(m, 1).key != 2 { panic(100781); };
+}
+
+@test "clear_changed_allows_systems_in_set"() {
+    let g = ecs_schedule_graph_deep_new();
+    let s = ecs_schedule_graph_deep_insert_set(g, 1, false);
+    g = s.0;
+    g = ecs_schedule_graph_deep_clear_changed(g);
+    let r = ecs_schedule_graph_deep_systems_in_set(g, 1);
+    if r.0 != ECS_SG_ERR_OK { panic(100790); };
+    if len(r.1) != 0 { panic(100791); };
+}

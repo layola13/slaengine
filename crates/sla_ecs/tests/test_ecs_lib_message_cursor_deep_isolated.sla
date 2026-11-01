@@ -1,0 +1,274 @@
+@import "../src/message_cursor_deep.sla"
+
+// Batch 203: MessageCursor deep (src/message/message_cursor.rs).
+
+@test "default_cursor_empty_messages"() {
+    let m = ecs_mc_messages_new();
+    let c = ecs_mc_cursor_default();
+    if ecs_mc_len(c, m) != 0 { panic(106600); };
+    if ecs_mc_is_empty(c, m) != true { panic(106601); };
+    if ecs_mc_missed(c, m) != 0 { panic(106602); };
+    if ecs_mc_cursor_last(c) != 0 { panic(106603); };
+}
+
+@test "write_and_len"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 10);
+    m = w.0;
+    if w.1 != 0 { panic(106610); };
+    w = ecs_mc_messages_write(m, 20);
+    m = w.0;
+    if w.1 != 1 { panic(106611); };
+    if ecs_mc_messages_message_count(m) != 2 { panic(106612); };
+    if ecs_mc_messages_len(m) != 2 { panic(106613); };
+    let c = ecs_mc_get_cursor(m);
+    if ecs_mc_len(c, m) != 2 { panic(106614); };
+}
+
+@test "get_cursor_current_skips_existing"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 2);
+    m = w.0;
+    let c = ecs_mc_get_cursor_current(m);
+    if ecs_mc_cursor_last(c) != 2 { panic(106620); };
+    if ecs_mc_len(c, m) != 0 { panic(106621); };
+    // future write is visible
+    w = ecs_mc_messages_write(m, 3);
+    m = w.0;
+    if ecs_mc_len(c, m) != 1 { panic(106622); };
+}
+
+@test "read_with_id_advances"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 5);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 6);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read_with_id(c, m, false);
+    c = r.0;
+    let it = r.1;
+    if ecs_mc_iter_unread(it) != 2 { panic(106630); };
+    if ecs_mc_iter_is_mut(it) != false { panic(106631); };
+    let n = ecs_mc_iter_next(it);
+    if n.0 != true { panic(106632); };
+    if n.1 != 5 { panic(106633); };
+    if n.2 != 0 { panic(106634); };
+    it = n.3;
+    n = ecs_mc_iter_next(it);
+    if n.1 != 6 { panic(106635); };
+    if n.2 != 1 { panic(106636); };
+    it = n.3;
+    n = ecs_mc_iter_next(it);
+    if n.0 != false { panic(106637); };
+    c = ecs_mc_cursor_from_iter(it);
+    if ecs_mc_cursor_last(c) != 2 { panic(106638); };
+    if ecs_mc_is_empty(c, m) != true { panic(106639); };
+}
+
+@test "read_mut_flag"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 9);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read_mut(c, m);
+    if ecs_mc_iter_is_mut(r.1) != true { panic(106640); };
+    if ecs_mc_iter_unread(r.1) != 1 { panic(106641); };
+}
+
+@test "clear_marks_all_read"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 2);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    c = ecs_mc_clear(c, m);
+    if ecs_mc_len(c, m) != 0 { panic(106650); };
+    if ecs_mc_cursor_last(c) != 2 { panic(106651); };
+}
+
+@test "update_drops_old_and_missed"() {
+    // write 2, update (moves to A), write 1 more into B, lagging cursor sees missed after further update
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 10);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 11);
+    m = w.0;
+    // frame update: A gets [10,11], B empty, message_count=2, a_start was 0, after update a_start=0? 
+    // On first update from empty A: swap makes A=[10,11] with b_start which was 0; B cleared with start=2
+    m = ecs_mc_messages_update(m);
+    if ecs_mc_messages_a_len(m) != 2 { panic(106660); };
+    if ecs_mc_messages_b_len(m) != 0 { panic(106661); };
+    if ecs_mc_messages_b_start(m) != 2 { panic(106662); };
+    // lagging cursor still at 0
+    let c = ecs_mc_cursor_default();
+    if ecs_mc_missed(c, m) != 0 { panic(106663); };
+    // second update drops A content: oldest becomes previous B start (=2)
+    m = ecs_mc_messages_update(m);
+    if ecs_mc_messages_oldest(m) != 2 { panic(106664); };
+    if ecs_mc_missed(c, m) != 2 { panic(106665); };
+    // len clamped by remaining buffer (empty)
+    if ecs_mc_len(c, m) != 0 { panic(106666); };
+}
+
+@test "read_after_update_sees_a_then_b"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 2);
+    m = w.0;
+    m = ecs_mc_messages_update(m);
+    w = ecs_mc_messages_write(m, 3);
+    m = w.0;
+    // A=[1,2] start0, B=[3] start2
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read_all_values(c, m);
+    c = r.0;
+    if r.1 != 3 { panic(106670); };
+    if r.2 != 6 { panic(106671); };
+    if ecs_mc_cursor_last(c) != 3 { panic(106672); };
+}
+
+@test "iter_count_and_last"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 4);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 5);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 6);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read(c, m);
+    let it = r.1;
+    let cnt = ecs_mc_iter_count(it);
+    if cnt.0 != 3 { panic(106680); };
+    if cnt.1.last_message_count != 3 { panic(106681); };
+
+    // rebuild for last
+    c = ecs_mc_cursor_default();
+    r = ecs_mc_read(c, m);
+    it = r.1;
+    let last = ecs_mc_iter_last(it);
+    if last.0 != true { panic(106682); };
+    if last.1 != 6 { panic(106683); };
+    if last.2 != 2 { panic(106684); };
+    if last.3.unread != 0 { panic(106685); };
+}
+
+@test "iter_nth"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 7);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 8);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 9);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read(c, m);
+    let it = r.1;
+    let n = ecs_mc_iter_nth(it, 1);
+    if n.0 != true { panic(106690); };
+    if n.1 != 8 { panic(106691); };
+    if n.2 != 1 { panic(106692); };
+    // overshoot
+    n = ecs_mc_iter_nth(n.3, 5);
+    if n.0 != false { panic(106693); };
+}
+
+@test "par_read_unread"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 2);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let p = ecs_mc_par_read(c, m);
+    if ecs_mc_par_unread(p.1) != 2 { panic(106700); };
+    if ecs_mc_par_is_mut(p.1) != false { panic(106701); };
+    let pm = ecs_mc_par_read_mut(ecs_mc_cursor_default(), m);
+    if ecs_mc_par_is_mut(pm.1) != true { panic(106702); };
+    if ecs_mc_par_unread(pm.1) != 2 { panic(106703); };
+}
+
+@test "cursor_clone_independent_last"() {
+    let c = ecs_mc_cursor_default();
+    c.last_message_count = 5;
+    // cannot assign field from test easily without helper — use get_cursor_current path
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    c = ecs_mc_get_cursor_current(m);
+    let c2 = ecs_mc_cursor_clone(c);
+    if ecs_mc_cursor_last(c2) != ecs_mc_cursor_last(c) { panic(106710); };
+    c2 = ecs_mc_clear(c2, m);
+    // clear on clone does not need to affect original in value semantics
+    if ecs_mc_cursor_last(c2) != 1 { panic(106711); };
+}
+
+@test "partial_read_then_more_writes"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 2);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read(c, m);
+    c = r.0;
+    let it = r.1;
+    let n = ecs_mc_iter_next(it);
+    it = n.3;
+    c = ecs_mc_cursor_from_iter(it);
+    // one left
+    if ecs_mc_len(c, m) != 1 { panic(106720); };
+    w = ecs_mc_messages_write(m, 3);
+    m = w.0;
+    if ecs_mc_len(c, m) != 2 { panic(106721); };
+    let all = ecs_mc_read_all_values(c, m);
+    if all.1 != 2 { panic(106722); };
+    if all.2 != 5 { panic(106723); }; // 2+3
+}
+
+@test "messages_clear_resets_sequences"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    m = ecs_mc_messages_clear(m);
+    if ecs_mc_messages_len(m) != 0 { panic(106730); };
+    if ecs_mc_messages_oldest(m) != 1 { panic(106731); };
+    if ecs_mc_messages_message_count(m) != 1 { panic(106732); };
+}
+
+@test "read_without_id_values_only"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 42);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    let r = ecs_mc_read(c, m);
+    let n = ecs_mc_iter_next_value(r.1);
+    if n.0 != true { panic(106740); };
+    if n.1 != 42 { panic(106741); };
+}
+
+@test "len_clamps_to_buffer_after_missed"() {
+    let m = ecs_mc_messages_new();
+    let w = ecs_mc_messages_write(m, 1);
+    m = w.0;
+    w = ecs_mc_messages_write(m, 2);
+    m = w.0;
+    let c = ecs_mc_cursor_default();
+    m = ecs_mc_messages_update(m);
+    m = ecs_mc_messages_update(m);
+    // all dropped; message_count=2, buffer empty, last=0
+    let diff = 2;
+    if ecs_mc_missed(c, m) != 2 { panic(106750); };
+    if ecs_mc_len(c, m) != 0 { panic(106751); };
+    // write new after double update
+    w = ecs_mc_messages_write(m, 99);
+    m = w.0;
+    // last still 0, message_count 3, buffer len 1 => len = min(3,1)=1
+    if ecs_mc_len(c, m) != 1 { panic(106752); };
+    if ecs_mc_missed(c, m) != 2 { panic(106753); };
+}

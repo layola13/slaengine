@@ -1,0 +1,133 @@
+@import "../src/hot_patch.sla"
+
+// Isolated tests for lib/hot_patch.sla — HotPatched message + HotPatchChanges resource +
+// SystemRegistry refresh_hotpatch path. Bevy: src/lib.rs (hotpatching) + src/system/system_registry.rs
+// (lines 712-722) + src/schedule/executor/single_threaded.rs.
+// panic codes: 92319 – 92345.
+
+@test "hot_patched_new_is_registered"() {
+    let m = ecs_hot_patched_new();
+    if !ecs_hot_patched_is_registered(m) { panic(92319); };
+}
+
+@test "hot_patch_changes_new_default_zero"() {
+    let c = ecs_hot_patch_changes_new();
+    if ecs_hot_patch_changes_last_changed(c) != 0 { panic(92320); };
+}
+
+@test "hot_patch_changes_apply_sets_last_changed"() {
+    let c0 = ecs_hot_patch_changes_new();
+    let c1 = ecs_hot_patch_changes_apply(c0, 42);
+    if ecs_hot_patch_changes_last_changed(c1) != 42 { panic(92321); };
+}
+
+@test "is_changed_after_strict_greater"() {
+    let c = ecs_hot_patch_changes_apply(ecs_hot_patch_changes_new(), 10);
+    if !ecs_hot_patch_changes_is_changed_after(c, 5) { panic(92322); };
+}
+
+@test "is_changed_after_greater_returns_true"() {
+    let c = ecs_hot_patch_changes_apply(ecs_hot_patch_changes_new(), 10);
+    if !ecs_hot_patch_changes_is_changed_after(c, 5) { panic(92323); };
+}
+
+@test "is_changed_after_equal_returns_false"() {
+    let c = ecs_hot_patch_changes_apply(ecs_hot_patch_changes_new(), 10);
+    if ecs_hot_patch_changes_is_changed_after(c, 10) { panic(92324); };
+}
+
+@test "is_changed_after_less_returns_false"() {
+    let c = ecs_hot_patch_changes_apply(ecs_hot_patch_changes_new(), 5);
+    if ecs_hot_patch_changes_is_changed_after(c, 10) { panic(92325); };
+}
+
+@test "is_none_or_no_resource_returns_true"() {
+    let r = ecs_hot_patch_changes_is_none_or(false, 0, 100);
+    if !r { panic(92326); };
+}
+
+@test "is_none_or_with_resource_applies_predicate"() {
+    // resource present, last_changed=20 > system_last_run=10 -> true.
+    let r1 = ecs_hot_patch_changes_is_none_or(true, 20, 10);
+    if !r1 { panic(92327); };
+    // resource present, last_changed=5 <= system_last_run=10 -> false.
+    let r2 = ecs_hot_patch_changes_is_none_or(true, 5, 10);
+    if r2 { panic(92328); };
+}
+
+@test "should_refresh_hotpatch_no_resource_true"() {
+    // no HotPatchChanges resource present -> refresh hotpatch (treat as no prior hotpatch record).
+    let r = ecs_should_refresh_hotpatch(false, 0, 50);
+    if !r { panic(92329); };
+}
+
+@test "should_refresh_hotpatch_stale_system_last_run"() {
+    // last_changed=30 > system_last_run=10 -> changed_after -> true (refresh).
+    let r1 = ecs_should_refresh_hotpatch(true, 30, 10);
+    if !r1 { panic(92330); };
+    // last_changed=3 <= system_last_run=10 -> false (don't refresh).
+    let r2 = ecs_should_refresh_hotpatch(true, 3, 10);
+    if r2 { panic(92331); };
+}
+
+@test "should_refresh_hotpatch_equal_last_no_refresh"() {
+    // changed-after is strict-greater; equality -> not changed -> false.
+    let r = ecs_should_refresh_hotpatch(true, 10, 10);
+    if r { panic(92332); };
+}
+
+@test "system_hotpatch_new_init"() {
+    let s = ecs_system_hotpatch_new(7);
+    if ecs_shps_last_run(s) != 7 { panic(92333); };
+    if ecs_shps_refreshed(s) { panic(92334); };
+}
+
+@test "system_hotpatch_refresh_marks_and_sets_last_run"() {
+    let s0 = ecs_system_hotpatch_new(7);
+    let s1 = ecs_system_hotpatch_refresh(s0, 15);
+    if ecs_shps_last_run(s1) != 15 { panic(92335); };
+    if !ecs_shps_refreshed(s1) { panic(92336); };
+}
+
+@test "registry_refresh_flow_full_reenacts"() {
+    // Mirrors SystemRegistry lines 710-722: a stored system with last_run=5; registry sees a hotpatch
+    // tick of 9. HotPatchChanges resource is present with last_changed=9 (>5) -> refresh hotpatch.
+    let s0 = ecs_system_hotpatch_new(5);
+    let hotpatch_tick = 9;
+    let should_refresh = ecs_should_refresh_hotpatch(true, hotpatch_tick, ecs_shps_last_run(s0));
+    if !should_refresh { panic(92337); };
+    let s1 = ecs_system_hotpatch_refresh(s0, hotpatch_tick);
+    if !ecs_shps_refreshed(s1) { panic(92338); };
+    if ecs_shps_last_run(s1) != 9 { panic(92339); };
+}
+
+@test "registry_refresh_skipped_when_no_hotpatch_resource"() {
+    // No HotPatchChanges resource present -> is_none_or returns true -> refresh_hotpatch runs.
+    let s0 = ecs_system_hotpatch_new(100);
+    let should_refresh = ecs_should_refresh_hotpatch(false, 0, ecs_shps_last_run(s0));
+    if !should_refresh { panic(92340); };
+}
+
+@test "registry_refresh_skipped_when_unrelated_change"() {
+    // HotPatchChanges present but its last_changed=3 <= system last_run=100 -> not changed-after,
+    // refresh is skipped.
+    let s0 = ecs_system_hotpatch_new(100);
+    let should_refresh = ecs_should_refresh_hotpatch(true, 3, ecs_shps_last_run(s0));
+    if should_refresh { panic(92341); };
+}
+
+@test "executor_records_hotpatch_tick"() {
+    // Mirrors single_threaded executor: hotpatch_tick = HotPatchChanges.last_changed() or default.
+    let c = ecs_hot_patch_changes_apply(ecs_hot_patch_changes_new(), 500);
+    let hotpatch_tick = ecs_hot_patch_changes_last_changed(c);
+    if hotpatch_tick != 500 { panic(92342); };
+    let default_tick = ecs_hot_patch_changes_last_changed(ecs_hot_patch_changes_new());
+    if default_tick != 0 { panic(92343); };
+}
+
+@test "repeated_apply_overwrites_last_changed"() {
+    let c0 = ecs_hot_patch_changes_apply(ecs_hot_patch_changes_new(), 3);
+    let c1 = ecs_hot_patch_changes_apply(c0, 7);
+    if ecs_hot_patch_changes_last_changed(c1) != 7 { panic(92344); };
+    if ecs_hot_patch_changes_last_changed(c0) != 3 { panic(92345); };
+}

@@ -1,0 +1,315 @@
+// Isolated test: Bevy ECS Archetype + Lifecycle + Hierarchy + Resource parity.
+// Mirrors src/archetype.rs + src/lifecycle.rs + src/hierarchy.rs + src/resource.rs
+
+// === Archetype (src/archetype.rs) ===
+struct ArchetypeId { value: i32 }
+struct TableId { value: i32 }
+struct ArchetypeRow { value: i32 }
+struct TableRow { value: i32 }
+
+fn aid_new(v: i32) -> ArchetypeId { return ArchetypeId { value: v }; }
+fn aid_index(a: ArchetypeId) -> i32 { return a.value; }
+fn tid_new(v: i32) -> TableId { return TableId { value: v }; }
+fn arow_new(v: i32) -> ArchetypeRow { return ArchetypeRow { value: v }; }
+fn trow_new(v: i32) -> TableRow { return TableRow { value: v }; }
+
+struct ArchetypeEntity {
+    entity: i64,
+    archetype_row: i32,
+}
+
+struct Archetype {
+    id: ArchetypeId,
+    table_id: TableId,
+    entities: Vec<ArchetypeEntity>,
+    table_components: Vec<i32>,
+    sparse_set_components: Vec<i32>,
+    entity_to_table_row: Vec<i32>,
+    has_add_hook: bool,
+}
+
+fn arch_new(id: i32, table_id: i32) -> Archetype {
+    return Archetype { id: aid_new(id), table_id: tid_new(table_id), entities: Vec::new(), table_components: Vec::new(), sparse_set_components: Vec::new(), entity_to_table_row: Vec::new(), has_add_hook: false };
+}
+
+fn arch_id(a: Archetype) -> i32 { return aid_index(a.id); }
+fn arch_table_id(a: Archetype) -> i32 { return a.table_id.value; }
+fn arch_len(a: Archetype) -> i64 { return len(a.entities) as i64; }
+fn arch_is_empty(a: Archetype) -> bool { return len(a.entities) == 0; }
+
+fn arch_add_entity(a: Archetype, entity: i64, table_row: i32) -> Archetype {
+    let arow = len(a.entities) as i32;
+    a.entities.push(ArchetypeEntity { entity: entity, archetype_row: arow });
+    a.entity_to_table_row.push(table_row);
+    return a;
+}
+
+fn arch_contains(a: Archetype, cid: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(a.table_components) as i64;
+    while i < cnt { if a.table_components[i] == cid { return true; }; i = i + 1; }
+    let j: i64 = 0;
+    let scnt = len(a.sparse_set_components) as i64;
+    while j < scnt { if a.sparse_set_components[j] == cid { return true; }; j = j + 1; }
+    return false;
+}
+
+fn arch_add_table_component(a: Archetype, cid: i32) -> Archetype { a.table_components.push(cid); return a; }
+fn arch_add_sparse_set_component(a: Archetype, cid: i32) -> Archetype { a.sparse_set_components.push(cid); return a; }
+
+fn arch_component_count(a: Archetype) -> i64 {
+    return (len(a.table_components) as i64) + (len(a.sparse_set_components) as i64);
+}
+
+fn arch_entity_table_row(a: Archetype, row: i32) -> i32 {
+    return a.entity_to_table_row[row];
+}
+
+fn arch_has_add_hook(a: Archetype) -> bool { return a.has_add_hook; }
+fn arch_set_add_hook(a: Archetype) -> Archetype { a.has_add_hook = true; return a; }
+
+// Edges: archetype transition graph
+struct ArchetypeEdge {
+    bundle_id: i32,
+    target_archetype: i32,
+    kind: i32,  // 0=insert, 1=remove, 2=take
+}
+
+struct Edges {
+    edges: Vec<ArchetypeEdge>,
+}
+
+fn edges_new() -> Edges { return Edges { edges: Vec::new() }; }
+
+fn edges_insert(edges: Edges, bundle_id: i32, target: i32, kind: i32) -> Edges {
+    edges.edges.push(ArchetypeEdge { bundle_id: bundle_id, target_archetype: target, kind: kind });
+    return edges;
+}
+
+fn edges_get_after_bundle(edges: Edges, bundle_id: i32, kind: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(edges.edges) as i64;
+    while i < cnt {
+        if edges.edges[i].bundle_id == bundle_id {
+            if edges.edges[i].kind == kind { return edges.edges[i].target_archetype; };
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+const EDGE_INSERT: i32 = 0;
+const EDGE_REMOVE: i32 = 1;
+const EDGE_TAKE: i32 = 2;
+
+// === Lifecycle (src/lifecycle.rs) ===
+const LC_ADD: i32 = 0;
+const LC_INSERT: i32 = 1;
+const LC_DISCARD: i32 = 2;
+const LC_REMOVE: i32 = 3;
+const LC_DESPAWN: i32 = 4;
+
+struct EventKey { value: i32 }
+fn ek_new(v: i32) -> EventKey { return EventKey { value: v }; }
+fn ek_value(e: EventKey) -> i32 { return e.value; }
+
+// Lifecycle constants map to component constants
+fn lc_add_key() -> EventKey { return ek_new(LC_ADD); }
+fn lc_insert_key() -> EventKey { return ek_new(LC_INSERT); }
+fn lc_discard_key() -> EventKey { return ek_new(LC_DISCARD); }
+fn lc_remove_key() -> EventKey { return ek_new(LC_REMOVE); }
+fn lc_despawn_key() -> EventKey { return ek_new(LC_DESPAWN); }
+
+// RemovedComponent tracking
+struct RemovedComponentEntity {
+    entity: i64,
+}
+
+struct RemovedComponentMessages {
+    entities: Vec<i64>,
+}
+
+fn rcm_new() -> RemovedComponentMessages { return RemovedComponentMessages { entities: Vec::new() }; }
+fn rcm_push(rcm: RemovedComponentMessages, entity: i64) -> RemovedComponentMessages { rcm.entities.push(entity); return rcm; }
+fn rcm_len(rcm: RemovedComponentMessages) -> i64 { return len(rcm.entities) as i64; }
+fn rcm_is_empty(rcm: RemovedComponentMessages) -> bool { return len(rcm.entities) == 0; }
+fn rcm_get(rcm: RemovedComponentMessages, idx: i64) -> i64 { return rcm.entities[idx]; }
+
+// === Hierarchy (src/hierarchy.rs) ===
+// Children relationship: parent → list of children
+struct ChildEntity { entity: i64 }
+
+struct Children {
+    entities: Vec<i64>,
+}
+
+fn children_new() -> Children { return Children { entities: Vec::new() }; }
+fn children_push(c: Children, e: i64) -> Children { c.entities.push(e); return c; }
+fn children_len(c: Children) -> i64 { return len(c.entities) as i64; }
+fn children_is_empty(c: Children) -> bool { return len(c.entities) == 0; }
+fn children_get(c: Children, idx: i64) -> i64 { return c.entities[idx]; }
+
+fn children_push_child(c: Children, e: i64) -> Children { return children_push(c, e); }
+fn children_remove(c: Children, e: i64) -> Children {
+    let i: i64 = 0;
+    let cnt = len(c.entities) as i64;
+    while i < cnt {
+        if c.entities[i] == e { c.entities[i] = c.entities[cnt - 1]; c.entities.pop(); return c; };
+        i = i + 1;
+    }
+    return c;
+}
+
+// Parent relationship: child → parent
+struct Parent {
+    entity: i64,
+}
+
+fn parent_new(e: i64) -> Parent { return Parent { entity: e }; }
+fn parent_get(p: Parent) -> i64 { return p.entity; }
+
+// === Resource (src/resource.rs) ===
+const IS_RESOURCE: i32 = 5;
+
+struct Resource {
+    component_id: i32,
+    is_present: bool,
+}
+
+fn resource_new(cid: i32) -> Resource { return Resource { component_id: cid, is_present: false }; }
+fn resource_insert(r: Resource) -> Resource { r.is_present = true; return r; }
+fn resource_remove(r: Resource) -> Resource { r.is_present = false; return r; }
+fn resource_is_present(r: Resource) -> bool { return r.is_present; }
+fn resource_id(r: Resource) -> i32 { return r.component_id; }
+
+// === Tests ===
+
+@test "archetype new"() {
+    let a = arch_new(1, 10);
+    if arch_id(a) != 1 { panic(28001); };
+    if arch_table_id(a) != 10 { panic(28002); };
+    if arch_is_empty(a) != true { panic(28003); };
+}
+
+@test "archetype add entity"() {
+    let a = arch_add_entity(arch_new(1, 1), 100, 0);
+    if arch_len(a) != 1 { panic(28004); };
+}
+
+@test "archetype entity table row"() {
+    let a = arch_add_entity(arch_add_entity(arch_new(1, 1), 100, 5), 200, 10);
+    if arch_entity_table_row(a, 0) != 5 { panic(28005); };
+    if arch_entity_table_row(a, 1) != 10 { panic(28006); };
+}
+
+@test "archetype contains table component"() {
+    let a = arch_add_table_component(arch_new(1, 1), 42);
+    if arch_contains(a, 42) != true { panic(28007); };
+    if arch_contains(a, 99) != false { panic(28008); };
+}
+
+@test "archetype contains sparse set component"() {
+    let a = arch_add_sparse_set_component(arch_new(1, 1), 77);
+    if arch_contains(a, 77) != true { panic(28009); };
+}
+
+@test "archetype component count"() {
+    let a = arch_add_sparse_set_component(arch_add_table_component(arch_new(1, 1), 1), 2);
+    if arch_component_count(a) != 2 { panic(28010); };
+}
+
+@test "archetype has_add_hook"() {
+    let a = arch_set_add_hook(arch_new(1, 1));
+    if arch_has_add_hook(a) != true { panic(28011); };
+}
+
+@test "edges insert and lookup"() {
+    let e = edges_insert(edges_new(), 5, 10, EDGE_INSERT);
+    if edges_get_after_bundle(e, 5, EDGE_INSERT) != 10 { panic(28012); };
+}
+
+@test "edges lookup miss"() {
+    if edges_get_after_bundle(edges_new(), 5, EDGE_INSERT) != -1 { panic(28013); };
+}
+
+@test "edges remove kind"() {
+    let e = edges_insert(edges_insert(edges_new(), 5, 10, EDGE_INSERT), 5, 20, EDGE_REMOVE);
+    if edges_get_after_bundle(e, 5, EDGE_INSERT) != 10 { panic(28014); };
+    if edges_get_after_bundle(e, 5, EDGE_REMOVE) != 20 { panic(28015); };
+}
+
+@test "edges take kind"() {
+    let e = edges_insert(edges_new(), 5, 30, EDGE_TAKE);
+    if edges_get_after_bundle(e, 5, EDGE_TAKE) != 30 { panic(28016); };
+}
+
+@test "lifecycle add key"() {
+    if ek_value(lc_add_key()) != LC_ADD { panic(28017); };
+}
+
+@test "lifecycle all keys"() {
+    if ek_value(lc_insert_key()) != LC_INSERT { panic(28018); };
+    if ek_value(lc_discard_key()) != LC_DISCARD { panic(28019); };
+    if ek_value(lc_remove_key()) != LC_REMOVE { panic(28020); };
+    if ek_value(lc_despawn_key()) != LC_DESPAWN { panic(28021); };
+}
+
+@test "removed component messages push"() {
+    let rcm = rcm_push(rcm_push(rcm_new(), 10), 20);
+    if rcm_len(rcm) != 2 { panic(28022); };
+}
+
+@test "removed component messages get"() {
+    let rcm = rcm_push(rcm_new(), 42);
+    if rcm_get(rcm, 0) != 42 { panic(28023); };
+}
+
+@test "removed component messages is_empty"() {
+    if rcm_is_empty(rcm_new()) != true { panic(28024); };
+    if rcm_is_empty(rcm_push(rcm_new(), 1)) != false { panic(28025); };
+}
+
+@test "children new empty"() {
+    let c = children_new();
+    if children_is_empty(c) != true { panic(28026); };
+}
+
+@test "children push and len"() {
+    let c = children_push(children_push(children_new(), 10), 20);
+    if children_len(c) != 2 { panic(28027); };
+}
+
+@test "children get"() {
+    let c = children_push(children_push(children_new(), 10), 20);
+    if children_get(c, 0) != 10 { panic(28028); };
+    if children_get(c, 1) != 20 { panic(28029); };
+}
+
+@test "children remove"() {
+    let c = children_remove(children_push(children_push(children_new(), 10), 20), 10);
+    if children_len(c) != 1 { panic(28030); };
+}
+
+@test "children remove absent"() {
+    let c = children_remove(children_push(children_new(), 10), 99);
+    if children_len(c) != 1 { panic(28031); };
+}
+
+@test "parent new and get"() {
+    let p = parent_new(42);
+    if parent_get(p) != 42 { panic(28032); };
+}
+
+@test "resource insert"() {
+    let r = resource_insert(resource_new(5));
+    if resource_is_present(r) != true { panic(28033); };
+}
+
+@test "resource remove"() {
+    let r = resource_remove(resource_insert(resource_new(5)));
+    if resource_is_present(r) != false { panic(28034); };
+}
+
+@test "resource id"() {
+    if resource_id(resource_new(77)) != 77 { panic(28035); };
+}

@@ -1,0 +1,215 @@
+@import "../src/function_system_deep.sla"
+
+// Batch 185 tests for SystemMeta flags, FunctionSystem lifecycle/errors,
+// IntoResult mapping, clone de-init, SystemState cache.
+
+@test "system_meta_new_defaults"() {
+    let m = ecs_system_meta_deep_new(42);
+    if ecs_system_meta_deep_name(m) != 42 { panic(101400); };
+    if ecs_system_meta_deep_flags(m) != ECS_FSF_EMPTY { panic(101401); };
+    if ecs_system_meta_deep_last_run(m) != 0 { panic(101402); };
+    if ecs_system_meta_deep_is_send(m) != true { panic(101403); };
+    if ecs_system_meta_deep_has_deferred(m) != false { panic(101404); };
+    if ecs_system_meta_deep_is_exclusive(m) != false { panic(101405); };
+}
+
+@test "system_meta_set_name_and_last_run"() {
+    let m = ecs_system_meta_deep_new(1);
+    m = ecs_system_meta_deep_set_name(m, 99);
+    if ecs_system_meta_deep_name(m) != 99 { panic(101410); };
+    m = ecs_system_meta_deep_set_last_run(m, 7);
+    if ecs_system_meta_deep_last_run(m) != 7 { panic(101411); };
+}
+
+@test "system_meta_non_send_irreversible"() {
+    let m = ecs_system_meta_deep_new(1);
+    m = ecs_system_meta_deep_set_non_send(m);
+    if ecs_system_meta_deep_is_send(m) != false { panic(101420); };
+    if (ecs_system_meta_deep_flags(m) & ECS_FSF_NON_SEND) == 0 { panic(101421); };
+    // second set stays non-send
+    m = ecs_system_meta_deep_set_non_send(m);
+    if ecs_system_meta_deep_is_send(m) != false { panic(101422); };
+}
+
+@test "system_meta_deferred_and_exclusive_flags"() {
+    let m = ecs_system_meta_deep_new(1);
+    m = ecs_system_meta_deep_set_has_deferred(m);
+    if ecs_system_meta_deep_has_deferred(m) != true { panic(101430); };
+    m = ecs_system_meta_deep_set_exclusive(m);
+    if ecs_system_meta_deep_is_exclusive(m) != true { panic(101431); };
+    if (ecs_system_meta_deep_flags(m) & ECS_FSF_DEFERRED) == 0 { panic(101432); };
+    if (ecs_system_meta_deep_flags(m) & ECS_FSF_EXCLUSIVE) == 0 { panic(101433); };
+}
+
+@test "into_result_plain_and_result_ok_err"() {
+    let ok = ecs_into_result_from_plain(12);
+    if ecs_into_result_is_ok(ok) != true { panic(101440); };
+    if ecs_into_result_value(ok) != 12 { panic(101441); };
+    let rok = ecs_into_result_from_result(true, 5, 0);
+    if ecs_into_result_is_ok(rok) != true { panic(101442); };
+    if ecs_into_result_value(rok) != 5 { panic(101443); };
+    let rerr = ecs_into_result_from_result(false, 0, 77);
+    if ecs_into_result_is_ok(rerr) != false { panic(101444); };
+    if ecs_into_result_err_code(rerr) != 77 { panic(101445); };
+}
+
+@test "into_result_bevy_error_maps_to_err"() {
+    let ok = ecs_into_result_from_bevy_error(true, 3, 0);
+    if ecs_into_result_is_ok(ok) != true { panic(101450); };
+    if ecs_into_result_value(ok) != 3 { panic(101451); };
+    let err = ecs_into_result_from_bevy_error(false, 0, 55);
+    if ecs_into_result_is_ok(err) != false { panic(101452); };
+    if ecs_into_result_err_code(err) != 55 { panic(101453); };
+}
+
+@test "function_system_new_uninitialized"() {
+    let s = ecs_function_system_deep_new(10);
+    if ecs_function_system_deep_name(s) != 10 { panic(101460); };
+    if ecs_function_system_deep_has_state(s) != false { panic(101461); };
+    if ecs_function_system_deep_world_id(s) != 0 { panic(101462); };
+    if ecs_function_system_deep_run_count(s) != 0 { panic(101463); };
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_OK { panic(101464); };
+    if ecs_function_system_deep_is_send(s) != true { panic(101465); };
+}
+
+@test "run_unsafe_errors_when_uninitialized"() {
+    let s = ecs_function_system_deep_new(1);
+    s = ecs_function_system_deep_run_plain(s, 1, 1, 99);
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_UNINITIALIZED { panic(101470); };
+    if ecs_function_system_deep_run_count(s) != 0 { panic(101471); };
+}
+
+@test "initialize_then_run_plain_ok"() {
+    let s = ecs_function_system_deep_from_func(20);
+    s = ecs_function_system_deep_initialize(s, 100, 7);
+    if ecs_function_system_deep_has_state(s) != true { panic(101480); };
+    if ecs_function_system_deep_world_id(s) != 100 { panic(101481); };
+    s = ecs_function_system_deep_run_plain(s, 100, 50, 42);
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_OK { panic(101482); };
+    if ecs_function_system_deep_last_output(s) != 42 { panic(101483); };
+    if ecs_function_system_deep_run_count(s) != 1 { panic(101484); };
+    if ecs_function_system_deep_last_run(s) != 50 { panic(101485); };
+}
+
+@test "run_unsafe_world_mismatch"() {
+    let s = ecs_function_system_deep_initialize(ecs_function_system_deep_new(1), 10, 1);
+    s = ecs_function_system_deep_run_plain(s, 11, 1, 1);
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_WORLD_MISMATCH { panic(101490); };
+    if ecs_function_system_deep_run_count(s) != 0 { panic(101491); };
+}
+
+@test "run_unsafe_param_validation_fail"() {
+    let s = ecs_function_system_deep_initialize(ecs_function_system_deep_new(1), 5, 2);
+    s = ecs_function_system_deep_run_unsafe(s, 5, 1, false, 123, 0, false, true, 0);
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_PARAM { panic(101500); };
+    if ecs_function_system_deep_last_err_code(s) != 123 { panic(101501); };
+    if ecs_function_system_deep_run_count(s) != 0 { panic(101502); };
+}
+
+@test "run_unsafe_into_result_err"() {
+    let s = ecs_function_system_deep_initialize(ecs_function_system_deep_new(1), 5, 2);
+    s = ecs_function_system_deep_run_unsafe(s, 5, 9, true, 0, 0, true, false, 88);
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_INTO_RESULT { panic(101510); };
+    if ecs_function_system_deep_last_err_code(s) != 88 { panic(101511); };
+    // run still increments and records last_run before result mapping outcome
+    if ecs_function_system_deep_run_count(s) != 1 { panic(101512); };
+    if ecs_function_system_deep_last_run(s) != 9 { panic(101513); };
+}
+
+@test "run_unsafe_result_ok_path"() {
+    let s = ecs_function_system_deep_initialize(ecs_function_system_deep_new(1), 5, 2);
+    s = ecs_function_system_deep_run_unsafe(s, 5, 3, true, 0, 17, true, true, 0);
+    if ecs_function_system_deep_last_error(s) != ECS_FS_ERR_OK { panic(101520); };
+    if ecs_function_system_deep_last_output(s) != 17 { panic(101521); };
+    if ecs_function_system_deep_run_count(s) != 1 { panic(101522); };
+}
+
+@test "with_name_and_meta_flags_on_system"() {
+    let s = ecs_function_system_deep_new(1);
+    s = ecs_function_system_deep_with_name(s, 77);
+    if ecs_function_system_deep_name(s) != 77 { panic(101530); };
+    s = ecs_function_system_deep_set_non_send(s);
+    if ecs_function_system_deep_is_send(s) != false { panic(101531); };
+    if ecs_function_system_deep_meta_is_send(s) != false { panic(101532); };
+    s = ecs_function_system_deep_set_has_deferred(s);
+    if ecs_function_system_deep_has_deferred(s) != true { panic(101533); };
+    s = ecs_function_system_deep_set_exclusive(s);
+    if (ecs_function_system_deep_flags(s) & ECS_FSF_EXCLUSIVE) == 0 { panic(101534); };
+    s = ecs_function_system_deep_set_last_run(s, 66);
+    if ecs_function_system_deep_last_run(s) != 66 { panic(101535); };
+}
+
+@test "clone_deinitializes_state"() {
+    let s = ecs_function_system_deep_initialize(ecs_function_system_deep_new(44), 9, 3);
+    s = ecs_function_system_deep_set_non_send(s);
+    s = ecs_function_system_deep_set_has_deferred(s);
+    s = ecs_function_system_deep_run_plain(s, 9, 1, 5);
+    let c = ecs_function_system_deep_clone(s);
+    if ecs_function_system_deep_name(c) != 44 { panic(101540); };
+    if ecs_function_system_deep_has_state(c) != false { panic(101541); };
+    if ecs_function_system_deep_world_id(c) != 0 { panic(101542); };
+    if ecs_function_system_deep_run_count(c) != 0 { panic(101543); };
+    if ecs_function_system_deep_flags(c) != ECS_FSF_EMPTY { panic(101544); };
+    if ecs_function_system_deep_last_run(c) != 0 { panic(101545); };
+    // original still initialized
+    if ecs_function_system_deep_has_state(s) != true { panic(101546); };
+}
+
+@test "system_state_new_and_matches_world"() {
+    let st = ecs_system_state_deep_fs_new(3, 100);
+    if ecs_system_state_deep_fs_param_id(st) != 3 { panic(101550); };
+    if ecs_system_state_deep_fs_world_id(st) != 100 { panic(101551); };
+    if ecs_system_state_deep_fs_initialized(st) != true { panic(101552); };
+    if ecs_system_state_deep_fs_matches_world(st, 100) != true { panic(101553); };
+    if ecs_system_state_deep_fs_matches_world(st, 101) != false { panic(101554); };
+}
+
+@test "system_state_get_mut_get_apply"() {
+    let st = ecs_system_state_deep_fs_new(1, 10);
+    st = ecs_system_state_deep_fs_get_mut(st, 10, 42);
+    if ecs_system_state_deep_fs_cached_value(st) != 42 { panic(101560); };
+    if ecs_system_state_deep_fs_applied(st) != false { panic(101561); };
+    let g = ecs_system_state_deep_fs_get(st, 10);
+    if g.0 != true { panic(101562); };
+    if g.1 != 42 { panic(101563); };
+    let bad = ecs_system_state_deep_fs_get(st, 11);
+    if bad.0 != false { panic(101564); };
+    // mismatch get_mut leaves value
+    st = ecs_system_state_deep_fs_get_mut(st, 11, 99);
+    if ecs_system_state_deep_fs_cached_value(st) != 42 { panic(101565); };
+    st = ecs_system_state_deep_fs_apply(st);
+    if ecs_system_state_deep_fs_applied(st) != true { panic(101566); };
+}
+
+@test "system_state_from_builder_and_build_system"() {
+    let st = ecs_system_state_deep_fs_from_builder(8, 200);
+    if ecs_system_state_deep_fs_param_id(st) != 8 { panic(101570); };
+    if ecs_system_state_deep_fs_world_id(st) != 200 { panic(101571); };
+    let fs = ecs_system_state_deep_fs_build_system(st, 33);
+    if ecs_function_system_deep_name(fs) != 33 { panic(101572); };
+    if ecs_function_system_deep_has_state(fs) != true { panic(101573); };
+    if ecs_function_system_deep_world_id(fs) != 200 { panic(101574); };
+    fs = ecs_function_system_deep_run_plain(fs, 200, 1, 9);
+    if ecs_function_system_deep_last_output(fs) != 9 { panic(101575); };
+}
+
+@test "markers_is_function_system_and_has_system_input"() {
+    if ecs_is_function_system_marker() != 1 { panic(101580); };
+    if ecs_has_system_input_marker() != 1 { panic(101581); };
+}
+
+@test "lifecycle_init_run_twice_clone_reinit"() {
+    let s = ecs_function_system_deep_new(1);
+    s = ecs_function_system_deep_initialize(s, 1, 1);
+    s = ecs_function_system_deep_run_plain(s, 1, 10, 1);
+    s = ecs_function_system_deep_run_plain(s, 1, 20, 2);
+    if ecs_function_system_deep_run_count(s) != 2 { panic(101590); };
+    if ecs_function_system_deep_last_output(s) != 2 { panic(101591); };
+    if ecs_function_system_deep_last_run(s) != 20 { panic(101592); };
+    let c = ecs_function_system_deep_clone(s);
+    c = ecs_function_system_deep_initialize(c, 2, 5);
+    c = ecs_function_system_deep_run_plain(c, 2, 30, 7);
+    if ecs_function_system_deep_last_error(c) != ECS_FS_ERR_OK { panic(101593); };
+    if ecs_function_system_deep_last_output(c) != 7 { panic(101594); };
+    if ecs_function_system_deep_run_count(c) != 1 { panic(101595); };
+}

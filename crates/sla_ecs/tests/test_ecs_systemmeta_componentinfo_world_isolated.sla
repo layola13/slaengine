@@ -1,0 +1,369 @@
+// Isolated test: Bevy ECS SystemMeta/FunctionSystem + ComponentInfo/Descriptor +
+// WorldId/CommandQueue + ComponentHooks + Reflect registries parity.
+// Mirrors src/system/function_system.rs + src/component/info.rs + src/world/identifier.rs +
+// src/world/command_queue.rs + src/component/mod.rs (hooks) + src/reflect/mod.rs
+
+// === SystemMeta + FunctionSystem (src/system/function_system.rs) ===
+struct SystemMeta {
+    name: i64,
+    is_send: bool,
+    is_exclusive: bool,
+    has_deferred: bool,
+    last_run: i64,
+}
+
+fn sm_new(name: i64) -> SystemMeta {
+    return SystemMeta { name: name, is_send: true, is_exclusive: false, has_deferred: false, last_run: 0 };
+}
+
+fn sm_name(m: SystemMeta) -> i64 { return m.name; }
+fn sm_set_name(m: SystemMeta, name: i64) -> SystemMeta { m.name = name; return m; }
+fn sm_is_send(m: SystemMeta) -> bool { return m.is_send; }
+fn sm_set_non_send(m: SystemMeta) -> SystemMeta { m.is_send = false; return m; }
+fn sm_has_deferred(m: SystemMeta) -> bool { return m.has_deferred; }
+fn sm_set_has_deferred(m: SystemMeta) -> SystemMeta { m.has_deferred = true; return m; }
+fn sm_set_exclusive(m: SystemMeta) -> SystemMeta { m.is_exclusive = true; return m; }
+fn sm_is_exclusive(m: SystemMeta) -> bool { return m.is_exclusive; }
+fn sm_get_last_run(m: SystemMeta) -> i64 { return m.last_run; }
+fn sm_set_last_run(m: SystemMeta, tick: i64) -> SystemMeta { m.last_run = tick; return m; }
+
+struct FunctionSystem {
+    meta: SystemMeta,
+    run_count: i64,
+    last_result: i64,
+}
+
+fn fs_new(name: i64) -> FunctionSystem {
+    return FunctionSystem { meta: sm_new(name), run_count: 0, last_result: 0 };
+}
+
+fn fs_with_name(fs: FunctionSystem, name: i64) -> FunctionSystem { fs.meta = sm_set_name(fs.meta, name); return fs; }
+fn fs_run(fs: FunctionSystem, result: i64) -> FunctionSystem { fs.run_count = fs.run_count + 1; fs.last_result = result; return fs; }
+fn fs_run_count(fs: FunctionSystem) -> i64 { return fs.run_count; }
+fn fs_last_result(fs: FunctionSystem) -> i64 { return fs.last_result; }
+fn fs_name(fs: FunctionSystem) -> i64 { return sm_name(fs.meta); }
+
+// SystemState<Param>
+struct SystemState {
+    meta: SystemMeta,
+    world_id: i64,
+    is_initialized: bool,
+}
+
+fn ss_new(world_id: i64) -> SystemState {
+    return SystemState { meta: sm_new(0), world_id: world_id, is_initialized: false };
+}
+
+fn ss_meta(ss: SystemState) -> SystemMeta { return ss.meta; }
+fn ss_matches_world(ss: SystemState, world_id: i64) -> bool { return ss.world_id == world_id; }
+fn ss_init(ss: SystemState) -> SystemState { ss.is_initialized = true; return ss; }
+
+// === ComponentInfo (src/component/info.rs) ===
+const STORAGE_TABLE: i32 = 0;
+const STORAGE_SPARSE_SET: i32 = 1;
+
+struct ComponentInfo {
+    id: i32,
+    name: i64,
+    mutable: bool,
+    storage_type: i32,
+    is_send_sync: bool,
+    layout_align: i64,
+    layout_size: i64,
+    has_drop: bool,
+}
+
+fn ci_new(id: i32, name: i64) -> ComponentInfo {
+    return ComponentInfo { id: id, name: name, mutable: true, storage_type: STORAGE_TABLE, is_send_sync: true, layout_align: 8, layout_size: 0, has_drop: false };
+}
+
+fn ci_id(ci: ComponentInfo) -> i32 { return ci.id; }
+fn ci_name(ci: ComponentInfo) -> i64 { return ci.name; }
+fn ci_mutable(ci: ComponentInfo) -> bool { return ci.mutable; }
+fn ci_set_immutable(ci: ComponentInfo) -> ComponentInfo { ci.mutable = false; return ci; }
+fn ci_storage_type(ci: ComponentInfo) -> i32 { return ci.storage_type; }
+fn ci_set_sparse_set(ci: ComponentInfo) -> ComponentInfo { ci.storage_type = STORAGE_SPARSE_SET; return ci; }
+fn ci_is_send_and_sync(ci: ComponentInfo) -> bool { return ci.is_send_sync; }
+fn ci_set_non_send(ci: ComponentInfo) -> ComponentInfo { ci.is_send_sync = false; return ci; }
+fn ci_layout_align(ci: ComponentInfo) -> i64 { return ci.layout_align; }
+fn ci_layout_size(ci: ComponentInfo) -> i64 { return ci.layout_size; }
+fn ci_set_layout(ci: ComponentInfo, align: i64, size: i64) -> ComponentInfo { ci.layout_align = align; ci.layout_size = size; return ci; }
+fn ci_has_drop(ci: ComponentInfo) -> bool { return ci.has_drop; }
+fn ci_set_drop(ci: ComponentInfo) -> ComponentInfo { ci.has_drop = true; return ci; }
+
+// ComponentDescriptor
+struct ComponentDescriptor {
+    name: i64,
+    storage_type: i32,
+    is_send_sync: bool,
+    is_resource: bool,
+}
+
+fn cd_new(name: i64) -> ComponentDescriptor {
+    return ComponentDescriptor { name: name, storage_type: STORAGE_TABLE, is_send_sync: true, is_resource: false };
+}
+
+fn cd_new_resource(name: i64) -> ComponentDescriptor {
+    return ComponentDescriptor { name: name, storage_type: STORAGE_SPARSE_SET, is_send_sync: true, is_resource: true };
+}
+
+fn cd_storage_type(cd: ComponentDescriptor) -> i32 { return cd.storage_type; }
+fn cd_is_resource(cd: ComponentDescriptor) -> bool { return cd.is_resource; }
+fn cd_set_non_send(cd: ComponentDescriptor) -> ComponentDescriptor { cd.is_send_sync = false; return cd; }
+
+// === WorldId (src/world/identifier.rs) ===
+struct WorldId {
+    value: i64,
+}
+
+fn world_id_new(counter: i64) -> (i64, WorldId) {
+    let next = counter + 1;
+    return (next, WorldId { value: next });
+}
+
+fn world_id_value(w: WorldId) -> i64 { return w.value; }
+fn world_id_eq(a: WorldId, b: WorldId) -> bool { return a.value == b.value; }
+
+// === CommandQueue (src/world/command_queue.rs) ===
+struct CommandQueue {
+    commands: Vec<i64>,
+}
+
+fn cq_new() -> CommandQueue { return CommandQueue { commands: Vec::new() }; }
+fn cq_silent() -> CommandQueue { return CommandQueue { commands: Vec::new() }; }
+
+fn cq_push(cq: CommandQueue, cmd: i64) -> CommandQueue { cq.commands.push(cmd); return cq; }
+
+fn cq_apply(cq: CommandQueue, applied: Vec<i64>) -> (Vec<i64>, CommandQueue) {
+    let i: i64 = 0;
+    let cnt = len(cq.commands) as i64;
+    while i < cnt { applied.push(cq.commands[i]); i = i + 1; }
+    return (applied, cq);
+}
+
+fn cq_append(cq: CommandQueue, other: CommandQueue) -> CommandQueue {
+    let i: i64 = 0;
+    let cnt = len(other.commands) as i64;
+    while i < cnt { cq.commands.push(other.commands[i]); i = i + 1; }
+    return cq;
+}
+
+fn cq_is_empty(cq: CommandQueue) -> bool { return len(cq.commands) == 0; }
+fn cq_len(cq: CommandQueue) -> i64 { return len(cq.commands) as i64; }
+
+// === ComponentHooks (src/component/mod.rs) ===
+struct ComponentHooks {
+    on_add: bool,
+    on_insert: bool,
+    on_replace: bool,
+    on_remove: bool,
+    on_despawn: bool,
+}
+
+fn ch_new() -> ComponentHooks {
+    return ComponentHooks { on_add: false, on_insert: false, on_replace: false, on_remove: false, on_despawn: false };
+}
+
+fn ch_on_add(h: ComponentHooks) -> ComponentHooks { h.on_add = true; return h; }
+fn ch_on_insert(h: ComponentHooks) -> ComponentHooks { h.on_insert = true; return h; }
+fn ch_on_replace(h: ComponentHooks) -> ComponentHooks { h.on_replace = true; return h; }
+fn ch_on_remove(h: ComponentHooks) -> ComponentHooks { h.on_remove = true; return h; }
+fn ch_on_despawn(h: ComponentHooks) -> ComponentHooks { h.on_despawn = true; return h; }
+
+fn ch_has_on_add(h: ComponentHooks) -> bool { return h.on_add; }
+fn ch_has_on_insert(h: ComponentHooks) -> bool { return h.on_insert; }
+fn ch_has_on_replace(h: ComponentHooks) -> bool { return h.on_replace; }
+fn ch_has_on_remove(h: ComponentHooks) -> bool { return h.on_remove; }
+fn ch_has_on_despawn(h: ComponentHooks) -> bool { return h.on_despawn; }
+
+// === Reflect: AppTypeRegistry + AppFunctionRegistry (src/reflect/mod.rs) ===
+struct AppTypeRegistry {
+    type_count: i64,
+}
+
+fn atr_new() -> AppTypeRegistry { return AppTypeRegistry { type_count: 0 }; }
+fn atr_register(atr: AppTypeRegistry) -> AppTypeRegistry { atr.type_count = atr.type_count + 1; return atr; }
+fn atr_count(atr: AppTypeRegistry) -> i64 { return atr.type_count; }
+
+struct AppFunctionRegistry {
+    fn_count: i64,
+}
+
+fn afr_new() -> AppFunctionRegistry { return AppFunctionRegistry { fn_count: 0 }; }
+fn afr_register(afr: AppFunctionRegistry) -> AppFunctionRegistry { afr.fn_count = afr.fn_count + 1; return afr; }
+fn afr_count(afr: AppFunctionRegistry) -> i64 { return afr.fn_count; }
+
+// === Tests ===
+
+@test "system meta new"() {
+    let m = sm_new(42);
+    if sm_name(m) != 42 { panic(27001); };
+    if sm_is_send(m) != true { panic(27002); };
+}
+
+@test "system meta set_non_send"() {
+    let m = sm_set_non_send(sm_new(1));
+    if sm_is_send(m) != false { panic(27003); };
+}
+
+@test "system meta set_exclusive"() {
+    let m = sm_set_exclusive(sm_new(1));
+    if sm_is_exclusive(m) != true { panic(27004); };
+}
+
+@test "system meta set_has_deferred"() {
+    let m = sm_set_has_deferred(sm_new(1));
+    if sm_has_deferred(m) != true { panic(27005); };
+}
+
+@test "system meta last_run"() {
+    let m = sm_set_last_run(sm_new(1), 100);
+    if sm_get_last_run(m) != 100 { panic(27006); };
+}
+
+@test "system meta set_name"() {
+    let m = sm_set_name(sm_new(1), 99);
+    if sm_name(m) != 99 { panic(27007); };
+}
+
+@test "function system with_name"() {
+    let fs = fs_with_name(fs_new(1), 55);
+    if fs_name(fs) != 55 { panic(27008); };
+}
+
+@test "function system run"() {
+    let fs = fs_run(fs_run(fs_new(1), 10), 20);
+    if fs_run_count(fs) != 2 { panic(27009); };
+    if fs_last_result(fs) != 20 { panic(27010); };
+}
+
+@test "system state matches_world"() {
+    let ss = ss_new(100);
+    if ss_matches_world(ss, 100) != true { panic(27011); };
+    if ss_matches_world(ss, 200) != false { panic(27012); };
+}
+
+@test "system state init"() {
+    let ss = ss_init(ss_new(1));
+    if ss.is_initialized != true { panic(27013); };
+}
+
+@test "component info new"() {
+    let ci = ci_new(5, 42);
+    if ci_id(ci) != 5 { panic(27014); };
+    if ci_name(ci) != 42 { panic(27015); };
+    if ci_mutable(ci) != true { panic(27016); };
+}
+
+@test "component info set_immutable"() {
+    let ci = ci_set_immutable(ci_new(1, 1));
+    if ci_mutable(ci) != false { panic(27017); };
+}
+
+@test "component info storage type"() {
+    let ci = ci_set_sparse_set(ci_new(1, 1));
+    if ci_storage_type(ci) != STORAGE_SPARSE_SET { panic(27018); };
+}
+
+@test "component info non_send"() {
+    let ci = ci_set_non_send(ci_new(1, 1));
+    if ci_is_send_and_sync(ci) != false { panic(27019); };
+}
+
+@test "component info layout"() {
+    let ci = ci_set_layout(ci_new(1, 1), 16, 32);
+    if ci_layout_align(ci) != 16 { panic(27020); };
+    if ci_layout_size(ci) != 32 { panic(27021); };
+}
+
+@test "component info drop"() {
+    let ci = ci_set_drop(ci_new(1, 1));
+    if ci_has_drop(ci) != true { panic(27022); };
+}
+
+@test "component descriptor new"() {
+    let cd = cd_new(42);
+    if cd_is_resource(cd) != false { panic(27023); };
+    if cd_storage_type(cd) != STORAGE_TABLE { panic(27024); };
+}
+
+@test "component descriptor new_resource"() {
+    let cd = cd_new_resource(42);
+    if cd_is_resource(cd) != true { panic(27025); };
+    if cd_storage_type(cd) != STORAGE_SPARSE_SET { panic(27026); };
+}
+
+@test "component descriptor set_non_send"() {
+    let cd = cd_set_non_send(cd_new(1));
+    if cd.is_send_sync != false { panic(27027); };
+}
+
+@test "world id unique"() {
+    let r1 = world_id_new(0);
+    let r2 = world_id_new(r1.0);
+    if world_id_value(r1.1) == world_id_value(r2.1) { panic(27028); };
+}
+
+@test "world id eq"() {
+    let w = WorldId { value: 5 };
+    if world_id_eq(w, WorldId { value: 5 }) != true { panic(27029); };
+    if world_id_eq(w, WorldId { value: 6 }) != false { panic(27030); };
+}
+
+@test "command queue push and len"() {
+    let cq = cq_push(cq_push(cq_new(), 1), 2);
+    if cq_len(cq) != 2 { panic(27031); };
+    if cq_is_empty(cq) != false { panic(27032); };
+}
+
+@test "command queue is_empty"() {
+    if cq_is_empty(cq_new()) != true { panic(27033); };
+}
+
+@test "command queue apply"() {
+    let cq = cq_push(cq_push(cq_new(), 10), 20);
+    let r = cq_apply(cq, Vec::new());
+    if len(r.0) as i64 != 2 { panic(27034); };
+    if r.0[0] != 10 { panic(27035); };
+}
+
+@test "command queue append"() {
+    let cq1 = cq_push(cq_new(), 1);
+    let cq2 = cq_push(cq_new(), 2);
+    let merged = cq_append(cq1, cq2);
+    if cq_len(merged) != 2 { panic(27036); };
+}
+
+@test "command queue silent"() {
+    let cq = cq_silent();
+    if cq_is_empty(cq) != true { panic(27037); };
+}
+
+@test "component hooks new"() {
+    let h = ch_new();
+    if ch_has_on_add(h) != false { panic(27038); };
+}
+
+@test "component hooks on_add"() {
+    let h = ch_on_add(ch_new());
+    if ch_has_on_add(h) != true { panic(27039); };
+}
+
+@test "component hooks all"() {
+    let h = ch_on_despawn(ch_on_remove(ch_on_replace(ch_on_insert(ch_on_add(ch_new())))));
+    if ch_has_on_add(h) != true { panic(27040); };
+    if ch_has_on_insert(h) != true { panic(27041); };
+    if ch_has_on_replace(h) != true { panic(27042); };
+    if ch_has_on_remove(h) != true { panic(27043); };
+    if ch_has_on_despawn(h) != true { panic(27044); };
+}
+
+@test "app type registry register"() {
+    let atr = atr_register(atr_register(atr_new()));
+    if atr_count(atr) != 2 { panic(27045); };
+}
+
+@test "app function registry register"() {
+    let afr = afr_register(afr_register(afr_new()));
+    if afr_count(afr) != 2 { panic(27046); };
+}

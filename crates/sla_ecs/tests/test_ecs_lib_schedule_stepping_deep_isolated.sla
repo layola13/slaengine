@@ -1,0 +1,258 @@
+// Isolated deep tests for lib/schedule_stepping_deep.sla (Batch 382).
+// Mirrors Bevy src/schedule/stepping.rs Stepping::next_frame + ScheduleState::skipped_systems
+// using cap-8 schedules x cap-16 systems. No tuple-return destructuring in tests
+// (wrapper structs EcsStepSchedulesDeep / EcsStepCursorDeep / EcsStepSkippedDeep +
+// EcsSteppingDeepSkippedResultDeep with scalar accessors). No `let m = fn(m, ...)`
+// chained rebinds. panic codes: 142300 - 142399.
+
+@import "../src/schedule_stepping_deep.sla"
+
+@test "EcsSteppingDeepS new / actions / enable / disable / step / continue queueing"() {
+    let d0 = ecs_stepping_deep_new_s();
+    if ecs_stepping_deep_is_enabled_s(d0) != false { panic(142300); };
+    if ecs_stepping_deep_action_s(d0) != ECS_STEPPING_ACTION_RUN_ALL_D { panic(142301); };
+    if ecs_stepping_deep_update_count_s(d0) != 0 { panic(142302); };
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    if ecs_stepping_deep_update_count_s(d1) != 1 { panic(142303); };
+    let d2 = ecs_stepping_deep_step_frame_s(d1);
+    let d3 = ecs_stepping_deep_continue_frame_s(d2);
+    let d4 = ecs_stepping_deep_disable_s(d3);
+    if ecs_stepping_deep_update_count_s(d4) != 4 { panic(142304); };
+    // action is still RunAll until next_frame applies; only the update count grows.
+    if ecs_stepping_deep_action_s(d4) != ECS_STEPPING_ACTION_RUN_ALL_D { panic(142305); };
+    // Verify queued SET_ACTION records (action_or_label at each slot).
+    if _ecs_stepping_deep_uv_at(d4, 0) != ECS_STEPPING_UPDATE_SET_ACTION_D { panic(142306); };
+    if _ecs_stepping_deep_ua_at(d4, 0) != ECS_STEPPING_ACTION_WAITING_D { panic(142307); };
+    if _ecs_stepping_deep_ua_at(d4, 1) != ECS_STEPPING_ACTION_STEP_D { panic(142308); };
+    if _ecs_stepping_deep_ua_at(d4, 2) != ECS_STEPPING_ACTION_CONTINUE_D { panic(142309); };
+    if _ecs_stepping_deep_ua_at(d4, 3) != ECS_STEPPING_ACTION_RUN_ALL_D { panic(142310); };
+}
+
+@test "EcsSteppingDeepS next_frame apply add/remove/clear schedule + has_schedule"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 100);
+    let d3 = ecs_stepping_deep_queue_add_schedule_s(d2, 101);
+    let d4 = ecs_stepping_deep_queue_remove_schedule_s(d3, 100);
+    // update_count = enable + add(100) + add(101) + remove(100) = 4
+    if ecs_stepping_deep_update_count_s(d4) != 4 { panic(142311); };
+    let d5 = ecs_stepping_deep_next_frame_s(d4);
+    // After apply: update_count reset to 0.
+    if ecs_stepping_deep_update_count_s(d5) != 0 { panic(142312); };
+    // action applied: RunAll -> Waiting via enable.
+    if ecs_stepping_deep_action_s(d5) != ECS_STEPPING_ACTION_WAITING_D { panic(142313); };
+    if ecs_stepping_deep_is_enabled_s(d5) != true { panic(142314); };
+    // schedule 100 should be removed; 101 kept.
+    if ecs_stepping_deep_has_schedule_s(d5, 100) != false { panic(142315); };
+    if ecs_stepping_deep_has_schedule_s(d5, 101) != true { panic(142316); };
+    // so_count / st_count: 1 (101 only).
+    // Clear the remaining schedule via another apply.
+    let d6 = ecs_stepping_deep_queue_clear_schedule_s(d5, 101);
+    let d7 = ecs_stepping_deep_next_frame_s(d6);
+    // state exists but all behaviors reset to Continue (clear_all).
+    if ecs_stepping_deep_has_schedule_s(d7, 101) != true { panic(142317); };
+    if ecs_stepping_deep_behavior_for_s(d7, 101, 0) != ECS_SB_CONTINUE_D { panic(142318); };
+}
+
+@test "EcsSteppingDeepS set_behavior + behavior_for apply drain"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 200);
+    let d3 = ecs_stepping_deep_queue_set_behavior_s(d2, 200, 3, ECS_SB_BREAK_D);
+    if ecs_stepping_deep_update_count_s(d3) != 3 { panic(142320); };
+    let d4 = ecs_stepping_deep_next_frame_s(d3);
+    if ecs_stepping_deep_update_count_s(d4) != 0 { panic(142321); };
+    if ecs_stepping_deep_has_schedule_s(d4, 200) != true { panic(142322); };
+    // Reading behavior_for before skipped_systems runs apply_behavior_updates: enqueue SET sets pending.
+    // behavior_for reads the stored per-slot behavior b3; before apply_updates, b3 == Continue (default).
+    if ecs_stepping_deep_behavior_for_s(d4, 200, 3) != ECS_SB_CONTINUE_D { panic(142323); };
+    // Running skipped_systems drains the pending update; b3 should become Break.
+    let wr = ecs_stepping_deep_skipped_systems_s(d4, 200, 4);
+    let d5 = ecs_stepping_deep_skipped_result_d_s(wr);
+    if ecs_stepping_deep_behavior_for_s(d5, 200, 3) != ECS_SB_BREAK_D { panic(142324); };
+    let sk = ecs_stepping_deep_skipped_result_skipped_s(wr);
+    if ecs_stepping_deep_skipped_valid_s(sk) != true { panic(142325); };
+}
+
+@test "EcsSteppingDeepS clear_behavior apply"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 300);
+    let d3 = ecs_stepping_deep_queue_set_behavior_s(d2, 300, 5, ECS_SB_NEVER_RUN_D);
+    let d4 = ecs_stepping_deep_next_frame_s(d3);
+    // First skipped_systems drains pending -> b5 = NeverRun.
+    let wr1 = ecs_stepping_deep_skipped_systems_s(d4, 300, 8);
+    let d5 = ecs_stepping_deep_skipped_result_d_s(wr1);
+    if ecs_stepping_deep_behavior_for_s(d5, 300, 5) != ECS_SB_NEVER_RUN_D { panic(142330); };
+    // Now queue a clear_behavior for system 5 + apply via next next_frame.
+    let d6 = ecs_stepping_deep_queue_clear_behavior_s(d5, 300, 5);
+    let d7 = ecs_stepping_deep_next_frame_s(d6);
+    // clear_behavior enqueued a -1 pending update; behavior_for still shows NeverRun until drain.
+    if ecs_stepping_deep_behavior_for_s(d7, 300, 5) != ECS_SB_NEVER_RUN_D { panic(142331); };
+    let wr2 = ecs_stepping_deep_skipped_systems_s(d7, 300, 8);
+    let d8 = ecs_stepping_deep_skipped_result_d_s(wr2);
+    // After draining the clear (reset to Continue), b5 should be Continue.
+    if ecs_stepping_deep_behavior_for_s(d8, 300, 5) != ECS_SB_CONTINUE_D { panic(142332); };
+}
+
+@test "EcsSteppingDeepS cursor() not-found on RunAll / found after enable+step"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let c0 = ecs_stepping_deep_cursor_s(d0);
+    if ecs_stepping_deep_cursor_valid_s(c0) != false { panic(142340); };
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 400);
+    let d3 = ecs_stepping_deep_next_frame_s(d2);
+    // add_schedule inserts into order; running schedules() / cursor() with cursor_schedule=0,
+    // so_count=1: cursor found state has node_count=0; cursor_system (0) >= node_count (0) -> not found.
+    let c1 = ecs_stepping_deep_cursor_s(d3);
+    if ecs_stepping_deep_cursor_valid_s(c1) != false { panic(142341); };
+    // Populate the schedule via skipped_systems with 4 systems.
+    let wr = ecs_stepping_deep_skipped_systems_s(d3, 400, 4);
+    let d4 = ecs_stepping_deep_skipped_result_d_s(wr);
+    // Waiting action + cursor_schedule=0, cursor_system=0 (from reset_cursor).
+    let c2 = ecs_stepping_deep_cursor_s(d4);
+    if ecs_stepping_deep_cursor_valid_s(c2) != true { panic(142342); };
+    if ecs_stepping_deep_cursor_label_s(c2) != 400 { panic(142343); };
+    if ecs_stepping_deep_cursor_system_s(c2) != 0 { panic(142344); };
+}
+
+@test "EcsSteppingDeepS schedules() valid / count / order copy"() {
+    let d0 = ecs_stepping_deep_new_s();
+    // Not initialized -- schedules() returns invalid.
+    let s0 = ecs_stepping_deep_schedules_s(d0);
+    if ecs_stepping_deep_schedules_valid_s(s0) != false { panic(142350); };
+    if ecs_stepping_deep_schedules_count_s(s0) != 0 { panic(142351); };
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 501);
+    let d3 = ecs_stepping_deep_queue_add_schedule_s(d2, 502);
+    let d4 = ecs_stepping_deep_next_frame_s(d3);
+    // initialized=1, so_count=2, st_count=2 -> valid + count 2.
+    let s1 = ecs_stepping_deep_schedules_s(d4);
+    if ecs_stepping_deep_schedules_valid_s(s1) != true { panic(142352); };
+    if ecs_stepping_deep_schedules_count_s(s1) != 2 { panic(142353); };
+    if ecs_stepping_deep_schedules_at_s(s1, 0) != 501 { panic(142354); };
+    if ecs_stepping_deep_schedules_at_s(s1, 1) != 502 { panic(142355); };
+    // Mismatch via remove: schedules() should be invalid (so_count != st_count while order compacts but states shift).
+    let d5 = ecs_stepping_deep_queue_remove_schedule_s(d4, 501);
+    let d6 = ecs_stepping_deep_next_frame_s(d5);
+    let s2 = ecs_stepping_deep_schedules_s(d6);
+    if ecs_stepping_deep_schedules_valid_s(s2) != true { panic(142356); };
+    if ecs_stepping_deep_schedules_count_s(s2) != 1 { panic(142357); };
+    if ecs_stepping_deep_schedules_at_s(s2, 0) != 502 { panic(142358); };
+}
+
+@test "EcsSteppingDeepS skipped_systems Waiting walk (4 Continue systems)"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 600);
+    let d3 = ecs_stepping_deep_next_frame_s(d2);
+    // action = Waiting after prelude.
+    let wr = ecs_stepping_deep_skipped_systems_s(d3, 600, 4);
+    let sk = ecs_stepping_deep_skipped_result_skipped_s(wr);
+    if ecs_stepping_deep_skipped_valid_s(sk) != true { panic(142360); };
+    // All 4 Continue systems skipped under Waiting action.
+    if ecs_stepping_deep_skipped_count_s(sk) != 4 { panic(142361); };
+    if ecs_stepping_deep_skipped_at_s(sk, 0) != true { panic(142362); };
+    if ecs_stepping_deep_skipped_at_s(sk, 1) != true { panic(142363); };
+    if ecs_stepping_deep_skipped_at_s(sk, 2) != true { panic(142364); };
+    if ecs_stepping_deep_skipped_at_s(sk, 3) != true { panic(142365); };
+    if ecs_stepping_deep_skipped_next_s(sk) != 0 { panic(142366); };
+    let d4 = ecs_stepping_deep_skipped_result_d_s(wr);
+    if ecs_stepping_deep_action_s(d4) != ECS_STEPPING_ACTION_WAITING_D { panic(142367); };
+}
+
+@test "EcsSteppingDeepS skipped_systems Step walk runs one then waits"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_step_frame_s(d1);
+    let d3 = ecs_stepping_deep_queue_add_schedule_s(d2, 700);
+    let d4 = ecs_stepping_deep_next_frame_s(d3);
+    // enable queues Waiting; step queues Step; the prelude sets action=Waiting, then the queued Step applies.
+    if ecs_stepping_deep_action_s(d4) != ECS_STEPPING_ACTION_STEP_D { panic(142370); };
+    let wr = ecs_stepping_deep_skipped_systems_s(d4, 700, 4);
+    let sk = ecs_stepping_deep_skipped_result_skipped_s(wr);
+    if ecs_stepping_deep_skipped_valid_s(sk) != true { panic(142371); };
+    // cursor at 0, Step runs system 0, then action -> Waiting; systems 1..3 skipped.
+    if ecs_stepping_deep_skipped_at_s(sk, 0) != false { panic(142372); };
+    if ecs_stepping_deep_skipped_at_s(sk, 1) != true { panic(142373); };
+    if ecs_stepping_deep_skipped_at_s(sk, 2) != true { panic(142374); };
+    if ecs_stepping_deep_skipped_at_s(sk, 3) != true { panic(142375); };
+    if ecs_stepping_deep_skipped_count_s(sk) != 3 { panic(142376); };
+    if ecs_stepping_deep_skipped_next_s(sk) != 1 { panic(142377); };
+    let d5 = ecs_stepping_deep_skipped_result_d_s(wr);
+    // After Step on cursor schedule, action transitions Step -> Waiting.
+    if ecs_stepping_deep_action_s(d5) != ECS_STEPPING_ACTION_WAITING_D { panic(142378); };
+    // cursor_system advanced to next_sys (1).
+    let c = ecs_stepping_deep_cursor_s(d5);
+    if ecs_stepping_deep_cursor_valid_s(c) != true { panic(142379); };
+    if ecs_stepping_deep_cursor_system_s(c) != 1 { panic(142380); };
+}
+
+@test "EcsSteppingDeepS skipped_systems Continue + Break breakpoint halts after Break"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    let d2 = ecs_stepping_deep_continue_frame_s(d1);
+    let d3 = ecs_stepping_deep_queue_add_schedule_s(d2, 800);
+    // Mark system 2 as Break; set-behavior enqueued for next next_frame.
+    let d4 = ecs_stepping_deep_queue_set_behavior_s(d3, 800, 2, ECS_SB_BREAK_D);
+    let d5 = ecs_stepping_deep_next_frame_s(d4);
+    // action: queued Continue applies.
+    if ecs_stepping_deep_action_s(d5) != ECS_STEPPING_ACTION_CONTINUE_D { panic(142381); };
+    // First skipped_systems drains the pending SET (b2 = Break) + walks; cursor starts at 0.
+    let wr = ecs_stepping_deep_skipped_systems_s(d5, 800, 4);
+    let sk = ecs_stepping_deep_skipped_result_skipped_s(wr);
+    if ecs_stepping_deep_skipped_valid_s(sk) != true { panic(142382); };
+    if ecs_stepping_deep_skipped_at_s(sk, 0) != false { panic(142383); };
+    if ecs_stepping_deep_skipped_at_s(sk, 1) != false { panic(142384); };
+    if ecs_stepping_deep_skipped_at_s(sk, 2) != true { panic(142385); };
+    if ecs_stepping_deep_skipped_at_s(sk, 3) != true { panic(142386); };
+    if ecs_stepping_deep_skipped_count_s(sk) != 2 { panic(142387); };
+    if ecs_stepping_deep_skipped_next_s(sk) != 2 { panic(142388); };
+    let d6 = ecs_stepping_deep_skipped_result_d_s(wr);
+    // Continue action unchanged (was Continue; Bevy only mutates Step -> Waiting).
+    if ecs_stepping_deep_action_s(d6) != ECS_STEPPING_ACTION_CONTINUE_D { panic(142389); };
+    // behavior_for after drain reads Break.
+    if ecs_stepping_deep_behavior_for_s(d6, 800, 2) != ECS_SB_BREAK_D { panic(142390); };
+}
+
+@test "EcsSteppingDeepS cap-8 schedule reject and cap-16 set_behavior clamp"() {
+    let d0 = ecs_stepping_deep_new_s();
+    let d1 = ecs_stepping_deep_enable_s(d0);
+    // Queue 9 add_schedule (labels 900..908); only 8 apply.
+    let d2 = ecs_stepping_deep_queue_add_schedule_s(d1, 900);
+    let d3 = ecs_stepping_deep_queue_add_schedule_s(d2, 901);
+    let d4 = ecs_stepping_deep_queue_add_schedule_s(d3, 902);
+    let d5 = ecs_stepping_deep_queue_add_schedule_s(d4, 903);
+    let d6 = ecs_stepping_deep_queue_add_schedule_s(d5, 904);
+    let d7 = ecs_stepping_deep_queue_add_schedule_s(d6, 905);
+    let d8 = ecs_stepping_deep_queue_add_schedule_s(d7, 906);
+    let d9 = ecs_stepping_deep_queue_add_schedule_s(d8, 907);
+    let d10 = ecs_stepping_deep_queue_add_schedule_s(d9, 908);
+    // The queue cap-8 reject: only 6 adds reached (since enable took slot 0); labels 906/907/908 overflow.
+    if ecs_stepping_deep_update_count_s(d10) != 8 { panic(142391); };
+    let d11 = ecs_stepping_deep_next_frame_s(d10);
+    // 7 states added (900..906 -- indices 7 didn't fit in cap-8 since enable used 1 slot).
+    let s = ecs_stepping_deep_schedules_s(d11);
+    if ecs_stepping_deep_schedules_valid_s(s) != true { panic(142392); };
+    if ecs_stepping_deep_schedules_count_s(s) != 7 { panic(142393); };
+    // set_behavior at system_index=15 grows node_count to 16; system_index=16 silently clamps via set_behavior guard.
+    let d12 = ecs_stepping_deep_queue_set_behavior_s(d11, 900, 15, ECS_SB_ALWAYS_RUN_D);
+    let d13 = ecs_stepping_deep_next_frame_s(d12);
+    let wr = ecs_stepping_deep_skipped_systems_s(d13, 900, 16);
+    let d14 = ecs_stepping_deep_skipped_result_d_s(wr);
+    if ecs_stepping_deep_behavior_for_s(d14, 900, 15) != ECS_SB_ALWAYS_RUN_D { panic(142394); };
+    // set_behavior at system_index=16 should be rejected by the set_behavior range guard (>= CAP_SYSTEMS).
+    let d15 = ecs_stepping_deep_queue_set_behavior_s(d14, 900, 16, ECS_SB_BREAK_D);
+    let d16 = ecs_stepping_deep_next_frame_s(d15);
+    let wr2 = ecs_stepping_deep_skipped_systems_s(d16, 900, 16);
+    let d17 = ecs_stepping_deep_skipped_result_d_s(wr2);
+    if ecs_stepping_deep_behavior_for_s(d17, 900, 16) != ECS_SB_CONTINUE_D { panic(142395); };
+    // behavior_for on a non-existent schedule returns Continue default.
+    if ecs_stepping_deep_behavior_for_s(d17, 999, 0) != ECS_SB_CONTINUE_D { panic(142396); };
+    // state_exists on schedule 900 hold.
+    if ecs_stepping_deep_has_schedule_s(d17, 900) != true { panic(142397); };
+    // begin_frame == next_frame identity preserves state on no updates.
+    let d18 = ecs_stepping_deep_begin_frame_s(d17);
+    if ecs_stepping_deep_action_s(d18) != ECS_STEPPING_ACTION_WAITING_D { panic(142398); };
+    if ecs_stepping_deep_update_count_s(d18) != 0 { panic(142399); };
+}

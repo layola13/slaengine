@@ -1,0 +1,129 @@
+// Isolated deep tests for lib/entity_deep.sla (Batch 350).
+// panic codes: 136001 - 136199.
+
+@import "../src/entity_deep.sla"
+
+@test "Entity placeholder is never alive"() {
+    let p = ecs_entity_placeholder();
+    let a = ecs_alloc_new();
+    let r = ecs_alloc_entity(a);
+    let a1 = ecs_alloc_result_alloc(r);
+    let e1 = ecs_alloc_result_entity(r);
+    if ecs_entity_eq(p, e1) != false { panic(136001); };
+    if ecs_is_alive(a1, p) != false { panic(136002); };
+    if p.id != 0 { panic(136003); };
+    if p.gen != -1 { panic(136004); };
+}
+
+@test "Entity bits pack/unpack roundtrip"() {
+    let e = ecs_entity_new(42, 7);
+    let bits = ecs_entity_to_bits(e);
+    let out = ecs_entity_from_bits(bits);
+    if ecs_entity_eq(e, out) != true { panic(136010); };
+    let out_id = ecs_entity_index(out);
+    let out_gen = ecs_entity_generation(out);
+    if out_id != 42 { panic(136011); };
+    if out_gen != 7 { panic(136012); };
+}
+
+@test "Entity accessors"() {
+    let e = ecs_entity_new(5, 3);
+    if ecs_entity_index(e) != 5 { panic(136020); };
+    if ecs_entity_generation(e) != 3 { panic(136021); };
+    if ecs_entity_eq(e, ecs_entity_new(5, 3)) != true { panic(136022); };
+    if ecs_entity_eq(e, ecs_entity_new(5, 4)) != false { panic(136023); };
+}
+
+@test "Entity ordering"() {
+    let a = ecs_entity_new(42, 7);
+    let b = ecs_entity_new(42, 8);
+    if ecs_entity_lt(a, b) != true { panic(136030); };
+    if ecs_entity_lt(b, a) != false { panic(136031); };
+    let c = ecs_entity_new(41, 9);
+    if ecs_entity_lt(c, a) != true { panic(136032); };
+}
+
+@test "Allocator allocates sequential ids starting at 1"() {
+    let a = ecs_alloc_new();
+    let r1 = ecs_alloc_entity(a);
+    let e1 = ecs_alloc_result_entity(r1);
+    if ecs_entity_index(e1) != 1 { panic(136040); };
+    if ecs_entity_generation(e1) != 0 { panic(136041); };
+    let r2 = ecs_alloc_entity(ecs_alloc_result_alloc(r1));
+    let e2 = ecs_alloc_result_entity(r2);
+    if ecs_entity_index(e2) != 2 { panic(136042); };
+    if ecs_alloc_len(ecs_alloc_result_alloc(r2)) != 2 { panic(136043); };
+}
+
+@test "Free then reallocate reuses id with bumped gen (FIFO oldest-first)"() {
+    let a = ecs_alloc_new();
+    let r1 = ecs_alloc_entity(a);
+    let e1 = ecs_alloc_result_entity(r1);
+    let a1 = ecs_alloc_result_alloc(r1);
+    let r2 = ecs_alloc_entity(a1);
+    let e2 = ecs_alloc_result_entity(r2);
+    let a2 = ecs_alloc_result_alloc(r2);
+    // Free both id 1 (oldest) and id 2 (newest).
+    let a3 = ecs_free_entity(a2, e1);
+    let a4 = ecs_free_entity(a3, e2);
+    if ecs_alloc_free_count(a4) != 2 { panic(136050); };
+    // FIFO: next alloc must be id 1 with gen 1.
+    let r3 = ecs_alloc_entity(a4);
+    let e3 = ecs_alloc_result_entity(r3);
+    if ecs_entity_index(e3) != 1 { panic(136051); };
+    if ecs_entity_generation(e3) != 1 { panic(136052); };
+    // Next alloc must be id 2 with gen 1.
+    let r4 = ecs_alloc_entity(ecs_alloc_result_alloc(r3));
+    let e4 = ecs_alloc_result_entity(r4);
+    if ecs_entity_index(e4) != 2 { panic(136053); };
+    if ecs_entity_generation(e4) != 1 { panic(136054); };
+}
+
+@test "Free rejects stale generation (indirect: stale entity is not alive)"() {
+    let a = ecs_alloc_new();
+    let r1 = ecs_alloc_entity(a);
+    let e1 = ecs_alloc_result_entity(r1);
+    let a1 = ecs_alloc_result_alloc(r1);
+    let a2 = ecs_free_entity(a1, e1);
+    let stale = ecs_entity_new(ecs_entity_index(e1), ecs_entity_generation(e1));
+    let fabricated = ecs_entity_new(ecs_entity_index(e1), ecs_entity_generation(e1) + 1);
+    if ecs_is_alive(a2, stale) != false { panic(136060); };
+    if ecs_is_alive(a2, fabricated) != false { panic(136061); };
+    let r3 = ecs_alloc_entity(a2);
+    let e3 = ecs_alloc_result_entity(r3);
+    if ecs_entity_eq(e3, fabricated) != true { panic(136062); };
+    if ecs_is_alive(ecs_alloc_result_alloc(r3), e3) != true { panic(136063); };
+}
+
+@test "is_alive rejects id 0 and out-of-cap ids"() {
+    let a = ecs_alloc_new();
+    let r = ecs_alloc_entity(a);
+    let a1 = ecs_alloc_result_alloc(r);
+    if ecs_is_alive(a1, ecs_entity_new(0, 0)) != false { panic(136070); };
+    if ecs_is_alive(a1, ecs_entity_new(16, 0)) != false { panic(136071); };
+    if ecs_is_alive(a1, ecs_entity_new(20, 0)) != false { panic(136072); };
+}
+
+@test "Free absent entity is no-op"() {
+    let a = ecs_alloc_new();
+    let r = ecs_alloc_entity(a);
+    let a1 = ecs_alloc_result_alloc(r);
+    let a2 = ecs_free_entity(a1, ecs_entity_new(99, 0));
+    if ecs_alloc_free_count(a2) != 0 { panic(136080); };
+    if ecs_alloc_len(a2) != 1 { panic(136081); };
+}
+
+@test "Allocator next_id tracks after frees"() {
+    let a = ecs_alloc_new();
+    let r1 = ecs_alloc_entity(a);
+    let a1 = ecs_alloc_result_alloc(r1);
+    let r2 = ecs_alloc_entity(a1);
+    let a2 = ecs_alloc_result_alloc(r2);
+    if ecs_alloc_next_id(a2) != 3 { panic(136090); };
+    let e1 = ecs_alloc_result_entity(r1);
+    let a3 = ecs_free_entity(a2, e1);
+    // Freeing does not advance next_id.
+    if ecs_alloc_next_id(a3) != 3 { panic(136091); };
+    // Freeing affects len.
+    if ecs_alloc_len(a3) != 1 { panic(136092); };
+}

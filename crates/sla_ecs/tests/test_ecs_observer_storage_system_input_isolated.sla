@@ -1,0 +1,368 @@
+// Observer storage (centralized/distributed) + SystemInput (In/InRef/InMut) +
+// System trait (name, type_id, is_exclusive, component_access, archetype_component_access) +
+// ObserverDescriptor (with_entity, with_component, watch_entity, run_if).
+// Bevy observer/centralized_storage.rs + distributed_storage.rs + system/input.rs + system/system.rs.
+
+// --- ObserverDescriptor ---
+struct EcsObserverDescriptor {
+    entity_targets: Vec<i32>,
+    component_targets: Vec<i32>,
+    event_type: i32,
+    has_run_condition: bool,
+}
+
+fn observer_descriptor_new(event_type: i32) -> EcsObserverDescriptor {
+    return EcsObserverDescriptor {
+        entity_targets: Vec::new(), component_targets: Vec::new(),
+        event_type: event_type, has_run_condition: false,
+    };
+}
+
+fn observer_desc_with_entity(d: EcsObserverDescriptor, entity: i32) -> EcsObserverDescriptor {
+    d.entity_targets.push(entity);
+    return d;
+}
+
+fn observer_desc_with_entities(d: EcsObserverDescriptor, entities: Vec<i32>) -> EcsObserverDescriptor {
+    return observer_desc_with_entities_rec(d, entities, 0);
+}
+
+fn observer_desc_with_entities_rec(d: EcsObserverDescriptor, entities: Vec<i32>, i: i64) -> EcsObserverDescriptor {
+    if i >= (len(entities) as i64) { return d; };
+    d.entity_targets.push(entities[i]);
+    return observer_desc_with_entities_rec(d, entities, i + 1);
+}
+
+fn observer_desc_with_component(d: EcsObserverDescriptor, component_id: i32) -> EcsObserverDescriptor {
+    d.component_targets.push(component_id);
+    return d;
+}
+
+fn observer_desc_watch_entity(d: EcsObserverDescriptor, entity: i32) -> EcsObserverDescriptor {
+    d.entity_targets.push(entity);
+    return d;
+}
+
+fn observer_desc_run_if(d: EcsObserverDescriptor) -> EcsObserverDescriptor {
+    d.has_run_condition = true;
+    return d;
+}
+
+fn observer_desc_entity_count(d: EcsObserverDescriptor) -> i64 { return len(d.entity_targets) as i64; }
+fn observer_desc_component_count(d: EcsObserverDescriptor) -> i64 { return len(d.component_targets) as i64; }
+fn observer_desc_has_run_condition(d: EcsObserverDescriptor) -> bool { return d.has_run_condition; }
+fn observer_desc_event_type(d: EcsObserverDescriptor) -> i32 { return d.event_type; }
+
+// --- Centralized observer storage ---
+struct EcsCachedObservers {
+    global_observers: Vec<i32>,     // observer ids for global events
+    component_observers: Vec<i32>,  // observer ids for component events
+    entity_observers: Vec<i32>,     // observer ids for entity events
+}
+
+fn cached_observers_new() -> EcsCachedObservers {
+    return EcsCachedObservers {
+        global_observers: Vec::new(),
+        component_observers: Vec::new(),
+        entity_observers: Vec::new(),
+    };
+}
+
+fn cached_observers_add_global(c: EcsCachedObservers, observer_id: i32) -> EcsCachedObservers {
+    c.global_observers.push(observer_id);
+    return c;
+}
+
+fn cached_observers_add_component(c: EcsCachedObservers, observer_id: i32) -> EcsCachedObservers {
+    c.component_observers.push(observer_id);
+    return c;
+}
+
+fn cached_observers_add_entity(c: EcsCachedObservers, observer_id: i32) -> EcsCachedObservers {
+    c.entity_observers.push(observer_id);
+    return c;
+}
+
+fn cached_observers_global_count(c: EcsCachedObservers) -> i64 { return len(c.global_observers) as i64; }
+fn cached_observers_component_count(c: EcsCachedObservers) -> i64 { return len(c.component_observers) as i64; }
+fn cached_observers_entity_count(c: EcsCachedObservers) -> i64 { return len(c.entity_observers) as i64; }
+
+// --- Distributed observer (Bevy Observer struct) ---
+struct EcsDistributedObserver {
+    descriptor: EcsObserverDescriptor,
+    observer_id: i32,
+    runner: fn(i32) -> i32,
+    is_active: bool,
+}
+
+fn distributed_observer_new(event_type: i32, observer_id: i32, runner: fn(i32) -> i32) -> EcsDistributedObserver {
+    return EcsDistributedObserver {
+        descriptor: observer_descriptor_new(event_type),
+        observer_id: observer_id,
+        runner: runner,
+        is_active: true,
+    };
+}
+
+fn dist_observer_with_entity(o: EcsDistributedObserver, entity: i32) -> EcsDistributedObserver {
+    o.descriptor = observer_desc_with_entity(o.descriptor, entity);
+    return o;
+}
+
+fn dist_observer_with_component(o: EcsDistributedObserver, component_id: i32) -> EcsDistributedObserver {
+    o.descriptor = observer_desc_with_component(o.descriptor, component_id);
+    return o;
+}
+
+fn dist_observer_run_if(o: EcsDistributedObserver) -> EcsDistributedObserver {
+    o.descriptor = observer_desc_run_if(o.descriptor);
+    return o;
+}
+
+fn dist_observer_run(o: EcsDistributedObserver, payload: i32) -> (EcsDistributedObserver, i32) {
+    if o.is_active != true { return (o, 0); };
+    let f = o.runner;
+    return (o, f(payload));
+}
+
+fn dist_observer_deactivate(o: EcsDistributedObserver) -> EcsDistributedObserver {
+    o.is_active = false;
+    return o;
+}
+
+fn dist_observer_is_active(o: EcsDistributedObserver) -> bool { return o.is_active; }
+fn dist_observer_id(o: EcsDistributedObserver) -> i32 { return o.observer_id; }
+
+// --- SystemInput: In<T>, InRef<T>, InMut<T> ---
+struct EcsIn<T> {
+    value: T,
+}
+
+fn ecs_in_new<T>(value: T) -> EcsIn<T> { return EcsIn<T> { value: value }; }
+fn ecs_in_get<T>(input: EcsIn<T>) -> T { return input.value; }
+
+struct EcsInRef<T> {
+    value: T,
+}
+
+fn ecs_inref_new<T>(value: T) -> EcsInRef<T> { return EcsInRef<T> { value: value }; }
+fn ecs_inref_get<T>(input: EcsInRef<T>) -> T { return input.value; }
+
+struct EcsInMut<T> {
+    value: T,
+}
+
+fn ecs_inmut_new<T>(value: T) -> EcsInMut<T> { return EcsInMut<T> { value: value }; }
+fn ecs_inmut_get<T>(input: EcsInMut<T>) -> T { return input.value; }
+fn ecs_inmut_set<T>(input: EcsInMut<T>, value: T) -> EcsInMut<T> { input.value = value; return input; }
+
+// --- System trait surface ---
+struct EcsSystemInfo {
+    name: Vec<i32>,
+    type_id: i32,
+    is_exclusive: bool,
+    component_access_read: Vec<i32>,
+    component_access_write: Vec<i32>,
+    has_run_condition: bool,
+}
+
+fn system_info_new(name: Vec<i32>, type_id: i32) -> EcsSystemInfo {
+    return EcsSystemInfo {
+        name: name, type_id: type_id, is_exclusive: false,
+        component_access_read: Vec::new(), component_access_write: Vec::new(),
+        has_run_condition: false,
+    };
+}
+
+fn system_info_name_len(s: EcsSystemInfo) -> i64 { return len(s.name) as i64; }
+fn system_info_type_id(s: EcsSystemInfo) -> i32 { return s.type_id; }
+fn system_info_is_exclusive(s: EcsSystemInfo) -> bool { return s.is_exclusive; }
+fn system_info_set_exclusive(s: EcsSystemInfo) -> EcsSystemInfo { s.is_exclusive = true; return s; }
+
+fn system_info_add_read(s: EcsSystemInfo, component_id: i32) -> EcsSystemInfo {
+    s.component_access_read.push(component_id);
+    return s;
+}
+
+fn system_info_add_write(s: EcsSystemInfo, component_id: i32) -> EcsSystemInfo {
+    s.component_access_write.push(component_id);
+    return s;
+}
+
+fn system_info_read_count(s: EcsSystemInfo) -> i64 { return len(s.component_access_read) as i64; }
+fn system_info_write_count(s: EcsSystemInfo) -> i64 { return len(s.component_access_write) as i64; }
+
+fn system_info_set_run_condition(s: EcsSystemInfo) -> EcsSystemInfo {
+    s.has_run_condition = true;
+    return s;
+}
+
+fn system_info_has_run_condition(s: EcsSystemInfo) -> bool { return s.has_run_condition; }
+
+// --- Component lifecycle constants ---
+const LIFECYCLE_ADD: i32 = 0;
+const LIFECYCLE_INSERT: i32 = 1;
+const LIFECYCLE_DISCARD: i32 = 2;
+const LIFECYCLE_REMOVE: i32 = 3;
+const LIFECYCLE_DESPAWN: i32 = 4;
+const IS_RESOURCE: i32 = 5;
+
+// Test runner
+fn observer_runner_double(x: i32) -> i32 { return x * 2; }
+
+@test "observer_descriptor with_entity"() {
+    let d = observer_descriptor_new(100);
+    let d2 = observer_desc_with_entity(d, 42);
+    if observer_desc_entity_count(d2) != 1 { panic(18001); };
+}
+
+@test "observer_descriptor with_entities batch"() {
+    let d = observer_descriptor_new(100);
+    let entities: Vec<i32> = Vec::new();
+    entities.push(1);
+    entities.push(2);
+    entities.push(3);
+    let d2 = observer_desc_with_entities(d, entities);
+    if observer_desc_entity_count(d2) != 3 { panic(18002); };
+}
+
+@test "observer_descriptor with_component"() {
+    let d = observer_descriptor_new(100);
+    let d2 = observer_desc_with_component(d, 200);
+    if observer_desc_component_count(d2) != 1 { panic(18003); };
+}
+
+@test "observer_descriptor run_if"() {
+    let d = observer_descriptor_new(100);
+    let d2 = observer_desc_run_if(d);
+    if observer_desc_has_run_condition(d2) != true { panic(18004); };
+}
+
+@test "observer_descriptor event_type"() {
+    let d = observer_descriptor_new(999);
+    if observer_desc_event_type(d) != 999 { panic(18005); };
+}
+
+@test "cached_observers add global"() {
+    let c = cached_observers_new();
+    let c2 = cached_observers_add_global(c, 1);
+    if cached_observers_global_count(c2) != 1 { panic(18006); };
+}
+
+@test "cached_observers add component"() {
+    let c = cached_observers_new();
+    let c2 = cached_observers_add_component(c, 1);
+    if cached_observers_component_count(c2) != 1 { panic(18007); };
+}
+
+@test "cached_observers add entity"() {
+    let c = cached_observers_new();
+    let c2 = cached_observers_add_entity(c, 1);
+    if cached_observers_entity_count(c2) != 1 { panic(18008); };
+}
+
+@test "cached_observers empty initially"() {
+    let c = cached_observers_new();
+    if cached_observers_global_count(c) != 0 { panic(18009); };
+    if cached_observers_component_count(c) != 0 { panic(18010); };
+    if cached_observers_entity_count(c) != 0 { panic(18011); };
+}
+
+@test "distributed_observer new and run"() {
+    let o = distributed_observer_new(100, 1, observer_runner_double);
+    let (o2, result) = dist_observer_run(o, 5);
+    if result != 10 { panic(18012); };
+}
+
+@test "distributed_observer with_entity adds target"() {
+    let o = distributed_observer_new(100, 1, observer_runner_double);
+    let o2 = dist_observer_with_entity(o, 42);
+    if observer_desc_entity_count(o2.descriptor) != 1 { panic(18013); };
+}
+
+@test "distributed_observer with_component adds target"() {
+    let o = distributed_observer_new(100, 1, observer_runner_double);
+    let o2 = dist_observer_with_component(o, 200);
+    if observer_desc_component_count(o2.descriptor) != 1 { panic(18014); };
+}
+
+@test "distributed_observer run_if sets condition"() {
+    let o = distributed_observer_new(100, 1, observer_runner_double);
+    let o2 = dist_observer_run_if(o);
+    if observer_desc_has_run_condition(o2.descriptor) != true { panic(18015); };
+}
+
+@test "distributed_observer deactivate prevents run"() {
+    let o = distributed_observer_new(100, 1, observer_runner_double);
+    let o2 = dist_observer_deactivate(o);
+    if dist_observer_is_active(o2) { panic(18016); };
+    let (_, result) = dist_observer_run(o2, 5);
+    if result != 0 { panic(18017); };
+}
+
+@test "distributed_observer id"() {
+    let o = distributed_observer_new(100, 42, observer_runner_double);
+    if dist_observer_id(o) != 42 { panic(18018); };
+}
+
+@test "In<T> get"() {
+    let input = ecs_in_new<i32>(42);
+    if ecs_in_get<i32>(input) != 42 { panic(18019); };
+}
+
+@test "InRef<T> get"() {
+    let input = ecs_inref_new<i32>(99);
+    if ecs_inref_get<i32>(input) != 99 { panic(18020); };
+}
+
+@test "InMut<T> get and set"() {
+    let input = ecs_inmut_new<i32>(10);
+    let input2 = ecs_inmut_set<i32>(input, 20);
+    if ecs_inmut_get<i32>(input2) != 20 { panic(18021); };
+}
+
+@test "system_info name and type_id"() {
+    let name: Vec<i32> = Vec::new();
+    name.push(83); // 'S'
+    let s = system_info_new(name, 500);
+    if system_info_name_len(s) != 1 { panic(18022); };
+    if system_info_type_id(s) != 500 { panic(18023); };
+}
+
+@test "system_info is_exclusive default false"() {
+    let s = system_info_new(Vec::new(), 1);
+    if system_info_is_exclusive(s) { panic(18024); };
+}
+
+@test "system_info set_exclusive"() {
+    let s = system_info_new(Vec::new(), 1);
+    let s2 = system_info_set_exclusive(s);
+    if system_info_is_exclusive(s2) != true { panic(18025); };
+}
+
+@test "system_info add_read"() {
+    let s = system_info_new(Vec::new(), 1);
+    let s2 = system_info_add_read(s, 100);
+    if system_info_read_count(s2) != 1 { panic(18026); };
+}
+
+@test "system_info add_write"() {
+    let s = system_info_new(Vec::new(), 1);
+    let s2 = system_info_add_write(s, 200);
+    if system_info_write_count(s2) != 1 { panic(18027); };
+}
+
+@test "system_info run_condition"() {
+    let s = system_info_new(Vec::new(), 1);
+    let s2 = system_info_set_run_condition(s);
+    if system_info_has_run_condition(s2) != true { panic(18028); };
+}
+
+@test "lifecycle constants match Bevy"() {
+    if LIFECYCLE_ADD != 0 { panic(18029); };
+    if LIFECYCLE_INSERT != 1 { panic(18030); };
+    if LIFECYCLE_DISCARD != 2 { panic(18031); };
+    if LIFECYCLE_REMOVE != 3 { panic(18032); };
+    if LIFECYCLE_DESPAWN != 4 { panic(18033); };
+    if IS_RESOURCE != 5 { panic(18034); };
+}

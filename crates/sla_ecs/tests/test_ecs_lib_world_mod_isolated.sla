@@ -1,0 +1,494 @@
+@import "../src/world_mod.sla"
+
+// Isolated tests for lib/world_mod.sla — World struct (src/world/mod.rs)
+// 50 tests covering spawn/despawn/resource/non_send/schedule/clear ticks
+
+@test "world_id"() {
+    let id = ecs_world_id_new(7);
+    if ecs_world_id_get(id) != 7 { panic(90209); };
+    let a = ecs_world_id_new(1);
+    let b = ecs_world_id_new(1);
+    let c = ecs_world_id_new(2);
+    if ecs_world_id_eq(a, b) != true { panic(90210); };
+    if ecs_world_id_eq(a, c) != false { panic(90211); };
+}
+
+@test "entity_location"() {
+    let l = ecs_entity_location_new(3, 4, 5);
+    if ecs_entity_location_archetype(l) != 3 { panic(90212); };
+    if ecs_entity_location_table(l) != 4 { panic(90213); };
+    if ecs_entity_location_row(l) != 5 { panic(90214); };
+}
+
+@test "check_change_ticks"() {
+    let c = ecs_check_change_ticks_new(99);
+    if ecs_check_change_ticks_max_age(c) != 99 { panic(90215); };
+    if ecs_check_change_ticks_checked(c) != false { panic(90216); };
+    let c2 = ecs_check_change_ticks_set_checked(c);
+    if ecs_check_change_ticks_checked(c2) != true { panic(90217); };
+}
+
+@test "world_new_counts"() {
+    let w = ecs_world_mod_new();
+    if ecs_world_mod_entity_count(w) != 0 { panic(90218); };
+    if ecs_world_mod_components_count(w) != 0 { panic(90219); };
+    if ecs_world_mod_resource_count(w) != 0 { panic(90220); };
+    if ecs_world_mod_non_send_count(w) != 0 { panic(90221); };
+    if ecs_world_mod_schedule_count(w) != 0 { panic(90222); };
+    if ecs_world_mod_observer_count(w) != 0 { panic(90223); };
+    if ecs_world_mod_read_change_tick(w) != 1 { panic(90224); };
+    if ecs_world_mod_change_tick(w) != 1 { panic(90225); };
+    if ecs_world_mod_last_change_tick(w) != 0 { panic(90226); };
+    if ecs_world_mod_apply_final_deferred(w) != true { panic(90227); };
+}
+
+@test "world_set_apply_final_deferred"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_set_apply_final_deferred(w, false);
+    if ecs_world_mod_apply_final_deferred(w2) != false { panic(90228); };
+}
+
+@test "world_spawn_empty"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_spawn_empty(w);
+    if r.1 != 1 { panic(90229); };
+    if ecs_world_mod_entity_count(r.0) != 1 { panic(90230); };
+    let r2 = ecs_world_mod_spawn_empty(r.0);
+    if r2.1 != 2 { panic(90231); };
+    if ecs_world_mod_entity_count(r2.0) != 2 { panic(90232); };
+    let ents = ecs_world_mod_entities(r2.0);
+    if ents[0] != 1 { panic(90233); };
+    if ents[1] != 2 { panic(90234); };
+}
+
+@test "world_spawn_at"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_spawn_at(w, 42);
+    // spawn_at returns (world, entity, was_new)
+    if r.1 != 42 { panic(90235); };
+    if r.2 != true { panic(90236); };
+    // spawn existing returns was_new = false
+    let r2 = ecs_world_mod_spawn_at(r.0, 42);
+    if r2.2 != false { panic(90237); };
+}
+
+@test "world_spawn_batch"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_spawn_batch_push(w, 10);
+    let w3 = ecs_world_mod_spawn_batch_push(w2, 11);
+    if ecs_world_mod_spawn_batch_len(w3) != 2 { panic(90238); };
+    if ecs_world_mod_entity_count(w3) != 2 { panic(90239); };
+}
+
+@test "world_register_component"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_component(w, 100);
+    if r.1 != 0 { panic(90240); };
+    let rec = ecs_world_mod_register_component(r.0, 100);
+    if rec.1 != 0 { panic(90241); };
+    if ecs_world_mod_components_count(rec.0) != 1 { panic(90242); };
+    let r3 = ecs_world_mod_register_component(rec.0, 200);
+    if r3.1 != 1 { panic(90243); };
+    if ecs_world_mod_component_id(r3.0, 200) != 1 { panic(90244); };
+}
+
+@test "world_resource_register_insert"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 5);
+    if r.1 != 0 { panic(90245); };
+    let r2 = ecs_world_mod_register_resource(r.0, 5);
+    // duplicate registration returns existing id (semantics: ComponentId is unique per type)
+    if r2.1 != 0 { panic(90246); };
+    if ecs_world_mod_resource_count(r2.0) != 1 { panic(902461); };
+    let inserted = ecs_world_mod_insert_resource(r2.0, 5, 42);
+    if inserted.1 != true { panic(90247); };
+    // insert_resource on already-existing is a no-op for count (recording updated)
+    if ecs_world_mod_resource_count(inserted.0) != 1 { panic(90248); };
+}
+
+@test "world_contains_resource"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_init_resource(w, 3);
+    if ecs_world_mod_contains_resource(r.0, 3) != true { panic(90249); };
+    if ecs_world_mod_contains_resource(r.0, 99) != false { panic(90250); };
+    if ecs_world_mod_contains_resource_by_id(r.0, 3) != true { panic(90251); };
+}
+
+@test "world_resource_change_ticks"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_init_resource(w, 7);
+    let t = ecs_world_mod_get_resource_change_ticks(r.0, 7);
+    if t.0 != true { panic(90252); };
+    if t.1 != 1 { panic(90253); };
+    let t2 = ecs_world_mod_get_resource_change_ticks(r.0, 99);
+    if t2.0 != false { panic(90254); };
+}
+
+@test "world_resource_api"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 1);
+    let g = ecs_world_mod_resource(r.0, 1);
+    if g.0 != true { panic(90255); };
+    let gr = ecs_world_mod_get_resource_ref(r.0, 1);
+    if gr.0 != true { panic(90256); };
+    let gm = ecs_world_mod_resource_mut(r.0, 1);
+    if gm.1 != true { panic(90257); };
+}
+
+@test "world_get_resource_or_insert_with"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_get_resource_or_insert_with(w, 8, 88);
+    if r.1 != true { panic(90258); };
+    // second call should return existing without reporting newly inserted
+    let r2 = ecs_world_mod_get_resource_or_insert_with(r.0, 8, 99);
+    if r2.1 != false { panic(90259); };
+}
+
+@test "world_get_resource_or_init"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_get_resource_or_init(w, 9);
+    if r.1 != true { panic(90260); };
+    let r2 = ecs_world_mod_get_resource_or_init(r.0, 9);
+    if r2.1 != false { panic(90261); };
+}
+
+@test "world_non_send_api"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_init_non_send(w, 11);
+    if r.1 != 0 { panic(90262); };
+    if ecs_world_mod_contains_non_send(r.0, 11) != true { panic(90263); };
+    let ins = ecs_world_mod_insert_non_send(r.0, 11);
+    if ins.1 != true { panic(90264); };
+}
+
+@test "world_remove_resource"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 2);
+    let rr = ecs_world_mod_remove_resource(r.0, 2);
+    if rr.1 != true { panic(90265); };
+    let gone = ecs_world_mod_remove_resource(rr.0, 999);
+    if gone.1 != false { panic(90266); };
+}
+
+@test "world_remove_non_send"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_init_non_send(w, 12).0;
+    let rr = ecs_world_mod_remove_non_send_resource(r, 12);
+    if rr.1 != true { panic(90267); };
+    let gone = ecs_world_mod_remove_non_send_resource(rr.0, 12);
+    if gone.1 != false { panic(90268); };
+}
+
+@test "world_despawn"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_spawn_empty(w);
+    let d = ecs_world_mod_despawn(r.0, r.1);
+    if d.1 != true { panic(90269); };
+    if ecs_world_mod_entity_count(d.0) != 0 { panic(90270); };
+    let d2 = ecs_world_mod_despawn(d.0, 999);
+    if d2.1 != false { panic(90271); };
+}
+
+@test "world_despawn_no_free"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_spawn_empty(w);
+    let dn = ecs_world_mod_despawn_no_free(r.0, r.1);
+    if dn.1 != r.1 { panic(90272); };
+    let dn2 = ecs_world_mod_despawn_no_free(dn.0, 999);
+    if dn2.1 != -1 { panic(90273); };
+}
+
+@test "world_clear_trackers"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_spawn_empty(w).0;
+    let w3 = ecs_world_mod_despawn(w2, 1).0;
+    let w4 = ecs_world_mod_clear_trackers(w3);
+    if ecs_world_mod_removed_entities_count(w4) != 0 { panic(90274); };
+    if ecs_world_mod_last_clear(w4) != 1 { panic(90275); };
+}
+
+@test "world_check_change_ticks"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_check_change_ticks(w, 50);
+    let c = r.1;
+    if ecs_check_change_ticks_max_age(c) != 50 { panic(90276); };
+}
+
+@test "world_change_tick_increments"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_increment_change_tick(w);
+    if r.1 != 2 { panic(90277); };
+    if ecs_world_mod_read_change_tick(r.0) != 2 { panic(90278); };
+}
+
+@test "world_last_change_tick_scope"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_last_change_tick_scope(w, 99);
+    if r.1 != 0 { panic(90279); };
+    if ecs_world_mod_last_change_tick(r.0) != 99 { panic(90280); };
+}
+
+@test "world_non_send_resource_getters"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_init_non_send(w, 4).0;
+    if ecs_world_mod_non_send_resource(r, 4).0 != true { panic(90281); };
+    if ecs_world_mod_non_send(r, 4).0 != true { panic(90282); };
+    let mut_r = ecs_world_mod_non_send_resource_mut(r, 4);
+    if mut_r.1 != true { panic(90283); };
+    if ecs_world_mod_get_non_send_resource(r, 4).0 != true { panic(90284); };
+}
+
+@test "world_modify_resource"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 1).0;
+    let mod_r = ecs_world_mod_modify_resource(r, 1, 5);
+    if mod_r.1 != true { panic(90285); };
+    if mod_r.2 != 5 { panic(90286); };
+    let mod_miss = ecs_world_mod_modify_resource(r, 123, 5);
+    if mod_miss.1 != false { panic(90287); };
+}
+
+@test "world_modify_component"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_component(w, 9).0;
+    let mod_r = ecs_world_mod_modify_component(r, 9, 42);
+    if mod_r.1 != true { panic(90288); };
+    let mod_miss = ecs_world_mod_modify_component(r, 123, 5);
+    if mod_miss.1 != false { panic(90289); };
+}
+
+@test "world_entity_valid_get"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_spawn_empty(w);
+    let e = ecs_world_mod_entity(r.0, r.1);
+    if e.0 != true { panic(90290); };
+    let me = ecs_world_mod_entity_valid(r.0, r.1);
+    if me != true { panic(90291); };
+    let inv = ecs_world_mod_entity_valid(r.0, 000);
+    if inv != false { panic(90292); };
+}
+
+@test "world_add_schedule_and_run"() {
+    let w = ecs_world_mod_new();
+    let added = ecs_world_mod_add_schedule(w, 7, 100);
+    if added.1 != true { panic(90293); };
+    let dup = ecs_world_mod_add_schedule(added.0, 7, 100);
+    if dup.1 != false { panic(90294); };
+    if ecs_world_mod_schedule_count(dup.0) != 2 { panic(90295); };
+    if ecs_world_mod_contains_schedule(dup.0, 7) != true { panic(90296); };
+    let r = ecs_world_mod_run_schedule(dup.0, 7);
+    if r.1 != true { panic(90297); };
+    if r.2 != 100 { panic(90298); };
+}
+
+@test "world_try_run_missing_schedule"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_try_run_schedule(w, 99);
+    if r.1 != false { panic(90299); };
+    if r.2 != 0 { panic(90300); };
+}
+
+@test "world_remove_schedule"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_add_schedule(w, 1, 10).0;
+    let rr = ecs_world_mod_remove_schedule(r, 1);
+    if rr.1 != true { panic(90301); };
+    if ecs_world_mod_contains_schedule(rr.0, 1) != false { panic(90302); };
+    let miss = ecs_world_mod_remove_schedule(rr.0, 999);
+    if miss.1 != false { panic(90303); };
+}
+
+@test "world_write_message"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_write_message(w, 55);
+    if r.1 != true { panic(90304); };
+    if r.2 != 55 { panic(90305); };
+    let r2 = ecs_world_mod_write_message_default(w);
+    if r2.1 != 0 { panic(90306); };
+    let msgs = Vec::new();
+    msgs.push(1);
+    msgs.push(2);
+    let r3 = ecs_world_mod_write_message_batch(w, msgs);
+    if r3.1 != 2 { panic(90307); };
+}
+
+@test "world_clear_all"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_spawn_empty(w).0;
+    let w3 = ecs_world_mod_register_resource(w2, 1).0;
+    let w4 = ecs_world_mod_init_non_send(w3, 2).0;
+    let cleared = ecs_world_mod_clear_all(w4);
+    if ecs_world_mod_entity_count(cleared) != 0 { panic(90308); };
+    if ecs_world_mod_resource_count(cleared) != 0 { panic(90309); };
+    if ecs_world_mod_non_send_count(cleared) != 0 { panic(90310); };
+}
+
+@test "world_clear_entities"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_spawn_empty(w).0;
+    let w3 = ecs_world_mod_spawn_empty(w2).0;
+    if ecs_world_mod_entity_count(w3) != 2 { panic(90311); };
+    let cleared = ecs_world_mod_clear_entities(w3);
+    if ecs_world_mod_entity_count(cleared) != 0 { panic(90312); };
+}
+
+@test "world_clear_resources"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_register_resource(w, 1).0;
+    let cleared = ecs_world_mod_clear_resources(w2);
+    if ecs_world_mod_resource_count(cleared) != 0 { panic(90313); };
+}
+
+@test "world_clear_non_send"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_init_non_send(w, 1).0;
+    let cleared = ecs_world_mod_clear_non_send(w2);
+    if ecs_world_mod_non_send_count(cleared) != 0 { panic(90314); };
+}
+
+@test "world_insert_batch"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_insert_batch(w, 5);
+    if r.1 != 5 { panic(90315); };
+    if ecs_world_mod_entity_count(r.0) != 5 { panic(90316); };
+}
+
+@test "world_allow_ambiguous"() {
+    let w = ecs_world_mod_new();
+    let r1 = ecs_world_mod_allow_ambiguous_component(w, 1);
+    if r1.1 != true { panic(90317); };
+    let r2 = ecs_world_mod_allow_ambiguous_resource(r1.0, 2);
+    if r2.1 != true { panic(90318); };
+}
+
+@test "world_required_components_register"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_required_components(w, 1, 2);
+    if r.1 != true { panic(90319); };
+    let rc = ecs_world_mod_get_required_components(r.0, 1);
+    if rc.0 != true { panic(90320); };
+}
+
+@test "world_register_component_hooks"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_component_hooks(w, 5);
+    if r.1 != true { panic(90321); };
+    let r2 = ecs_world_mod_register_component_hooks_by_id(r.0, 5);
+    if r2.1 != true { panic(90322); };
+}
+
+@test "world_resource_scope"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 1).0;
+    let rs = ecs_world_mod_resource_scope(r, 1);
+    if rs.1 != true { panic(90323); };
+    let miss = ecs_world_mod_try_resource_scope(r, 99);
+    if miss.1 != false { panic(90324); };
+}
+
+@test "world_spawn_batch_iter"() {
+    let it = ecs_spawn_batch_iter_new();
+    if ecs_spawn_batch_iter_len(it) != 0 { panic(90325); };
+    let it2 = ecs_spawn_batch_iter_push(it, 10);
+    let it3 = ecs_spawn_batch_iter_push(it2, 20);
+    let n = ecs_spawn_batch_iter_next(it3);
+    if n.1 != true { panic(90326); };
+    if n.2 != 10 { panic(90327); };
+    let n2 = ecs_spawn_batch_iter_next(n.0);
+    if n2.1 != true { panic(90328); };
+    if n2.2 != 20 { panic(90329); };
+    let n3 = ecs_spawn_batch_iter_next(n2.0);
+    if n3.1 != false { panic(90330); };
+}
+
+@test "world_iter_resources"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 1).0;
+    let r2 = ecs_world_mod_register_resource(r, 2).0;
+    let ids = ecs_world_mod_iter_resources(r2);
+    if (len(ids) as i64) != 2 { panic(90331); };
+    if ids[0] != 1 { panic(90332); };
+    let mut_r = ecs_world_mod_iter_resources_mut(r2);
+    if (len(mut_r.1) as i64) != 2 { panic(90333); };
+}
+
+@test "world_get_resource_by_id"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 1).0;
+    let g = ecs_world_mod_get_resource_by_id(r, 1);
+    if g.0 != true { panic(90334); };
+    let gm = ecs_world_mod_get_resource_mut_by_id(r, 1);
+    if gm.1 != true { panic(90335); };
+    let gn = ecs_world_mod_get_non_send_by_id(r, 1);
+    if gn.0 != false { panic(90336); };
+}
+
+@test "world_remove_resource_by_id"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_resource(w, 1).0;
+    let rr = ecs_world_mod_remove_resource_by_id(r, 1);
+    if rr.1 != true { panic(90337); };
+    let miss = ecs_world_mod_remove_resource_by_id(rr.0, 999);
+    if miss.1 != false { panic(90338); };
+}
+
+@test "world_entity_allocator"() {
+    let w = ecs_world_mod_new();
+    let alloc = ecs_world_mod_entity_allocator(w);
+    if alloc != 1 { panic(90339); };
+    let w2 = ecs_world_mod_spawn_empty(w).0;
+    let alloc2 = ecs_world_mod_entity_allocator(w2);
+    if alloc2 != 2 { panic(90340); };
+}
+
+@test "world_flush"() {
+    let w = ecs_world_mod_new();
+    let w2 = ecs_world_mod_flush(w);
+    if ecs_world_mod_entity_count(w2) != 0 { panic(90341); };
+}
+
+@test "world_query_state"() {
+    let w = ecs_world_mod_new();
+    let q = ecs_world_mod_query(w);
+    if q.1 != -1 { panic(90342); };
+    let qf = ecs_world_mod_query_filtered(w);
+    if qf.1 != -1 { panic(90343); };
+    let tq = ecs_world_mod_try_query(w);
+    if tq.0 != false { panic(90344); };
+    let tqf = ecs_world_mod_try_query_filtered(w);
+    if tqf.0 != false { panic(90345); };
+}
+
+@test "world_removed_components"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_clear_trackers(w);
+    if ecs_world_mod_removed_components_count(r) != 0 { panic(90346); };
+    let removed = ecs_world_mod_removed(r, 1);
+    if (len(removed) as i64) != 0 { panic(90347); };
+}
+
+@test "world_register_bundle"() {
+    let w = ecs_world_mod_new();
+    let rb = ecs_world_mod_register_bundle(w, 42);
+    if rb.1 != 42 { panic(90348); };
+    let rdb = ecs_world_mod_register_dynamic_bundle(w, Vec::new());
+    if rdb.1 != 0 { panic(90349); };
+}
+
+@test "world_inspect_entity"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_spawn_empty(w);
+    let ins = ecs_world_mod_inspect_entity(r.0, r.1);
+    if ins.0 != true { panic(90350); };
+    let ins2 = ecs_world_mod_inspect_entity(r.0, 999);
+    if ins2.0 != false { panic(90351); };
+}
+
+@test "world_get_by_id"() {
+    let w = ecs_world_mod_new();
+    let r = ecs_world_mod_register_component(w, 5).0;
+    let g = ecs_world_mod_get_by_id(r, 1, 5);
+    if g.0 != true { panic(90352); };
+    let gm = ecs_world_mod_get_mut_by_id(r, 1, 5);
+    if gm.0 != true { panic(90353); };
+}

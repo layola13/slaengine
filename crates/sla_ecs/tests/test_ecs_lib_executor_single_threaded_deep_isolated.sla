@@ -1,0 +1,156 @@
+// Isolated deep tests for lib/executor_single_threaded_deep.sla (Batch 419).
+// Covers the fixed-cap SingleThreadedExecutor model without Vec-backed bitsets.
+
+@import "../src/executor_single_threaded_deep.sla"
+
+@test "st_deep_new_and_init"() {
+    let e = ecs_single_threaded_executor_deep_new();
+    if ecs_st_deep_apply_final_deferred(e) != true { panic(147810); };
+    let e2 = ecs_single_threaded_executor_deep_init(e, 5, 3);
+    if ecs_st_deep_system_count(e2) != 5 { panic(147811); };
+    if ecs_st_deep_set_count(e2) != 3 { panic(147812); };
+    if ecs_st_deep_completed_count(e2) != 0 { panic(147813); };
+}
+
+@test "st_deep_run_system_marks_completed_and_unapplied"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 1);
+    let e2 = ecs_st_deep_run_system(e, 0, false);
+    if ecs_st_deep_systems_run(e2) != 1 { panic(147814); };
+    if ecs_st_deep_is_completed(e2, 0) != true { panic(147815); };
+    if ecs_st_deep_is_unapplied(e2, 0) != true { panic(147816); };
+}
+
+@test "st_deep_apply_deferred_barrier_applies_prior_unapplied"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 4, 0);
+    let e1 = ecs_st_deep_run_system(e, 0, false);
+    let e2 = ecs_st_deep_run_system(e1, 1, false);
+    if ecs_st_deep_unapplied_count(e2) != 2 { panic(147817); };
+    let e3 = ecs_st_deep_run_system(e2, 2, true);
+    if ecs_st_deep_systems_run(e3) != 3 { panic(147818); };
+    if ecs_st_deep_deferred_applied(e3) != 2 { panic(147819); };
+    if ecs_st_deep_unapplied_count(e3) != 0 { panic(147820); };
+    if ecs_st_deep_is_unapplied(e3, 2) { panic(147821); };
+}
+
+@test "st_deep_skip_system_completes_without_unapplied"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 2, 0);
+    let e2 = ecs_st_deep_skip_system(e, 1);
+    if ecs_st_deep_systems_skipped(e2) != 1 { panic(147822); };
+    if ecs_st_deep_is_completed(e2, 1) != true { panic(147823); };
+    if ecs_st_deep_is_unapplied(e2, 1) { panic(147824); };
+}
+
+@test "st_deep_finish_applies_final_deferred_and_clears_transient"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 1);
+    let e1 = ecs_st_deep_run_system(e, 0, false);
+    let e2 = ecs_st_deep_mark_set_evaluated(e1, 0);
+    let e3 = ecs_st_deep_finish_run(e2);
+    if ecs_st_deep_completed_count(e3) != 0 { panic(147825); };
+    if ecs_st_deep_evaluated_set_count(e3) != 0 { panic(147826); };
+    if ecs_st_deep_unapplied_count(e3) != 0 { panic(147827); };
+    if ecs_st_deep_deferred_applied(e3) != 1 { panic(147828); };
+}
+
+@test "st_deep_finish_without_final_deferred_preserves_unapplied"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 1);
+    let e1 = ecs_st_deep_set_apply_final_deferred(e, false);
+    let e2 = ecs_st_deep_run_system(e1, 0, false);
+    let e3 = ecs_st_deep_skip_system(e2, 1);
+    let e4 = ecs_st_deep_mark_set_evaluated(e3, 0);
+    let finished = ecs_st_deep_finish_run(e4);
+    if ecs_st_deep_completed_count(finished) != 0 { panic(147829); };
+    if ecs_st_deep_evaluated_set_count(finished) != 0 { panic(147830); };
+    if ecs_st_deep_unapplied_count(finished) != 1 { panic(147831); };
+    if ecs_st_deep_is_unapplied(finished, 0) != true { panic(147832); };
+}
+
+@test "st_deep_failed_and_passed_set_conditions"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 1);
+    let failed = ecs_st_deep_apply_failed_set_condition3(e, 0, 0, 1, -1);
+    if ecs_st_deep_is_set_evaluated(failed, 0) != true { panic(147833); };
+    if ecs_st_deep_completed_count(failed) != 2 { panic(147834); };
+    if ecs_st_deep_systems_skipped(failed) != 2 { panic(147835); };
+    let passed = ecs_st_deep_apply_passed_set_condition(e, 0);
+    if ecs_st_deep_is_set_evaluated(passed, 0) != true { panic(147836); };
+    let no_failed_after_pass = ecs_st_deep_apply_failed_set_condition3(passed, 0, 0, 1, -1);
+    if ecs_st_deep_completed_count(no_failed_after_pass) != 0 { panic(147837); };
+}
+
+@test "st_deep_initial_skips_prevent_later_run"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 0);
+    let e1 = ecs_st_deep_apply_initial_skips3(e, 1, -1, -1);
+    let e2 = ecs_st_deep_process_system(e1, 0, true, false);
+    let e3 = ecs_st_deep_process_system(e2, 1, true, false);
+    let e4 = ecs_st_deep_process_system(e3, 2, true, false);
+    if ecs_st_deep_systems_run(e4) != 2 { panic(147838); };
+    if ecs_st_deep_systems_skipped(e4) != 1 { panic(147839); };
+    if ecs_st_deep_is_unapplied(e4, 1) { panic(147840); };
+}
+
+@test "st_deep_system_error_paths_mark_unapplied"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 2, 0);
+    let handled = ecs_st_deep_run_system_with_handled_error(e, 0);
+    if ecs_st_deep_system_handled_error_count(handled) != 1 { panic(147841); };
+    if ecs_st_deep_handled_error_phase(handled) != ecs_st_deep_panic_phase_system() { panic(147842); };
+    if ecs_st_deep_has_panic_payload(handled) { panic(147843); };
+    if ecs_st_deep_is_unapplied(handled, 0) != true { panic(147844); };
+    let panicked = ecs_st_deep_run_system_with_panic_payload(e, 1);
+    if ecs_st_deep_has_panic_payload(panicked) != true { panic(147845); };
+    if ecs_st_deep_system_panic_payload_count(panicked) != 1 { panic(147846); };
+    if ecs_st_deep_panic_payload_phase(panicked) != ecs_st_deep_panic_phase_system() { panic(147847); };
+}
+
+@test "st_deep_deferred_error_and_payload_take"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 0);
+    let e1 = ecs_st_deep_run_system(e, 0, false);
+    let e2 = ecs_st_deep_run_system(e1, 1, false);
+    let e3 = ecs_st_deep_run_system(e2, 2, false);
+    let finished = ecs_st_deep_finish_run_with_deferred_error(e3, 1);
+    if ecs_st_deep_deferred_applied(finished) != 2 { panic(147848); };
+    if ecs_st_deep_deferred_panic_payload_count(finished) != 1 { panic(147849); };
+    if ecs_st_deep_panic_payload_phase(finished) != ecs_st_deep_panic_phase_apply_deferred() { panic(147850); };
+    if ecs_st_deep_panic_payload_system(finished) != 1 { panic(147851); };
+    let after_take = ecs_st_deep_take_panic_payload(finished);
+    if ecs_st_deep_has_panic_payload(after_take) { panic(147852); };
+    if ecs_st_deep_panic_rethrow_count(after_take) != 1 { panic(147853); };
+}
+
+@test "st_deep_deferred_handled_error_applies_all"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 3, 0);
+    let e1 = ecs_st_deep_run_system(e, 0, false);
+    let e2 = ecs_st_deep_run_system(e1, 1, false);
+    let applied = ecs_st_deep_apply_deferred_with_handled_error(e2, 1);
+    if ecs_st_deep_deferred_applied(applied) != 2 { panic(147854); };
+    if ecs_st_deep_deferred_handled_error_count(applied) != 1 { panic(147855); };
+    if ecs_st_deep_handled_error_phase(applied) != ecs_st_deep_panic_phase_apply_deferred() { panic(147856); };
+    if ecs_st_deep_unapplied_count(applied) != 0 { panic(147857); };
+}
+
+@test "st_deep_condition_fold_evaluates_all_after_false"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 1, 0);
+    let r = ecs_st_deep_evaluate_and_fold_conditions4(e, 0, ecs_st_deep_condition_outcome_true(), ecs_st_deep_condition_outcome_false(), ecs_st_deep_condition_outcome_true(), ecs_st_deep_condition_outcome_true(), 3);
+    if ecs_st_deep_condition_fold_should_run(r) { panic(147858); };
+    if ecs_st_deep_condition_fold_evaluated_count(r) != 3 { panic(147859); };
+    if ecs_st_deep_condition_fold_aborted(r) { panic(147860); };
+}
+
+@test "st_deep_condition_fold_error_handler_panic_aborts"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 1, 0);
+    let r = ecs_st_deep_evaluate_and_fold_conditions4(e, 0, ecs_st_deep_condition_outcome_true(), ecs_st_deep_condition_outcome_error_handler_panic(), ecs_st_deep_condition_outcome_true(), ecs_st_deep_condition_outcome_true(), 4);
+    if ecs_st_deep_condition_fold_should_run(r) { panic(147861); };
+    if ecs_st_deep_condition_fold_evaluated_count(r) != 2 { panic(147862); };
+    if ecs_st_deep_condition_fold_aborted(r) != true { panic(147863); };
+    if ecs_st_deep_condition_fold_has_payload(r) != true { panic(147864); };
+    if ecs_st_deep_condition_fold_phase(r) != ecs_st_deep_panic_phase_run_condition() { panic(147865); };
+    if ecs_st_deep_condition_fold_system(r) != 0 { panic(147866); };
+}
+
+@test "st_deep_condition_fold_handled_error_continues"() {
+    let e = ecs_single_threaded_executor_deep_init(ecs_single_threaded_executor_deep_new(), 1, 0);
+    let r = ecs_st_deep_evaluate_and_fold_conditions4(e, 4, ecs_st_deep_condition_outcome_true(), ecs_st_deep_condition_outcome_handled_error(), ecs_st_deep_condition_outcome_true(), ecs_st_deep_condition_outcome_true(), 3);
+    if ecs_st_deep_condition_fold_should_run(r) { panic(147867); };
+    if ecs_st_deep_condition_fold_evaluated_count(r) != 3 { panic(147868); };
+    if ecs_st_deep_condition_fold_handled_errors(r) != 1 { panic(147869); };
+    if ecs_st_deep_condition_fold_phase(r) != ecs_st_deep_panic_phase_run_condition() { panic(147870); };
+    if ecs_st_deep_condition_fold_system(r) != 4 { panic(147871); };
+}

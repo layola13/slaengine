@@ -1,0 +1,234 @@
+// Isolated deep tests for lib/world_dynamic3_deep.sla (Batch 391).
+// Mirrors shallow lib/world_dynamic3.sla's generically-typed DynamicWorld3<A,B,C,R,M> (Vec/
+// dyn_store-backed dynamic 3-column variant: A=Pos{x,y}, B=Vel{x,y}, C=Player{team}) as a
+// SELF-CONTAINED fixed-cap-16 variant. Each Vec/dyn_store becomes a cap-16 scalar slot family;
+// `impl DynamicWorld3TripleQuery { fn self }` method-call syntax becomes free functions (Batch
+// 388 #7), and shallow's `for pos in with_c { ... }` becomes `while i < count { ... }` loops
+// (SA `_deep.sla` tests cannot use for-in). Wrapper structs EcsWD3Spawn/EcsWD3TripleQuery/
+// EcsWD3QueryA/EcsWD3Read expose scalar accessors so tests NEVER destructure tuples
+// (`let (w, e) = spawn`) — the wrapper-first style established in Batch 386/388.
+// panic codes: 143500 - 143529 (Batch 391 band; the previous Batch 390 used 143300-143433).
+
+@import "../src/world_dynamic3_deep.sla"
+
+// ── convenience helpers: spawn wrapper decomposition (idiomatic in every test). ─────────────
+fn sw_world(s: EcsWD3Spawn) -> EcsWD3World { return ecs_wd3_spawn_world(s); }
+fn sw_entity(s: EcsWD3Spawn) -> EcsWD3Entity { return ecs_wd3_spawn_entity(s); }
+
+// ── Test 1 (shallow test 1) — spawn_abc bundle + triple query count/item. ──────────────────
+// Shallow's first embedded test: spawn_abc e1 (Pos 1,0),(Vel 2,0),(Player team 7); spawn e2; insert_a(5)
+// into e2 only; insert_b(10) into e2 only; query_a_b_c must yield exactly 1 triple (e1 has all three),
+// entity is e1, and a.x + b.x + c.team == 1 + 2 + 7 == 10.
+@test "EcsWD3World spawn_abc bundle and triple query"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_spawn_abc(w0, 1, 0, 2, 0, 7);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    let s2 = ecs_wd3_world_spawn(w1);
+    let w2 = sw_world(s2);
+    let e2 = sw_entity(s2);
+    let w3 = ecs_wd3_insert_a(w2, e2, 5, 0);
+    let w4 = ecs_wd3_insert_b(w3, e2, 10, 0);
+    let q = ecs_wd3_query_a_b_c(w4);
+    if ecs_wd3_pair_query_count(q) != 1 { panic(143500); };
+    let item_entity = ecs_wd3_pair_query_entity_at(q, 0);
+    if item_entity.id != e1.id { panic(143501); };
+    let item_a = ecs_wd3_pair_query_a_at(q, 0);
+    let item_b = ecs_wd3_pair_query_b_at(q, 0);
+    let item_c = ecs_wd3_pair_query_c_at(q, 0);
+    if item_a.x + item_b.x + item_c.team != 10 { panic(143502); };
+}
+
+// ── Test 2 (shallow test 2) — query_a_with_c vs query_a_without_c filter boundary. ───────────
+// Shallow's second embedded test: spawn_abc e1 (Pos 3),(Vel 1),(Player team 1); spawn e2 (only A);
+// insert_a(9) into e2; with_c contains only e1's (3,0); without_c contains only e2's (9,0);
+// has_c(e1) is true. Since SA tests cannot use `for pos in with_c` we sum a_x while looping.
+@test "EcsWD3World with without c filters and while-loop sums"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_spawn_abc(w0, 3, 0, 1, 0, 1);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    let s2 = ecs_wd3_world_spawn(w1);
+    let w2 = sw_world(s2);
+    let e2 = sw_entity(s2);
+    let w3 = ecs_wd3_insert_a(w2, e2, 9, 0);
+    let with_c = ecs_wd3_query_a_with_c(w3);
+    let without_c = ecs_wd3_query_a_without_c(w3);
+    let total: i32 = 0;
+    let i: i32 = 0;
+    while i < ecs_wd3_query_a_count(with_c) {
+        total = total + ecs_wd3_query_a_x_at(with_c, i);
+        i = i + 1;
+    }
+    if total != 3 { panic(143505); };
+    if ecs_wd3_query_a_count(without_c) != 1 { panic(143506); };
+    if ecs_wd3_query_a_x_at(without_c, 0) != 9 { panic(143507); };
+    if ecs_wd3_has_c(w3, e1) != true { panic(143508); };
+}
+
+// ── Test 3 (shallow test 3) — c change detection (added/changed since) + despawn. ────────────
+// Shallow's third embedded test: spawn_abc e1; c_added_since(e1,0) true (added_t = 1 > 0);
+// increment_tick (now 2); write_c team 4 (changed_t = 2); c_changed_since(e1,1) true (2 > 1);
+// get_c team 4; despawn e1; is_alive false; has_a false.
+// change_tick starts at 1 in the fresh world, so right after spawn_abc the c_added/c_changed stamps
+// are 1 (insert_c stamps added+changed = current change_tick = 1).
+@test "EcsWD3World c change detection and despawn"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_spawn_abc(w0, 0, 0, 0, 0, 1);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    if ecs_wd3_c_added_since(w1, e1, 0) != true { panic(143510); };
+    let w2 = ecs_wd3_increment_tick(w1);
+    let w3 = ecs_wd3_write_c(w2, e1, 4);
+    if ecs_wd3_c_changed_since(w3, e1, 1) != true { panic(143511); };
+    let c = ecs_wd3_get_c(w3, e1);
+    if ecs_wd3_player_team(c) != 4 { panic(143512); };
+    let w4 = ecs_wd3_despawn(w3, e1);
+    if ecs_wd3_is_alive(w4, e1) != false { panic(143513); };
+    if ecs_wd3_has_a(w4, e1) != false { panic(143514); };
+}
+
+// ── Test 4 — wrap-around rectify: c_added_since(e1, 1) is FALSE (added_t = 1, strict-greater). ─
+// This exercises the Batch 388 #5 `*_since` strict-greater rule directly: equal-stamp returns
+// false even when added at exactly that tick. The shallow test asserts changed_since is true
+// (changed bumped to 2 > 1) but never directly asserts added_since(1) is false; add it here.
+@test "EcsWD3World c_added_since is strict-greater (equal stamp returns false)"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_spawn_abc(w0, 0, 0, 0, 0, 1);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    // add stamp is 1 (current change_tick at insert time). c_added_since(tick=1) = 1 > 1 = false.
+    if ecs_wd3_c_added_since(w1, e1, 1) != false { panic(143515); };
+    // c_added_since(tick=0) = 1 > 0 = true (already asserted in Test 3 but reinforced here).
+    if ecs_wd3_c_added_since(w1, e1, 0) != true { panic(143516); };
+    // Before increment_tick + write_c, c_changed_since(tick=1) is also false (changed stamp is 1).
+    if ecs_wd3_c_changed_since(w1, e1, 1) != false { panic(143517); };
+}
+
+// ── Test 5 — cap-16 spawn reject sentinel (NO panic). ───────────────────────────────────────
+// Spawn 16 entities (ids 1..16) succeed; 17th spawn rejects with sentinel entity id== -1.
+// Per Batch 388/389/390 #2/#3 the public spawn returns a sentinel wrapper (NOT panic) when the
+// allocator is exhausted. The returned world must be unchanged (cap hit is a read-only reject).
+@test "EcsWD3World spawn at cap-16 yields sentinel entity id=-1 (no panic)"() {
+    // Deep slot 0 is reserved (ecs_wd3_is_alive rejects id <= 0, mirroring shallow dyn_is_alive
+    // which rejects id <= 0). So only ids 1..15 (15 ids) are allocatable before the cap-16
+    // sentinel fires on the 16th spawn attempt.
+    let w = ecs_wd3_world_new();
+    let i: i32 = 0;
+    while i < 15 {
+        let sp = ecs_wd3_world_spawn(w);
+        w = sw_world(sp);
+        if sw_entity(sp).id != i + 1 { panic(143520 + i); };
+        i = i + 1;
+    }
+    // 16th spawn attempt (i == 15, ids 1..15 already taken): next_id is now 16 == ECS_WD3_CAP.
+    let s16 = ecs_wd3_world_spawn(w);
+    let e16 = sw_entity(s16);
+    if e16.id != -1 { panic(143540); };
+    if e16.generation != 0 { panic(143541); };
+    // The rejecting spawn leaves world unchanged (next_id still 16 at cap).
+    if ecs_wd3_allocator_next_id(w) != 16 { panic(143542); };
+}
+
+// ── Test 6 — remove_a swap-remove moves the last A slot into the freed slot. ────────────────
+// Spawn e1, e2, e3; insert_a into all three (a_count = 3); remove_a(e1) must swap e3's data
+// into slot 0 and drop the count to 2. Subsequent query fetch must return the relocated value.
+@test "EcsWD3World remove_a swap-remove relocates last slot into freed slot"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_world_spawn(w0); let w1 = sw_world(s1); let e1 = sw_entity(s1);
+    let s2 = ecs_wd3_world_spawn(w1); let w2 = sw_world(s2); let e2 = sw_entity(s2);
+    let s3 = ecs_wd3_world_spawn(w2); let w3 = sw_world(s3); let e3 = sw_entity(s3);
+    let w4 = ecs_wd3_insert_a(w3, e1, 11, 0);
+    let w5 = ecs_wd3_insert_a(w4, e2, 22, 0);
+    let w6 = ecs_wd3_insert_a(w5, e3, 33, 0);
+    // Remove e1's A. With swap-remove the last slot (e3's 33,0) is copied into e1's slot.
+    let w7 = ecs_wd3_remove_a(w6, e1);
+    if ecs_wd3_has_a(w7, e1) != false { panic(143550); };
+    if ecs_wd3_has_a(w7, e3) != true { panic(143551); };
+    // get_a(e3) must still return (33, 0) — the relocated value survives.
+    let e3_a = ecs_wd3_get_a(w7, e3);
+    if e3_a.x != 33 { panic(143552); };
+    if e3_a.y != 0 { panic(143553); };
+    // e2's A is untouched.
+    let e2_a = ecs_wd3_get_a(w7, e2);
+    if e2_a.x != 22 { panic(143554); };
+}
+
+// ── Test 7 — despawn frees the entity id and a later spawn reuses the same id (+1 gen). ─────
+// This exercises generation bump-on-free + free_id reuse. After spawn_abc+despawn(e1), the next
+// spawn (alloc_entity pops the freed id) returns the same id at generation 1.
+@test "EcsWD3World despawn then spawn reuses freed id with bumped generation"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_spawn_abc(w0, 1, 0, 2, 0, 7);
+    let w1 = sw_world(s1); let e1 = sw_entity(s1);
+    let w2 = ecs_wd3_despawn(w1, e1);
+    if ecs_wd3_is_alive(w2, e1) != false { panic(143560); };
+    let s2 = ecs_wd3_world_spawn(w2);
+    let w3 = sw_world(s2); let e2 = sw_entity(s2);
+    if e2.id != e1.id { panic(143561); };
+    if e2.generation != e1.generation + 1 { panic(143562); };
+    if ecs_wd3_is_alive(w3, e2) != true { panic(143563); };
+    // Reused id starts with no components.
+    if ecs_wd3_has_a(w3, e2) != false { panic(143564); };
+    if ecs_wd3_has_c(w3, e2) != false { panic(143565); };
+}
+
+// ── Test 8 — insert_c replace-in-place bumps changed-tick only (added stays put). ───────────
+// After spawn_abc the c_added_t and c_changed_t are both = 1 (current change_tick). Insert_c again
+// with a new team value must NOT bump added (still 1) but MUST set changed to the new change_tick.
+// Capture baseline = change_tick BEFORE the second insert_jumps then increment_tick to make the
+// change_tick increment observable. Strict-greater via Batch 388 #5.
+@test "EcsWD3World insert_c replace bumps changed-tick only (added unchanged)"() {
+    let w0 = ecs_wd3_world_new();
+    let s1 = ecs_wd3_spawn_abc(w0, 0, 0, 0, 0, 1);
+    let w1 = sw_world(s1); let e1 = sw_entity(s1);
+    // After spawn_abc: change_tick still 1, both stamps = 1.
+    if ecs_wd3_c_added_since(w1, e1, 0) != true { panic(143570); };
+    let w2 = ecs_wd3_increment_tick(w1);    // change_tick = 2
+    let w3 = ecs_wd3_insert_c(w2, e1, 9);   // replace path: bumps changed_t to 2, leaves added_t 1.
+    // c_added_since(tick=1) = added_t(1) > 1 = false (insert_c replace did not bump added).
+    if ecs_wd3_c_added_since(w3, e1, 1) != false { panic(143571); };
+    // c_changed_since(tick=1) = changed_t(2) > 1 = true.
+    if ecs_wd3_c_changed_since(w3, e1, 1) != true { panic(143572); };
+    let c = ecs_wd3_get_c(w3, e1);
+    if ecs_wd3_player_team(c) != 9 { panic(143573); };
+}
+
+// ── Test 9 — resource lifecycle (insert/has/get/remove). ─────────────────────────────────────
+// The shallow's embedded tests do NOT exercise the resource surface (the shallow has it but the
+// tests skip it). Add parity coverage here mirroring Batch 389's resource ops.
+@test "EcsWD3World resource insert has get remove"() {
+    let w0 = ecs_wd3_world_new();
+    if ecs_wd3_has_resource(w0) != false { panic(143580); };
+    let w1 = ecs_wd3_insert_resource(w0, 42);
+    if ecs_wd3_has_resource(w1) != true { panic(143581); };
+    let r = ecs_wd3_get_resource(w1);
+    if ecs_wd3_time_tick(r) != 42 { panic(143582); };
+    let w2 = ecs_wd3_remove_resource(w1);
+    if ecs_wd3_has_resource(w2) != false { panic(143583); };
+}
+
+// ── Test 10 — message queue cap-16 write + drain via reader + cap-reject panic. ─────────────
+// The shallow's embedded tests do not exercise messages. Add parity coverage here: enqueue 3
+// messages then drain all 3 via repeated read_message calls; the 4th read reports has_value=0.
+// Writing past cap-16 raises panic 8108 (the lib reserves this unique sentinel).
+@test "EcsWD3World message write read drain and cap-reject"() {
+    let w0 = ecs_wd3_world_new();
+    let w1 = ecs_wd3_write_message(w0, 100);
+    let w2 = ecs_wd3_write_message(w1, 200);
+    let w3 = ecs_wd3_write_message(w2, 300);
+    if ecs_wd3_message_count(w3) != 3 { panic(143590); };
+    let reader0 = ecs_wd3_message_reader_new();
+    let r1 = ecs_wd3_read_message(w3, reader0);
+    if ecs_wd3_read_has_value(r1) != 1 { panic(143591); };
+    if ecs_wd3_read_amount(r1) != 100 { panic(143592); };
+    let reader1 = ecs_wd3_message_reader_with_cursor(ecs_wd3_read_cursor(r1));
+    let r2 = ecs_wd3_read_message(w3, reader1);
+    if ecs_wd3_read_amount(r2) != 200 { panic(143593); };
+    let reader2 = ecs_wd3_message_reader_with_cursor(ecs_wd3_read_cursor(r2));
+    let r3 = ecs_wd3_read_message(w3, reader2);
+    if ecs_wd3_read_amount(r3) != 300 { panic(143594); };
+    let reader3 = ecs_wd3_message_reader_with_cursor(ecs_wd3_read_cursor(r3));
+    let r4 = ecs_wd3_read_message(w3, reader3);
+    if ecs_wd3_read_has_value(r4) != 0 { panic(143595); };
+}

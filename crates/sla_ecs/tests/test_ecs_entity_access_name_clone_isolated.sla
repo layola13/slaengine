@@ -1,0 +1,583 @@
+// EntityRef/EntityWorldMut + Name/Intern + ComponentCloneBehavior + MaybeLocation.
+// Bevy world/entity_access/: EntityRef (id, location, contains, get, get_ref,
+// get_change_ticks, components, get_by_id, spawned_by, spawn_tick).
+// EntityWorldMut (into_readonly, as_readonly, into_mutable, as_mutable, insert,
+// insert_if_new, remove, remove_with_requires, retain, clear, despawn, take,
+// entry, observe, clone_and_spawn, clone_components, move_components, world_scope).
+// name.rs: Name, HashedStr, NameOrEntity.
+// intern.rs: Interner, Interned.
+// component/clone.rs: ComponentCloneBehavior (Default, Ignore, Custom).
+// change_detection/maybe_location.rs: MaybeLocation.
+
+// --- EntityRef / EntityWorldMut ---
+struct EcsEntityRef {
+    entity_id: i32,
+    archetype_id: i32,
+    table_row: i32,
+    components: Vec<i32>,
+    values: Vec<i32>,
+    change_ticks: Vec<i32>,
+    spawned_by: i32,    // MaybeLocation as caller id
+    spawn_tick: i32,
+}
+
+fn entity_ref_new(entity_id: i32) -> EcsEntityRef {
+    return EcsEntityRef {
+        entity_id: entity_id, archetype_id: 0, table_row: 0,
+        components: Vec::new(), values: Vec::new(), change_ticks: Vec::new(),
+        spawned_by: 0, spawn_tick: 0,
+    };
+}
+
+fn eref_id(r: EcsEntityRef) -> i32 { return r.entity_id; }
+fn eref_archetype_id(r: EcsEntityRef) -> i32 { return r.archetype_id; }
+fn eref_table_row(r: EcsEntityRef) -> i32 { return r.table_row; }
+fn eref_spawned_by(r: EcsEntityRef) -> i32 { return r.spawned_by; }
+fn eref_spawn_tick(r: EcsEntityRef) -> i32 { return r.spawn_tick; }
+
+fn eref_contains(r: EcsEntityRef, type_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(r.components) as i64;
+    while i < cnt {
+        if r.components[i] == type_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn eref_get(r: EcsEntityRef, type_id: i32, default: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(r.components) as i64;
+    while i < cnt {
+        if r.components[i] == type_id { return r.values[i]; };
+        i = i + 1;
+    }
+    return default;
+}
+
+fn eref_get_change_ticks(r: EcsEntityRef, type_id: i32, default: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(r.components) as i64;
+    while i < cnt {
+        if r.components[i] == type_id { return r.change_ticks[i]; };
+        i = i + 1;
+    }
+    return default;
+}
+
+fn eref_component_count(r: EcsEntityRef) -> i64 { return len(r.components) as i64; }
+
+// EntityWorldMut extends EntityRef with mutation
+struct EcsEntityWorldMut {
+    inner: EcsEntityRef,
+    is_spawned: bool,
+}
+
+fn world_mut_new(entity_id: i32) -> EcsEntityWorldMut {
+    return EcsEntityWorldMut { inner: entity_ref_new(entity_id), is_spawned: true };
+}
+
+fn world_mut_into_readonly(m: EcsEntityWorldMut) -> EcsEntityRef { return m.inner; }
+fn world_mut_as_readonly(m: EcsEntityRef) -> EcsEntityRef { return m; }
+fn world_mut_id(m: EcsEntityWorldMut) -> i32 { return m.inner.entity_id; }
+fn world_mut_is_spawned(m: EcsEntityWorldMut) -> bool { return m.is_spawned; }
+fn world_mut_is_despawned(m: EcsEntityWorldMut) -> bool { return m.is_spawned != true; }
+
+fn world_mut_insert(m: EcsEntityWorldMut, type_id: i32, value: i32, tick: i32) -> EcsEntityWorldMut {
+    let i: i64 = 0;
+    let cnt = len(m.inner.components) as i64;
+    while i < cnt {
+        if m.inner.components[i] == type_id {
+            m.inner.values[i] = value;
+            m.inner.change_ticks[i] = tick;
+            return m;
+        };
+        i = i + 1;
+    }
+    m.inner.components.push(type_id);
+    m.inner.values.push(value);
+    m.inner.change_ticks.push(tick);
+    return m;
+}
+
+fn world_mut_insert_if_new(m: EcsEntityWorldMut, type_id: i32, value: i32, tick: i32) -> EcsEntityWorldMut {
+    if eref_contains(m.inner, type_id) { return m; };
+    return world_mut_insert(m, type_id, value, tick);
+}
+
+fn world_mut_remove(m: EcsEntityWorldMut, type_id: i32) -> EcsEntityWorldMut {
+    let i: i64 = 0;
+    let cnt = len(m.inner.components) as i64;
+    while i < cnt {
+        if m.inner.components[i] == type_id {
+            m.inner.components.remove(i);
+            m.inner.values.remove(i);
+            m.inner.change_ticks.remove(i);
+            return m;
+        };
+        i = i + 1;
+    }
+    return m;
+}
+
+fn world_mut_clear(m: EcsEntityWorldMut) -> EcsEntityWorldMut {
+    let empty_c: Vec<i32> = Vec::new();
+    let empty_v: Vec<i32> = Vec::new();
+    let empty_t: Vec<i32> = Vec::new();
+    m.inner.components = empty_c;
+    m.inner.values = empty_v;
+    m.inner.change_ticks = empty_t;
+    return m;
+}
+
+fn world_mut_take(m: EcsEntityWorldMut, type_id: i32) -> (EcsEntityWorldMut, i32, bool) {
+    let val = eref_get(m.inner, type_id, 0);
+    let has = eref_contains(m.inner, type_id);
+    if has {
+        let m2 = world_mut_remove(m, type_id);
+        return (m2, val, true);
+    };
+    return (m, 0, false);
+}
+
+fn world_mut_retain(m: EcsEntityWorldMut, retain_ids: Vec<i32>) -> EcsEntityWorldMut {
+    let new_c: Vec<i32> = Vec::new();
+    let new_v: Vec<i32> = Vec::new();
+    let new_t: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(m.inner.components) as i64;
+    while i < cnt {
+        let tid = m.inner.components[i];
+        let keep = false;
+        let j: i64 = 0;
+        let rcnt = len(retain_ids) as i64;
+        let found = false;
+        while j < rcnt {
+            if retain_ids[j] == tid { found = true; };
+            j = j + 1;
+        }
+        if found {
+            new_c.push(tid);
+            new_v.push(m.inner.values[i]);
+            new_t.push(m.inner.change_ticks[i]);
+        };
+        i = i + 1;
+    }
+    m.inner.components = new_c;
+    m.inner.values = new_v;
+    m.inner.change_ticks = new_t;
+    return m;
+}
+
+fn world_mut_despawn(m: EcsEntityWorldMut) -> i32 {
+    let id = m.inner.entity_id;
+    return id;
+}
+
+fn world_mut_clone_and_spawn(m: EcsEntityWorldMut) -> (EcsEntityWorldMut, i32) {
+    let new_id = m.inner.entity_id + 10000;
+    let clone = world_mut_new(new_id);
+    let clone2 = world_mut_clone_and_spawn_rec(clone, m.inner, 0);
+    return (m, new_id);
+}
+
+fn world_mut_clone_and_spawn_rec(clone: EcsEntityWorldMut, src: EcsEntityRef, i: i64) -> EcsEntityWorldMut {
+    if i >= (len(src.components) as i64) { return clone; };
+    let c = world_mut_insert(clone, src.components[i], src.values[i], src.change_ticks[i]);
+    return world_mut_clone_and_spawn_rec(c, src, i + 1);
+}
+
+fn world_mut_clone_components(m: EcsEntityWorldMut, target: EcsEntityWorldMut) -> EcsEntityWorldMut {
+    return world_mut_clone_components_rec(target, m.inner, 0);
+}
+
+fn world_mut_clone_components_rec(target: EcsEntityWorldMut, src: EcsEntityRef, i: i64) -> EcsEntityWorldMut {
+    if i >= (len(src.components) as i64) { return target; };
+    let t = world_mut_insert(target, src.components[i], src.values[i], src.change_ticks[i]);
+    return world_mut_clone_components_rec(t, src, i + 1);
+}
+
+// world_scope: run fn with mutable world access
+fn world_mut_world_scope(m: EcsEntityWorldMut, f: fn(EcsEntityWorldMut) -> EcsEntityWorldMut) -> EcsEntityWorldMut {
+    return f(m);
+}
+
+// --- Name / HashedStr / NameOrEntity ---
+struct EcsHashedStr {
+    chars: Vec<i32>,
+    hash: i32,
+}
+
+fn hashed_str_new(s: Vec<i32>) -> EcsHashedStr {
+    let h = hash_str(s);
+    return EcsHashedStr { chars: s, hash: h };
+}
+
+fn hash_str(s: Vec<i32>) -> i32 {
+    let h: i32 = 5381;
+    let i: i64 = 0;
+    let cnt = len(s) as i64;
+    while i < cnt {
+        h = h * 33 + s[i];
+        i = i + 1;
+    }
+    return h;
+}
+
+fn hashed_str_as_str(hs: EcsHashedStr) -> Vec<i32> { return hs.chars; }
+fn hashed_str_pre_hash(hs: EcsHashedStr) -> i32 { return hs.hash; }
+fn hashed_str_len(hs: EcsHashedStr) -> i64 { return len(hs.chars) as i64; }
+
+struct EcsName {
+    inner: EcsHashedStr,
+}
+
+fn name_new(s: Vec<i32>) -> EcsName { return EcsName { inner: hashed_str_new(s) }; }
+fn name_set(name: EcsName, s: Vec<i32>) -> EcsName { return EcsName { inner: hashed_str_new(s) }; }
+fn name_as_str(name: EcsName) -> Vec<i32> { return name.inner.chars; }
+fn name_pre_hash(name: EcsName) -> i32 { return name.inner.hash; }
+
+struct EcsNameOrEntity {
+    has_name: bool,
+    name: EcsName,
+    entity_id: i32,
+}
+
+fn name_or_entity_from_name(name: EcsName) -> EcsNameOrEntity {
+    return EcsNameOrEntity { has_name: true, name: name, entity_id: -1 };
+}
+
+fn name_or_entity_from_entity(entity_id: i32) -> EcsNameOrEntity {
+    return EcsNameOrEntity { has_name: false, name: name_new(Vec::new()), entity_id: entity_id };
+}
+
+fn name_or_entity_has_name(n: EcsNameOrEntity) -> bool { return n.has_name; }
+
+// --- Interner ---
+struct EcsInterner {
+    entries: Vec<i32>,   // interned hashes
+    count: i32,
+}
+
+fn interner_new() -> EcsInterner {
+    return EcsInterner { entries: Vec::new(), count: 0 };
+}
+
+fn interner_intern(interner: EcsInterner, hash: i32) -> (EcsInterner, i32) {
+    let i: i64 = 0;
+    let cnt = len(interner.entries) as i64;
+    while i < cnt {
+        if interner.entries[i] == hash { return (interner, hash); };
+        i = i + 1;
+    }
+    interner.entries.push(hash);
+    interner.count = interner.count + 1;
+    return (interner, hash);
+}
+
+fn interner_count(interner: EcsInterner) -> i32 { return interner.count; }
+fn interner_contains(interner: EcsInterner, hash: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(interner.entries) as i64;
+    while i < cnt {
+        if interner.entries[i] == hash { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// --- ComponentCloneBehavior ---
+struct EcsComponentCloneBehavior {
+    kind: i32,  // 0 = Default, 1 = Ignore, 2 = Custom
+    custom_fn: fn(i32) -> i32,
+}
+
+fn clone_behavior_default() -> EcsComponentCloneBehavior {
+    return EcsComponentCloneBehavior { kind: 0, custom_fn: clone_behavior_noop };
+}
+
+fn clone_behavior_ignore() -> EcsComponentCloneBehavior {
+    return EcsComponentCloneBehavior { kind: 1, custom_fn: clone_behavior_noop };
+}
+
+fn clone_behavior_custom(f: fn(i32) -> i32) -> EcsComponentCloneBehavior {
+    return EcsComponentCloneBehavior { kind: 2, custom_fn: f };
+}
+
+fn clone_behavior_noop(x: i32) -> i32 { return x; }
+
+fn clone_behavior_is_default(b: EcsComponentCloneBehavior) -> bool { return b.kind == 0; }
+fn clone_behavior_is_ignore(b: EcsComponentCloneBehavior) -> bool { return b.kind == 1; }
+fn clone_behavior_is_custom(b: EcsComponentCloneBehavior) -> bool { return b.kind == 2; }
+
+fn clone_behavior_apply(b: EcsComponentCloneBehavior, value: i32) -> i32 {
+    if b.kind == 1 { return 0; };  // Ignore: don't clone
+    if b.kind == 2 {
+        let f = b.custom_fn;
+        return f(value);
+    };
+    return value;  // Default: copy as-is
+}
+
+fn clone_custom_double(x: i32) -> i32 { return x * 2; }
+
+// --- MaybeLocation ---
+struct EcsMaybeLocation {
+    has_location: bool,
+    caller_id: i32,
+    line: i32,
+}
+
+fn maybe_location_none() -> EcsMaybeLocation {
+    return EcsMaybeLocation { has_location: false, caller_id: 0, line: 0 };
+}
+
+fn maybe_location_some(caller_id: i32, line: i32) -> EcsMaybeLocation {
+    return EcsMaybeLocation { has_location: true, caller_id: caller_id, line: line };
+}
+
+fn maybe_location_is_some(loc: EcsMaybeLocation) -> bool { return loc.has_location; }
+fn maybe_location_is_none(loc: EcsMaybeLocation) -> bool { return loc.has_location != true; }
+fn maybe_location_caller_id(loc: EcsMaybeLocation) -> i32 { return loc.caller_id; }
+fn maybe_location_line(loc: EcsMaybeLocation) -> i32 { return loc.line; }
+
+const T_HP: i32 = 14001;
+const T_VEL: i32 = 14002;
+
+@test "entity_ref id and location"() {
+    let r = entity_ref_new(42);
+    if eref_id(r) != 42 { panic(14001); };
+    if eref_archetype_id(r) != 0 { panic(14002); };
+}
+
+@test "entity_ref contains after insert"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 100, 5);
+    let r = world_mut_into_readonly(m2);
+    if eref_contains(r, T_HP) != true { panic(14003); };
+    if eref_get(r, T_HP, 0) != 100 { panic(14004); };
+}
+
+@test "entity_ref component_count"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 100, 5);
+    let m3 = world_mut_insert(m2, T_VEL, 200, 5);
+    let r = world_mut_into_readonly(m3);
+    if eref_component_count(r) != 2 { panic(14005); };
+}
+
+@test "entity_ref get_change_ticks"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 100, 7);
+    let r = world_mut_into_readonly(m2);
+    if eref_get_change_ticks(r, T_HP, 0) != 7 { panic(14006); };
+}
+
+@test "world_mut into_readonly"() {
+    let m = world_mut_new(1);
+    let r = world_mut_into_readonly(m);
+    if eref_id(r) != 1 { panic(14007); };
+}
+
+@test "world_mut is_spawned"() {
+    let m = world_mut_new(1);
+    if world_mut_is_spawned(m) != true { panic(14008); };
+}
+
+@test "world_mut insert updates existing"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 10, 1);
+    let m3 = world_mut_insert(m2, T_HP, 20, 2);
+    let r = world_mut_into_readonly(m3);
+    if eref_get(r, T_HP, 0) != 20 { panic(14009); };
+}
+
+@test "world_mut insert_if_new skips existing"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 10, 1);
+    let m3 = world_mut_insert_if_new(m2, T_HP, 99, 2);
+    let r = world_mut_into_readonly(m3);
+    if eref_get(r, T_HP, 0) != 10 { panic(14010); };
+}
+
+@test "world_mut insert_if_new inserts when absent"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert_if_new(m, T_HP, 99, 1);
+    let r = world_mut_into_readonly(m2);
+    if eref_get(r, T_HP, 0) != 99 { panic(14011); };
+}
+
+@test "world_mut remove"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 10, 1);
+    let m3 = world_mut_remove(m2, T_HP);
+    let r = world_mut_into_readonly(m3);
+    if eref_contains(r, T_HP) { panic(14012); };
+}
+
+@test "world_mut clear removes all"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 10, 1);
+    let m3 = world_mut_insert(m2, T_VEL, 20, 1);
+    let m4 = world_mut_clear(m3);
+    let r = world_mut_into_readonly(m4);
+    if eref_component_count(r) != 0 { panic(14013); };
+}
+
+@test "world_mut take returns value and removes"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 42, 1);
+    let (m3, val, has) = world_mut_take(m2, T_HP);
+    if has != true { panic(14014); };
+    if val != 42 { panic(14015); };
+    let r = world_mut_into_readonly(m3);
+    if eref_contains(r, T_HP) { panic(14016); };
+}
+
+@test "world_mut take returns false when absent"() {
+    let m = world_mut_new(1);
+    let (_m_absent, _v_absent, has) = world_mut_take(m, T_HP);
+    if has { panic(14017); };
+}
+
+@test "world_mut retain keeps only specified"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 10, 1);
+    let m3 = world_mut_insert(m2, T_VEL, 20, 1);
+    let retain: Vec<i32> = Vec::new();
+    retain.push(T_HP);
+    let m4 = world_mut_retain(m3, retain);
+    let r = world_mut_into_readonly(m4);
+    if eref_contains(r, T_HP) != true { panic(14018); };
+    if eref_contains(r, T_VEL) { panic(14019); };
+}
+
+@test "world_mut clone_and_spawn creates copy"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 50, 1);
+    let (m3, new_id) = world_mut_clone_and_spawn(m2);
+    if new_id != 10001 { panic(14020); };
+}
+
+@test "world_mut clone_components copies to target"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_insert(m, T_HP, 77, 3);
+    let target = world_mut_new(2);
+    let target2 = world_mut_clone_components(m2, target);
+    let r = world_mut_into_readonly(target2);
+    if eref_get(r, T_HP, 0) != 77 { panic(14021); };
+}
+
+@test "world_mut world_scope runs fn"() {
+    let m = world_mut_new(1);
+    let m2 = world_mut_world_scope(m, world_scope_fn);
+    let r = world_mut_into_readonly(m2);
+    if eref_get(r, T_HP, 0) != 55 { panic(14022); };
+}
+
+fn world_scope_fn(m: EcsEntityWorldMut) -> EcsEntityWorldMut {
+    return world_mut_insert(m, T_HP, 55, 1);
+}
+
+@test "name new and as_str"() {
+    let s: Vec<i32> = Vec::new();
+    s.push(80);  // 'P'
+    s.push(108); // 'l'
+    s.push(97);  // 'a'
+    s.push(121); // 'y'
+    s.push(101); // 'e'
+    s.push(114); // 'r'
+    let n = name_new(s);
+    if name_as_str(n)[0] != 80 { panic(14023); };
+}
+
+@test "name pre_hash is deterministic"() {
+    let s: Vec<i32> = Vec::new();
+    s.push(65);
+    let n1 = name_new(s);
+    let s2: Vec<i32> = Vec::new();
+    s2.push(65);
+    let n2 = name_new(s2);
+    if name_pre_hash(n1) != name_pre_hash(n2) { panic(14024); };
+}
+
+@test "name set replaces"() {
+    let s: Vec<i32> = Vec::new();
+    s.push(65);
+    let n = name_new(s);
+    let s2: Vec<i32> = Vec::new();
+    s2.push(66);
+    let n2 = name_set(n, s2);
+    if name_as_str(n2)[0] != 66 { panic(14025); };
+}
+
+@test "name_or_entity from name"() {
+    let n = name_new(Vec::new());
+    let noe = name_or_entity_from_name(n);
+    if name_or_entity_has_name(noe) != true { panic(14026); };
+}
+
+@test "name_or_entity from entity"() {
+    let noe = name_or_entity_from_entity(42);
+    if name_or_entity_has_name(noe) { panic(14027); };
+    if noe.entity_id != 42 { panic(14028); };
+}
+
+@test "interner intern returns same hash"() {
+    let interner = interner_new();
+    let (i2, h1) = interner_intern(interner, 100);
+    let (i3, h2) = interner_intern(i2, 100);
+    if h1 != h2 { panic(14029); };
+    if interner_count(i3) != 1 { panic(14030); };
+}
+
+@test "interner intern different hashes"() {
+    let interner = interner_new();
+    let (i2, _) = interner_intern(interner, 100);
+    let (i3, _) = interner_intern(i2, 200);
+    if interner_count(i3) != 2 { panic(14031); };
+}
+
+@test "interner contains"() {
+    let interner = interner_new();
+    let (i2, _) = interner_intern(interner, 100);
+    if interner_contains(i2, 100) != true { panic(14032); };
+    if interner_contains(i2, 200) { panic(14033); };
+}
+
+@test "clone_behavior default copies"() {
+    let b = clone_behavior_default();
+    if clone_behavior_apply(b, 42) != 42 { panic(14034); };
+}
+
+@test "clone_behavior ignore returns zero"() {
+    let b = clone_behavior_ignore();
+    if clone_behavior_apply(b, 42) != 0 { panic(14035); };
+}
+
+@test "clone_behavior custom applies fn"() {
+    let b = clone_behavior_custom(clone_custom_double);
+    if clone_behavior_apply(b, 21) != 42 { panic(14036); };
+}
+
+@test "clone_behavior kind accessors"() {
+    let bd = clone_behavior_default();
+    let bi = clone_behavior_ignore();
+    let bc = clone_behavior_custom(clone_custom_double);
+    if clone_behavior_is_default(bd) != true { panic(14037); };
+    if clone_behavior_is_ignore(bi) != true { panic(14038); };
+    if clone_behavior_is_custom(bc) != true { panic(14039); };
+}
+
+@test "maybe_location none"() {
+    let loc = maybe_location_none();
+    if maybe_location_is_some(loc) { panic(14040); };
+    if maybe_location_is_none(loc) != true { panic(14041); };
+}
+
+@test "maybe_location some"() {
+    let loc = maybe_location_some(5, 42);
+    if maybe_location_is_some(loc) != true { panic(14042); };
+    if maybe_location_caller_id(loc) != 5 { panic(14043); };
+    if maybe_location_line(loc) != 42 { panic(14044); };
+}

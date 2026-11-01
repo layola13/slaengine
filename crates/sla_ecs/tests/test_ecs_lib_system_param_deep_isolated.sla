@@ -1,0 +1,283 @@
+@import "../src/system_param_deep.sla"
+
+// Batch 189 tests for system_param deep: access/conflict, ParamSet, Local,
+// Deferred, validation, Option/If mapping, Dyn/Static, SystemChangeTick.
+
+@test "validation_ok_invalid_skipped"() {
+    let vok = ecs_sp_val_ok();
+    if ecs_sp_val_is_ok(vok) != true { panic(103000); };
+    let vin = ecs_sp_val_invalid(7, 1);
+    if ecs_sp_val_is_invalid(vin) != true { panic(103001); };
+    if ecs_sp_val_param_id(vin) != 7 { panic(103002); };
+    if ecs_sp_val_message_id(vin) != 1 { panic(103003); };
+    let vsk = ecs_sp_val_skipped(5, 2);
+    if ecs_sp_val_is_skipped(vsk) != true { panic(103004); };
+    let vn = ecs_sp_val_new(true, 9, 1, 3);
+    if ecs_sp_val_is_skipped(vn) != true { panic(103005); };
+    if ecs_sp_val_field_id(vn) != 3 { panic(103006); };
+    let vn2 = ecs_sp_val_mark_skipped(vin);
+    if ecs_sp_val_is_skipped(vn2) != true { panic(103007); };
+}
+
+@test "access_add_read_write"() {
+    let a = ecs_sp_access_empty();
+    if ecs_sp_access_reads(a) != 0 { panic(103010); };
+    a = ecs_sp_access_add_read(a, 3);
+    if ecs_sp_access_reads(a) != 8 { panic(103011); };
+    a = ecs_sp_access_add_write(a, 1);
+    if (ecs_sp_access_writes(a) & 2) == 0 { panic(103012); };
+    if (ecs_sp_access_reads(a) & 2) == 0 { panic(103013); };
+    let c = ecs_sp_access_clone(a);
+    if ecs_sp_access_reads(c) != ecs_sp_access_reads(a) { panic(103014); };
+}
+
+@test "access_conflict_and_extend"() {
+    let a = ecs_sp_access_add_write(ecs_sp_access_empty(), 0);
+    let b = ecs_sp_access_add_read(ecs_sp_access_empty(), 0);
+    if ecs_sp_access_conflicts(a, b) != true { panic(103020); };
+    let r = ecs_sp_access_empty();
+    let w2 = ecs_sp_access_add_read(ecs_sp_access_empty(), 1);
+    if ecs_sp_access_conflicts(r, w2) != false { panic(103021); };
+    let e = ecs_sp_access_extend(r, w2);
+    if (ecs_sp_access_reads(e) & 2) == 0 { panic(103022); };
+    let w3 = ecs_sp_access_add_write(ecs_sp_access_empty(), 1);
+    if ecs_sp_access_conflicts(e, w3) != true { panic(103023); };
+}
+
+@test "meta_deferred_non_send_last_run"() {
+    let m = ecs_sp_meta_deep_new(2);
+    if ecs_sp_meta_deep_has_deferred(m) != false { panic(103030); };
+    m = ecs_sp_meta_deep_set_deferred(m);
+    if ecs_sp_meta_deep_has_deferred(m) != true { panic(103031); };
+    m = ecs_sp_meta_deep_set_non_send(m);
+    if ecs_sp_meta_deep_is_non_send(m) != true { panic(103032); };
+    m = ecs_sp_meta_deep_set_last_run(m, 42);
+    if ecs_sp_meta_deep_last_run(m) != 42 { panic(103033); };
+}
+
+@test "param_res_res_mut_query_build_access"() {
+    let r = ecs_sp_param_res(0);
+    let a = ecs_sp_param_build_access(r);
+    if (ecs_sp_access_reads(a) & 1) == 0 { panic(103040); };
+    if ecs_sp_access_writes(a) != 0 { panic(103041); };
+    let rm = ecs_sp_param_res_mut(2);
+    let am = ecs_sp_param_build_access(rm);
+    if (ecs_sp_access_writes(am) & 4) == 0 { panic(103042); };
+    let q = ecs_sp_param_query(3, true);
+    let aq = ecs_sp_param_build_access(q);
+    if (ecs_sp_access_reads(aq) & 8) == 0 { panic(103043); };
+    if ecs_sp_param_readonly(q) != true { panic(103044); };
+}
+
+@test "param_local_deferred_phantom_no_access"() {
+    let l = ecs_sp_param_local(5);
+    let al = ecs_sp_param_build_access(l);
+    if ecs_sp_access_reads(al) != 0 { panic(103050); };
+    if ecs_sp_param_local_value(l) != 5 { panic(103051); };
+    let d = ecs_sp_param_deferred();
+    let ad = ecs_sp_param_build_access(d);
+    if ecs_sp_access_reads(ad) != 0 { panic(103052); };
+    let ph = ecs_sp_param_phantom();
+    let aph = ecs_sp_param_build_access(ph);
+    if ecs_sp_access_reads(aph) != 0 { panic(103053); };
+    let ct = ecs_sp_param_change_tick();
+    let act = ecs_sp_param_build_access(ct);
+    if ecs_sp_access_reads(act) != 0 { panic(103054); };
+}
+
+@test "param_init_access_conflict_detection"() {
+    let p1 = ecs_sp_param_res_mut(1);
+    let p2 = ecs_sp_param_res(1);
+    let set = ecs_sp_access_empty();
+    let meta = ecs_sp_meta_deep_new(0);
+    let r1 = ecs_sp_param_init_access(p1, set, meta);
+    set = r1.0;
+    if r1.2 { panic(103060); };
+    let r2 = ecs_sp_param_init_access(p2, set, r1.1);
+    // Res read doesn't conflict with ResMut write of same id? Bevy: write implies read; adding read after write of same id is a conflict.
+    // Our model: conflicts(a_write, b_touch) is true if same bit.
+    if r2.2 != true { panic(103061); };
+}
+
+@test "param_init_access_deferred_set_meta"() {
+    let d = ecs_sp_param_deferred();
+    let set = ecs_sp_access_empty();
+    let meta = ecs_sp_meta_deep_new(1);
+    let r = ecs_sp_param_init_access(d, set, meta);
+    if ecs_sp_meta_deep_has_deferred(r.1) != true { panic(103070); };
+}
+
+@test "param_set_new_add_count"() {
+    let ps = ecs_sp_param_set_new();
+    if ecs_sp_param_set_count(ps) != 0 { panic(103080); };
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res(0));
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res_mut(1));
+    if ecs_sp_param_set_count(ps) != 2 { panic(103081); };
+}
+
+@test "param_set_init_access_no_conflict_with_other_params"() {
+    let ps = ecs_sp_param_set_new();
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res_mut(0));
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res_mut(1));
+    let set = ecs_sp_access_empty();
+    let meta = ecs_sp_meta_deep_new(0);
+    let r = ecs_sp_param_set_init_access(ps, set, meta);
+    if r.2 { panic(103090); };
+    // Both writes of distinct ids merged
+    if (ecs_sp_access_writes(r.0) & 1) == 0 { panic(103091); };
+    if (ecs_sp_access_writes(r.0) & 2) == 0 { panic(103092); };
+}
+
+@test "param_set_init_access_conflict_with_prior"() {
+    let ps = ecs_sp_param_set_new();
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res(2));
+    let set = ecs_sp_access_add_write(ecs_sp_access_empty(), 2);
+    let meta = ecs_sp_meta_deep_new(0);
+    let r = ecs_sp_param_set_init_access(ps, set, meta);
+    if r.2 != true { panic(103100); };
+}
+
+@test "param_set_p_exclusive_access"() {
+    let ps = ecs_sp_param_set_new();
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res(0));
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res_mut(1));
+    let pr = ecs_sp_param_set_p(ps, 0);
+    ps = pr.0;
+    if pr.1 != true { panic(103110); };
+    if ecs_sp_param_set_active(ps) != 0 { panic(103111); };
+    let p0 = pr.2;
+    if ecs_sp_param_kind(p0) != ECS_SP_KIND_RES { panic(103112); };
+    ps = ecs_sp_param_set_release(ps);
+    if ecs_sp_param_set_active(ps) != -1 { panic(103113); };
+    let pr2 = ecs_sp_param_set_p(ps, 1);
+    ps = pr2.0;
+    if ecs_sp_param_kind(pr2.2) != ECS_SP_KIND_RES_MUT { panic(103114); };
+    let bad = ecs_sp_param_set_p(ps, 5);
+    if bad.1 != false { panic(103115); };
+}
+
+@test "local_get_set_bump"() {
+    let l = ecs_sp_param_local(0);
+    l = ecs_sp_local_set(l, 10);
+    if ecs_sp_local_get(l) != 10 { panic(103120); };
+    l = ecs_sp_local_bump(l);
+    if ecs_sp_local_get(l) != 11 { panic(103121); };
+}
+
+@test "deferred_queue_apply"() {
+    let d = ecs_sp_param_deferred();
+    d = ecs_sp_deferred_queue(d, 3);
+    d = ecs_sp_deferred_queue(d, 2);
+    if ecs_sp_param_deferred_len(d) != 5 { panic(103130); };
+    d = ecs_sp_deferred_apply(d);
+    if ecs_sp_param_deferred_len(d) != 0 { panic(103131); };
+    if ecs_sp_deferred_is_applied(d) != true { panic(103132); };
+}
+
+@test "get_param_option_and_if_mapping"() {
+    let opt_ok = ecs_sp_param_option(ecs_sp_param_res(0));
+    let g = ecs_sp_get_param(opt_ok, 1);
+    if ecs_sp_val_is_ok(g.1) != true { panic(103140); };
+    let opt_bad = ecs_sp_param_option(ecs_sp_param_set_valid(ecs_sp_param_res(0), false));
+    let g2 = ecs_sp_get_param(opt_bad, 1);
+    if ecs_sp_val_is_ok(g2.1) != true { panic(103141); };
+    let if_bad = ecs_sp_param_if(ecs_sp_param_set_valid(ecs_sp_param_res(0), false));
+    let g3 = ecs_sp_get_param(if_bad, 1);
+    if ecs_sp_val_is_skipped(g3.1) != true { panic(103142); };
+    let plain_bad = ecs_sp_param_set_valid(ecs_sp_param_res(0), false);
+    let g4 = ecs_sp_get_param(plain_bad, 1);
+    if ecs_sp_val_is_invalid(g4.1) != true { panic(103143); };
+}
+
+@test "get_param_change_tick_records"() {
+    let ct = ecs_sp_param_change_tick();
+    let g = ecs_sp_get_param(ct, 99);
+    if ecs_sp_param_local_value(g.0) != 99 { panic(103150); };
+    if ecs_sp_val_is_ok(g.1) != true { panic(103151); };
+}
+
+@test "static_into_inner_unwraps"() {
+    let st = ecs_sp_param_static(ecs_sp_param_res(2));
+    if ecs_sp_param_kind(st) != ECS_SP_KIND_STATIC { panic(103160); };
+    let inr = ecs_sp_static_into_inner(st);
+    if ecs_sp_param_kind(inr) != ECS_SP_KIND_RES { panic(103161); };
+}
+
+@test "dyn_is_and_downcast"() {
+    let d = ecs_sp_param_dyn(55, ECS_SP_KIND_RES, 0);
+    if ecs_sp_dyn_is(d, 55) != true { panic(103170); };
+    if ecs_sp_dyn_is(d, 99) != false { panic(103171); };
+    let dc = ecs_sp_dyn_downcast(d, 55);
+    if dc.0 != true { panic(103172); };
+    if ecs_sp_param_kind(dc.1) != ECS_SP_KIND_RES { panic(103173); };
+    let dcb = ecs_sp_dyn_downcast(d, 77);
+    if dcb.0 != false { panic(103174); };
+}
+
+@test "change_tick_helper"() {
+    let t = ecs_sp_change_tick_new(3, 7);
+    if ecs_sp_change_tick_last_run(t) != 3 { panic(103180); };
+    if ecs_sp_change_tick_this_run(t) != 7 { panic(103181); };
+    let meta = ecs_sp_meta_deep_set_last_run(ecs_sp_meta_deep_new(0), 11);
+    let t2 = ecs_sp_change_tick_from_meta(meta, 22);
+    if ecs_sp_change_tick_last_run(t2) != 11 { panic(103182); };
+    if ecs_sp_change_tick_this_run(t2) != 22 { panic(103183); };
+}
+
+@test "system_params_new_add_init_access_no_conflict"() {
+    let s = ecs_sp_system_params_new(1);
+    s = ecs_sp_system_params_add(s, ecs_sp_param_res(0));
+    s = ecs_sp_system_params_add(s, ecs_sp_param_res(1));
+    s = ecs_sp_system_params_init_access(s);
+    if ecs_sp_system_params_conflict(s) { panic(103190); };
+    if (ecs_sp_system_params_access_reads(s) & 1) == 0 { panic(103191); };
+    if (ecs_sp_system_params_access_reads(s) & 2) == 0 { panic(103192); };
+}
+
+@test "system_params_init_conflict_detected"() {
+    let s = ecs_sp_system_params_new(1);
+    s = ecs_sp_system_params_add(s, ecs_sp_param_res_mut(0));
+    s = ecs_sp_system_params_add(s, ecs_sp_param_res_mut(0));
+    s = ecs_sp_system_params_init_access(s);
+    if ecs_sp_system_params_conflict(s) != true { panic(103200); };
+}
+
+@test "system_params_deferred_sets_meta"() {
+    let s = ecs_sp_system_params_new(1);
+    s = ecs_sp_system_params_add(s, ecs_sp_param_deferred());
+    s = ecs_sp_system_params_init_access(s);
+    if ecs_sp_system_params_has_deferred(s) != true { panic(103210); };
+}
+
+@test "system_params_get_all_and_apply"() {
+    let s = ecs_sp_system_params_new(1);
+    s = ecs_sp_system_params_add(s, ecs_sp_param_deferred());
+    s = ecs_sp_system_params_init_access(s);
+    s = ecs_sp_system_params_get_all(s, 5);
+    if ecs_sp_val_is_ok(ecs_sp_system_params_last_val(s)) != true { panic(103220); };
+    s = ecs_sp_system_params_apply(s);
+    // deferred apply zeroed len on the param; indirect — cant easily read but no panic ok
+    if ecs_sp_val_is_ok(ecs_sp_system_params_last_val(s)) != true { panic(103221); };
+}
+
+@test "system_params_is_readonly"() {
+    let s = ecs_sp_system_params_new(1);
+    s = ecs_sp_system_params_add(s, ecs_sp_param_res(0));
+    s = ecs_sp_system_params_add(s, ecs_sp_param_res(1));
+    s = ecs_sp_system_params_init_access(s);
+    if ecs_sp_system_params_is_readonly(s) != true { panic(103230); };
+    let s2 = ecs_sp_system_params_new(2);
+    s2 = ecs_sp_system_params_add(s2, ecs_sp_param_res_mut(0));
+    s2 = ecs_sp_system_params_init_access(s2);
+    if ecs_sp_system_params_is_readonly(s2) { panic(103231); };
+}
+
+@test "res_mut_pair_conflicts_and_init_against_empty"() {
+    if ecs_sp_res_mut_pair_conflicts(3, 3) != true { panic(103240); };
+    if ecs_sp_res_mut_pair_conflicts(3, 4) { panic(103241); };
+    let ps = ecs_sp_param_set_new();
+    ps = ecs_sp_param_set_add(ps, ecs_sp_param_res(0));
+    let r = ecs_sp_param_set_init_against_empty(ps);
+    if r.1 { panic(103242); };
+    if (ecs_sp_access_reads(r.0) & 1) == 0 { panic(103243); };
+}

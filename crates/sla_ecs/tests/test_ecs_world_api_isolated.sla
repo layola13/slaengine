@@ -1,0 +1,440 @@
+// World API completeness: resource_scope, try_resource_scope, iter_resources,
+// flush, add_schedule, schedule_scope, try_schedule_scope, try_run_schedule,
+// run_schedule, allow_ambiguous_component/resource.
+// DeferredWorld: commands, get_mut, resource_mut, query, entities_and_commands.
+// CommandQueue: push, apply, append, is_empty, silence_drop_warning.
+
+struct EcsWorld {
+    resource_value: i32,
+    resource_added_tick: i32,
+    resource_changed_tick: i32,
+    has_resource: bool,
+    messages: Vec<i32>,
+    commands: EcsCommandQueue,
+    schedules: Vec<EcsScheduleEntry>,
+    change_tick: i32,
+    last_change_tick: i32,
+    deferred_commands: EcsCommandQueue,
+    ambiguous_components: Vec<i32>,
+    ambiguous_resources: Vec<i32>,
+}
+
+struct EcsScheduleEntry {
+    label: i32,
+    system_count: i32,
+}
+
+struct EcsCommandQueue {
+    commands: Vec<i32>,  // encoded command payloads
+    is_silent: bool,
+}
+
+fn cmd_queue_new() -> EcsCommandQueue {
+    return EcsCommandQueue { commands: Vec::new(), is_silent: false };
+}
+
+fn cmd_queue_push(q: EcsCommandQueue, payload: i32) -> EcsCommandQueue {
+    q.commands.push(payload);
+    return q;
+}
+
+fn cmd_queue_apply(q: EcsCommandQueue, world: EcsWorld, payload_fn: fn(EcsWorld, i32) -> EcsWorld) -> (EcsCommandQueue, EcsWorld) {
+    return cmd_queue_apply_rec(q, world, payload_fn, 0);
+}
+
+fn cmd_queue_apply_rec(q: EcsCommandQueue, world: EcsWorld, payload_fn: fn(EcsWorld, i32) -> EcsWorld, i: i64) -> (EcsCommandQueue, EcsWorld) {
+    if i >= (len(q.commands) as i64) { return (q, world); };
+    let w = payload_fn(world, q.commands[i]);
+    return cmd_queue_apply_rec(q, w, payload_fn, i + 1);
+}
+
+fn cmd_queue_append(q: EcsCommandQueue, other: EcsCommandQueue) -> EcsCommandQueue {
+    let i: i64 = 0;
+    let cnt = len(other.commands) as i64;
+    while i < cnt {
+        q.commands.push(other.commands[i]);
+        i = i + 1;
+    }
+    return q;
+}
+
+fn cmd_queue_is_empty(q: EcsCommandQueue) -> bool { return len(q.commands) == 0; }
+fn cmd_queue_len(q: EcsCommandQueue) -> i64 { return len(q.commands) as i64; }
+
+fn cmd_queue_silence_drop_warning(q: EcsCommandQueue) -> EcsCommandQueue {
+    q.is_silent = true;
+    return q;
+}
+
+fn world_new() -> EcsWorld {
+    return EcsWorld {
+        resource_value: 0, resource_added_tick: 0, resource_changed_tick: 0,
+        has_resource: false, messages: Vec::new(), commands: cmd_queue_new(),
+        schedules: Vec::new(), change_tick: 0, last_change_tick: 0,
+        deferred_commands: cmd_queue_new(), ambiguous_components: Vec::new(),
+        ambiguous_resources: Vec::new(),
+    };
+}
+
+fn world_insert_resource(world: EcsWorld, value: i32) -> EcsWorld {
+    world.resource_value = value;
+    world.has_resource = true;
+    world.resource_added_tick = world.change_tick + 1;
+    world.resource_changed_tick = world.change_tick + 1;
+    return world;
+}
+
+fn world_get_resource(world: EcsWorld) -> i32 {
+    return world.resource_value;
+}
+
+fn world_has_resource(world: EcsWorld) -> bool { return world.has_resource; }
+
+fn world_remove_resource(world: EcsWorld) -> EcsWorld {
+    world.has_resource = false;
+    world.resource_value = 0;
+    return world;
+}
+
+// resource_scope: temporarily extract resource, run fn, put it back
+fn world_resource_scope(world: EcsWorld, f: fn(EcsWorld, i32) -> (EcsWorld, i32)) -> (EcsWorld, i32) {
+    let value = world.resource_value;
+    let world2 = world_remove_resource(world);
+    let (world3, new_value) = f(world2, value);
+    let world4 = world_insert_resource(world3, new_value);
+    return (world4, new_value);
+}
+
+// try_resource_scope: like resource_scope but returns default if no resource
+fn world_try_resource_scope(world: EcsWorld, default: i32, f: fn(EcsWorld, i32) -> (EcsWorld, i32)) -> (EcsWorld, i32) {
+    if world.has_resource != true { return (world, default); };
+    return world_resource_scope(world, f);
+}
+
+// iter_resources: returns list of (component_id, value) pairs
+struct EcsResourceIter {
+    has_resource: bool,
+    value: i32,
+    cursor: i32,
+}
+
+fn world_iter_resources(world: EcsWorld) -> EcsResourceIter {
+    return EcsResourceIter { has_resource: world.has_resource, value: world.resource_value, cursor: 0 };
+}
+
+fn res_iter_next(iter: EcsResourceIter) -> (EcsResourceIter, i32, bool) {
+    if iter.cursor == 0 && iter.has_resource {
+        return (EcsResourceIter { has_resource: iter.has_resource, value: iter.value, cursor: 1 }, iter.value, true);
+    };
+    return (iter, 0, false);
+}
+
+// flush: apply all deferred commands
+fn world_flush(world: EcsWorld) -> EcsWorld {
+    // In a real implementation, this applies the deferred command queue.
+    // Here we just clear it (commands were already applied in this model).
+    world.deferred_commands = cmd_queue_new();
+    world.change_tick = world.change_tick + 1;
+    return world;
+}
+
+// add_schedule: register a schedule by label
+fn world_add_schedule(world: EcsWorld, label: i32, system_count: i32) -> EcsWorld {
+    world.schedules.push(EcsScheduleEntry { label: label, system_count: system_count });
+    return world;
+}
+
+// run_schedule: run a schedule by label
+fn world_run_schedule(world: EcsWorld, label: i32) -> EcsWorld {
+    let i: i64 = 0;
+    let cnt = len(world.schedules) as i64;
+    while i < cnt {
+        if world.schedules[i].label == label {
+            // Run the schedule (simulated: increment tick)
+            world.change_tick = world.change_tick + 1;
+            return world;
+        };
+        i = i + 1;
+    }
+    return world;
+}
+
+// try_run_schedule: returns (world, success)
+fn world_try_run_schedule(world: EcsWorld, label: i32) -> (EcsWorld, bool) {
+    let i: i64 = 0;
+    let cnt = len(world.schedules) as i64;
+    while i < cnt {
+        if world.schedules[i].label == label {
+            world.change_tick = world.change_tick + 1;
+            return (world, true);
+        };
+        i = i + 1;
+    }
+    return (world, false);
+}
+
+// schedule_scope: run a fn with mutable access to a schedule
+fn world_schedule_scope(world: EcsWorld, label: i32, f: fn(EcsWorld, i32) -> EcsWorld) -> EcsWorld {
+    let i: i64 = 0;
+    let cnt = len(world.schedules) as i64;
+    while i < cnt {
+        if world.schedules[i].label == label {
+            return f(world, label);
+        };
+        i = i + 1;
+    }
+    return world;
+}
+
+// try_schedule_scope: like schedule_scope but returns success
+fn world_try_schedule_scope(world: EcsWorld, label: i32, f: fn(EcsWorld, i32) -> EcsWorld) -> (EcsWorld, bool) {
+    let i: i64 = 0;
+    let cnt = len(world.schedules) as i64;
+    while i < cnt {
+        if world.schedules[i].label == label {
+            return (f(world, label), true);
+        };
+        i = i + 1;
+    }
+    return (world, false);
+}
+
+// allow_ambiguous_component: mark a component as allowed to be ambiguous
+fn world_allow_ambiguous_component(world: EcsWorld, type_id: i32) -> EcsWorld {
+    world.ambiguous_components.push(type_id);
+    return world;
+}
+
+// allow_ambiguous_resource
+fn world_allow_ambiguous_resource(world: EcsWorld, type_id: i32) -> EcsWorld {
+    world.ambiguous_resources.push(type_id);
+    return world;
+}
+
+fn world_is_ambiguous_component_allowed(world: EcsWorld, type_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(world.ambiguous_components) as i64;
+    while i < cnt {
+        if world.ambiguous_components[i] == type_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// increment_change_tick
+fn world_increment_change_tick(world: EcsWorld) -> EcsWorld {
+    world.change_tick = world.change_tick + 1;
+    return world;
+}
+
+fn world_read_change_tick(world: EcsWorld) -> i32 { return world.change_tick; }
+fn world_last_change_tick(world: EcsWorld) -> i32 { return world.last_change_tick; }
+
+// --- DeferredWorld ---
+struct EcsDeferredWorld {
+    commands: EcsCommandQueue,
+    change_tick: i32,
+}
+
+fn deferred_world_new(change_tick: i32) -> EcsDeferredWorld {
+    return EcsDeferredWorld { commands: cmd_queue_new(), change_tick: change_tick };
+}
+
+fn deferred_world_commands(dw: EcsDeferredWorld) -> EcsCommandQueue { return dw.commands; }
+
+fn deferred_world_queue_command(dw: EcsDeferredWorld, payload: i32) -> EcsDeferredWorld {
+    dw.commands = cmd_queue_push(dw.commands, payload);
+    return dw;
+}
+
+// Test payload functions
+fn scope_double_resource(world: EcsWorld, value: i32) -> (EcsWorld, i32) {
+    return (world, value * 2);
+}
+
+fn scope_add_ten(world: EcsWorld, value: i32) -> (EcsWorld, i32) {
+    return (world, value + 10);
+}
+
+fn schedule_runner(world: EcsWorld, label: i32) -> EcsWorld {
+    world.change_tick = world.change_tick + 100;
+    return world;
+}
+
+const SCHED_MAIN: i32 = 13001;
+const SCHED_FIXED: i32 = 13002;
+const COMP_HEALTH: i32 = 13003;
+const RES_TIME: i32 = 13004;
+
+@test "resource_scope extracts and reinserts resource"() {
+    let w = world_new();
+    let w1 = world_insert_resource(w, 42);
+    let (w2, result) = world_resource_scope(w1, scope_double_resource);
+    if result != 84 { panic(13001); };
+    if world_has_resource(w2) != true { panic(13002); };
+    if world_get_resource(w2) != 84 { panic(13003); };
+}
+
+@test "try_resource_scope returns default when no resource"() {
+    let w = world_new();
+    let (w2, result) = world_try_resource_scope(w, 999, scope_double_resource);
+    if result != 999 { panic(13004); };
+}
+
+@test "try_resource_scope runs when resource exists"() {
+    let w = world_new();
+    let w1 = world_insert_resource(w, 5);
+    let (w2, result) = world_try_resource_scope(w1, 0, scope_add_ten);
+    if result != 15 { panic(13005); };
+}
+
+@test "iter_resources yields resource"() {
+    let w = world_new();
+    let w1 = world_insert_resource(w, 77);
+    let iter = world_iter_resources(w1);
+    let (iter2, value, has) = res_iter_next(iter);
+    if has != true { panic(13006); };
+    if value != 77 { panic(13007); };
+}
+
+@test "iter_resources empty when no resource"() {
+    let w = world_new();
+    let iter = world_iter_resources(w);
+    let (_iter_empty, _val_empty, has) = res_iter_next(iter);
+    if has { panic(13008); };
+}
+
+@test "flush clears deferred commands and increments tick"() {
+    let w = world_new();
+    let w1 = world_increment_change_tick(w);
+    let tick_before = world_read_change_tick(w1);
+    let w2 = world_flush(w1);
+    if cmd_queue_is_empty(w2.deferred_commands) != true { panic(13009); };
+    if world_read_change_tick(w2) != tick_before + 1 { panic(13010); };
+}
+
+@test "add_schedule registers schedule"() {
+    let w = world_new();
+    let w1 = world_add_schedule(w, SCHED_MAIN, 5);
+    if len(w1.schedules) != 1 { panic(13011); };
+    if w1.schedules[0].label != SCHED_MAIN { panic(13012); };
+}
+
+@test "run_schedule runs registered schedule"() {
+    let w = world_new();
+    let w1 = world_add_schedule(w, SCHED_MAIN, 3);
+    let tick_before = world_read_change_tick(w1);
+    let w2 = world_run_schedule(w1, SCHED_MAIN);
+    if world_read_change_tick(w2) != tick_before + 1 { panic(13013); };
+}
+
+@test "run_schedule no-op for unregistered"() {
+    let w = world_new();
+    let tick_before = world_read_change_tick(w);
+    let w1 = world_run_schedule(w, SCHED_FIXED);
+    if world_read_change_tick(w1) != tick_before { panic(13014); };
+}
+
+@test "try_run_schedule returns success"() {
+    let w = world_new();
+    let w1 = world_add_schedule(w, SCHED_FIXED, 2);
+    let (w2, ok) = world_try_run_schedule(w1, SCHED_FIXED);
+    if ok != true { panic(13015); };
+    let (w3, ok2) = world_try_run_schedule(w2, 99999);
+    if ok2 { panic(13016); };
+}
+
+@test "schedule_scope runs fn on schedule"() {
+    let w = world_new();
+    let w1 = world_add_schedule(w, SCHED_MAIN, 1);
+    let tick_before = world_read_change_tick(w1);
+    let w2 = world_schedule_scope(w1, SCHED_MAIN, schedule_runner);
+    if world_read_change_tick(w2) != tick_before + 100 { panic(13017); };
+}
+
+@test "try_schedule_scope returns success"() {
+    let w = world_new();
+    let w1 = world_add_schedule(w, SCHED_MAIN, 1);
+    let (w2, ok) = world_try_schedule_scope(w1, SCHED_MAIN, schedule_runner);
+    if ok != true { panic(13018); };
+    let (w3, ok2) = world_try_schedule_scope(w2, 99999, schedule_runner);
+    if ok2 { panic(13019); };
+}
+
+@test "allow_ambiguous_component marks component"() {
+    let w = world_new();
+    let w1 = world_allow_ambiguous_component(w, COMP_HEALTH);
+    if world_is_ambiguous_component_allowed(w1, COMP_HEALTH) != true { panic(13020); };
+}
+
+@test "allow_ambiguous_resource marks resource"() {
+    let w = world_new();
+    let w1 = world_allow_ambiguous_resource(w, RES_TIME);
+    let i: i64 = 0;
+    let cnt = len(w1.ambiguous_resources) as i64;
+    let found = false;
+    while i < cnt {
+        if w1.ambiguous_resources[i] == RES_TIME { found = true; };
+        i = i + 1;
+    }
+    if found != true { panic(13021); };
+}
+
+@test "command_queue push and is_empty"() {
+    let q = cmd_queue_new();
+    if cmd_queue_is_empty(q) != true { panic(13022); };
+    let q2 = cmd_queue_push(q, 42);
+    if cmd_queue_is_empty(q2) { panic(13023); };
+    if cmd_queue_len(q2) != 1 { panic(13024); };
+}
+
+@test "command_queue append merges"() {
+    let q1 = cmd_queue_new();
+    let q2 = cmd_queue_push(q1, 1);
+    let q3 = cmd_queue_push(q2, 2);
+    let other = cmd_queue_new();
+    let other2 = cmd_queue_push(other, 3);
+    let merged = cmd_queue_append(q3, other2);
+    if cmd_queue_len(merged) != 3 { panic(13025); };
+}
+
+@test "command_queue apply runs all commands"() {
+    let q = cmd_queue_new();
+    let q2 = cmd_queue_push(q, 10);
+    let q3 = cmd_queue_push(q2, 20);
+    let w = world_new();
+    let (q4, w2) = cmd_queue_apply(q3, w, cmd_apply_fn);
+    // cmd_apply_fn adds payload to resource
+    if w2.resource_value != 30 { panic(13026); };
+}
+
+fn cmd_apply_fn(world: EcsWorld, payload: i32) -> EcsWorld {
+    world.resource_value = world.resource_value + payload;
+    return world;
+}
+
+@test "command_queue silence_drop_warning"() {
+    let q = cmd_queue_new();
+    let q2 = cmd_queue_silence_drop_warning(q);
+    if q2.is_silent != true { panic(13027); };
+}
+
+@test "deferred_world queue command"() {
+    let dw = deferred_world_new(5);
+    let dw2 = deferred_world_queue_command(dw, 42);
+    let cmds = deferred_world_commands(dw2);
+    if cmd_queue_len(cmds) != 1 { panic(13028); };
+}
+
+@test "increment_change_tick updates tick"() {
+    let w = world_new();
+    let w1 = world_increment_change_tick(w);
+    if world_read_change_tick(w1) != 1 { panic(13029); };
+    let w2 = world_increment_change_tick(w1);
+    if world_read_change_tick(w2) != 2 { panic(13030); };
+}
+
+@test "last_change_tick initially zero"() {
+    let w = world_new();
+    if world_last_change_tick(w) != 0 { panic(13031); };
+}

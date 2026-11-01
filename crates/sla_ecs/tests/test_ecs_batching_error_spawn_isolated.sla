@@ -1,0 +1,483 @@
+// Isolated test: Bevy ECS BatchingStrategy + Error/Severity/ErrorContext +
+// EntityHash/EntityHashSet + Spawn/SpawnableList parity.
+// Mirrors src/batching.rs + src/error/ + src/entity/hash*.rs + src/spawn.rs
+
+// === BatchingStrategy (src/batching.rs) ===
+struct BatchingStrategy {
+    min_batch: i64,
+    max_batch: i64,
+    batches_per_thread: i64,
+}
+
+fn bs_new() -> BatchingStrategy {
+    return BatchingStrategy { min_batch: 1, max_batch: 9223372036854775807, batches_per_thread: 1 };
+}
+
+fn bs_fixed(batch_size: i64) -> BatchingStrategy {
+    return BatchingStrategy { min_batch: batch_size, max_batch: batch_size, batches_per_thread: 1 };
+}
+
+fn bs_min_batch(bs: BatchingStrategy, batch_size: i64) -> BatchingStrategy {
+    bs.min_batch = batch_size;
+    return bs;
+}
+
+fn bs_max_batch(bs: BatchingStrategy, batch_size: i64) -> BatchingStrategy {
+    bs.max_batch = batch_size;
+    return bs;
+}
+
+fn bs_batches_per_thread(bs: BatchingStrategy, bpt: i64) -> BatchingStrategy {
+    bs.batches_per_thread = bpt;
+    return bs;
+}
+
+fn div_ceil(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    if a % b != 0 { q = q + 1; };
+    return q;
+}
+
+fn bs_calc_batch_size(bs: BatchingStrategy, max_items: i64, thread_count: i64) -> i64 {
+    if bs.min_batch > bs.max_batch {
+        return bs.min_batch;
+    };
+    let batches = thread_count * bs.batches_per_thread;
+    let batch_size = div_ceil(max_items, batches);
+    if batch_size < bs.min_batch { return bs.min_batch; };
+    if batch_size > bs.max_batch { return bs.max_batch; };
+    return batch_size;
+}
+
+// === BevyError + Severity + ErrorContext (src/error/) ===
+const SEV_IGNORE: i32 = 0;
+const SEV_TRACE: i32 = 1;
+const SEV_DEBUG: i32 = 2;
+const SEV_INFO: i32 = 3;
+const SEV_WARN: i32 = 4;
+const SEV_ERROR: i32 = 5;
+const SEV_PANIC: i32 = 6;
+
+struct BevyError {
+    message: i64,
+    severity: i32,
+    context_msgs: Vec<i64>,
+}
+
+fn be_new(severity: i32, msg: i64) -> BevyError {
+    return BevyError { message: msg, severity: severity, context_msgs: Vec::new() };
+}
+
+fn be_ignore(msg: i64) -> BevyError { return be_new(SEV_IGNORE, msg); }
+fn be_trace(msg: i64) -> BevyError { return be_new(SEV_TRACE, msg); }
+fn be_debug(msg: i64) -> BevyError { return be_new(SEV_DEBUG, msg); }
+fn be_info(msg: i64) -> BevyError { return be_new(SEV_INFO, msg); }
+fn be_warn(msg: i64) -> BevyError { return be_new(SEV_WARN, msg); }
+fn be_error(msg: i64) -> BevyError { return be_new(SEV_ERROR, msg); }
+fn be_panic(msg: i64) -> BevyError { return be_new(SEV_PANIC, msg); }
+
+fn be_severity(e: BevyError) -> i32 { return e.severity; }
+fn be_message(e: BevyError) -> i64 { return e.message; }
+
+fn be_with_severity(e: BevyError, severity: i32) -> BevyError {
+    e.severity = severity;
+    return e;
+}
+
+fn be_with_context(e: BevyError, ctx_msg: i64) -> BevyError {
+    e.context_msgs.push(ctx_msg);
+    return e;
+}
+
+fn be_context_len(e: BevyError) -> i64 { return len(e.context_msgs) as i64; }
+
+const ERR_CTX_SYSTEM: i32 = 0;
+const ERR_CTX_RUN_CONDITION: i32 = 1;
+const ERR_CTX_COMMAND: i32 = 2;
+const ERR_CTX_OBSERVER: i32 = 3;
+
+struct ErrorContext {
+    kind: i32,
+    name: i64,
+    last_run: i64,
+    system_name: i64,
+    on_set: bool,
+}
+
+fn ec_system(name: i64, last_run: i64) -> ErrorContext {
+    return ErrorContext { kind: ERR_CTX_SYSTEM, name: name, last_run: last_run, system_name: 0, on_set: false };
+}
+
+fn ec_run_condition(name: i64, last_run: i64, system: i64, on_set: bool) -> ErrorContext {
+    return ErrorContext { kind: ERR_CTX_RUN_CONDITION, name: name, last_run: last_run, system_name: system, on_set: on_set };
+}
+
+fn ec_command(name: i64) -> ErrorContext {
+    return ErrorContext { kind: ERR_CTX_COMMAND, name: name, last_run: 0, system_name: 0, on_set: false };
+}
+
+fn ec_observer(name: i64, last_run: i64) -> ErrorContext {
+    return ErrorContext { kind: ERR_CTX_OBSERVER, name: name, last_run: last_run, system_name: 0, on_set: false };
+}
+
+fn ec_name(ctx: ErrorContext) -> i64 { return ctx.name; }
+fn ec_kind(ctx: ErrorContext) -> i32 { return ctx.kind; }
+
+// Error handlers (match_severity, panic, error, warn, info, debug, trace, ignore)
+const HANDLER_PANIC: i32 = 0;
+const HANDLER_ERROR: i32 = 1;
+const HANDLER_WARN: i32 = 2;
+const HANDLER_INFO: i32 = 3;
+const HANDLER_DEBUG: i32 = 4;
+const HANDLER_TRACE: i32 = 5;
+const HANDLER_IGNORE: i32 = 6;
+
+fn severity_to_handler(sev: i32) -> i32 {
+    if sev == SEV_PANIC { return HANDLER_PANIC; };
+    if sev == SEV_ERROR { return HANDLER_ERROR; };
+    if sev == SEV_WARN { return HANDLER_WARN; };
+    if sev == SEV_INFO { return HANDLER_INFO; };
+    if sev == SEV_DEBUG { return HANDLER_DEBUG; };
+    if sev == SEV_TRACE { return HANDLER_TRACE; };
+    return HANDLER_IGNORE;
+}
+
+// CommandOutput trait: to_err converts Result → Option<BevyError>
+struct CmdResult {
+    is_ok: bool,
+    err: BevyError,
+}
+
+fn cmd_ok() -> CmdResult { return CmdResult { is_ok: true, err: be_ignore(0) }; }
+fn cmd_err(e: BevyError) -> CmdResult { return CmdResult { is_ok: false, err: e }; }
+
+fn cmd_to_err(r: CmdResult) -> (bool, BevyError) {
+    if r.is_ok { return (false, be_ignore(0)); };
+    return (true, r.err);
+}
+
+// FallbackErrorHandler resource
+struct FallbackErrorHandler {
+    handler: i32,
+}
+
+fn feh_new(handler: i32) -> FallbackErrorHandler { return FallbackErrorHandler { handler: handler }; }
+fn feh_default() -> FallbackErrorHandler { return FallbackErrorHandler { handler: HANDLER_PANIC }; }
+
+// === EntityHash + EntityHashSet (src/entity/hash*.rs) ===
+// EntityHasher: optimized for u64 entity indices
+fn entity_hash(bits: i64) -> i64 {
+    // Simple fast hash optimized for contiguous indices
+    let h = bits * 2654435761;
+    h = h ^ (h >> 32);
+    return h;
+}
+
+struct EntityHashSet {
+    entries: Vec<i64>,
+}
+
+fn ehs_new() -> EntityHashSet { return EntityHashSet { entries: Vec::new() }; }
+
+fn ehs_len(s: EntityHashSet) -> i64 { return len(s.entries) as i64; }
+fn ehs_is_empty(s: EntityHashSet) -> bool { return len(s.entries) == 0; }
+
+fn ehs_contains(s: EntityHashSet, e: i64) -> bool {
+    let i: i64 = 0;
+    let cnt = len(s.entries) as i64;
+    while i < cnt { if s.entries[i] == e { return true; }; i = i + 1; }
+    return false;
+}
+
+fn ehs_insert(s: EntityHashSet, e: i64) -> EntityHashSet {
+    if ehs_contains(s, e) { return s; };
+    s.entries.push(e);
+    return s;
+}
+
+fn ehs_remove(s: EntityHashSet, e: i64) -> EntityHashSet {
+    let i: i64 = 0;
+    let cnt = len(s.entries) as i64;
+    while i < cnt {
+        if s.entries[i] == e {
+            s.entries[i] = s.entries[cnt - 1];
+            s.entries.pop();
+            return s;
+        };
+        i = i + 1;
+    }
+    return s;
+}
+
+fn ehs_clear(s: EntityHashSet) -> EntityHashSet { s.entries = Vec::new(); return s; }
+
+// === Spawn + SpawnableList (src/spawn.rs) ===
+struct SpawnBundle {
+    name: i64,
+    value: i32,
+}
+
+struct Spawn {
+    bundle: SpawnBundle,
+}
+
+fn spawn_new(name: i64, value: i32) -> Spawn {
+    return Spawn { bundle: SpawnBundle { name: name, value: value } };
+}
+
+fn spawn_bundle(s: Spawn) -> SpawnBundle { return s.bundle; }
+
+// SpawnableList: collect spawn operations
+struct SpawnableList {
+    spawns: Vec<Spawn>,
+    target_entity: i64,
+}
+
+fn sl_new(target: i64) -> SpawnableList { return SpawnableList { spawns: Vec::new(), target_entity: target }; }
+
+fn sl_push(sl: SpawnableList, s: Spawn) -> SpawnableList {
+    sl.spawns.push(s);
+    return sl;
+}
+
+fn sl_len(sl: SpawnableList) -> i64 { return len(sl.spawns) as i64; }
+fn sl_is_empty(sl: SpawnableList) -> bool { return len(sl.spawns) == 0; }
+
+fn sl_target(sl: SpawnableList) -> i64 { return sl.target_entity; }
+
+// SpawnRelated: spawn related entities
+struct RelatedSpawner {
+    list: SpawnableList,
+    relationship: i64,
+}
+
+fn rs_new(target: i64, rel: i64) -> RelatedSpawner {
+    return RelatedSpawner { list: sl_new(target), relationship: rel };
+}
+
+fn rs_spawn(rs: RelatedSpawner, name: i64, value: i32) -> RelatedSpawner {
+    rs.list = sl_push(rs.list, spawn_new(name, value));
+    return rs;
+}
+
+fn rs_count(rs: RelatedSpawner) -> i64 { return sl_len(rs.list); }
+
+// === Tests ===
+
+@test "batching strategy default"() {
+    let bs = bs_new();
+    if bs.min_batch != 1 { panic(23001); };
+    if bs.batches_per_thread != 1 { panic(23002); };
+}
+
+@test "batching strategy fixed"() {
+    let bs = bs_fixed(64);
+    if bs.min_batch != 64 { panic(23003); };
+    if bs.max_batch != 64 { panic(23004); };
+}
+
+@test "batching strategy min_batch"() {
+    let bs = bs_min_batch(bs_new(), 16);
+    if bs.min_batch != 16 { panic(23005); };
+}
+
+@test "batching strategy max_batch"() {
+    let bs = bs_max_batch(bs_new(), 256);
+    if bs.max_batch != 256 { panic(23006); };
+}
+
+@test "batching strategy batches_per_thread"() {
+    let bs = bs_batches_per_thread(bs_new(), 4);
+    if bs.batches_per_thread != 4 { panic(23007); };
+}
+
+@test "batching calc_batch_size basic"() {
+    let bs = bs_new();
+    // 100 items, 4 threads, 1 batch/thread = 4 batches → ceil(100/4) = 25
+    let sz = bs_calc_batch_size(bs, 100, 4);
+    if sz != 25 { panic(23008); };
+}
+
+@test "batching calc_batch_size clamped to min"() {
+    let bs = bs_min_batch(bs_new(), 50);
+    // 100 items, 4 threads → 25, but min is 50 → 50
+    let sz = bs_calc_batch_size(bs, 100, 4);
+    if sz != 50 { panic(23009); };
+}
+
+@test "batching calc_batch_size clamped to max"() {
+    let bs = bs_max_batch(bs_new(), 10);
+    // 100 items, 4 threads → 25, but max is 10 → 10
+    let sz = bs_calc_batch_size(bs, 100, 4);
+    if sz != 10 { panic(23010); };
+}
+
+@test "batching calc_batch_size fixed"() {
+    let bs = bs_fixed(32);
+    let sz = bs_calc_batch_size(bs, 1000, 8);
+    if sz != 32 { panic(23011); };
+}
+
+@test "batching calc_batch_size single thread"() {
+    let bs = bs_new();
+    // 100 items, 1 thread, 1 batch → ceil(100/1) = 100
+    let sz = bs_calc_batch_size(bs, 100, 1);
+    if sz != 100 { panic(23012); };
+}
+
+@test "bevy error new with severity"() {
+    let e = be_new(SEV_WARN, 42);
+    if be_severity(e) != SEV_WARN { panic(23013); };
+    if be_message(e) != 42 { panic(23014); };
+}
+
+@test "bevy error ignore shorthand"() {
+    let e = be_ignore(1);
+    if be_severity(e) != SEV_IGNORE { panic(23015); };
+}
+
+@test "bevy error panic shorthand"() {
+    let e = be_panic(2);
+    if be_severity(e) != SEV_PANIC { panic(23016); };
+}
+
+@test "bevy error with_severity"() {
+    let e = be_with_severity(be_ignore(1), SEV_ERROR);
+    if be_severity(e) != SEV_ERROR { panic(23017); };
+}
+
+@test "bevy error with_context"() {
+    let e = be_with_context(be_warn(1), 99);
+    if be_context_len(e) != 1 { panic(23018); };
+    let e2 = be_with_context(e, 100);
+    if be_context_len(e2) != 2 { panic(23019); };
+}
+
+@test "error context system"() {
+    let ctx = ec_system(100, 5);
+    if ec_kind(ctx) != ERR_CTX_SYSTEM { panic(23020); };
+    if ec_name(ctx) != 100 { panic(23021); };
+}
+
+@test "error context run_condition"() {
+    let ctx = ec_run_condition(200, 3, 300, true);
+    if ec_kind(ctx) != ERR_CTX_RUN_CONDITION { panic(23022); };
+    if ctx.on_set != true { panic(23023); };
+}
+
+@test "error context command"() {
+    let ctx = ec_command(400);
+    if ec_kind(ctx) != ERR_CTX_COMMAND { panic(23024); };
+}
+
+@test "error context observer"() {
+    let ctx = ec_observer(500, 7);
+    if ec_kind(ctx) != ERR_CTX_OBSERVER { panic(23025); };
+}
+
+@test "severity to handler mapping"() {
+    if severity_to_handler(SEV_PANIC) != HANDLER_PANIC { panic(23026); };
+    if severity_to_handler(SEV_ERROR) != HANDLER_ERROR { panic(23027); };
+    if severity_to_handler(SEV_WARN) != HANDLER_WARN { panic(23028); };
+    if severity_to_handler(SEV_IGNORE) != HANDLER_IGNORE { panic(23029); };
+}
+
+@test "command output ok to_err"() {
+    let r = cmd_ok();
+    let res = cmd_to_err(r);
+    if res.0 != false { panic(23030); };
+}
+
+@test "command output err to_err"() {
+    let r = cmd_err(be_warn(1));
+    let res = cmd_to_err(r);
+    if res.0 != true { panic(23031); };
+    if be_severity(res.1) != SEV_WARN { panic(23032); };
+}
+
+@test "fallback error handler default"() {
+    let feh = feh_default();
+    if feh.handler != HANDLER_PANIC { panic(23033); };
+}
+
+@test "fallback error handler custom"() {
+    let feh = feh_new(HANDLER_WARN);
+    if feh.handler != HANDLER_WARN { panic(23034); };
+}
+
+@test "entity hash deterministic"() {
+    let h1 = entity_hash(42);
+    let h2 = entity_hash(42);
+    if h1 != h2 { panic(23035); };
+}
+
+@test "entity hash different inputs"() {
+    let h1 = entity_hash(1);
+    let h2 = entity_hash(2);
+    if h1 == h2 { panic(23036); };
+}
+
+@test "entity hash set new empty"() {
+    let s = ehs_new();
+    if ehs_is_empty(s) != true { panic(23037); };
+    if ehs_len(s) != 0 { panic(23038); };
+}
+
+@test "entity hash set insert"() {
+    let s = ehs_insert(ehs_new(), 10);
+    if ehs_len(s) != 1 { panic(23039); };
+    if ehs_contains(s, 10) != true { panic(23040); };
+}
+
+@test "entity hash set insert dedup"() {
+    let s = ehs_insert(ehs_insert(ehs_new(), 10), 10);
+    if ehs_len(s) != 1 { panic(23041); };
+}
+
+@test "entity hash set remove"() {
+    let s = ehs_remove(ehs_insert(ehs_new(), 10), 10);
+    if ehs_is_empty(s) != true { panic(23042); };
+}
+
+@test "entity hash set remove absent"() {
+    let s = ehs_remove(ehs_new(), 99);
+    if ehs_len(s) != 0 { panic(23043); };
+}
+
+@test "entity hash set clear"() {
+    let s = ehs_clear(ehs_insert(ehs_insert(ehs_new(), 1), 2));
+    if ehs_is_empty(s) != true { panic(23044); };
+}
+
+@test "entity hash set contains absent"() {
+    if ehs_contains(ehs_new(), 5) != false { panic(23045); };
+}
+
+@test "spawn new"() {
+    let s = spawn_new(42, 100);
+    let b = spawn_bundle(s);
+    if b.name != 42 { panic(23046); };
+    if b.value != 100 { panic(23047); };
+}
+
+@test "spawnable list push and len"() {
+    let sl = sl_push(sl_push(sl_new(1), spawn_new(10, 1)), spawn_new(11, 2));
+    if sl_len(sl) != 2 { panic(23048); };
+    if sl_is_empty(sl) != false { panic(23049); };
+}
+
+@test "spawnable list target"() {
+    let sl = sl_new(77);
+    if sl_target(sl) != 77 { panic(23050); };
+}
+
+@test "spawnable list empty"() {
+    let sl = sl_new(1);
+    if sl_is_empty(sl) != true { panic(23051); };
+}
+
+@test "related spawner spawn"() {
+    let rs = rs_new(1, 100);
+    let rs2 = rs_spawn(rs_spawn(rs, 10, 1), 11, 2);
+    if rs_count(rs2) != 2 { panic(23052); };
+}

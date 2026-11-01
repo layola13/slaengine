@@ -1,0 +1,217 @@
+@import "../src/observer_runner_deep.sla"
+
+// Batch 216: observer runner deep (src/observer/runner.rs).
+// panic codes: 109200 – 109399.
+
+@test "status_constants"() {
+    if ecs_or_ok() != 0 { panic(109200); };
+    if ecs_or_skip_same_trigger() != 1 { panic(109201); };
+    if ecs_or_skip_condition() != 2 { panic(109202); };
+    if ecs_or_system_failed() != 3 { panic(109203); };
+    if ecs_or_missing_observer() != 4 { panic(109204); };
+}
+
+@test "trigger_context"() {
+    let c = ecs_or_ctx_new(55, 9, true);
+    if ecs_or_ctx_event_key(c) != 55 { panic(109210); };
+    if ecs_or_ctx_caller(c) != 9 { panic(109211); };
+    if ecs_or_ctx_has_caller(c) != true { panic(109212); };
+}
+
+@test "successful_run_updates_observer"() {
+    let w = ecs_or_world_new(900);
+    let o = ecs_or_observer_new(7, 1001);
+    let c = ecs_or_ctx_new(3, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 42, 8);
+    w = r.0;
+    o = r.1;
+    if r.2 != ECS_OR_OK { panic(109220); };
+    if ecs_or_observer_run_count(o) != 1 { panic(109221); };
+    if ecs_or_observer_last_event(o) != 42 { panic(109222); };
+    if ecs_or_world_last_on_event(w) != 42 { panic(109223); };
+    if ecs_or_world_last_on_observer(w) != 7 { panic(109224); };
+    if ecs_or_observer_last_run(o) != 1 { panic(109225); };
+    if ecs_or_world_run_invocations(w) != 1 { panic(109226); };
+}
+
+@test "same_trigger_id_skips_reentry"() {
+    let w = ecs_or_world_new(1);
+    w = ecs_or_world_set_trigger(w, 10);
+    let o = ecs_or_observer_new(1, 1);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r1 = ecs_or_run(w, o, c, 5, 0);
+    w = r1.0;
+    o = r1.1;
+    if r1.2 != ECS_OR_OK { panic(109230); };
+    let r2 = ecs_or_run(w, o, c, 6, 0);
+    w = r2.0;
+    o = r2.1;
+    if r2.2 != ECS_OR_SKIP_SAME_TRIGGER { panic(109231); };
+    if ecs_or_observer_run_count(o) != 1 { panic(109232); };
+    if ecs_or_world_last_status(w) != ECS_OR_SKIP_SAME_TRIGGER { panic(109233); };
+}
+
+@test "new_trigger_allows_second_run"() {
+    let w = ecs_or_world_new(1);
+    let o = ecs_or_observer_new(2, 2);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r1 = ecs_or_trigger_and_run(w, o, c, 1, 0);
+    w = r1.0;
+    o = r1.1;
+    let r2 = ecs_or_trigger_and_run(w, o, c, 2, 0);
+    w = r2.0;
+    o = r2.1;
+    if r2.2 != ECS_OR_OK { panic(109240); };
+    if ecs_or_observer_run_count(o) != 2 { panic(109241); };
+    if ecs_or_observer_last_event(o) != 2 { panic(109242); };
+    if ecs_or_world_last_trigger(w) != 2 { panic(109243); };
+}
+
+@test "condition_false_skips_system"() {
+    let w = ecs_or_world_new(1);
+    let o = ecs_or_observer_new(3, 3);
+    o = ecs_or_observer_push_condition(o, true);
+    o = ecs_or_observer_push_condition(o, false);
+    o = ecs_or_observer_push_condition(o, true);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 9, 0);
+    w = r.0;
+    o = r.1;
+    if r.2 != ECS_OR_SKIP_CONDITION { panic(109250); };
+    if ecs_or_observer_run_count(o) != 0 { panic(109251); };
+    // all three conditions still checked (non-short-circuit count)
+    if ecs_or_world_last_conditions_checked(w) != 3 { panic(109252); };
+}
+
+@test "all_conditions_true_runs"() {
+    let w = ecs_or_world_new(1);
+    let o = ecs_or_observer_new(4, 4);
+    o = ecs_or_observer_push_condition(o, true);
+    o = ecs_or_observer_push_condition(o, true);
+    let c = ecs_or_ctx_new(2, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 11, 0);
+    if r.2 != ECS_OR_OK { panic(109260); };
+    if ecs_or_observer_run_count(r.1) != 1 { panic(109261); };
+    if ecs_or_world_last_conditions_checked(r.0) != 2 { panic(109262); };
+}
+
+@test "failed_system_uses_observer_handler"() {
+    let w = ecs_or_world_new(500);
+    let o = ecs_or_observer_new(5, 777);
+    o = ecs_or_observer_set_fail_mode(o, ECS_OR_SYS_FAILED);
+    o = ecs_or_observer_set_handler(o, 42);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 1, 0);
+    w = r.0;
+    o = r.1;
+    if r.2 != ECS_OR_SYSTEM_FAILED { panic(109270); };
+    if ecs_or_world_last_handler(w) != 42 { panic(109271); };
+    if ecs_or_world_last_err_name(w) != 777 { panic(109272); };
+    if ecs_or_observer_run_count(o) != 0 { panic(109273); };
+    if ecs_or_observer_last_run(o) != 1 { panic(109274); };
+}
+
+@test "failed_system_uses_fallback_handler"() {
+    let w = ecs_or_world_new(888);
+    let o = ecs_or_observer_new(6, 111);
+    o = ecs_or_observer_set_fail_mode(o, ECS_OR_SYS_FAILED);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 1, 0);
+    w = r.0;
+    if r.2 != ECS_OR_SYSTEM_FAILED { panic(109280); };
+    if ecs_or_world_last_handler(w) != 888 { panic(109281); };
+    if ecs_or_world_last_err_name(w) != 111 { panic(109282); };
+}
+
+@test "two_observers_same_trigger_both_run"() {
+    let w = ecs_or_world_new(1);
+    w = ecs_or_world_bump_trigger(w);
+    let a = ecs_or_observer_new(10, 1);
+    let b = ecs_or_observer_new(11, 2);
+    let c = ecs_or_ctx_new(9, 0, false);
+    let r = ecs_or_run_two(w, a, b, c, 70, 0);
+    w = r.0;
+    a = r.1;
+    b = r.2;
+    let fan = r.3;
+    if ecs_or_fanout_status0(fan) != ECS_OR_OK { panic(109290); };
+    if ecs_or_fanout_status1(fan) != ECS_OR_OK { panic(109291); };
+    if ecs_or_observer_run_count(a) != 1 { panic(109292); };
+    if ecs_or_observer_run_count(b) != 1 { panic(109293); };
+    if ecs_or_observer_last_trigger(a) == ecs_or_observer_last_trigger(b) { };
+    if ecs_or_observer_last_trigger(a) != ecs_or_world_last_trigger(w) { panic(109294); };
+}
+
+@test "second_observer_can_skip_condition_independently"() {
+    let w = ecs_or_world_new(1);
+    w = ecs_or_world_bump_trigger(w);
+    let a = ecs_or_observer_new(20, 1);
+    let b = ecs_or_observer_new(21, 2);
+    b = ecs_or_observer_push_condition(b, false);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r = ecs_or_run_two(w, a, b, c, 1, 0);
+    a = r.1;
+    b = r.2;
+    let fan = r.3;
+    if ecs_or_fanout_status0(fan) != ECS_OR_OK { panic(109300); };
+    if ecs_or_fanout_status1(fan) != ECS_OR_SKIP_CONDITION { panic(109301); };
+    if ecs_or_observer_run_count(a) != 1 { panic(109302); };
+    if ecs_or_observer_run_count(b) != 0 { panic(109303); };
+}
+
+@test "on_payload_fields_from_run"() {
+    let w = ecs_or_world_new(1);
+    let o = ecs_or_observer_new(33, 1);
+    let c = ecs_or_ctx_new(44, 55, true);
+    let r = ecs_or_trigger_and_run(w, o, c, 66, 77);
+    w = r.0;
+    if ecs_or_world_last_on_event(w) != 66 { panic(109310); };
+    if ecs_or_world_last_on_observer(w) != 33 { panic(109311); };
+}
+
+@test "clear_handler_falls_back"() {
+    let w = ecs_or_world_new(12);
+    let o = ecs_or_observer_new(1, 2);
+    o = ecs_or_observer_set_handler(o, 99);
+    o = ecs_or_observer_clear_handler(o);
+    o = ecs_or_observer_set_fail_mode(o, ECS_OR_SYS_FAILED);
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 1, 0);
+    if ecs_or_world_last_handler(r.0) != 12 { panic(109320); };
+}
+
+@test "no_conditions_defaults_to_run"() {
+    let w = ecs_or_world_new(1);
+    let o = ecs_or_observer_new(1, 1);
+    if ecs_or_observer_cond_len(o) != 0 { panic(109330); };
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r = ecs_or_trigger_and_run(w, o, c, 3, 0);
+    if r.2 != ECS_OR_OK { panic(109331); };
+    if ecs_or_world_last_conditions_checked(r.0) != 0 { panic(109332); };
+}
+
+@test "error_context_last_run_from_system"() {
+    let w = ecs_or_world_new(1);
+    let o = ecs_or_observer_new(1, 50);
+    // prime last_run via successful run
+    let c = ecs_or_ctx_new(1, 0, false);
+    let r0 = ecs_or_trigger_and_run(w, o, c, 1, 0);
+    w = r0.0;
+    o = r0.1;
+    if ecs_or_observer_last_run(o) != 1 { panic(109340); };
+    o = ecs_or_observer_set_fail_mode(o, ECS_OR_SYS_FAILED);
+    let r1 = ecs_or_trigger_and_run(w, o, c, 2, 0);
+    w = r1.0;
+    if ecs_or_world_last_err_last_run(w) != 1 { panic(109341); };
+    if ecs_or_world_last_err_name(w) != 50 { panic(109342); };
+}
+
+@test "observer_accessors"() {
+    let o = ecs_or_observer_new(9, 8);
+    if ecs_or_observer_entity(o) != 9 { panic(109350); };
+    if ecs_or_observer_name(o) != 8 { panic(109351); };
+    if ecs_or_observer_has_handler(o) != false { panic(109352); };
+    o = ecs_or_observer_set_handler(o, 3);
+    if ecs_or_observer_has_handler(o) != true { panic(109353); };
+    if ecs_or_observer_handler_id(o) != 3 { panic(109354); };
+}

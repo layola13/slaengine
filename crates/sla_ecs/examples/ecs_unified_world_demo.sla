@@ -1,0 +1,115 @@
+// End-to-end Bevy README parity demo using the unified ecs_world facade.
+// Exercises spawn/insert/query/resource/message/schedule through the single
+// ecs_world_* entry point instead of touching table_erased_* directly.
+@import "../src/ecs_world.sla"
+
+const ECS_DEMO_POSITION: i32 = 9001;
+const ECS_DEMO_VELOCITY: i32 = 9002;
+const ECS_DEMO_HEALTH: i32 = 9003;
+const ECS_DEMO_FROZEN: i32 = 9004;
+
+struct DemoPosition { x: i32, y: i32 }
+struct DemoVelocity { dx: i32, dy: i32 }
+struct DemoHealth { hp: i32 }
+struct DemoFrozen { flag: i32 }
+struct DemoTime { tick: i32 }
+struct DemoSpawnEvent { amount: i32 }
+
+fn demo_time_default() -> DemoTime { return DemoTime { tick: 0 }; }
+fn demo_event_default() -> DemoSpawnEvent { return DemoSpawnEvent { amount: 0 }; }
+
+fn demo_spawn_system_real(world: TableErasedWorld<DemoTime, DemoSpawnEvent>) -> TableErasedWorld<DemoTime, DemoSpawnEvent> {
+    let commands0 = ecs_world_commands_new<DemoTime, DemoSpawnEvent>();
+    let (w1, c1, hero) = ecs_world_commands_spawn<DemoTime, DemoSpawnEvent>(world, commands0);
+    let c2 = ecs_world_commands_insert<DemoPosition, DemoTime, DemoSpawnEvent>(w1, c1, hero, ECS_DEMO_POSITION, DemoPosition { x: 0, y: 0 });
+    let c3 = ecs_world_commands_insert<DemoVelocity, DemoTime, DemoSpawnEvent>(w1, c2, hero, ECS_DEMO_VELOCITY, DemoVelocity { dx: 3, dy: 1 });
+    let c4 = ecs_world_commands_insert<DemoHealth, DemoTime, DemoSpawnEvent>(w1, c3, hero, ECS_DEMO_HEALTH, DemoHealth { hp: 100 });
+    let (w2, c5, foe) = ecs_world_commands_spawn<DemoTime, DemoSpawnEvent>(w1, c4);
+    let c6 = ecs_world_commands_insert<DemoPosition, DemoTime, DemoSpawnEvent>(w2, c5, foe, ECS_DEMO_POSITION, DemoPosition { x: 50, y: 0 });
+    let c7 = ecs_world_commands_insert<DemoHealth, DemoTime, DemoSpawnEvent>(w2, c6, foe, ECS_DEMO_HEALTH, DemoHealth { hp: 5 });
+    let c8 = ecs_world_commands_insert<DemoFrozen, DemoTime, DemoSpawnEvent>(w2, c7, foe, ECS_DEMO_FROZEN, DemoFrozen { flag: 1 });
+    let c9 = ecs_world_commands_write_message<DemoTime, DemoSpawnEvent>(c8, DemoSpawnEvent { amount: 2 });
+    let (w3, _c10) = ecs_world_commands_apply<DemoTime, DemoSpawnEvent>(w2, c9);
+    return w3;
+}
+
+// Recursive move helper: SLA while-loop back edges do not restore world
+// register state for the `w = func(w)` pattern (UseAfterMove), so the move
+// loop is expressed as a recursive free function per the FAQ A-section rule.
+fn demo_move_step(world: TableErasedWorld<DemoTime, DemoSpawnEvent>, positions: Query<EntityItem<DemoPosition>>, velocities: Query<EntityItem<DemoVelocity>>, index: i64, count: i64) -> TableErasedWorld<DemoTime, DemoSpawnEvent> {
+    if index >= count { return world; };
+    let entity = positions.items[index].entity;
+    if ecs_world_has<DemoTime, DemoSpawnEvent>(world, entity, ECS_DEMO_FROZEN) {
+        return demo_move_step(world, positions, velocities, index + 1, count);
+    };
+    let pos = positions.items[index].value;
+    let vel = velocities.items[index].value;
+    let moved = DemoPosition { x: pos.x + vel.dx, y: pos.y + vel.dy };
+    let next = ecs_world_insert<DemoPosition, DemoTime, DemoSpawnEvent>(world, entity, ECS_DEMO_POSITION, moved);
+    return demo_move_step(next, positions, velocities, index + 1, count);
+}
+
+fn demo_move_system(world: TableErasedWorld<DemoTime, DemoSpawnEvent>) -> TableErasedWorld<DemoTime, DemoSpawnEvent> {
+    let positions = ecs_world_query<DemoPosition, DemoTime, DemoSpawnEvent>(world, ECS_DEMO_POSITION);
+    let velocities = ecs_world_query<DemoVelocity, DemoTime, DemoSpawnEvent>(world, ECS_DEMO_VELOCITY);
+    let cnt = len(positions.items) as i64;
+    return demo_move_step(world, positions, velocities, 0, cnt);
+}
+
+fn demo_time_system(world: TableErasedWorld<DemoTime, DemoSpawnEvent>) -> TableErasedWorld<DemoTime, DemoSpawnEvent> {
+    let tick = ecs_world_change_tick<DemoTime, DemoSpawnEvent>(world);
+    return ecs_world_insert_resource<DemoTime, DemoSpawnEvent>(world, DemoTime { tick: tick });
+}
+
+@test "ecs unified world facade runs movement schedule"() {
+    let w0 = ecs_world_new<DemoTime, DemoSpawnEvent>(demo_time_default(), demo_event_default());
+    let w1 = ecs_world_register_table<DemoPosition, DemoTime, DemoSpawnEvent>(w0, ECS_DEMO_POSITION);
+    let w2 = ecs_world_register_table<DemoVelocity, DemoTime, DemoSpawnEvent>(w1, ECS_DEMO_VELOCITY);
+    let w3 = ecs_world_register_table<DemoHealth, DemoTime, DemoSpawnEvent>(w2, ECS_DEMO_HEALTH);
+    let w4 = ecs_world_register_sparse_set<DemoFrozen, DemoTime, DemoSpawnEvent>(w3, ECS_DEMO_FROZEN);
+
+    let spawn_access = ecs_world_access_write_messages<DemoTime, DemoSpawnEvent>(
+        ecs_world_access_write<DemoTime, DemoSpawnEvent>(w4,
+            ecs_world_access_write<DemoTime, DemoSpawnEvent>(w4,
+                ecs_world_access_write<DemoTime, DemoSpawnEvent>(w4,
+                    ecs_world_access_write<DemoTime, DemoSpawnEvent>(w4, ecs_world_access_none(), ECS_DEMO_POSITION),
+                    ECS_DEMO_VELOCITY),
+                ECS_DEMO_HEALTH),
+            ECS_DEMO_FROZEN));
+    let move_access = ecs_world_access_read<DemoTime, DemoSpawnEvent>(w4,
+        ecs_world_access_read<DemoTime, DemoSpawnEvent>(w4,
+            ecs_world_access_write<DemoTime, DemoSpawnEvent>(w4,
+                ecs_world_access_read<DemoTime, DemoSpawnEvent>(w4, ecs_world_access_none(), ECS_DEMO_FROZEN),
+                ECS_DEMO_POSITION),
+            ECS_DEMO_VELOCITY),
+        ECS_DEMO_HEALTH);
+    let time_access = ecs_world_access_write_resource(ecs_world_access_none());
+
+    let s0 = ecs_world_schedule_default<DemoTime, DemoSpawnEvent>();
+    let s1 = ecs_world_schedule_add_systems<DemoTime, DemoSpawnEvent>(s0, demo_spawn_system_real, spawn_access);
+    let s2 = ecs_world_schedule_add_systems<DemoTime, DemoSpawnEvent>(s1, demo_move_system, move_access);
+    let s3 = ecs_world_schedule_add_systems<DemoTime, DemoSpawnEvent>(s2, demo_time_system, time_access);
+    let w5 = ecs_world_schedule_run<DemoTime, DemoSpawnEvent>(s3, w4);
+
+    let positions = ecs_world_query<DemoPosition, DemoTime, DemoSpawnEvent>(w5, ECS_DEMO_POSITION);
+    if len(positions.items) != 2 { panic(19001); };
+
+    // hero moved by velocity (3,1) from (0,0) -> (3,1)
+    let hero_pos = positions.items[0].value;
+    if hero_pos.x != 3 { panic(19002); };
+    if hero_pos.y != 1 { panic(19003); };
+
+    // foe is frozen, stayed at (50,0)
+    let foe_pos = positions.items[1].value;
+    if foe_pos.x != 50 { panic(19004); };
+    if foe_pos.y != 0 { panic(19005); };
+
+    // resource tick was set
+    let time = ecs_world_get_resource<DemoTime, DemoSpawnEvent>(w5);
+    // Schedule increments tick to 1, then spawn_system's ecs_world_commands_spawn
+    // calls table_erased_world_spawn which increments tick to 2 for structural change.
+    if time.tick != 2 { panic(19006); };
+
+    // spawn event message was written
+    if ecs_world_messages_len<DemoTime, DemoSpawnEvent>(w5) != 1 { panic(19007); };
+}

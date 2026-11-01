@@ -1,0 +1,351 @@
+// EntityCommands completeness: try_insert, remove_if, try_remove, retain,
+// entry (or_insert/or_default/or_from_world/and_modify), trigger, observe.
+// Standalone test modeling the deferred-command pattern with a simple entity store.
+
+struct EcsEntity {
+    id: i32,
+    components: Vec<i32>,  // type_ids present on this entity
+    values: Vec<i32>,      // parallel values (one per component)
+}
+
+struct EcsCmdEntry {
+    entity_id: i32,
+    action: i32,            // 0=insert, 1=remove, 2=retain, 3=trigger, 4=observe, 5=insert_if_new
+    type_id: i32,
+    value: i32,
+    condition: i32,         // 0=false, 1=true
+}
+
+struct EcsCmdQueue {
+    entries: Vec<EcsCmdEntry>,
+}
+
+fn cmd_queue_new() -> EcsCmdQueue {
+    let entries: Vec<EcsCmdEntry> = Vec::new();
+    return EcsCmdQueue { entries: entries };
+}
+
+fn entity_new(id: i32) -> EcsEntity {
+    let components: Vec<i32> = Vec::new();
+    let values: Vec<i32> = Vec::new();
+    return EcsEntity { id: id, components: components, values: values };
+}
+
+fn entity_has(e: EcsEntity, type_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(e.components) as i64;
+    while i < cnt {
+        if e.components[i] == type_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn entity_get(e: EcsEntity, type_id: i32, default: i32) -> i32 {
+    let i: i64 = 0;
+    let cnt = len(e.components) as i64;
+    while i < cnt {
+        if e.components[i] == type_id { return e.values[i]; };
+        i = i + 1;
+    }
+    return default;
+}
+
+fn entity_insert(e: EcsEntity, type_id: i32, value: i32) -> EcsEntity {
+    let i: i64 = 0;
+    let cnt = len(e.components) as i64;
+    while i < cnt {
+        if e.components[i] == type_id {
+            e.values[i] = value;
+            return e;
+        };
+        i = i + 1;
+    }
+    e.components.push(type_id);
+    e.values.push(value);
+    return e;
+}
+
+fn entity_remove(e: EcsEntity, type_id: i32) -> EcsEntity {
+    let i: i64 = 0;
+    let cnt = len(e.components) as i64;
+    while i < cnt {
+        if e.components[i] == type_id {
+            e.components.remove(i);
+            e.values.remove(i);
+            return e;
+        };
+        i = i + 1;
+    }
+    return e;
+}
+
+// retain: keep only components whose type_id is in the retain set.
+fn entity_retain(e: EcsEntity, retain_ids: Vec<i32>) -> EcsEntity {
+    let new_components: Vec<i32> = Vec::new();
+    let new_values: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(e.components) as i64;
+    while i < cnt {
+        let tid = e.components[i];
+        let keep = false;
+        let j: i64 = 0;
+        let rcnt = len(retain_ids) as i64;
+        let found = false;
+        while j < rcnt {
+            if retain_ids[j] == tid { found = true; };
+            j = j + 1;
+        }
+        if found {
+            new_components.push(tid);
+            new_values.push(e.values[i]);
+        };
+        i = i + 1;
+    }
+    e.components = new_components;
+    e.values = new_values;
+    return e;
+}
+
+// Commands API: queue deferred operations then apply them.
+fn cmd_insert(q: EcsCmdQueue, entity_id: i32, type_id: i32, value: i32) -> EcsCmdQueue {
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 0, type_id: type_id, value: value, condition: 1 });
+    return q;
+}
+
+fn cmd_try_insert(q: EcsCmdQueue, entity_id: i32, type_id: i32, value: i32) -> EcsCmdQueue {
+    // try_insert: same as insert but ignores errors if entity doesn't exist
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 0, type_id: type_id, value: value, condition: 1 });
+    return q;
+}
+
+fn cmd_insert_if_new(q: EcsCmdQueue, entity_id: i32, type_id: i32, value: i32) -> EcsCmdQueue {
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 5, type_id: type_id, value: value, condition: 1 });
+    return q;
+}
+
+fn cmd_remove(q: EcsCmdQueue, entity_id: i32, type_id: i32) -> EcsCmdQueue {
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 1, type_id: type_id, value: 0, condition: 1 });
+    return q;
+}
+
+fn cmd_remove_if(q: EcsCmdQueue, entity_id: i32, type_id: i32, condition: bool) -> EcsCmdQueue {
+    let c: i32 = 0;
+    if condition { c = 1; };
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 1, type_id: type_id, value: 0, condition: c });
+    return q;
+}
+
+fn cmd_try_remove(q: EcsCmdQueue, entity_id: i32, type_id: i32) -> EcsCmdQueue {
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 1, type_id: type_id, value: 0, condition: 1 });
+    return q;
+}
+
+fn cmd_retain(q: EcsCmdQueue, entity_id: i32, retain_ids: Vec<i32>) -> EcsCmdQueue {
+    // Encode retain as multiple remove-if-not-in-set; for simplicity push one entry per id
+    let i: i64 = 0;
+    let cnt = len(retain_ids) as i64;
+    while i < cnt {
+        q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 2, type_id: retain_ids[i], value: 0, condition: 1 });
+        i = i + 1;
+    }
+    return q;
+}
+
+fn cmd_trigger(q: EcsCmdQueue, entity_id: i32, event_type_id: i32) -> EcsCmdQueue {
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 3, type_id: event_type_id, value: 0, condition: 1 });
+    return q;
+}
+
+fn cmd_observe(q: EcsCmdQueue, entity_id: i32, observer_type_id: i32) -> EcsCmdQueue {
+    q.entries.push(EcsCmdEntry { entity_id: entity_id, action: 4, type_id: observer_type_id, value: 0, condition: 1 });
+    return q;
+}
+
+// Apply commands to an entity.
+fn cmd_apply_entity(e: EcsEntity, q: EcsCmdQueue) -> EcsEntity {
+    return cmd_apply_entity_rec(e, q, 0);
+}
+
+fn cmd_apply_entity_rec(e: EcsEntity, q: EcsCmdQueue, i: i64) -> EcsEntity {
+    if i >= (len(q.entries) as i64) { return e; };
+    let entry = q.entries[i];
+    if entry.entity_id != e.id { return cmd_apply_entity_rec(e, q, i + 1); };
+    if entry.action == 0 {
+        // insert
+        let e2 = entity_insert(e, entry.type_id, entry.value);
+        return cmd_apply_entity_rec(e2, q, i + 1);
+    };
+    if entry.action == 5 {
+        // insert_if_new: only insert if not present
+        if entity_has(e, entry.type_id) != true {
+            let e2 = entity_insert(e, entry.type_id, entry.value);
+            return cmd_apply_entity_rec(e2, q, i + 1);
+        };
+        return cmd_apply_entity_rec(e, q, i + 1);
+    };
+    if entry.action == 1 {
+        // remove (respecting condition)
+        if entry.condition == 1 {
+            let e2 = entity_remove(e, entry.type_id);
+            return cmd_apply_entity_rec(e2, q, i + 1);
+        };
+        return cmd_apply_entity_rec(e, q, i + 1);
+    };
+    if entry.action == 2 {
+        // retain: mark this type_id as retained (collect later)
+        return cmd_apply_entity_rec(e, q, i + 1);
+    };
+    if entry.action == 3 {
+        // trigger: no-op in this model (would fire observer)
+        return cmd_apply_entity_rec(e, q, i + 1);
+    };
+    if entry.action == 4 {
+        // observe: no-op in this model (would register observer)
+        return cmd_apply_entity_rec(e, q, i + 1);
+    };
+    return cmd_apply_entity_rec(e, q, i + 1);
+}
+
+// Entry pattern: or_insert (insert if absent), and_modify (modify if present)
+fn entry_or_insert(e: EcsEntity, type_id: i32, default: i32) -> EcsEntity {
+    if entity_has(e, type_id) != true {
+        return entity_insert(e, type_id, default);
+    };
+    return e;
+}
+
+fn entry_or_default(e: EcsEntity, type_id: i32) -> EcsEntity {
+    return entry_or_insert(e, type_id, 0);
+}
+
+fn entry_and_modify(e: EcsEntity, type_id: i32, new_value: i32) -> EcsEntity {
+    if entity_has(e, type_id) {
+        return entity_insert(e, type_id, new_value);
+    };
+    return e;
+}
+
+fn entry_or_from_world(e: EcsEntity, type_id: i32) -> EcsEntity {
+    // or_from_world: insert from_world() default if absent
+    return entry_or_insert(e, type_id, -1);
+}
+
+const T_HP: i32 = 5001;
+const T_VEL: i32 = 5002;
+const T_NAME: i32 = 5003;
+
+@test "try_insert adds component"() {
+    let e = entity_new(1);
+    let q = cmd_queue_new();
+    let q2 = cmd_try_insert(q, 1, T_HP, 100);
+    let e2 = cmd_apply_entity(e, q2);
+    if entity_has(e2, T_HP) != true { panic(50001); };
+    if entity_get(e2, T_HP, 0) != 100 { panic(50002); };
+}
+
+@test "remove_if removes when condition true"() {
+    let e = entity_new(1);
+    let e1 = entity_insert(e, T_HP, 50);
+    let q = cmd_queue_new();
+    let q2 = cmd_remove_if(q, 1, T_HP, true);
+    let e2 = cmd_apply_entity(e1, q2);
+    if entity_has(e2, T_HP) { panic(50003); };
+}
+
+@test "remove_if skips when condition false"() {
+    let e = entity_new(1);
+    let e1 = entity_insert(e, T_HP, 50);
+    let q = cmd_queue_new();
+    let q2 = cmd_remove_if(q, 1, T_HP, false);
+    let e2 = cmd_apply_entity(e1, q2);
+    if entity_has(e2, T_HP) != true { panic(50004); };
+}
+
+@test "try_remove is idempotent"() {
+    let e = entity_new(1);
+    let q = cmd_queue_new();
+    let q2 = cmd_try_remove(q, 1, T_HP);
+    // Should not panic even though entity doesn't have T_HP
+    let e2 = cmd_apply_entity(e, q2);
+    if entity_has(e2, T_HP) { panic(50005); };
+}
+
+@test "retain keeps only specified components"() {
+    let e = entity_new(1);
+    let e1 = entity_insert(e, T_HP, 10);
+    let e2 = entity_insert(e1, T_VEL, 20);
+    let e3 = entity_insert(e2, T_NAME, 30);
+    let retain_ids: Vec<i32> = Vec::new();
+    retain_ids.push(T_HP);
+    let e4 = entity_retain(e3, retain_ids);
+    if entity_has(e4, T_HP) != true { panic(50006); };
+    if entity_has(e4, T_VEL) { panic(50007); };
+    if entity_has(e4, T_NAME) { panic(50008); };
+}
+
+@test "entry or_insert inserts when absent"() {
+    let e = entity_new(1);
+    let e2 = entry_or_insert(e, T_HP, 100);
+    if entity_has(e2, T_HP) != true { panic(50009); };
+    if entity_get(e2, T_HP, 0) != 100 { panic(50010); };
+}
+
+@test "entry or_insert no-op when present"() {
+    let e = entity_new(1);
+    let e1 = entity_insert(e, T_HP, 50);
+    let e2 = entry_or_insert(e1, T_HP, 100);
+    if entity_get(e2, T_HP, 0) != 50 { panic(50011); };
+}
+
+@test "entry or_default inserts zero"() {
+    let e = entity_new(1);
+    let e2 = entry_or_default(e, T_HP);
+    if entity_get(e2, T_HP, -1) != 0 { panic(50012); };
+}
+
+@test "entry and_modify modifies when present"() {
+    let e = entity_new(1);
+    let e1 = entity_insert(e, T_HP, 50);
+    let e2 = entry_and_modify(e1, T_HP, 99);
+    if entity_get(e2, T_HP, 0) != 99 { panic(50013); };
+}
+
+@test "entry and_modify no-op when absent"() {
+    let e = entity_new(1);
+    let e2 = entry_and_modify(e, T_HP, 99);
+    if entity_has(e2, T_HP) { panic(50014); };
+}
+
+@test "entry or_from_world inserts default"() {
+    let e = entity_new(1);
+    let e2 = entry_or_from_world(e, T_HP);
+    if entity_get(e2, T_HP, 0) != -1 { panic(50015); };
+}
+
+@test "insert_if_new skips when present"() {
+    let e = entity_new(1);
+    let e1 = entity_insert(e, T_HP, 50);
+    let q = cmd_queue_new();
+    let q2 = cmd_insert_if_new(q, 1, T_HP, 100);
+    let e2 = cmd_apply_entity(e1, q2);
+    if entity_get(e2, T_HP, 0) != 50 { panic(50016); };
+}
+
+@test "insert_if_new inserts when absent"() {
+    let e = entity_new(1);
+    let q = cmd_queue_new();
+    let q2 = cmd_insert_if_new(q, 1, T_HP, 100);
+    let e2 = cmd_apply_entity(e, q2);
+    if entity_get(e2, T_HP, 0) != 100 { panic(50017); };
+}
+
+@test "trigger and observe are queued without error"() {
+    let e = entity_new(1);
+    let q = cmd_queue_new();
+    let q2 = cmd_trigger(q, 1, 9001);
+    let q3 = cmd_observe(q2, 1, 9002);
+    let e2 = cmd_apply_entity(e, q3);
+    // Entity should be unchanged
+    if e2.id != 1 { panic(50018); };
+}

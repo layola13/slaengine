@@ -1,0 +1,319 @@
+@import "../src/auto_insert_apply_deferred_deep.sla"
+
+// Batch 176 tests for deepened auto_insert_apply_deferred surface.
+
+@test "node_key_accessor_eq"() {
+    let a = ecs_aid_node_key_new(7);
+    let b = ecs_aid_node_key_new(7);
+    let c = ecs_aid_node_key_new(8);
+    if ecs_aid_node_key_id(a) != 7 { panic(99400); };
+    if ecs_aid_node_key_eq(a, b) != true { panic(99401); };
+    if ecs_aid_node_key_eq(a, c) != false { panic(99402); };
+}
+
+@test "flat_edges_add_remove_outgoing"() {
+    let d = ecs_aid_flat_edges_new();
+    d = ecs_aid_flat_edges_add(d, 1, 2);
+    d = ecs_aid_flat_edges_add(d, 1, 3);
+    d = ecs_aid_flat_edges_add(d, 2, 4);
+    let r = ecs_aid_flat_edges_remove(d, 1, 3);
+    d = r.0;
+    if r.1 != true { panic(99410); };
+    let r2 = ecs_aid_flat_edges_remove(d, 1, 99);
+    if r2.1 != false { panic(99411); };
+    let out = ecs_aid_flat_edges_outgoing_targets(d, 1);
+    if len(out) != 1 { panic(99412); };
+    if out[0] != 2 { panic(99413); };
+}
+
+@test "pass_new_starts_clean"() {
+    let p = ecs_aid_pass_new();
+    if ecs_aid_pass_no_sync_count(p) != 0 { panic(99420); };
+    if ecs_aid_pass_sync_count(p) != 0 { panic(99421); };
+}
+
+@test "pass_add_dependency_ignore_deferred_records_no_sync"() {
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_add_dependency(p, 1, 2, true);
+    if ecs_aid_pass_no_sync_count(p) != 1 { panic(99430); };
+    p = ecs_aid_pass_add_dependency(p, 3, 4, false);
+    if ecs_aid_pass_no_sync_count(p) != 1 { panic(99431); };
+}
+
+@test "pass_no_sync_contains_dedup"() {
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_no_sync_add(p, 5, 6);
+    p = ecs_aid_pass_no_sync_add(p, 5, 6);
+    if ecs_aid_pass_no_sync_count(p) != 1 { panic(99440); };
+    if ecs_aid_pass_no_sync_contains(p, 5, 6) != true { panic(99441); };
+    if ecs_aid_pass_no_sync_contains(p, 5, 7) != false { panic(99442); };
+}
+
+@test "pass_add_auto_sync_allocates_monotonic_keys"() {
+    let p = ecs_aid_pass_new();
+    let r1 = ecs_aid_pass_add_auto_sync(p);
+    let r2 = ecs_aid_pass_add_auto_sync(r1.0);
+    if r1.1 != 100000 { panic(99450); };
+    if r2.1 != 100001 { panic(99451); };
+}
+
+@test "pass_get_sync_point_caches_by_distance"() {
+    let p = ecs_aid_pass_new();
+    let r1 = ecs_aid_pass_get_sync_point(p, 2);
+    let r2 = ecs_aid_pass_get_sync_point(r1.0, 2);
+    if r1.1 != r2.1 { panic(99460); };
+    let r3 = ecs_aid_pass_get_sync_point(r2.0, 5);
+    if r1.1 == r3.1 { panic(99461); };
+    // second distance allocates a new sync node
+    if r2.0.next_sync_node != r3.0.next_sync_node { panic(99462); };
+    if ecs_aid_pass_sync_count(r3.0) != 2 { panic(99463); };
+}
+
+@test "build_no_deferred_keeps_edges_unchanged"() {
+    let p = ecs_aid_pass_new();
+    let topo: Vec<i64> = Vec::new();
+    topo.push(1);
+    topo.push(2);
+    let ef: Vec<i64> = Vec::new();
+    ef.push(1);
+    let et: Vec<i64> = Vec::new();
+    et.push(2);
+    let hd: Vec<bool> = Vec::new();
+    hd.push(false);
+    hd.push(false);
+    let es: Vec<bool> = Vec::new();
+    es.push(false);
+    es.push(false);
+    let hc: Vec<bool> = Vec::new();
+    hc.push(false);
+    hc.push(false);
+    let ex: Vec<bool> = Vec::new();
+    ex.push(false);
+    ex.push(false);
+    let r = ecs_aid_pass_build(p, topo, ef, et, hd, es, hc, ex);
+    let res = r.1;
+    if ecs_aid_build_result_edge_count(res) != 1 { panic(99470); };
+    if ecs_aid_build_result_sync_edges_count(res) != 0 { panic(99471); };
+    if ecs_aid_build_result_new_sync_points(res) != 0 { panic(99472); };
+    let from = ecs_aid_build_result_edges_from(res);
+    let to = ecs_aid_build_result_edges_to(res);
+    if from[0] != 1 { panic(99473); };
+    if to[0] != 2 { panic(99474); };
+}
+
+@test "build_deferred_inserts_sync_point"() {
+    // 1 -> 2, system 1 has deferred, neither is exclusive or explicit sync.
+    let p = ecs_aid_pass_new();
+    let topo: Vec<i64> = Vec::new();
+    topo.push(1);
+    topo.push(2);
+    let ef: Vec<i64> = Vec::new();
+    ef.push(1);
+    let et: Vec<i64> = Vec::new();
+    et.push(2);
+    let hd: Vec<bool> = Vec::new();
+    hd.push(true);
+    hd.push(false);
+    let es: Vec<bool> = Vec::new();
+    es.push(false);
+    es.push(false);
+    let hc: Vec<bool> = Vec::new();
+    hc.push(false);
+    hc.push(false);
+    let ex: Vec<bool> = Vec::new();
+    ex.push(false);
+    ex.push(false);
+    let r = ecs_aid_pass_build(p, topo, ef, et, hd, es, hc, ex);
+    let res = r.1;
+    if ecs_aid_build_result_edge_count(res) != 2 { panic(99480); };
+    if ecs_aid_build_result_sync_edges_count(res) != 1 { panic(99481); };
+    if ecs_aid_build_result_new_sync_points(res) != 1 { panic(99482); };
+    let t = ecs_aid_build_result_sync_edge_triple(res, 0);
+    if t.0 != 1 { panic(99483); };
+    if t.2 != 2 { panic(99484); };
+    // sync node sits between
+    let from = ecs_aid_build_result_edges_from(res);
+    let to = ecs_aid_build_result_edges_to(res);
+    if from[0] != 1 { panic(99485); };
+    if to[0] != t.1 { panic(99486); };
+    if from[1] != t.1 { panic(99487); };
+    if to[1] != 2 { panic(99488); };
+}
+
+@test "build_no_sync_edge_delays_sync_to_later_edge"() {
+    // 1 -> 2 -> 3, system 1 has deferred, edge (1,2) is no_sync (IgnoreDeferred),
+    // edge (2,3) is not. System 2 is not exclusive, so the pending sync from (1->2) carries over
+    // to (2->3) and Bevy inserts the sync before node 3.
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_add_dependency(p, 1, 2, true);
+    let topo: Vec<i64> = Vec::new();
+    topo.push(1);
+    topo.push(2);
+    topo.push(3);
+    let ef: Vec<i64> = Vec::new();
+    ef.push(1);
+    ef.push(2);
+    let et: Vec<i64> = Vec::new();
+    et.push(2);
+    et.push(3);
+    let hd: Vec<bool> = Vec::new();
+    hd.push(true);
+    hd.push(false);
+    hd.push(false);
+    let es: Vec<bool> = Vec::new();
+    es.push(false);
+    es.push(false);
+    es.push(false);
+    let hc: Vec<bool> = Vec::new();
+    hc.push(false);
+    hc.push(false);
+    hc.push(false);
+    let ex: Vec<bool> = Vec::new();
+    ex.push(false);
+    ex.push(false);
+    ex.push(false);
+    let r = ecs_aid_pass_build(p, topo, ef, et, hd, es, hc, ex);
+    let res = r.1;
+    // (1,2) survives as-is; (2,3) gets a sync inserted because pending_sync carried over.
+    if ecs_aid_build_result_edge_count(res) != 3 { panic(99490); };
+    if ecs_aid_build_result_sync_edges_count(res) != 1 { panic(99491); };
+    let t = ecs_aid_build_result_sync_edge_triple(res, 0);
+    if t.0 != 2 { panic(99492); };
+    if t.2 != 3 { panic(99493); };
+}
+
+@test "build_explicit_sync_node_not_replaced"() {
+    // If the target is itself an explicit sync point, no sync is inserted between key->target.
+    let p = ecs_aid_pass_new();
+    let topo: Vec<i64> = Vec::new();
+    topo.push(1);
+    topo.push(2);
+    let ef: Vec<i64> = Vec::new();
+    ef.push(1);
+    let et: Vec<i64> = Vec::new();
+    et.push(2);
+    let hd: Vec<bool> = Vec::new();
+    hd.push(true);
+    hd.push(false);
+    let es: Vec<bool> = Vec::new();
+    es.push(false);
+    es.push(true);  // target is explicit ApplyDeferred
+    let hc: Vec<bool> = Vec::new();
+    hc.push(false);
+    hc.push(false);
+    let ex: Vec<bool> = Vec::new();
+    ex.push(false);
+    ex.push(false);
+    let r = ecs_aid_pass_build(p, topo, ef, et, hd, es, hc, ex);
+    let res = r.1;
+    // target is explicit sync, so no insertion; original edge is preserved.
+    if ecs_aid_build_result_edge_count(res) != 1 { panic(99500); };
+    if ecs_aid_build_result_sync_edges_count(res) != 0 { panic(99501); };
+}
+
+@test "build_cache_reuse_explicit_sync_node"() {
+    // Two parallel edges where both targets share the same target_distance: the second uses the
+    // newly-allocated sync node from the first get_sync_point call only when no explicit node has
+    // that distance. We verify only one new sync node is allocated per distinct distance.
+    let p = ecs_aid_pass_new();
+    let topo: Vec<i64> = Vec::new();
+    topo.push(1);
+    topo.push(2);
+    topo.push(3);
+    let ef: Vec<i64> = Vec::new();
+    ef.push(1);
+    ef.push(1);
+    let et: Vec<i64> = Vec::new();
+    et.push(2);
+    et.push(3);
+    let hd: Vec<bool> = Vec::new();
+    hd.push(true);
+    hd.push(false);
+    hd.push(false);
+    let es: Vec<bool> = Vec::new();
+    es.push(false);
+    es.push(false);
+    es.push(false);
+    let hc: Vec<bool> = Vec::new();
+    hc.push(false);
+    hc.push(false);
+    hc.push(false);
+    let ex: Vec<bool> = Vec::new();
+    ex.push(false);
+    ex.push(false);
+    ex.push(false);
+    let r = ecs_aid_pass_build(p, topo, ef, et, hd, es, hc, ex);
+    let res = r.1;
+    if ecs_aid_build_result_new_sync_points(res) != 1 { panic(99510); };
+    // two parallel inserted triples sharing the same sync node
+    let t1 = ecs_aid_build_result_sync_edge_triple(res, 0);
+    let t2 = ecs_aid_build_result_sync_edge_triple(res, 1);
+    if t1.1 != t2.1 { panic(99511); };
+}
+
+@test "index_of_helper"() {
+    let topo: Vec<i64> = Vec::new();
+    topo.push(5);
+    topo.push(6);
+    topo.push(7);
+    if ecs_aid_index_of(topo, 5) != 0 { panic(99520); };
+    if ecs_aid_index_of(topo, 7) != 2 { panic(99521); };
+    if ecs_aid_index_of(topo, 99) != -1 { panic(99522); };
+}
+
+@test "collapse_set_empty_systems_chains_through_a_b"() {
+    // empty systems: (a, set) and (set, b) both no_sync -> insert (a, b)
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_no_sync_add(p, 11, 999);  // (a=11, set=999)
+    p = ecs_aid_pass_no_sync_add(p, 999, 22);  // (set=999, b=22)
+    let systems: Vec<i64> = Vec::new();
+    let incoming: Vec<i64> = Vec::new();
+    incoming.push(11);
+    let outgoing: Vec<i64> = Vec::new();
+    outgoing.push(22);
+    p = ecs_aid_pass_collapse_set(p, 999, systems, incoming, outgoing);
+    if ecs_aid_pass_no_sync_contains(p, 11, 22) != true { panic(99530); };
+}
+
+@test "collapse_set_nonempty_systems_forwards_incoming_to_each_system"() {
+    // nonempty systems: (a, set) no_sync -> for each system sys, insert (a, System(sys))
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_no_sync_add(p, 7, 888);
+    let systems: Vec<i64> = Vec::new();
+    systems.push(30);
+    systems.push(31);
+    let incoming: Vec<i64> = Vec::new();
+    incoming.push(7);
+    let outgoing: Vec<i64> = Vec::new();
+    p = ecs_aid_pass_collapse_set(p, 888, systems, incoming, outgoing);
+    if ecs_aid_pass_no_sync_contains(p, 7, 30) != true { panic(99540); };
+    if ecs_aid_pass_no_sync_contains(p, 7, 31) != true { panic(99541); };
+    // outgoing empty, no (sys, b) inserted
+    if ecs_aid_pass_no_sync_contains(p, 30, 999) != false { panic(99542); };
+}
+
+@test "collapse_set_nonempty_systems_forwards_outgoing_to_each_system"() {
+    // nonempty systems: (set, b) no_sync -> for each system sys, insert (System(sys), b)
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_no_sync_add(p, 888, 77);
+    let systems: Vec<i64> = Vec::new();
+    systems.push(50);
+    systems.push(51);
+    let incoming: Vec<i64> = Vec::new();
+    let outgoing: Vec<i64> = Vec::new();
+    outgoing.push(77);
+    p = ecs_aid_pass_collapse_set(p, 888, systems, incoming, outgoing);
+    if ecs_aid_pass_no_sync_contains(p, 50, 77) != true { panic(99550); };
+    if ecs_aid_pass_no_sync_contains(p, 51, 77) != true { panic(99551); };
+}
+
+@test "collapse_set_no_incoming_or_outgoing_no_forwarding"() {
+    let p = ecs_aid_pass_new();
+    p = ecs_aid_pass_no_sync_add(p, 888, 77);
+    let systems: Vec<i64> = Vec::new();
+    systems.push(50);
+    let incoming: Vec<i64> = Vec::new();
+    let outgoing: Vec<i64> = Vec::new();
+    p = ecs_aid_pass_collapse_set(p, 888, systems, incoming, outgoing);
+    if ecs_aid_pass_no_sync_count(p) != 1 { panic(99560); };
+}

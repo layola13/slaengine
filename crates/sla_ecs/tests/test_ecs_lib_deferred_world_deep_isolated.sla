@@ -1,0 +1,249 @@
+@import "../src/deferred_world_deep.sla"
+
+// Batch 190 tests for DeferredWorld deep: fetch errors, modify_component hooks,
+// trigger_raw, messages, structural ban, reborrow.
+
+@test "new_defaults_and_reborrow"() {
+    let d = ecs_dw_deep_new(7, 3);
+    if ecs_dw_deep_world_id(d) != 7 { panic(103300); };
+    if ecs_dw_deep_change_tick(d) != 3 { panic(103301); };
+    if ecs_dw_deep_structural_ban(d) != true { panic(103302); };
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_OK { panic(103303); };
+    d = ecs_dw_deep_reborrow(d);
+    if ecs_dw_deep_world_id(d) != 7 { panic(103304); };
+    if ecs_dw_deep_as_unsafe_world_cell(d) != 7 { panic(103305); };
+}
+
+@test "from_world_constructs_deferred"() {
+    let d = ecs_dw_deep_from_world(9, 1);
+    if ecs_dw_deep_world_id(d) != 9 { panic(103310); };
+    if ecs_dw_deep_change_tick(d) != 1 { panic(103311); };
+}
+
+@test "seed_entity_and_has_component"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_seed_entity(d, 0, 2, 42);
+    if ecs_dw_deep_entity_occupied(d, 0) != true { panic(103320); };
+    if ecs_dw_deep_entity_has_component(d, 0, 2) != true { panic(103321); };
+    if ecs_dw_deep_entity_has_component(d, 0, 3) != false { panic(103322); };
+    if ecs_dw_deep_get_value(d, 0) != 42 { panic(103323); };
+    if ecs_dw_deep_component_registered(d, 2) != true { panic(103324); };
+}
+
+@test "get_entity_mut_not_spawned"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_get_entity_mut(d, 3);
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_NOT_SPAWNED { panic(103330); };
+}
+
+@test "get_entity_mut_ok_and_aliased"() {
+    let d = ecs_dw_deep_seed_entity(ecs_dw_deep_new(1, 0), 1, 0, 5);
+    d = ecs_dw_deep_get_entity_mut(d, 1);
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_OK { panic(103340); };
+    // second borrow of same entity without release => aliased
+    d = ecs_dw_deep_get_entity_mut(d, 1);
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_ALIASED_MUT { panic(103341); };
+    d = ecs_dw_deep_release_borrow(d);
+    d = ecs_dw_deep_get_entity_mut(d, 1);
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_OK { panic(103342); };
+}
+
+@test "get_mut_present_and_missing_component"() {
+    let d = ecs_dw_deep_seed_entity(ecs_dw_deep_new(1, 0), 0, 1, 10);
+    let g = ecs_dw_deep_get_mut(d, 0, 1);
+    d = g.0;
+    if g.1 != true { panic(103350); };
+    if g.2 != 10 { panic(103351); };
+    d = ecs_dw_deep_release_borrow(d);
+    let g2 = ecs_dw_deep_get_mut(d, 0, 5);
+    if g2.1 != false { panic(103352); };
+}
+
+@test "get_mut_missing_entity"() {
+    let d = ecs_dw_deep_new(1, 0);
+    let g = ecs_dw_deep_get_mut(d, 2, 0);
+    d = g.0;
+    if g.1 != false { panic(103360); };
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_NOT_SPAWNED { panic(103361); };
+}
+
+@test "modify_component_unregistered_returns_none"() {
+    let d = ecs_dw_deep_seed_entity(ecs_dw_deep_new(1, 0), 0, 0, 1);
+    // component 5 not registered
+    let r = ecs_dw_deep_modify_component(d, 0, 5, 3, ECS_DW_HOOK_RUN);
+    d = r.0;
+    if r.1 != true { panic(103370); };
+    if r.2 != false { panic(103371); };
+    if ecs_dw_deep_hook_len(d) != 0 { panic(103372); };
+}
+
+@test "modify_component_missing_on_entity_returns_none"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_register_component(d, 2);
+    d = ecs_dw_deep_seed_entity(d, 0, 0, 1);
+    // entity has component 0, not 2
+    let r = ecs_dw_deep_modify_component(d, 0, 2, 1, ECS_DW_HOOK_RUN);
+    d = r.0;
+    if r.1 != true { panic(103380); };
+    if r.2 != false { panic(103381); };
+}
+
+@test "modify_component_discard_then_insert_hooks"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_seed_entity(d, 0, 1, 10);
+    d = ecs_dw_deep_set_has_discard_hook(d, true);
+    d = ecs_dw_deep_set_has_insert_hook(d, true);
+    let r = ecs_dw_deep_modify_component(d, 0, 1, 5, ECS_DW_HOOK_RUN);
+    d = r.0;
+    if r.1 != true { panic(103390); };
+    if r.2 != true { panic(103391); };
+    if r.3 != 15 { panic(103392); };
+    if ecs_dw_deep_get_value(d, 0) != 15 { panic(103393); };
+    if ecs_dw_deep_hook_len(d) != 2 { panic(103394); };
+    let h0 = ecs_dw_deep_hook_at(d, 0);
+    if ecs_dw_deep_hook_kind(h0) != ECS_DW_HOOK_DISCARD { panic(103395); };
+    if ecs_dw_deep_hook_entity(h0) != 0 { panic(103396); };
+    if ecs_dw_deep_hook_component(h0) != 1 { panic(103397); };
+    let h1 = ecs_dw_deep_hook_at(d, 1);
+    if ecs_dw_deep_hook_kind(h1) != ECS_DW_HOOK_INSERT { panic(103398); };
+}
+
+@test "modify_component_with_observers"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_seed_entity(d, 2, 0, 1);
+    d = ecs_dw_deep_set_has_discard_observer(d, true);
+    d = ecs_dw_deep_set_has_insert_observer(d, true);
+    let r = ecs_dw_deep_modify_component(d, 2, 0, 1, ECS_DW_HOOK_RUN);
+    d = r.0;
+    if ecs_dw_deep_trigger_count(d) != 2 { panic(103400); };
+    // last event key should be INSERT sentinel 101
+    if ecs_dw_deep_last_event_key(d) != 101 { panic(103401); };
+    // hook log: observer discard + observer insert
+    if ecs_dw_deep_hook_len(d) != 2 { panic(103402); };
+}
+
+@test "modify_component_skip_relationship_hooks"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_seed_entity(d, 0, 0, 5);
+    d = ecs_dw_deep_set_has_discard_hook(d, true);
+    d = ecs_dw_deep_set_has_insert_hook(d, true);
+    let r = ecs_dw_deep_modify_component(d, 0, 0, 1, ECS_DW_HOOK_SKIP);
+    d = r.0;
+    if r.3 != 6 { panic(103410); };
+    // hooks skipped
+    if ecs_dw_deep_hook_len(d) != 0 { panic(103411); };
+}
+
+@test "modify_component_entity_not_spawned"() {
+    let d = ecs_dw_deep_register_component(ecs_dw_deep_new(1, 0), 0);
+    let r = ecs_dw_deep_modify_component(d, 4, 0, 1, ECS_DW_HOOK_RUN);
+    d = r.0;
+    if r.1 != false { panic(103420); };
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_NOT_SPAWNED { panic(103421); };
+}
+
+@test "trigger_on_remove_and_despawn"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_set_has_remove_hook(d, true);
+    d = ecs_dw_deep_set_has_despawn_hook(d, true);
+    d = ecs_dw_deep_trigger_on_remove(d, 1, 3);
+    d = ecs_dw_deep_trigger_on_despawn(d, 1, 3);
+    if ecs_dw_deep_hook_len(d) != 2 { panic(103430); };
+    if ecs_dw_deep_hook_kind(ecs_dw_deep_hook_at(d, 0)) != ECS_DW_HOOK_REMOVE { panic(103431); };
+    if ecs_dw_deep_hook_kind(ecs_dw_deep_hook_at(d, 1)) != ECS_DW_HOOK_DESPAWN { panic(103432); };
+}
+
+@test "trigger_raw_and_trigger"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_trigger_raw(d, 50, 2);
+    if ecs_dw_deep_trigger_count(d) != 1 { panic(103440); };
+    if ecs_dw_deep_last_event_key(d) != 50 { panic(103441); };
+    d = ecs_dw_deep_trigger(d, 77);
+    if ecs_dw_deep_trigger_count(d) != 2 { panic(103442); };
+    if ecs_dw_deep_last_event_key(d) != 77 { panic(103443); };
+}
+
+@test "write_message_ok_and_none"() {
+    let d = ecs_dw_deep_new(1, 0);
+    let w = ecs_dw_deep_write_message(d, 99);
+    d = w.0;
+    if w.1 != 1 { panic(103450); };
+    if ecs_dw_deep_msg_len(d) != 1 { panic(103451); };
+    if ecs_dw_deep_message_at(d, 0) != 99 { panic(103452); };
+    d = ecs_dw_deep_set_has_messages(d, false);
+    let w2 = ecs_dw_deep_write_message(d, 1);
+    d = w2.0;
+    if w2.1 != ECS_DW_MSG_NONE { panic(103453); };
+}
+
+@test "write_message_default_and_batch"() {
+    let d = ecs_dw_deep_new(1, 0);
+    let w = ecs_dw_deep_write_message_default(d);
+    d = w.0;
+    if w.1 != 1 { panic(103460); };
+    if ecs_dw_deep_message_at(d, 0) != 0 { panic(103461); };
+    let b = ecs_dw_deep_write_message_batch(d, 10, 3);
+    d = b.0;
+    if b.1 != 2 { panic(103462); };
+    if ecs_dw_deep_msg_len(d) != 4 { panic(103463); };
+    if ecs_dw_deep_message_at(d, 1) != 10 { panic(103464); };
+    if ecs_dw_deep_message_at(d, 3) != 12 { panic(103465); };
+}
+
+@test "write_message_batch_empty_or_no_channel"() {
+    let d = ecs_dw_deep_new(1, 0);
+    let b = ecs_dw_deep_write_message_batch(d, 0, 0);
+    if b.1 != ECS_DW_MSG_NONE { panic(103470); };
+    d = ecs_dw_deep_set_has_messages(d, false);
+    let b2 = ecs_dw_deep_write_message_batch(d, 1, 2);
+    if b2.1 != ECS_DW_MSG_NONE { panic(103471); };
+}
+
+@test "resource_mut_and_get_resource_mut"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_resource_mut(d);
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_OK { panic(103480); };
+    let g = ecs_dw_deep_get_resource_mut(d, true);
+    if g.1 != true { panic(103481); };
+    let g2 = ecs_dw_deep_get_resource_mut(d, false);
+    if g2.1 != false { panic(103482); };
+}
+
+@test "try_spawn_banned_structural"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_try_spawn_banned(d);
+    if ecs_dw_deep_last_error(d) != ECS_DW_ERR_STRUCTURAL { panic(103490); };
+}
+
+@test "entities_and_commands_count"() {
+    let d = ecs_dw_deep_new(1, 0);
+    d = ecs_dw_deep_seed_entity(d, 0, 0, 1);
+    d = ecs_dw_deep_seed_entity(d, 2, 0, 2);
+    let ec = ecs_dw_deep_entities_and_commands(d);
+    if ec.0 != 2 { panic(103500); };
+    if ecs_dw_deep_entity_count(ec.1) != 2 { panic(103501); };
+}
+
+@test "get_mut_by_id_path"() {
+    let d = ecs_dw_deep_seed_entity(ecs_dw_deep_new(1, 0), 3, 4, 8);
+    let g = ecs_dw_deep_get_mut_by_id(d, 3, 4);
+    if g.1 != true { panic(103510); };
+    if g.2 != 8 { panic(103511); };
+}
+
+@test "lifecycle_seed_modify_message_trigger"() {
+    let d = ecs_dw_deep_new(5, 10);
+    d = ecs_dw_deep_seed_entity(d, 1, 0, 100);
+    d = ecs_dw_deep_set_has_discard_hook(d, true);
+    d = ecs_dw_deep_set_has_insert_hook(d, true);
+    let r = ecs_dw_deep_modify_component(d, 1, 0, 7, ECS_DW_HOOK_RUN);
+    d = r.0;
+    if r.3 != 107 { panic(103520); };
+    let w = ecs_dw_deep_write_message(d, 1);
+    d = w.0;
+    d = ecs_dw_deep_trigger(d, 9);
+    if ecs_dw_deep_msg_len(d) != 1 { panic(103521); };
+    if ecs_dw_deep_trigger_count(d) != 1 { panic(103522); };
+    if ecs_dw_deep_hook_len(d) != 3 { panic(103523); }; // discard+insert+trigger observer
+    if ecs_dw_deep_last_error(d) != ECS_DW_FETCH_OK { panic(103524); };
+}

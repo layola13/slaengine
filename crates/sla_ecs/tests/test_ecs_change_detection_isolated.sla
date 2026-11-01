@@ -1,0 +1,287 @@
+// ChangeDetection: DetectChanges + DetectChangesMut full parity.
+// Bevy change_detection/traits.rs: is_added, is_changed, is_added_after,
+// is_changed_after, last_changed, added, this_run, last_run, set_changed,
+// set_added, set_last_changed, set_last_added, bypass_change_detection,
+// set_if_neq. Plus Tick: set, is_newer_than, check_tick.
+
+struct EcsTick {
+    tick: i32,
+}
+
+fn tick_new(t: i32) -> EcsTick { return EcsTick { tick: t }; }
+fn tick_get(t: EcsTick) -> i32 { return t.tick; }
+fn tick_set(t: EcsTick, new_val: i32) -> EcsTick { t.tick = new_val; return t; }
+fn tick_is_newer_than(this: EcsTick, last_run: EcsTick, this_run: EcsTick) -> bool {
+    // Bevy: is_newer_than(last_run, this_run) means tick is in (last_run, this_run]
+    if this_run.tick >= last_run.tick {
+        return this.tick > last_run.tick && this.tick <= this_run.tick;
+    };
+    // Tick wrapped around
+    return this.tick > last_run.tick || this.tick <= this_run.tick;
+}
+
+// ComponentTicks: tracks added and changed ticks for a component instance.
+struct EcsComponentTicks {
+    added_tick: i32,
+    changed_tick: i32,
+}
+
+fn ticks_new(change_tick: i32) -> EcsComponentTicks {
+    return EcsComponentTicks { added_tick: change_tick, changed_tick: change_tick };
+}
+
+fn ticks_is_added(ticks: EcsComponentTicks, last_run: EcsTick, this_run: EcsTick) -> bool {
+    return tick_is_newer_than(tick_new(ticks.added_tick), last_run, this_run);
+}
+
+fn ticks_is_changed(ticks: EcsComponentTicks, last_run: EcsTick, this_run: EcsTick) -> bool {
+    return tick_is_newer_than(EcsTick { tick: ticks.changed_tick }, last_run, this_run);
+}
+
+fn ticks_is_added_after(ticks: EcsComponentTicks, other: EcsTick) -> bool {
+    return ticks.added_tick > other.tick;
+}
+
+fn ticks_is_changed_after(ticks: EcsComponentTicks, other: EcsTick) -> bool {
+    return ticks.changed_tick > other.tick;
+}
+
+fn ticks_last_changed(ticks: EcsComponentTicks) -> EcsTick {
+    return EcsTick { tick: ticks.changed_tick };
+}
+
+fn ticks_added(ticks: EcsComponentTicks) -> EcsTick {
+    return EcsTick { tick: ticks.added_tick };
+}
+
+fn ticks_set_changed(ticks: EcsComponentTicks, change_tick: i32) -> EcsComponentTicks {
+    ticks.changed_tick = change_tick;
+    return ticks;
+}
+
+fn ticks_set_added(ticks: EcsComponentTicks, change_tick: i32) -> EcsComponentTicks {
+    ticks.added_tick = change_tick;
+    ticks.changed_tick = change_tick;
+    return ticks;
+}
+
+fn ticks_set_last_changed(ticks: EcsComponentTicks, last_changed: i32) -> EcsComponentTicks {
+    ticks.changed_tick = last_changed;
+    return ticks;
+}
+
+fn ticks_set_last_added(ticks: EcsComponentTicks, last_added: i32) -> EcsComponentTicks {
+    ticks.added_tick = last_added;
+    ticks.changed_tick = last_added;
+    return ticks;
+}
+
+// Ref<T> model: value + ticks + last_run + this_run
+struct EcsRef<T> {
+    value: T,
+    ticks: EcsComponentTicks,
+    last_run: i32,
+    this_run: i32,
+}
+
+fn ref_is_added(r: EcsRef<i32>) -> bool {
+    return r.ticks.added_tick > r.last_run && r.ticks.added_tick <= r.this_run;
+}
+
+fn ref_is_changed(r: EcsRef<i32>) -> bool {
+    return r.ticks.changed_tick > r.last_run && r.ticks.changed_tick <= r.this_run;
+}
+
+fn ref_is_added_after(r: EcsRef<i32>, other: i32) -> bool {
+    return r.ticks.added_tick > other;
+}
+
+fn ref_is_changed_after(r: EcsRef<i32>, other: i32) -> bool {
+    return r.ticks.changed_tick > other;
+}
+
+fn ref_last_changed(r: EcsRef<i32>) -> i32 {
+    return r.ticks.changed_tick;
+}
+
+fn ref_added(r: EcsRef<i32>) -> i32 {
+    return r.ticks.added_tick;
+}
+
+fn ref_set_changed(r: EcsRef<i32>) -> EcsRef<i32> {
+    r.ticks.changed_tick = r.this_run;
+    return r;
+}
+
+fn ref_set_added(r: EcsRef<i32>) -> EcsRef<i32> {
+    r.ticks.added_tick = r.this_run;
+    r.ticks.changed_tick = r.this_run;
+    return r;
+}
+
+fn ref_set_last_changed(r: EcsRef<i32>, last_changed: i32) -> EcsRef<i32> {
+    r.ticks.changed_tick = last_changed;
+    return r;
+}
+
+fn ref_set_if_neq(r: EcsRef<i32>, new_value: i32) -> (EcsRef<i32>, bool) {
+    if r.value != new_value {
+        r.value = new_value;
+        r.ticks.changed_tick = r.this_run;
+        return (r, true);
+    };
+    return (r, false);
+}
+
+fn ref_bypass_change_detection(r: EcsRef<i32>, new_value: i32) -> EcsRef<i32> {
+    r.value = new_value;
+    // Does NOT update ticks
+    return r;
+}
+
+// CheckChangeTicks: periodic tick wrapping check
+struct EcsCheckChangeTicks {
+    max_age: i32,
+}
+
+fn check_change_ticks_new() -> EcsCheckChangeTicks {
+    return EcsCheckChangeTicks { max_age: 2147483647 };
+}
+
+fn ticks_check_tick(ticks: EcsComponentTicks, check: EcsCheckChangeTicks, this_run: i32) -> bool {
+    // Bevy: returns true if ticks need wrapping
+    let age = this_run - ticks.changed_tick;
+    if age < 0 { return false; };  // wrapped already
+    if age > check.max_age { return true; };
+    return false;
+}
+
+@test "tick is_newer_than normal range"() {
+    let t = tick_new(5);
+    let last_run = tick_new(3);
+    let this_run = tick_new(7);
+    if tick_is_newer_than(t, last_run, this_run) != true { panic(60001); };
+}
+
+@test "tick is_newer_than at boundary"() {
+    let t = tick_new(3);
+    let last_run = tick_new(3);
+    let this_run = tick_new(7);
+    // tick == last_run is NOT newer (exclusive)
+    if tick_is_newer_than(t, last_run, this_run) { panic(60002); };
+}
+
+@test "tick is_newer_than this_run inclusive"() {
+    let t = tick_new(7);
+    let last_run = tick_new(3);
+    let this_run = tick_new(7);
+    // tick == this_run IS newer (inclusive)
+    if tick_is_newer_than(t, last_run, this_run) != true { panic(60003); };
+}
+
+@test "component ticks is_added"() {
+    let ticks = ticks_new(5);
+    let last_run = tick_new(3);
+    let this_run = tick_new(7);
+    if ticks_is_added(ticks, last_run, this_run) != true { panic(60004); };
+}
+
+@test "component ticks is_changed"() {
+    let ticks = ticks_new(5);
+    let last_run = tick_new(3);
+    let this_run = tick_new(7);
+    if ticks_is_changed(ticks, last_run, this_run) != true { panic(60005); };
+}
+
+@test "is_added_after"() {
+    let ticks = ticks_new(5);
+    if ticks_is_added_after(ticks, EcsTick { tick: 3 }) != true { panic(60006); };
+    if ticks_is_added_after(ticks, EcsTick { tick: 5 }) { panic(60007); };
+}
+
+@test "is_changed_after"() {
+    let ticks = ticks_new(5);
+    if ticks_is_changed_after(ticks, EcsTick { tick: 3 }) != true { panic(60008); };
+    if ticks_is_changed_after(ticks, EcsTick { tick: 7 }) { panic(60009); };
+}
+
+@test "ref is_added in range"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(5), last_run: 3, this_run: 7 };
+    if ref_is_added(r) != true { panic(60010); };
+}
+
+@test "ref is_changed in range"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(5), last_run: 3, this_run: 7 };
+    if ref_is_changed(r) != true { panic(60011); };
+}
+
+@test "ref set_changed updates tick"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(3), last_run: 3, this_run: 7 };
+    let r2 = ref_set_changed(r);
+    if r2.ticks.changed_tick != 7 { panic(60012); };
+}
+
+@test "ref set_added updates both ticks"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(3), last_run: 3, this_run: 7 };
+    let r2 = ref_set_added(r);
+    if r2.ticks.added_tick != 7 { panic(60013); };
+    if r2.ticks.changed_tick != 7 { panic(60014); };
+}
+
+@test "ref set_if_neq changes value"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(3), last_run: 3, this_run: 7 };
+    let (r2, changed) = ref_set_if_neq(r, 100);
+    if changed != true { panic(60015); };
+    if r2.value != 100 { panic(60016); };
+    if r2.ticks.changed_tick != 7 { panic(60017); };
+}
+
+@test "ref set_if_neq no change when equal"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(3), last_run: 3, this_run: 7 };
+    let (r2, changed) = ref_set_if_neq(r, 42);
+    if changed { panic(60018); };
+    if r2.ticks.changed_tick != 3 { panic(60019); };
+}
+
+@test "ref bypass_change_detection does not update tick"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(3), last_run: 3, this_run: 7 };
+    let r2 = ref_bypass_change_detection(r, 99);
+    if r2.value != 99 { panic(60020); };
+    if r2.ticks.changed_tick != 3 { panic(60021); };
+}
+
+@test "ref last_changed and added accessors"() {
+    let r = EcsRef<i32> { value: 42, ticks: ticks_new(5), last_run: 3, this_run: 7 };
+    if ref_last_changed(r) != 5 { panic(60022); };
+    if ref_added(r) != 5 { panic(60023); };
+}
+
+@test "check_tick detects stale ticks"() {
+    let ticks = ticks_new(1);
+    let check = check_change_ticks_new();
+    check.max_age = 10;
+    // this_run = 20, age = 19 > max_age = 10 -> needs wrap
+    if ticks_check_tick(ticks, check, 20) != true { panic(60024); };
+}
+
+@test "check_tick passes fresh ticks"() {
+    let ticks = ticks_new(15);
+    let check = check_change_ticks_new();
+    check.max_age = 10;
+    // this_run = 20, age = 5 < max_age = 10 -> no wrap
+    if ticks_check_tick(ticks, check, 20) { panic(60025); };
+}
+
+@test "set_last_changed updates only changed tick"() {
+    let ticks = ticks_new(5);
+    let t2 = ticks_set_last_changed(ticks, 10);
+    if t2.changed_tick != 10 { panic(60026); };
+    if t2.added_tick != 5 { panic(60027); };
+}
+
+@test "set_last_added updates both"() {
+    let ticks = ticks_new(5);
+    let t2 = ticks_set_last_added(ticks, 10);
+    if t2.added_tick != 10 { panic(60028); };
+    if t2.changed_tick != 10 { panic(60029); };
+}

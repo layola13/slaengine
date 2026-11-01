@@ -1,0 +1,90 @@
+@import "../src/world_table_erased.sla"
+@import "../src/parallel.sla"
+@import "sa_std/core/arc.sa"
+@import "sa_std/thread.sa"
+@import "sa_std/core/result.sa"
+
+const PARALLEL_QUERY_POSITION_TYPE: i32 = 15120;
+
+struct ParallelQueryPosition { x: i32, y: i32 }
+struct ParallelQueryTime { tick: i32 }
+struct ParallelQueryEvent { amount: i32 }
+
+fn parallel_query_time_default() -> ParallelQueryTime { return ParallelQueryTime { tick: 0 }; }
+fn parallel_query_event_default() -> ParallelQueryEvent { return ParallelQueryEvent { amount: 0 }; }
+
+fn parallel_query_world_new() -> TableErasedWorld<ParallelQueryTime, ParallelQueryEvent> {
+    return table_erased_world_new<ParallelQueryTime, ParallelQueryEvent>(parallel_query_time_default(), parallel_query_event_default());
+}
+
+fn parallel_query_spawn_position(world: TableErasedWorld<ParallelQueryTime, ParallelQueryEvent>, component_id: i32, x: i32) -> TableErasedWorld<ParallelQueryTime, ParallelQueryEvent> {
+    let (w1, entity) = table_erased_world_spawn<ParallelQueryTime, ParallelQueryEvent>(world);
+    return table_erased_world_insert<ParallelQueryPosition, ParallelQueryTime, ParallelQueryEvent>(w1, entity, component_id, PARALLEL_QUERY_POSITION_TYPE, ParallelQueryPosition { x: x, y: 0 });
+}
+
+fn parallel_query_sum_world_range(shared: Arc<TableErasedWorld<ParallelQueryTime, ParallelQueryEvent> >, start: i64, end: i64) -> i32 {
+    let query = table_erased_world_query_auto<ParallelQueryPosition, ParallelQueryTime, ParallelQueryEvent>(*shared, PARALLEL_QUERY_POSITION_TYPE);
+    let total: i32 = 0;
+    let i = start;
+    let cnt = len(query.items) as i64;
+    while i < end {
+        if i < cnt {
+            let item = query.items[i];
+            total = total + item.value.x;
+        };
+        i = i + 1;
+    }
+    return total;
+}
+
+fn bevy_style_parallel_query_demo() -> i32 {
+    let w0 = parallel_query_world_new();
+    let (w1, position) = table_erased_world_register_table<ParallelQueryTime, ParallelQueryEvent>(w0, PARALLEL_QUERY_POSITION_TYPE, ecs_box_drop<ParallelQueryPosition>);
+    let w2 = parallel_query_spawn_position(w1, position.id, 3);
+    let w3 = parallel_query_spawn_position(w2, position.id, 5);
+    let w4 = parallel_query_spawn_position(w3, position.id, 7);
+    let w5 = parallel_query_spawn_position(w4, position.id, 11);
+    let query = table_erased_world_query_auto<ParallelQueryPosition, ParallelQueryTime, ParallelQueryEvent>(w5, PARALLEL_QUERY_POSITION_TYPE);
+
+    let left: Vec<i32> = Vec::new();
+    let right: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(query.items) as i64;
+    while i < cnt {
+        let item = query.items[i];
+        if i < 2 {
+            left.push(item.value.x);
+        } else {
+            right.push(item.value.x);
+        };
+        i = i + 1;
+    }
+
+    return ecs_parallel_sum_i32_two(left, right);
+}
+
+fn bevy_style_parallel_world_snapshot_query_demo() -> i32 {
+    let w0 = parallel_query_world_new();
+    let (w1, position) = table_erased_world_register_table<ParallelQueryTime, ParallelQueryEvent>(w0, PARALLEL_QUERY_POSITION_TYPE, ecs_box_drop<ParallelQueryPosition>);
+    let w2 = parallel_query_spawn_position(w1, position.id, 3);
+    let w3 = parallel_query_spawn_position(w2, position.id, 5);
+    let w4 = parallel_query_spawn_position(w3, position.id, 7);
+    let w5 = parallel_query_spawn_position(w4, position.id, 11);
+
+    let shared = Arc::new(w5);
+    let left_world = shared.clone();
+    let right_world = shared.clone();
+    let left = thread::spawn(^|| parallel_query_sum_world_range(left_world, 0, 2));
+    let right = thread::spawn(^|| parallel_query_sum_world_range(right_world, 2, 4));
+    return left.join().unwrap() + right.join().unwrap();
+}
+
+fn main() -> i32 { return bevy_style_parallel_query_demo(); }
+
+@test "parallel query demo runs table erased query shards on threads"() {
+    if bevy_style_parallel_query_demo() != 26 { panic(15080); };
+}
+
+@test "parallel query demo reads shared table erased world snapshot on threads"() {
+    if bevy_style_parallel_world_snapshot_query_demo() != 26 { panic(15081); };
+}

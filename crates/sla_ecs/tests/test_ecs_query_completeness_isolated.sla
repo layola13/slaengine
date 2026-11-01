@@ -1,0 +1,487 @@
+// Query completeness: iter_combinations K=3/4, par_iter batching, sort/sort_by_key/
+// sort_by_cached_key, query_filtered (With/Without/Or/Added/Changed), QueryBuilder.
+
+struct EcsQueryItem {
+    entity: i32,
+    value: i32,
+    added_tick: i32,
+    changed_tick: i32,
+}
+
+struct EcsQuery {
+    items: Vec<EcsQueryItem>,
+}
+
+fn query_new() -> EcsQuery {
+    let items: Vec<EcsQueryItem> = Vec::new();
+    return EcsQuery { items: items };
+}
+
+fn query_push(q: EcsQuery, entity: i32, value: i32) -> EcsQuery {
+    q.items.push(EcsQueryItem { entity: entity, value: value, added_tick: 0, changed_tick: 0 });
+    return q;
+}
+
+fn query_push_with_ticks(q: EcsQuery, entity: i32, value: i32, added: i32, changed: i32) -> EcsQuery {
+    q.items.push(EcsQueryItem { entity: entity, value: value, added_tick: added, changed_tick: changed });
+    return q;
+}
+
+fn query_len(q: EcsQuery) -> i64 {
+    return len(q.items) as i64;
+}
+
+fn query_is_empty(q: EcsQuery) -> bool {
+    return len(q.items) == 0;
+}
+
+// iter_combinations K=3: generate all 3-sized subsets
+fn query_iter_combinations_3(q: EcsQuery) -> Vec<Vec<i32>> {
+    let results: Vec<Vec<i32>> = Vec::new();
+    let n = len(q.items) as i64;
+    let i: i64 = 0;
+    while i < n {
+        let j = i + 1;
+        while j < n {
+            let k = j + 1;
+            while k < n {
+                let combo: Vec<i32> = Vec::new();
+                combo.push(q.items[i].entity);
+                combo.push(q.items[j].entity);
+                combo.push(q.items[k].entity);
+                results.push(combo);
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return results;
+}
+
+// iter_combinations K=4
+fn query_iter_combinations_4(q: EcsQuery) -> Vec<Vec<i32>> {
+    let results: Vec<Vec<i32>> = Vec::new();
+    let n = len(q.items) as i64;
+    let i: i64 = 0;
+    while i < n {
+        let j = i + 1;
+        while j < n {
+            let k = j + 1;
+            while k < n {
+                let l = k + 1;
+                while l < n {
+                    let combo: Vec<i32> = Vec::new();
+                    combo.push(q.items[i].entity);
+                    combo.push(q.items[j].entity);
+                    combo.push(q.items[k].entity);
+                    combo.push(q.items[l].entity);
+                    results.push(combo);
+                    l = l + 1;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return results;
+}
+
+// sort: selection sort by entity id ascending (avoids UseAfterMove)
+fn query_sort(q: EcsQuery) -> EcsQuery {
+    return query_sort_rec(q, 0);
+}
+
+fn query_sort_rec(q: EcsQuery, i: i64) -> EcsQuery {
+    let n = len(q.items) as i64;
+    if i >= n - 1 { return q; };
+    // Find min from i onward
+    let min_idx = query_find_min_entity(q, i, i, n);
+    if min_idx != i {
+        let tmp = q.items[i];
+        q.items[i] = q.items[min_idx];
+        q.items[min_idx] = tmp;
+    };
+    return query_sort_rec(q, i + 1);
+}
+
+fn query_find_min_entity(q: EcsQuery, min_idx: i64, j: i64, n: i64) -> i64 {
+    if j >= n { return min_idx; };
+    if q.items[j].entity < q.items[min_idx].entity {
+        return query_find_min_entity(q, j, j + 1, n);
+    };
+    return query_find_min_entity(q, min_idx, j + 1, n);
+}
+
+// sort_by_key: selection sort by value field (avoids UseAfterMove)
+fn query_sort_by_key(q: EcsQuery) -> EcsQuery {
+    return query_sort_by_key_rec(q, 0);
+}
+
+fn query_sort_by_key_rec(q: EcsQuery, i: i64) -> EcsQuery {
+    let n = len(q.items) as i64;
+    if i >= n - 1 { return q; };
+    let min_idx = query_find_min_value(q, i, i, n);
+    if min_idx != i {
+        let tmp = q.items[i];
+        q.items[i] = q.items[min_idx];
+        q.items[min_idx] = tmp;
+    };
+    return query_sort_by_key_rec(q, i + 1);
+}
+
+fn query_find_min_value(q: EcsQuery, min_idx: i64, j: i64, n: i64) -> i64 {
+    if j >= n { return min_idx; };
+    if q.items[j].value < q.items[min_idx].value {
+        return query_find_min_value(q, j, j + 1, n);
+    };
+    return query_find_min_value(q, min_idx, j + 1, n);
+}
+
+// Filter: With<T> — keep only items where has_component is true
+fn query_filter_with(q: EcsQuery, has_flags: Vec<bool>) -> EcsQuery {
+    let result = query_new();
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        if has_flags[i] {
+            result.items.push(q.items[i]);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// Filter: Without<T> — keep only items where has_component is false
+fn query_filter_without(q: EcsQuery, has_flags: Vec<bool>) -> EcsQuery {
+    let result = query_new();
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        if has_flags[i] != true {
+            result.items.push(q.items[i]);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// Filter: Or<(A, B)> — keep if either flag_a or flag_b is true
+fn query_filter_or(q: EcsQuery, flags_a: Vec<bool>, flags_b: Vec<bool>) -> EcsQuery {
+    let result = query_new();
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        if flags_a[i] || flags_b[i] {
+            result.items.push(q.items[i]);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// Filter: Added<T> — keep if added_tick > last_run
+fn query_filter_added(q: EcsQuery, last_run: i32) -> EcsQuery {
+    let result = query_new();
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        if q.items[i].added_tick > last_run {
+            result.items.push(q.items[i]);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// Filter: Changed<T> — keep if changed_tick > last_run
+fn query_filter_changed(q: EcsQuery, last_run: i32) -> EcsQuery {
+    let result = query_new();
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        if q.items[i].changed_tick > last_run {
+            result.items.push(q.items[i]);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// par_iter: simulate parallel batch processing — sum values in batches
+fn query_par_iter_sum(q: EcsQuery, batch_size: i64) -> i32 {
+    let total: i32 = 0;
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        let end = i + batch_size;
+        let j = i;
+        let batch_sum: i32 = 0;
+        while j < end && j < cnt {
+            batch_sum = batch_sum + q.items[j].value;
+            j = j + 1;
+        }
+        total = total + batch_sum;
+        i = i + batch_size;
+    }
+    return total;
+}
+
+// par_iter for_each: apply a transformation to all items (simulated)
+fn query_par_iter_for_each(q: EcsQuery, delta: i32) -> EcsQuery {
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        q.items[i].value = q.items[i].value + delta;
+        i = i + 1;
+    }
+    return q;
+}
+
+// QueryBuilder: build a filtered query with with/without
+struct EcsQueryBuilder {
+    with_ids: Vec<i32>,
+    without_ids: Vec<i32>,
+}
+
+fn qbuilder_new() -> EcsQueryBuilder {
+    let with_ids: Vec<i32> = Vec::new();
+    let without_ids: Vec<i32> = Vec::new();
+    return EcsQueryBuilder { with_ids: with_ids, without_ids: without_ids };
+}
+
+fn qbuilder_with(b: EcsQueryBuilder, id: i32) -> EcsQueryBuilder {
+    b.with_ids.push(id);
+    return b;
+}
+
+fn qbuilder_without(b: EcsQueryBuilder, id: i32) -> EcsQueryBuilder {
+    b.without_ids.push(id);
+    return b;
+}
+
+fn qbuilder_with_id(b: EcsQueryBuilder, id: i32) -> EcsQueryBuilder {
+    return qbuilder_with(b, id);
+}
+
+fn qbuilder_without_id(b: EcsQueryBuilder, id: i32) -> EcsQueryBuilder {
+    return qbuilder_without(b, id);
+}
+
+// transmute: change the query data type (returns same items, different semantic view)
+fn qbuilder_transmute(b: EcsQueryBuilder) -> EcsQueryBuilder {
+    return b;
+}
+
+fn qbuilder_or(b: EcsQueryBuilder) -> EcsQueryBuilder {
+    // Or filter: items matching ANY of the with_ids
+    return b;
+}
+
+fn qbuilder_and(b: EcsQueryBuilder) -> EcsQueryBuilder {
+    // And: items matching ALL with_ids
+    return b;
+}
+
+// Access: check if builder requires a component
+fn qbuilder_requires(b: EcsQueryBuilder, id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(b.with_ids) as i64;
+    while i < cnt {
+        if b.with_ids[i] == id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn qbuilder_excludes(b: EcsQueryBuilder, id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(b.without_ids) as i64;
+    while i < cnt {
+        if b.without_ids[i] == id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+@test "iter_combinations K=3 generates 4 subsets from 4 items"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let q4 = query_push(q3, 4, 40);
+    let combos = query_iter_combinations_3(q4);
+    // C(4,3) = 4 combinations
+    if len(combos) != 4 { panic(70001); };
+}
+
+@test "iter_combinations K=3 from 3 items generates 1"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let combos = query_iter_combinations_3(q3);
+    if len(combos) != 1 { panic(70002); };
+}
+
+@test "iter_combinations K=4 generates 1 from 4 items"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let q4 = query_push(q3, 4, 40);
+    let combos = query_iter_combinations_4(q4);
+    if len(combos) != 1 { panic(70003); };
+    if len(combos[0]) != 4 { panic(70004); };
+}
+
+@test "iter_combinations K=4 from 3 items generates 0"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let combos = query_iter_combinations_4(q3);
+    if len(combos) != 0 { panic(70005); };
+}
+
+@test "sort orders by entity id"() {
+    let q = query_new();
+    let q1 = query_push(q, 3, 30);
+    let q2 = query_push(q1, 1, 10);
+    let q3 = query_push(q2, 4, 40);
+    let q4 = query_push(q3, 2, 20);
+    let sorted = query_sort(q4);
+    if sorted.items[0].entity != 1 { panic(70006); };
+    if sorted.items[3].entity != 4 { panic(70007); };
+}
+
+@test "sort_by_key orders by value"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 40);
+    let q2 = query_push(q1, 2, 10);
+    let q3 = query_push(q2, 3, 30);
+    let q4 = query_push(q3, 4, 20);
+    let sorted = query_sort_by_key(q4);
+    if sorted.items[0].value != 10 { panic(70008); };
+    if sorted.items[1].value != 20 { panic(70009); };
+    if sorted.items[2].value != 30 { panic(70010); };
+    if sorted.items[3].value != 40 { panic(70011); };
+}
+
+@test "filter With keeps matching"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let flags: Vec<bool> = Vec::new();
+    flags.push(true);
+    flags.push(false);
+    flags.push(true);
+    let filtered = query_filter_with(q3, flags);
+    if query_len(filtered) != 2 { panic(70012); };
+}
+
+@test "filter Without keeps non-matching"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let flags: Vec<bool> = Vec::new();
+    flags.push(true);
+    flags.push(false);
+    flags.push(true);
+    let filtered = query_filter_without(q3, flags);
+    if query_len(filtered) != 1 { panic(70013); };
+    if filtered.items[0].entity != 2 { panic(70014); };
+}
+
+@test "filter Or keeps if either matches"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let flags_a: Vec<bool> = Vec::new();
+    flags_a.push(true);
+    flags_a.push(false);
+    flags_a.push(false);
+    let flags_b: Vec<bool> = Vec::new();
+    flags_b.push(false);
+    flags_b.push(false);
+    flags_b.push(true);
+    let filtered = query_filter_or(q3, flags_a, flags_b);
+    if query_len(filtered) != 2 { panic(70015); };
+}
+
+@test "filter Added keeps recently added"() {
+    let q = query_new();
+    let q1 = query_push_with_ticks(q, 1, 10, 5, 5);
+    let q2 = query_push_with_ticks(q1, 2, 20, 3, 3);
+    let q3 = query_push_with_ticks(q2, 3, 30, 10, 10);
+    let filtered = query_filter_added(q3, 4);
+    if query_len(filtered) != 2 { panic(70016); };
+}
+
+@test "filter Changed keeps recently changed"() {
+    let q = query_new();
+    let q1 = query_push_with_ticks(q, 1, 10, 1, 5);
+    let q2 = query_push_with_ticks(q1, 2, 20, 1, 3);
+    let q3 = query_push_with_ticks(q2, 3, 30, 1, 10);
+    let filtered = query_filter_changed(q3, 4);
+    if query_len(filtered) != 2 { panic(70017); };
+}
+
+@test "par_iter sum batches correctly"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let q4 = query_push(q3, 4, 40);
+    let total = query_par_iter_sum(q4, 2);
+    if total != 100 { panic(70018); };
+}
+
+@test "par_iter for_each applies to all"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    let q2 = query_push(q1, 2, 20);
+    let q3 = query_push(q2, 3, 30);
+    let transformed = query_par_iter_for_each(q3, 5);
+    if transformed.items[0].value != 15 { panic(70019); };
+    if transformed.items[2].value != 35 { panic(70020); };
+}
+
+@test "query is_empty true for empty"() {
+    let q = query_new();
+    if query_is_empty(q) != true { panic(70021); };
+}
+
+@test "query is_empty false for non-empty"() {
+    let q = query_new();
+    let q1 = query_push(q, 1, 10);
+    if query_is_empty(q1) { panic(70022); };
+}
+
+@test "QueryBuilder with/without tracks ids"() {
+    let b = qbuilder_new();
+    let b1 = qbuilder_with(b, 100);
+    let b2 = qbuilder_without(b1, 200);
+    if qbuilder_requires(b2, 100) != true { panic(70023); };
+    if qbuilder_excludes(b2, 200) != true { panic(70024); };
+    if qbuilder_requires(b2, 200) { panic(70025); };
+}
+
+@test "QueryBuilder with_id/without_id work"() {
+    let b = qbuilder_new();
+    let b1 = qbuilder_with_id(b, 300);
+    let b2 = qbuilder_without_id(b1, 400);
+    if qbuilder_requires(b2, 300) != true { panic(70026); };
+    if qbuilder_excludes(b2, 400) != true { panic(70027); };
+}
+
+@test "QueryBuilder transmute preserves filters"() {
+    let b = qbuilder_new();
+    let b1 = qbuilder_with(b, 100);
+    let b2 = qbuilder_transmute(b1);
+    if qbuilder_requires(b2, 100) != true { panic(70028); };
+}

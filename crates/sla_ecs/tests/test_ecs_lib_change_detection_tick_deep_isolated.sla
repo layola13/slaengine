@@ -1,0 +1,163 @@
+@import "../src/change_detection_tick_deep.sla"
+
+// Batch 219: change_detection tick deep (src/change_detection/tick.rs + mod constants).
+// panic codes: 109800 – 109999.
+
+@test "constants"() {
+    if ecs_cdt_check_tick_threshold() != 518400000 { panic(109800); };
+    if ecs_cdt_max_change_age() != 3258167296 { panic(109801); };
+    if ecs_cdt_tick_max_value() != ecs_cdt_max_change_age() { panic(109802); };
+    if ecs_cdt_u32_mod() != 4294967296 { panic(109803); };
+}
+
+@test "tick_new_get_set"() {
+    let t = ecs_cdt_tick_new(10);
+    if ecs_cdt_tick_get(t) != 10 { panic(109810); };
+    t = ecs_cdt_tick_set(t, 20);
+    if ecs_cdt_tick_get(t) != 20 { panic(109811); };
+    let m = ecs_cdt_tick_max();
+    if ecs_cdt_tick_get(m) != ECS_CDT_TICK_MAX { panic(109812); };
+}
+
+@test "wrapping_sub_basic"() {
+    // 5 - 3 = 2
+    if ecs_cdt_wrapping_sub(5, 3) != 2 { panic(109820); };
+    // 0 - 1 wraps to u32::MAX
+    if ecs_cdt_wrapping_sub(0, 1) != 4294967295 { panic(109821); };
+    // wrap_u32 negative
+    if ecs_cdt_wrap_u32(0 - 1) != 4294967295 { panic(109822); };
+}
+
+@test "relative_to"() {
+    let a = ecs_cdt_tick_new(10);
+    let b = ecs_cdt_tick_new(3);
+    let r = ecs_cdt_tick_relative_to(a, b);
+    if ecs_cdt_tick_get(r) != 7 { panic(109830); };
+}
+
+@test "is_newer_than_simple"() {
+    // component changed at 5; last_run=3; this_run=10
+    // since_insert=5, since_system=7 → 7>5 → true
+    let c = ecs_cdt_tick_new(5);
+    let lr = ecs_cdt_tick_new(3);
+    let tr = ecs_cdt_tick_new(10);
+    if ecs_cdt_tick_is_newer_than(c, lr, tr) != true { panic(109840); };
+    // changed at 2; last_run=5; this_run=10 → since_insert=8, since_system=5 → false
+    let c2 = ecs_cdt_tick_new(2);
+    let lr2 = ecs_cdt_tick_new(5);
+    if ecs_cdt_tick_is_newer_than(c2, lr2, tr) != false { panic(109841); };
+}
+
+@test "is_newer_than_equal_ages_false"() {
+    // both ages equal after clamp → not newer
+    if ecs_cdt_both_at_max_is_changed(ECS_CDT_MAX_CHANGE_AGE, ECS_CDT_MAX_CHANGE_AGE) != false { panic(109850); };
+    if ecs_cdt_both_at_max_is_changed(10, 5) != true { panic(109851); };
+    if ecs_cdt_both_at_max_is_changed(5, 10) != false { panic(109852); };
+}
+
+@test "check_tick_no_wrap_when_young"() {
+    let t = ecs_cdt_tick_new(100);
+    let check = ecs_cdt_check_new(200);
+    let r = ecs_cdt_tick_check_tick(t, check);
+    if r.1 != false { panic(109860); };
+    if ecs_cdt_tick_get(r.0) != 100 { panic(109861); };
+}
+
+@test "check_tick_wraps_when_older_than_max"() {
+    // present = MAX + 10, tick = 0 → age = MAX+10 > MAX → wrap
+    let present = ECS_CDT_TICK_MAX + 10;
+    let t = ecs_cdt_tick_new(0);
+    let check = ecs_cdt_check_new(present);
+    let r = ecs_cdt_tick_check_tick(t, check);
+    if r.1 != true { panic(109870); };
+    // present.relative_to(MAX) = (MAX+10) - MAX = 10
+    if ecs_cdt_tick_get(r.0) != 10 { panic(109871); };
+}
+
+@test "component_ticks_new_and_flags"() {
+    let ct = ecs_cdt_ct_new(5);
+    if ecs_cdt_ct_added(ct) != 5 { panic(109880); };
+    if ecs_cdt_ct_changed(ct) != 5 { panic(109881); };
+    // last_run=3, this_run=10 → added/changed at 5 is newer
+    if ecs_cdt_ct_is_added(ct, 3, 10) != true { panic(109882); };
+    if ecs_cdt_ct_is_changed(ct, 3, 10) != true { panic(109883); };
+    ct = ecs_cdt_ct_set_changed(ct, 8);
+    if ecs_cdt_ct_changed(ct) != 8 { panic(109884); };
+    if ecs_cdt_ct_added(ct) != 5 { panic(109885); };
+    // only changed is newer than last_run=6
+    if ecs_cdt_ct_is_added(ct, 6, 10) != false { panic(109886); };
+    if ecs_cdt_ct_is_changed(ct, 6, 10) != true { panic(109887); };
+}
+
+@test "component_ticks_mut_setters"() {
+    let m = ecs_cdt_ctm_new(1, 1);
+    m = ecs_cdt_ctm_set_changed(m, 9, 100, true);
+    if ecs_cdt_ctm_changed(m) != 9 { panic(109890); };
+    if ecs_cdt_ctm_added(m) != 1 { panic(109891); };
+    if ecs_cdt_ctm_has_caller(m) != true { panic(109892); };
+    if ecs_cdt_ctm_caller(m) != 100 { panic(109893); };
+    m = ecs_cdt_ctm_set_both(m, 4, 0, false);
+    if ecs_cdt_ctm_added(m) != 4 { panic(109894); };
+    if ecs_cdt_ctm_changed(m) != 4 { panic(109895); };
+    if ecs_cdt_ctm_has_caller(m) != false { panic(109896); };
+    let ct = ecs_cdt_ctm_as_ref(m);
+    if ecs_cdt_ct_added(ct) != 4 { panic(109897); };
+    if ecs_cdt_ct_changed(ct) != 4 { panic(109898); };
+}
+
+@test "ctm_set_added_only"() {
+    let m = ecs_cdt_ctm_new(0, 5);
+    m = ecs_cdt_ctm_set_added(m, 3, 7, true);
+    if ecs_cdt_ctm_added(m) != 3 { panic(109900); };
+    if ecs_cdt_ctm_changed(m) != 5 { panic(109901); };
+    if ecs_cdt_ctm_caller(m) != 7 { panic(109902); };
+}
+
+@test "ct_check_ticks_wraps_old_fields"() {
+    let present = ECS_CDT_TICK_MAX + 5;
+    let ct = ecs_cdt_ct_from_parts(0, 1);
+    let r = ecs_cdt_ct_check_ticks(ct, present);
+    ct = r.0;
+    // both should wrap: present - MAX = 5 for tick 0; for tick 1 age = MAX+4 still > MAX → present - MAX = 5
+    if r.1 != true { panic(109910); };
+    if r.2 != true { panic(109911); };
+    if ecs_cdt_ct_added(ct) != 5 { panic(109912); };
+    if ecs_cdt_ct_changed(ct) != 5 { panic(109913); };
+}
+
+@test "world_tick_increment_and_wrap"() {
+    let w = ecs_cdt_world_new(4294967295);
+    w = ecs_cdt_world_increment(w);
+    if ecs_cdt_world_change_tick(w) != 0 { panic(109920); };
+    w = ecs_cdt_world_add(w, 3);
+    if ecs_cdt_world_change_tick(w) != 3 { panic(109921); };
+}
+
+@test "check_present_tick_accessor"() {
+    let c = ecs_cdt_check_new(42);
+    if ecs_cdt_check_present(c) != 42 { panic(109930); };
+    let t = ecs_cdt_check_present_tick(c);
+    if ecs_cdt_tick_get(t) != 42 { panic(109931); };
+    let c2 = ecs_cdt_check_from_tick(ecs_cdt_tick_new(9));
+    if ecs_cdt_check_present(c2) != 9 { panic(109932); };
+}
+
+@test "tick_eq"() {
+    let a = ecs_cdt_tick_new(3);
+    let b = ecs_cdt_tick_new(3);
+    let c = ecs_cdt_tick_new(4);
+    if ecs_cdt_tick_eq(a, b) != true { panic(109940); };
+    if ecs_cdt_tick_eq(a, c) != false { panic(109941); };
+}
+
+@test "is_newer_than_with_wraparound_reference"() {
+    // this_run near wrap; last_run and component after wrap conceptually still works via relative
+    // this_run=2, last_run=u32::MAX-1 (=4294967294), component=0
+    // since_system = 2 - (MAX-1) = 2 - 4294967294 = 4 (wrapped)
+    // since_insert = 2 - 0 = 2
+    // 4 > 2 → true
+    let c = ecs_cdt_tick_new(0);
+    let lr = ecs_cdt_tick_new(4294967294);
+    let tr = ecs_cdt_tick_new(2);
+    if ecs_cdt_tick_is_newer_than(c, lr, tr) != true { panic(109950); };
+}

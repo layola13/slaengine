@@ -1,0 +1,293 @@
+// Isolated deep tests for lib/commands_world_deep.sla (Batch 390).
+// Mirrors shallow lib/commands_world.sla's mutable Vec-backed Commands context (entity table +
+// flat (entity, comp_id, comp_value) component table + resource table + registered-systems list
+// + command queue + schedule label list) as a SELF-CONTAINED fixed-cap variant with each Vec+count
+// pair flattened to a cap-N scalar slot family. Wrapper structs EcsCmdSpawn / EcsCmdGetVal /
+// EcsCmdBool / EcsCmdRegister replace tuple-return ops so tests NEVER destructure tuples
+// (let r = fn(); x = r.0) — the Batch 373 rule. Vec-parameterized batch APIs (insert_batch /
+// spawn_batch / append) are OMITTED in the deep (Batch 368/380 convention); the same scenarios
+// are exercised via repeated single-element ops.
+// panic codes: 143300 - 143359 (Batch 390 band; the previous Batch 389 used 143200-143264).
+
+@import "../src/commands_world_deep.sla"
+
+// convenience wrappers for spawn/register decomposition (idiomatic in the test file).
+fn sp_c(s: EcsCmdSpawn) -> EcsCmdWorldDeep { return ecs_cmd_spawn_commands(s); }
+fn sp_e(s: EcsCmdSpawn) -> i32 { return ecs_cmd_spawn_entity_id(s); }
+fn rg_c(r: EcsCmdRegister) -> EcsCmdWorldDeep { return ecs_cmd_register_commands(r); }
+fn rg_id(r: EcsCmdRegister) -> i32 { return ecs_cmd_register_system_id(r); }
+fn bv_c(b: EcsCmdBool) -> EcsCmdWorldDeep { return ecs_cmd_bool_commands(b); }
+fn bv_ok(b: EcsCmdBool) -> i32 { return ecs_cmd_bool_ok(b); }
+
+// ── Test 1 (shallow test 1) — spawn_empty + entity_count + ids start at 0. ─────────────────
+@test "EcsCmdWorldDeep spawn_empty allocates ids starting at 0 + 1 entity added per spawn"() {
+    let c0 = ecs_commands_world_new();
+    if ecs_commands_entity_count(c0) != 0 { panic(143300); };
+    if ecs_commands_next_entity_id(c0) != 0 { panic(143301); };
+    let s1 = ecs_commands_spawn_empty(c0);
+    let c1 = sp_c(s1);
+    let e1 = sp_e(s1);
+    if e1 != 0 { panic(143302); };
+    if ecs_commands_entity_count(c1) != 1 { panic(143303); };
+    if ecs_commands_next_entity_id(c1) != 1 { panic(143304); };
+    if ecs_commands_queue_len(c1) != 1 { panic(143305); };
+}
+
+// ── Test 2 (shallow test 2) — spawn_empty multiple increments next_entity per call. ─────────
+@test "EcsCmdWorldDeep spawn_empty calls allocate sequential entity ids"() {
+    let c0 = ecs_commands_world_new();
+    let s1 = ecs_commands_spawn_empty(c0);
+    let c1 = sp_c(s1);
+    let s2 = ecs_commands_spawn_empty(c1);
+    let c2 = sp_c(s2);
+    let s3 = ecs_commands_spawn_empty(c2);
+    let c3 = sp_c(s3);
+    if ecs_commands_entity_count(c3) != 3 { panic(143310); };
+    if sp_e(s1) != 0 { panic(143311); };
+    if sp_e(s2) != 1 { panic(143312); };
+    if sp_e(s3) != 2 { panic(143313); };
+}
+
+// ── Test 3 (shallow test 3) — spawn with initial component + get_component + queue_len++. ─
+@test "EcsCmdWorldDeep spawn with initial component then get_component"() {
+    let c0 = ecs_commands_world_new();
+    let sp = ecs_commands_spawn(c0, 5, 50);
+    let c1 = sp_c(sp);
+    let e = sp_e(sp);
+    if e != 0 { panic(143320); };
+    if ecs_commands_entity_count(c1) != 1 { panic(143321); };
+    if ecs_commands_component_count(c1) != 1 { panic(143322); };
+    let g = ecs_commands_get_component(c1, e, 5);
+    if ecs_cmd_get_val_found(g) != 1 { panic(143323); };
+    if ecs_cmd_get_val_value(g) != 50 { panic(143324); };
+    if ecs_commands_queue_len(c1) != 1 { panic(143325); };
+}
+
+// ── Test 4 (shallow test entity) — get_entity found/not-found + entity id lookup. ─────────
+@test "EcsCmdWorldDeep entity/get_entity lookup found and not-found"() {
+    let c0 = ecs_commands_world_new();
+    let sp = ecs_commands_spawn_empty(c0);
+    let c1 = sp_c(sp);
+    let e = sp_e(sp);
+    let idx = ecs_commands_entity(c1, e);
+    if idx != 0 { panic(143330); };
+    let ge = ecs_commands_get_entity(c1, e);
+    if ecs_cmd_get_val_found(ge) != 1 { panic(143331); };
+    if ecs_cmd_get_val_value(ge) != 0 { panic(143332); };
+    let idx2 = ecs_commands_entity(c1, 99);
+    if idx2 != -1 { panic(143333); };
+    let ge2 = ecs_commands_get_entity(c1, 99);
+    if ecs_cmd_get_val_found(ge2) != 0 { panic(143334); };
+}
+
+// ── Test 5 (shallow test insert_entity + has_component) — new + overwrite + multiple comps ─
+@test "EcsCmdWorldDeep insert_entity new + overwrite + multiple components"() {
+    let c0 = ecs_commands_world_new();
+    let sp = ecs_commands_spawn_empty(c0);
+    let c1 = sp_c(sp);
+    let e = sp_e(sp);
+    let c2 = ecs_commands_insert_entity(c1, e, 3, 30);
+    if ecs_commands_has_component(c2, e, 3) != true { panic(143340); };
+    if ecs_commands_has_component(c2, e, 4) != false { panic(143341); };
+    let g1 = ecs_commands_get_component(c2, e, 3);
+    if ecs_cmd_get_val_value(g1) != 30 { panic(143342); };
+    let c3 = ecs_commands_insert_entity(c2, e, 3, 99);
+    let g2 = ecs_commands_get_component(c3, e, 3);
+    if ecs_cmd_get_val_value(g2) != 99 { panic(143343); };
+    let c4 = ecs_commands_insert_entity(c3, e, 4, 40);
+    let g3 = ecs_commands_get_component(c4, e, 4);
+    if ecs_cmd_get_val_value(g3) != 40 { panic(143344); };
+    if ecs_commands_component_count(c4) != 2 { panic(143345); };
+}
+
+// ── Test 6 — resources full lifecycle: insert_resource/init/insert_resource_if_neq/remove +
+//    get_resource. Mirrors shallow tests for resources in one combined scenario. ───────────
+@test "EcsCmdWorldDeep resource lifecycle insert/init/if_neq/remove"() {
+    let c0 = ecs_commands_world_new();
+    if ecs_commands_resource_count(c0) != 0 { panic(143350); };
+    let c1 = ecs_commands_insert_resource(c0, 100, 1000);
+    let g0 = ecs_commands_get_resource(c1, 100);
+    if ecs_cmd_get_val_found(g0) != 1 { panic(143351); };
+    if ecs_cmd_get_val_value(g0) != 1000 { panic(143352); };
+    // overwrite
+    let c2 = ecs_commands_insert_resource(c1, 100, 1100);
+    if ecs_commands_resource_count(c2) != 1 { panic(143353); };
+    let g1 = ecs_commands_get_resource(c2, 100);
+    if ecs_cmd_get_val_value(g1) != 1100 { panic(143354); };
+    // init_resource new (insert value=0)
+    let c3 = ecs_commands_init_resource(c2, 200);
+    let g2 = ecs_commands_get_resource(c3, 200);
+    if ecs_cmd_get_val_found(g2) != 1 { panic(143355); };
+    if ecs_cmd_get_val_value(g2) != 0 { panic(143356); };
+    // init_resource existing noop
+    let c4 = ecs_commands_init_resource(c3, 100);
+    let g3 = ecs_commands_get_resource(c4, 100);
+    if ecs_cmd_get_val_value(g3) != 1100 { panic(143357); };
+    // insert_resource_if_neq — different value triggers overwrite
+    let c5 = ecs_commands_insert_resource_if_neq(c4, 100, 5);
+    let g4 = ecs_commands_get_resource(c5, 100);
+    if ecs_cmd_get_val_value(g4) != 5 { panic(143358); };
+    // insert_resource_if_neq — same value is a no-op
+    let c6 = ecs_commands_insert_resource_if_neq(c5, 100, 5);
+    let g5 = ecs_commands_get_resource(c6, 100);
+    if ecs_cmd_get_val_value(g5) != 5 { panic(143359); };
+    // remove_resource swap-removes from the middle slot
+    let c7 = ecs_commands_insert_resource(c6, 300, 3000);
+    let c8 = ecs_commands_remove_resource(c7, 100);
+    if ecs_commands_resource_count(c8) != 2 { panic(143360); };
+    let g6 = ecs_commands_get_resource(c8, 100);
+    if ecs_cmd_get_val_found(g6) != 0 { panic(143361); };
+    // remove_resource nonexistent is no-op
+    let c9 = ecs_commands_remove_resource(c8, 999);
+    if ecs_commands_resource_count(c9) != 2 { panic(143362); };
+}
+
+// ── Test 7 (shallow system tests) — register_system + unregister_system + run_system. ────
+@test "EcsCmdWorldDeep system register/unregister/run lifecycle"() {
+    let c0 = ecs_commands_world_new();
+    if ecs_commands_system_count(c0) != 0 { panic(143370); };
+    if ecs_commands_next_system_id(c0) != 1 { panic(143371); };
+    let r1 = ecs_commands_register_system(c0);
+    let c1 = rg_c(r1);
+    let sid1 = rg_id(r1);
+    if sid1 != 1 { panic(143372); };
+    if ecs_commands_system_count(c1) != 1 { panic(143373); };
+    let r2 = ecs_commands_register_system(c1);
+    let c2 = rg_c(r2);
+    let sid2 = rg_id(r2);
+    if sid2 != 2 { panic(143374); };
+    // run_system registered → ok=1 + enqueues one QUEUE code
+    let rb1 = ecs_commands_run_system(c2, sid1);
+    let c3 = bv_c(rb1);
+    if bv_ok(rb1) != 1 { panic(143375); };
+    if ecs_commands_queue_len(c3) != 1 { panic(143376); };
+    // run_system not registered → ok=0 + queue len unchanged
+    let rb2 = ecs_commands_run_system(c3, 99);
+    let c4 = bv_c(rb2);
+    if bv_ok(rb2) != 0 { panic(143377); };
+    if ecs_commands_queue_len(c4) != 1 { panic(143378); };
+    // unregister_system registered → ok=1 + system_count drops to 1
+    let rb3 = ecs_commands_unregister_system(c4, sid1);
+    let c5 = bv_c(rb3);
+    if bv_ok(rb3) != 1 { panic(143379); };
+    if ecs_commands_system_count(c5) != 1 { panic(143380); };
+    // unregister_system not found → ok=0
+    let rb4 = ecs_commands_unregister_system(c5, 999);
+    let c6 = bv_c(rb4);
+    if bv_ok(rb4) != 0 { panic(143381); };
+    if ecs_commands_system_count(c6) != 1 { panic(143382); };
+}
+
+// ── Test 8 (shallow test queue/queue_handled/queue_silenced/run_schedule/write_message). ─
+@test "EcsCmdWorldDeep queue codes + run_schedule + write_message append to command queue"() {
+    let c0 = ecs_commands_world_new();
+    let c1 = ecs_commands_queue(c0);
+    let c2 = ecs_commands_queue(c1);
+    if ecs_commands_queue_len(c2) != 2 { panic(143390); };
+    if ecs_commands_queue_at(c2, 0) != ECS_CMD_WD_QUEUE { panic(143391); };
+    if ecs_commands_queue_at(c2, 1) != ECS_CMD_WD_QUEUE { panic(143392); };
+    let c3 = ecs_commands_queue_handled(c2);
+    let c4 = ecs_commands_queue_silenced(c3);
+    if ecs_commands_queue_len(c4) != 4 { panic(143393); };
+    if ecs_commands_queue_at(c4, 2) != ECS_CMD_WD_QUEUE_HANDLED { panic(143394); };
+    if ecs_commands_queue_at(c4, 3) != ECS_CMD_WD_QUEUE_SILENCED { panic(143395); };
+    let c5 = ecs_commands_run_schedule(c4, 5);
+    if ecs_commands_schedule_count(c5) != 1 { panic(143396); };
+    if ecs_commands_schedule_at(c5, 0) != 5 { panic(143397); };
+    let c6 = ecs_commands_run_schedule(c5, 10);
+    if ecs_commands_schedule_count(c6) != 2 { panic(143398); };
+    if ecs_commands_schedule_at(c6, 1) != 10 { panic(143399); };
+    let c7 = ecs_commands_write_message(c6, 42);
+    if ecs_commands_queue_len(c7) != 5 { panic(143400); };
+    if ecs_commands_queue_at(c7, 4) != 42 { panic(143401); };
+}
+
+// ── Test 9 — cap-16 spawn reject returns sentinel EcsCmdSpawn.entity_id = -1 + cap-8 system
+//    register reject returns EcsCmdRegister.system_id = -1 (Batch 388/389 no-panic convention).
+@test "EcsCmdWorldDeep cap-16 spawn reject + cap-8 system register reject sentinel"() {
+    let c0 = ecs_commands_world_new();
+    let c1 = sp_c(ecs_commands_spawn_empty(c0));
+    let c2 = sp_c(ecs_commands_spawn_empty(c1));
+    let c3 = sp_c(ecs_commands_spawn_empty(c2));
+    let c4 = sp_c(ecs_commands_spawn_empty(c3));
+    let c5 = sp_c(ecs_commands_spawn_empty(c4));
+    let c6 = sp_c(ecs_commands_spawn_empty(c5));
+    let c7 = sp_c(ecs_commands_spawn_empty(c6));
+    let c8 = sp_c(ecs_commands_spawn_empty(c7));
+    let c9 = sp_c(ecs_commands_spawn_empty(c8));
+    let c10 = sp_c(ecs_commands_spawn_empty(c9));
+    let c11 = sp_c(ecs_commands_spawn_empty(c10));
+    let c12 = sp_c(ecs_commands_spawn_empty(c11));
+    let c13 = sp_c(ecs_commands_spawn_empty(c12));
+    let c14 = sp_c(ecs_commands_spawn_empty(c13));
+    let c15 = sp_c(ecs_commands_spawn_empty(c14));
+    let c16 = sp_c(ecs_commands_spawn_empty(c15));
+    if ecs_commands_entity_count(c16) != 16 { panic(143410); };
+    let s17 = ecs_commands_spawn_empty(c16);
+    if sp_e(s17) != -1 { panic(143411); };
+    // The capped world state is unchanged: count stays 16.
+    let c17 = sp_c(s17);
+    if ecs_commands_entity_count(c17) != 16 { panic(143412); };
+    // Cap-8 system register: 8 successfulRegisters then the 9th rejects with system_id=-1.
+    let r1 = ecs_commands_register_system(c0);
+    let s2_c = rg_c(r1);
+    let r2 = ecs_commands_register_system(s2_c);
+    let s3_c = rg_c(r2);
+    let r3 = ecs_commands_register_system(s3_c);
+    let s4_c = rg_c(r3);
+    let r4 = ecs_commands_register_system(s4_c);
+    let s5_c = rg_c(r4);
+    let r5 = ecs_commands_register_system(s5_c);
+    let s6_c = rg_c(r5);
+    let r6 = ecs_commands_register_system(s6_c);
+    let s7_c = rg_c(r6);
+    let r7 = ecs_commands_register_system(s7_c);
+    let s8_c = rg_c(r7);
+    let r8 = ecs_commands_register_system(s8_c);
+    if ecs_commands_system_count(rg_c(r8)) != 8 { panic(143413); };
+    let r9 = ecs_commands_register_system(rg_c(r8));
+    if rg_id(r9) != -1 { panic(143414); };
+    if ecs_commands_system_count(rg_c(r9)) != 8 { panic(143415); };
+}
+
+// ── Test 10 — combined shape: spawn + insert_entity + run_system + run_schedule + write_message
+//    end-to-end flow mirroring a real command sequence + stats checks. ────────────────────
+@test "EcsCmdWorldDeep end-to-end flow with spawn + multi-component + run_system + message"() {
+    let c0 = ecs_commands_world_new();
+    // Register one system (id=1).
+    let r1 = ecs_commands_register_system(c0);
+    let c1 = rg_c(r1);
+    let sid1 = rg_id(r1);
+    if sid1 != 1 { panic(143420); };
+    // Spawn two entities each with one component.
+    let sp1 = ecs_commands_spawn(c1, 1, 10);
+    let c2 = sp_c(sp1);
+    let e1 = sp_e(sp1);
+    if e1 != 0 { panic(143421); };
+    let sp2 = ecs_commands_spawn(c2, 2, 20);
+    let c3 = sp_c(sp2);
+    let e2 = sp_e(sp2);
+    if e2 != 1 { panic(143422); };
+    if ecs_commands_entity_count(c3) != 2 { panic(143423); };
+    if ecs_commands_component_count(c3) != 2 { panic(143424); };
+    // Insert a second component on e1 (now e1 has 2 components).
+    let c4 = ecs_commands_insert_entity(c3, e1, 2, 200);
+    if ecs_commands_component_count(c4) != 3 { panic(143425); };
+    if ecs_commands_has_component(c4, e1, 2) != true { panic(143426); };
+    // Run the registered system: enqueues one QUEUE code.
+    let rb = ecs_commands_run_system(c4, sid1);
+    let c5 = bv_c(rb);
+    if bv_ok(rb) != 1 { panic(143427); };
+    if ecs_commands_queue_len(c5) != 3 { panic(143428); };
+    // Run a schedule label twice.
+    let c6 = ecs_commands_run_schedule(c5, 7);
+    let c7 = ecs_commands_run_schedule(c6, 7);
+    if ecs_commands_schedule_count(c7) != 2 { panic(143429); };
+    if ecs_commands_schedule_at(c7, 0) != 7 { panic(143430); };
+    if ecs_commands_schedule_at(c7, 1) != 7 { panic(143431); };
+    // write_message enqueues 42.
+    let c8 = ecs_commands_write_message(c7, 42);
+    if ecs_commands_queue_at(c8, 3) != 42 { panic(143432); };
+    // Entity id 2 is unspawned → entity() returns -1.
+    if ecs_commands_entity(c8, 2) != -1 { panic(143433); };
+}

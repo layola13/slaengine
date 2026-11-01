@@ -1,0 +1,359 @@
+// Isolated test: Bevy ECS query Access + schedule Stepping parity.
+// Mirrors src/query/access.rs + src/schedule/stepping.rs.
+
+// === Access (src/query/access.rs) ===
+// Tracks read/write access to components/resources with inversion support.
+struct Access {
+    reads: Vec<i32>,
+    writes: Vec<i32>,
+    reads_inverted: bool,
+    writes_inverted: bool,
+    archetypal: Vec<i32>,
+}
+
+fn acc_new() -> Access {
+    return Access { reads: Vec::new(), writes: Vec::new(), reads_inverted: false, writes_inverted: false, archetypal: Vec::new() };
+}
+
+fn vec_contains(v: Vec<i32>, x: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(v) as i64;
+    while i < cnt { if v[i] == x { return true; }; i = i + 1; }
+    return false;
+}
+
+fn vec_remove(v: Vec<i32>, x: i32) -> Vec<i32> {
+    let i: i64 = 0;
+    let cnt = len(v) as i64;
+    while i < cnt {
+        if v[i] == x {
+            v[i] = v[cnt - 1];
+            v.pop();
+            return v;
+        };
+        i = i + 1;
+    }
+    return v;
+}
+
+fn acc_add_read(a: Access, idx: i32) -> Access {
+    if vec_contains(a.reads, idx) != true { a.reads.push(idx); };
+    return a;
+}
+
+fn acc_add_write(a: Access, idx: i32) -> Access {
+    if vec_contains(a.writes, idx) != true { a.writes.push(idx); };
+    a = acc_add_read(a, idx);
+    return a;
+}
+
+fn acc_add_archetypal(a: Access, idx: i32) -> Access {
+    if vec_contains(a.archetypal, idx) != true { a.archetypal.push(idx); };
+    return a;
+}
+
+fn acc_remove_read(a: Access, idx: i32) -> Access { a.reads = vec_remove(a.reads, idx); return a; }
+fn acc_remove_write(a: Access, idx: i32) -> Access { a.writes = vec_remove(a.writes, idx); return a; }
+
+fn acc_has_read(a: Access, idx: i32) -> bool {
+    if a.reads_inverted { return vec_contains(a.reads, idx) != true; };
+    return vec_contains(a.reads, idx);
+}
+
+fn acc_has_write(a: Access, idx: i32) -> bool {
+    if a.writes_inverted { return vec_contains(a.writes, idx) != true; };
+    return vec_contains(a.writes, idx);
+}
+
+fn acc_has_archetypal(a: Access, idx: i32) -> bool { return vec_contains(a.archetypal, idx); }
+
+fn acc_has_any_read(a: Access) -> bool {
+    if a.reads_inverted { return true; };
+    return len(a.reads) > 0;
+}
+
+fn acc_has_any_write(a: Access) -> bool {
+    if a.writes_inverted { return true; };
+    return len(a.writes) > 0;
+}
+
+fn acc_read_all(a: Access) -> Access { a.reads_inverted = true; a.reads = Vec::new(); return a; }
+fn acc_write_all(a: Access) -> Access { a.writes_inverted = true; a.writes = Vec::new(); a = acc_read_all(a); return a; }
+
+fn acc_has_read_all(a: Access) -> bool { return a.reads_inverted; }
+fn acc_has_write_all(a: Access) -> bool { return a.writes_inverted; }
+
+fn acc_clear_writes(a: Access) -> Access { a.writes = Vec::new(); a.writes_inverted = false; return a; }
+fn acc_clear(a: Access) -> Access {
+    a.reads = Vec::new();
+    a.writes = Vec::new();
+    a.reads_inverted = false;
+    a.writes_inverted = false;
+    a.archetypal = Vec::new();
+    return a;
+}
+
+// is_compatible: no conflicting writes between two accesses
+fn acc_is_compatible(a: Access, b: Access) -> bool {
+    // Check if any write in a conflicts with read/write in b, or vice versa
+    let i: i64 = 0;
+    let cnt = len(a.writes) as i64;
+    while i < cnt {
+        let w = a.writes[i];
+        if acc_has_read(b, w) { return false; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let cnt2 = len(b.writes) as i64;
+    while j < cnt2 {
+        let w = b.writes[j];
+        if acc_has_read(a, w) { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+// is_subset: a's reads ⊆ b's reads AND a's writes ⊆ b's writes
+fn acc_is_subset(a: Access, b: Access) -> bool {
+    let i: i64 = 0;
+    let cnt = len(a.reads) as i64;
+    while i < cnt {
+        if acc_has_read(b, a.reads[i]) != true { return false; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let cnt2 = len(a.writes) as i64;
+    while j < cnt2 {
+        if acc_has_write(b, a.writes[j]) != true { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+// === Stepping (src/schedule/stepping.rs) ===
+struct Stepping {
+    enabled: bool,
+    schedules: Vec<i32>,
+    cursor: i64,
+    step_count: i64,
+    continue_count: i64,
+    breakpoints: Vec<i32>,
+    always_run_nodes: Vec<i32>,
+    never_run_nodes: Vec<i32>,
+}
+
+fn stepping_new() -> Stepping {
+    return Stepping { enabled: false, schedules: Vec::new(), cursor: 0, step_count: 0, continue_count: 0, breakpoints: Vec::new(), always_run_nodes: Vec::new(), never_run_nodes: Vec::new() };
+}
+
+fn stepping_enable(s: Stepping) -> Stepping { s.enabled = true; return s; }
+fn stepping_disable(s: Stepping) -> Stepping { s.enabled = false; return s; }
+fn stepping_is_enabled(s: Stepping) -> bool { return s.enabled; }
+
+fn stepping_add_schedule(s: Stepping, label: i32) -> Stepping { s.schedules.push(label); return s; }
+fn stepping_remove_schedule(s: Stepping, label: i32) -> Stepping { s.schedules = vec_remove(s.schedules, label); return s; }
+fn stepping_schedule_count(s: Stepping) -> i64 { return len(s.schedules) as i64; }
+
+fn stepping_step_frame(s: Stepping) -> Stepping { s.step_count = s.step_count + 1; return s; }
+fn stepping_continue_frame(s: Stepping) -> Stepping { s.continue_count = s.continue_count + 1; return s; }
+
+fn stepping_set_breakpoint(s: Stepping, node: i32) -> Stepping {
+    if vec_contains(s.breakpoints, node) != true { s.breakpoints.push(node); };
+    return s;
+}
+
+fn stepping_clear_breakpoint(s: Stepping, node: i32) -> Stepping {
+    s.breakpoints = vec_remove(s.breakpoints, node);
+    return s;
+}
+
+fn stepping_has_breakpoint(s: Stepping, node: i32) -> bool { return vec_contains(s.breakpoints, node); }
+
+fn stepping_always_run_node(s: Stepping, node: i32) -> Stepping {
+    if vec_contains(s.always_run_nodes, node) != true { s.always_run_nodes.push(node); };
+    return s;
+}
+
+fn stepping_never_run_node(s: Stepping, node: i32) -> Stepping {
+    if vec_contains(s.never_run_nodes, node) != true { s.never_run_nodes.push(node); };
+    return s;
+}
+
+fn stepping_is_always_run(s: Stepping, node: i32) -> bool { return vec_contains(s.always_run_nodes, node); }
+fn stepping_is_never_run(s: Stepping, node: i32) -> bool { return vec_contains(s.never_run_nodes, node); }
+
+fn stepping_begin_frame(s: Stepping) -> Stepping { s.cursor = 0; return s; }
+
+fn stepping_cursor(s: Stepping) -> i64 { return s.cursor; }
+
+// === Tests ===
+
+@test "access new empty"() {
+    let a = acc_new();
+    if acc_has_any_read(a) != false { panic(24001); };
+    if acc_has_any_write(a) != false { panic(24002); };
+}
+
+@test "access add_read"() {
+    let a = acc_add_read(acc_new(), 5);
+    if acc_has_read(a, 5) != true { panic(24003); };
+    if acc_has_any_read(a) != true { panic(24004); };
+}
+
+@test "access add_write implies read"() {
+    let a = acc_add_write(acc_new(), 3);
+    if acc_has_write(a, 3) != true { panic(24005); };
+    if acc_has_read(a, 3) != true { panic(24006); };
+}
+
+@test "access add_read idempotent"() {
+    let a = acc_add_read(acc_add_read(acc_new(), 7), 7);
+    let cnt = len(a.reads) as i64;
+    if cnt != 1 { panic(24007); };
+}
+
+@test "access remove_read"() {
+    let a = acc_remove_read(acc_add_read(acc_new(), 5), 5);
+    if acc_has_read(a, 5) != false { panic(24008); };
+}
+
+@test "access remove_write"() {
+    let a = acc_remove_write(acc_add_write(acc_new(), 5), 5);
+    if acc_has_write(a, 5) != false { panic(24009); };
+}
+
+@test "access add_archetypal"() {
+    let a = acc_add_archetypal(acc_new(), 9);
+    if acc_has_archetypal(a, 9) != true { panic(24010); };
+}
+
+@test "access read_all"() {
+    let a = acc_read_all(acc_new());
+    if acc_has_read_all(a) != true { panic(24011); };
+    if acc_has_read(a, 42) != true { panic(24012); };
+}
+
+@test "access write_all"() {
+    let a = acc_write_all(acc_new());
+    if acc_has_write_all(a) != true { panic(24013); };
+    if acc_has_write(a, 42) != true { panic(24014); };
+    if acc_has_read_all(a) != true { panic(24015); };
+}
+
+@test "access clear"() {
+    let a = acc_clear(acc_add_write(acc_new(), 5));
+    if acc_has_any_read(a) != false { panic(24016); };
+    if acc_has_any_write(a) != false { panic(24017); };
+}
+
+@test "access clear_writes"() {
+    let a = acc_clear_writes(acc_add_write(acc_new(), 5));
+    if acc_has_write(a, 5) != false { panic(24018); };
+    if acc_has_read(a, 5) != true { panic(24019); };
+}
+
+@test "access is_compatible no conflict"() {
+    let a = acc_add_read(acc_new(), 1);
+    let b = acc_add_read(acc_new(), 2);
+    if acc_is_compatible(a, b) != true { panic(24020); };
+}
+
+@test "access is_compatible write conflict"() {
+    let a = acc_add_write(acc_new(), 1);
+    let b = acc_add_read(acc_new(), 1);
+    if acc_is_compatible(a, b) != false { panic(24021); };
+}
+
+@test "access is_compatible mutual write conflict"() {
+    let a = acc_add_write(acc_new(), 1);
+    let b = acc_add_write(acc_new(), 1);
+    if acc_is_compatible(a, b) != false { panic(24022); };
+}
+
+@test "access is_compatible disjoint writes ok"() {
+    let a = acc_add_write(acc_new(), 1);
+    let b = acc_add_write(acc_new(), 2);
+    if acc_is_compatible(a, b) != true { panic(24023); };
+}
+
+@test "access is_subset true"() {
+    let a = acc_add_read(acc_new(), 1);
+    let b = acc_add_read(acc_add_read(acc_new(), 1), 2);
+    if acc_is_subset(a, b) != true { panic(24024); };
+}
+
+@test "access is_subset false"() {
+    let a = acc_add_read(acc_add_read(acc_new(), 1), 2);
+    let b = acc_add_read(acc_new(), 1);
+    if acc_is_subset(a, b) != false { panic(24025); };
+}
+
+@test "access has_read absent"() {
+    if acc_has_read(acc_new(), 5) != false { panic(24026); };
+}
+
+@test "access has_write absent"() {
+    if acc_has_write(acc_new(), 5) != false { panic(24027); };
+}
+
+@test "stepping new disabled"() {
+    let s = stepping_new();
+    if stepping_is_enabled(s) != false { panic(24028); };
+}
+
+@test "stepping enable"() {
+    let s = stepping_enable(stepping_new());
+    if stepping_is_enabled(s) != true { panic(24029); };
+}
+
+@test "stepping disable"() {
+    let s = stepping_disable(stepping_enable(stepping_new()));
+    if stepping_is_enabled(s) != false { panic(24030); };
+}
+
+@test "stepping add_schedule"() {
+    let s = stepping_add_schedule(stepping_new(), 100);
+    if stepping_schedule_count(s) != 1 { panic(24031); };
+}
+
+@test "stepping remove_schedule"() {
+    let s = stepping_remove_schedule(stepping_add_schedule(stepping_new(), 100), 100);
+    if stepping_schedule_count(s) != 0 { panic(24032); };
+}
+
+@test "stepping step_frame"() {
+    let s = stepping_step_frame(stepping_new());
+    if s.step_count != 1 { panic(24033); };
+    let s2 = stepping_step_frame(s);
+    if s2.step_count != 2 { panic(24034); };
+}
+
+@test "stepping continue_frame"() {
+    let s = stepping_continue_frame(stepping_new());
+    if s.continue_count != 1 { panic(24035); };
+}
+
+@test "stepping set_breakpoint"() {
+    let s = stepping_set_breakpoint(stepping_new(), 42);
+    if stepping_has_breakpoint(s, 42) != true { panic(24036); };
+}
+
+@test "stepping clear_breakpoint"() {
+    let s = stepping_clear_breakpoint(stepping_set_breakpoint(stepping_new(), 42), 42);
+    if stepping_has_breakpoint(s, 42) != false { panic(24037); };
+}
+
+@test "stepping always_run_node"() {
+    let s = stepping_always_run_node(stepping_new(), 7);
+    if stepping_is_always_run(s, 7) != true { panic(24038); };
+}
+
+@test "stepping never_run_node"() {
+    let s = stepping_never_run_node(stepping_new(), 8);
+    if stepping_is_never_run(s, 8) != true { panic(24039); };
+}
+
+@test "stepping begin_frame resets cursor"() {
+    let s = stepping_begin_frame(stepping_new());
+    if stepping_cursor(s) != 0 { panic(24040); };
+}

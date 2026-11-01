@@ -1,0 +1,196 @@
+@import "../src/remote_allocator_deep.sla"
+
+// Batch 211: RemoteAllocator deep (src/entity/remote_allocator.rs).
+
+@test "fresh_alloc_monotonic_indices"() {
+    let a = ecs_ra_allocator_new();
+    let r0 = ecs_ra_allocator_alloc(a);
+    a = r0.0;
+    let r1 = ecs_ra_allocator_alloc(a);
+    a = r1.0;
+    if ecs_ra_entity_index(r0.1) != 0 { panic(108200); };
+    if ecs_ra_entity_index(r1.1) != 1 { panic(108201); };
+    if ecs_ra_entity_generation(r0.1) != 0 { panic(108202); };
+    if ecs_ra_entity_eq(r0.1, r1.1) != false { panic(108203); };
+    if ecs_ra_allocator_stats_fresh_hits(a) != 2 { panic(108204); };
+}
+
+@test "free_then_reuse_bumps_generation"() {
+    let a = ecs_ra_allocator_new();
+    let r0 = ecs_ra_allocator_alloc(a);
+    a = r0.0;
+    let e0 = r0.1;
+    a = ecs_ra_allocator_free(a, e0);
+    if ecs_ra_allocator_free_len(a) != 1 { panic(108210); };
+    if ecs_ra_is_live(a, e0) != false { panic(108211); };
+    let r1 = ecs_ra_allocator_alloc(a);
+    a = r1.0;
+    let e1 = r1.1;
+    if ecs_ra_entity_index(e1) != ecs_ra_entity_index(e0) { panic(108212); };
+    if ecs_ra_entity_generation(e1) != 1 { panic(108213); };
+    if ecs_ra_entity_eq(e0, e1) != false { panic(108214); };
+    if ecs_ra_allocator_stats_free_hits(a) != 1 { panic(108215); };
+    if ecs_ra_is_live(a, e1) != true { panic(108216); };
+}
+
+@test "stale_free_ignored"() {
+    let a = ecs_ra_allocator_new();
+    let r0 = ecs_ra_allocator_alloc(a);
+    a = r0.0;
+    let e0 = r0.1;
+    a = ecs_ra_allocator_free(a, e0);
+    let r1 = ecs_ra_allocator_alloc(a);
+    a = r1.0;
+    // free stale e0 again should not corrupt
+    let free_len_before = ecs_ra_allocator_free_len(a);
+    a = ecs_ra_allocator_free(a, e0);
+    if ecs_ra_allocator_free_len(a) != free_len_before { panic(108220); };
+    if ecs_ra_is_live(a, r1.1) != true { panic(108221); };
+}
+
+@test "alloc_many_unique"() {
+    let a = ecs_ra_allocator_new();
+    let r = ecs_ra_allocator_alloc_many(a, 5);
+    a = r.0;
+    let m = r.1;
+    if ecs_ra_many_count(m) != 5 { panic(108230); };
+    if ecs_ra_entities_unique(m) != true { panic(108231); };
+    if ecs_ra_entity_index(ecs_ra_many_get(m, 0)) != 0 { panic(108232); };
+    if ecs_ra_entity_index(ecs_ra_many_get(m, 4)) != 4 { panic(108233); };
+}
+
+@test "alloc_many_iterator"() {
+    let a = ecs_ra_allocator_new();
+    let r = ecs_ra_allocator_alloc_many(a, 3);
+    let m = r.1;
+    let n0 = ecs_ra_many_next(m);
+    m = n0.0;
+    if n0.1 != true { panic(108240); };
+    let n1 = ecs_ra_many_next(m);
+    m = n1.0;
+    let n2 = ecs_ra_many_next(m);
+    m = n2.0;
+    let n3 = ecs_ra_many_next(m);
+    if n3.1 != false { panic(108241); };
+    if ecs_ra_entity_index(n0.2) != 0 { panic(108242); };
+    if ecs_ra_entity_index(n2.2) != 2 { panic(108243); };
+}
+
+@test "free_many_then_reuse"() {
+    let a = ecs_ra_allocator_new();
+    let r = ecs_ra_allocator_alloc_many(a, 3);
+    a = r.0;
+    a = ecs_ra_allocator_free_many(a, r.1);
+    if ecs_ra_allocator_free_len(a) != 3 { panic(108250); };
+    if ecs_ra_allocator_stats_free(a) != 3 { panic(108251); };
+    // LIFO: last freed index 2 reused first
+    let r2 = ecs_ra_allocator_alloc(a);
+    a = r2.0;
+    if ecs_ra_entity_index(r2.1) != 2 { panic(108252); };
+    if ecs_ra_entity_generation(r2.1) != 1 { panic(108253); };
+}
+
+@test "remote_alloc_from_handle"() {
+    let a = ecs_ra_allocator_new();
+    let remote = ecs_ra_remote_from_allocator(a);
+    let r = ecs_ra_remote_alloc(remote);
+    remote = r.0;
+    if ecs_ra_entity_index(r.1) != 0 { panic(108260); };
+    a = ecs_ra_allocator_sync_from_remote(a, remote);
+    if ecs_ra_allocator_fresh(a) != 1 { panic(108261); };
+    if ecs_ra_shared_remote_alloc_count(a.shared) != 1 { panic(108262); };
+}
+
+@test "remote_close_is_diagnostic_only"() {
+    let a = ecs_ra_allocator_new();
+    let remote = ecs_ra_remote_from_allocator(a);
+    remote = ecs_ra_remote_close(remote);
+    if ecs_ra_remote_is_closed(remote) != true { panic(108270); };
+    // still can allocate
+    let r = ecs_ra_remote_alloc(remote);
+    if ecs_ra_entity_is_placeholder(r.1) != false { panic(108271); };
+    if ecs_ra_entity_index(r.1) != 0 { panic(108272); };
+}
+
+@test "remote_alloc_many"() {
+    let a = ecs_ra_allocator_new();
+    let remote = ecs_ra_remote_from_allocator(a);
+    let r = ecs_ra_remote_alloc_many(remote, 4);
+    if ecs_ra_many_count(r.1) != 4 { panic(108280); };
+    if ecs_ra_entities_unique(r.1) != true { panic(108281); };
+}
+
+@test "capacity_exhaustion_returns_placeholder"() {
+    let a = ecs_ra_allocator_new();
+    let i: i32 = 0;
+    while i < 16 {
+        let r = ecs_ra_allocator_alloc(a);
+        a = r.0;
+        if ecs_ra_entity_is_placeholder(r.1) != false { panic(108290); };
+        i = i + 1;
+    }
+    let r = ecs_ra_allocator_alloc(a);
+    if ecs_ra_entity_is_placeholder(r.1) != true { panic(108291); };
+}
+
+@test "recycle_helper"() {
+    let a = ecs_ra_allocator_new();
+    let r0 = ecs_ra_allocator_alloc(a);
+    a = r0.0;
+    let rec = ecs_ra_recycle_generation(a, r0.1);
+    a = rec.0;
+    if ecs_ra_entity_index(rec.1) != 0 { panic(108300); };
+    if ecs_ra_entity_generation(rec.1) != 1 { panic(108301); };
+}
+
+@test "pack_unpack_roundtrip"() {
+    let e = ecs_ra_entity(3, 2);
+    let p = ecs_ra_pack(e);
+    let u = ecs_ra_unpack(p);
+    if ecs_ra_entity_eq(e, u) != true { panic(108310); };
+}
+
+@test "placeholder_helpers"() {
+    let p = ecs_ra_placeholder();
+    if ecs_ra_entity_is_placeholder(p) != true { panic(108320); };
+    if ecs_ra_entity_is_placeholder(ecs_ra_entity(0, 0)) != false { panic(108321); };
+}
+
+@test "mixed_world_and_remote"() {
+    let a = ecs_ra_allocator_new();
+    let r0 = ecs_ra_allocator_alloc(a);
+    a = r0.0;
+    let remote = ecs_ra_remote_from_allocator(a);
+    let r1 = ecs_ra_remote_alloc(remote);
+    remote = r1.0;
+    a = ecs_ra_allocator_sync_from_remote(a, remote);
+    if ecs_ra_entity_index(r0.1) != 0 { panic(108330); };
+    if ecs_ra_entity_index(r1.1) != 1 { panic(108331); };
+    if ecs_ra_allocator_fresh(a) != 2 { panic(108332); };
+}
+
+@test "free_list_lifo_order"() {
+    let a = ecs_ra_allocator_new();
+    let a0 = ecs_ra_allocator_alloc(a); a = a0.0;
+    let a1 = ecs_ra_allocator_alloc(a); a = a1.0;
+    let a2 = ecs_ra_allocator_alloc(a); a = a2.0;
+    a = ecs_ra_allocator_free(a, a0.1);
+    a = ecs_ra_allocator_free(a, a1.1);
+    a = ecs_ra_allocator_free(a, a2.1);
+    // LIFO: 2,1,0
+    let x = ecs_ra_allocator_alloc(a); a = x.0;
+    let y = ecs_ra_allocator_alloc(a); a = y.0;
+    let z = ecs_ra_allocator_alloc(a); a = z.0;
+    if ecs_ra_entity_index(x.1) != 2 { panic(108340); };
+    if ecs_ra_entity_index(y.1) != 1 { panic(108341); };
+    if ecs_ra_entity_index(z.1) != 0 { panic(108342); };
+}
+
+@test "stats_track_alloc_free"() {
+    let a = ecs_ra_allocator_new();
+    let r = ecs_ra_allocator_alloc(a);
+    a = r.0;
+    a = ecs_ra_allocator_free(a, r.1);
+    if ecs_ra_allocator_stats_alloc(a) != 1 { panic(108350); };
+    if ecs_ra_allocator_stats_free(a) != 1 { panic(108351); };
+}

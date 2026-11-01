@@ -1,0 +1,162 @@
+@import "../src/entity_generation_extras.sla"
+
+// Isolated tests for lib/entity_generation_extras.sla — EntityGeneration gap surface
+// (FIRST / to_bits / from_bits / after_versions / after_versions_and_could_alias / cmp_approx +
+// Entity::try_from_bits + EntityIndex::from_raw_u32). Bevy: src/entity/mod.rs.
+
+@test "gen_first_zero"() {
+    let g = ecs_entity_generation_first();
+    if ecs_entity_generation_to_bits(g) != 0 { panic(92034); };
+}
+
+@test "gen_from_bits_identity"() {
+    let g = ecs_entity_generation_from_bits(42);
+    if ecs_entity_generation_to_bits(g) != 42 { panic(92035); };
+}
+
+@test "gen_after_versions_increments"() {
+    let g0 = ecs_entity_generation_first();
+    let g1 = ecs_entity_generation_after_versions(g0, 400);
+    if ecs_entity_generation_to_bits(g1) != 400 { panic(92036); };
+}
+
+@test "gen_after_versions_accumulates"() {
+    let g0 = ecs_entity_generation_from_bits(100);
+    let g1 = ecs_entity_generation_after_versions(g0, 300);
+    if ecs_entity_generation_to_bits(g1) != 400 { panic(92037); };
+}
+
+@test "gen_after_versions_wrap_zero"() {
+    // start at 100, advance by 2^32 - 100 (wraps to 0)
+    let g0 = ecs_entity_generation_from_bits(100);
+    let g1 = ecs_entity_generation_after_versions(g0, 4294967296 - 100);
+    if ecs_entity_generation_to_bits(g1) != 0 { panic(92038); };
+}
+
+@test "gen_after_versions_no_alias_small_incr"() {
+    let g0 = ecs_entity_generation_first();
+    let res = ecs_entity_generation_after_versions_and_could_alias(g0, 400);
+    if ecs_gen_alias_new_bits(res) != 400 { panic(92039); };
+    if ecs_gen_alias_could_alias(res) != 0 { panic(92040); };
+}
+
+@test "gen_after_versions_and_could_alias_overflow_true"() {
+    // start at 100, add (2^32 - 100 + 5) = 4294967201.
+    // total = 100 + 4294967201 = 4294967301 (>= 2^32) — overflow=true; new bits = 5
+    let g0 = ecs_entity_generation_from_bits(100);
+    let res = ecs_entity_generation_after_versions_and_could_alias(g0, 4294967201);
+    if ecs_gen_alias_could_alias(res) != 1 { panic(92041); };
+    if ecs_gen_alias_new_bits(res) != 5 { panic(92042); };
+}
+
+@test "gen_after_versions_and_could_alias_exact_no_overflow"() {
+    // start at 0, add 2^32 - 1: result is 2^32 - 1 (< 2^32), no overflow
+    let g0 = ecs_entity_generation_first();
+    let res = ecs_entity_generation_after_versions_and_could_alias(g0, 4294967295);
+    if ecs_gen_alias_could_alias(res) != 0 { panic(92043); };
+    if ecs_gen_alias_new_bits(res) != 4294967295 { panic(92044); };
+}
+
+@test "gen_after_versions_and_could_alias_subtract_10_via_wrap"() {
+    // Modeling "subtract 10" by adding (2^32 - 10) = 4294967286 (no negative literals, Rule 8).
+    // start=50 + 4294967286 = 4294967336 — overflows; mod 2^32 yields 40; overflow=1.
+    let g0 = ecs_entity_generation_from_bits(50);
+    let res = ecs_entity_generation_after_versions_and_could_alias(g0, 4294967286);
+    if ecs_gen_alias_could_alias(res) != 1 { panic(92045); };
+    if ecs_gen_alias_new_bits(res) != 40 { panic(92046); };
+}
+
+@test "gen_cmp_approx_equal"() {
+    let g1 = ecs_entity_generation_from_bits(42);
+    let g2 = ecs_entity_generation_from_bits(42);
+    if ecs_entity_generation_cmp_approx(g1, g2) != ecs_entity_ord_equal() { panic(92047); };
+}
+
+@test "gen_cmp_approx_greater_small_diff"() {
+    let later = ecs_entity_generation_from_bits(400);
+    let first = ecs_entity_generation_first();
+    if ecs_entity_generation_cmp_approx(later, first) != ecs_entity_ord_greater() { panic(92048); };
+}
+
+@test "gen_cmp_approx_less_aliased"() {
+    // first .cmp_approx(later) = Less
+    let later = ecs_entity_generation_from_bits(400);
+    let first = ecs_entity_generation_first();
+    if ecs_entity_generation_cmp_approx(first, later) != ecs_entity_ord_less() { panic(92049); };
+}
+
+@test "gen_cmp_approx_greater_when_close_to_half"() {
+    // diff = ECS_GEN_HALF - 1 -> still Greater (Bevy: 1..DIFF_MAX exclusive)
+    let later = ecs_entity_generation_from_bits(2147483647);
+    let first = ecs_entity_generation_first();
+    if ecs_entity_generation_cmp_approx(later, first) != ecs_entity_ord_greater() { panic(92050); };
+}
+
+@test "gen_cmp_approx_less_when_diff_reaches_half"() {
+    // diff = ECS_GEN_HALF -> wraps to Less (Bevy: 1..DIFF_MAX EXCLUSIVE; the half boundary counts as Less)
+    let later = ecs_entity_generation_from_bits(2147483648);
+    let first = ecs_entity_generation_first();
+    if ecs_entity_generation_cmp_approx(later, first) != ecs_entity_ord_less() { panic(92051); };
+}
+
+@test "gen_cmp_approx_less_complementary_wrap"() {
+    // self=10, other=2^32-5 => diff wraps to 15 -> Greater (small positive diff)
+    let s = ecs_entity_generation_from_bits(10);
+    let o = ecs_entity_generation_from_bits(4294967291);
+    if ecs_entity_generation_cmp_approx(s, o) != ecs_entity_ord_greater() { panic(92052); };
+}
+
+@test "entity_ord_constants_distinct"() {
+    if ecs_entity_ord_less() == ecs_entity_ord_equal() { panic(92053); };
+    if ecs_entity_ord_equal() == ecs_entity_ord_greater() { panic(92054); };
+}
+
+@test "try_from_bits_valid"() {
+    let r = ecs_entity_try_from_bits(42);
+    if ecs_entity_try_from_bits_has(r) != 1 { panic(92055); };
+    if ecs_entity_try_from_bits_bits(r) != 42 { panic(92056); };
+}
+
+@test "try_from_bits_zero_valid"() {
+    let r = ecs_entity_try_from_bits(0);
+    if ecs_entity_try_from_bits_has(r) != 1 { panic(92057); };
+}
+
+@test "try_from_bits_negative_invalid"() {
+    let r = ecs_entity_try_from_bits(-1);
+    if ecs_entity_try_from_bits_has(r) != 0 { panic(92058); };
+    if ecs_entity_try_from_bits_bits(r) != -1 { panic(92059); };
+}
+
+@test "try_from_bits_oob_invalid"() {
+    let r = ecs_entity_try_from_bits(4294967296);
+    if ecs_entity_try_from_bits_has(r) != 0 { panic(92060); };
+}
+
+@test "entity_index_from_raw_u32_valid"() {
+    let r = ecs_entity_index_from_raw_u32(42);
+    if ecs_entity_try_from_bits_has(r) != 1 { panic(92061); };
+    if ecs_entity_try_from_bits_bits(r) != 42 { panic(92062); };
+}
+
+@test "entity_index_from_raw_u32_zero_valid"() {
+    let r = ecs_entity_index_from_raw_u32(0);
+    if ecs_entity_try_from_bits_has(r) != 1 { panic(92063); };
+}
+
+@test "entity_index_from_raw_u32_max_invalid"() {
+    // NonMaxU32 disallows u32::MAX (2^32 - 1)
+    let r = ecs_entity_index_from_raw_u32(4294967295);
+    if ecs_entity_try_from_bits_has(r) != 0 { panic(92064); };
+}
+
+@test "entity_index_from_raw_u32_negative_invalid"() {
+    let r = ecs_entity_index_from_raw_u32(-5);
+    if ecs_entity_try_from_bits_has(r) != 0 { panic(92065); };
+}
+
+@test "entity_index_from_raw_u32_just_below_max_valid"() {
+    let r = ecs_entity_index_from_raw_u32(4294967294);
+    if ecs_entity_try_from_bits_has(r) != 1 { panic(92066); };
+    if ecs_entity_try_from_bits_bits(r) != 4294967294 { panic(92067); };
+}

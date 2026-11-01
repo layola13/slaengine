@@ -1,0 +1,181 @@
+// Isolated deep tests for lib/entities_collection_deep.sla (Batch 351).
+// panic codes: 136201 - 136399.
+
+@import "../src/entities_collection_deep.sla"
+
+@test "Entities new and counters at zero"() {
+    let e = ecs_entities_new();
+    if ecs_entities_len(e) != 0 { panic(136201); };
+    if ecs_entities_is_empty(e) != true { panic(136202); };
+    if ecs_entities_count_spawned(e) != 0 { panic(136203); };
+    if ecs_entities_any_spawned(e) != false { panic(136204); };
+    if ecs_entities_free_count(e) != 0 { panic(136205); };
+    if ecs_entities_next_index(e) != 0 { panic(136206); };
+    if ecs_entities_current_tick(e) != 0 { panic(136207); };
+}
+
+@test "Entities alloc returns sequential ids and gens starting at 0/0"() {
+    let e = ecs_entities_new();
+    let r1 = ecs_entities_alloc(e);
+    let i1 = ecs_entities_result_index(r1);
+    let g1 = ecs_entities_result_generation(r1);
+    if i1 != 0 { panic(136210); };
+    if g1 != 0 { panic(136211); };
+    let r2 = ecs_entities_alloc(ecs_entities_result_entities(r1));
+    let i2 = ecs_entities_result_index(r2);
+    let g2 = ecs_entities_result_generation(r2);
+    if i2 != 1 { panic(136212); };
+    if g2 != 0 { panic(136213); };
+    let e2 = ecs_entities_result_entities(r2);
+    if ecs_entities_len(e2) != 2 { panic(136214); };
+    if ecs_entities_count_spawned(e2) != 2 { panic(136215); };
+}
+
+@test "Entities contains spawned and is_index_spawned"() {
+    let e = ecs_entities_new();
+    let r = ecs_entities_alloc(e);
+    let idx = ecs_entities_result_index(r);
+    let gen = ecs_entities_result_generation(r);
+    let e1 = ecs_entities_result_entities(r);
+    if ecs_entities_contains(e1, idx, gen) != true { panic(136220); };
+    if ecs_entities_contains_spawned(e1, idx, gen) != true { panic(136221); };
+    if ecs_entities_is_index_spawned(e1, idx) != true { panic(136222); };
+    if ecs_entities_contains(e1, idx + 1, gen) != false { panic(136223); };
+    if ecs_entities_is_index_spawned(e1, idx + 5) != false { panic(136224); };
+}
+
+@test "Entities free then verify rejected by contains_spawned"() {
+    let e = ecs_entities_new();
+    let r = ecs_entities_alloc(e);
+    let idx = ecs_entities_result_index(r);
+    let gen = ecs_entities_result_generation(r);
+    let e1 = ecs_entities_result_entities(r);
+    let e2 = ecs_entities_free(e1, idx, gen);
+    if ecs_entities_count_spawned(e2) != 0 { panic(136230); };
+    if ecs_entities_contains_spawned(e2, idx, gen) != false { panic(136231); };
+    if ecs_entities_contains(e2, idx, gen) != true { panic(136232); };
+    if ecs_entities_free_count(e2) != 1 { panic(136233); };
+    // Stale gen on spawned slot is not alive.
+    if ecs_entities_is_index_spawned(e2, idx) != false { panic(136234); };
+}
+
+@test "Entities alloc after free reuses oldest slot with bumped gen (FIFO)"() {
+    let e = ecs_entities_new();
+    let r1 = ecs_entities_alloc(e);
+    let i1 = ecs_entities_result_index(r1);
+    let g1 = ecs_entities_result_generation(r1);
+    let e1 = ecs_entities_result_entities(r1);
+    let r2 = ecs_entities_alloc(e1);
+    let i2 = ecs_entities_result_index(r2);
+    let g2 = ecs_entities_result_generation(r2);
+    let e2 = ecs_entities_result_entities(r2);
+    let e3 = ecs_entities_free(e2, i1, g1);
+    let e4 = ecs_entities_free(e3, i2, g2);
+    if ecs_entities_free_count(e4) != 2 { panic(136240); };
+    if ecs_entities_count_spawned(e4) != 0 { panic(136241); };
+    // FIFO: next two allocs should be i1 then i2, each with gen+1.
+    let r3 = ecs_entities_alloc(e4);
+    let i3 = ecs_entities_result_index(r3);
+    let g3 = ecs_entities_result_generation(r3);
+    if i3 != i1 { panic(136242); };
+    if g3 != g1 + 1 { panic(136243); };
+    let r4 = ecs_entities_alloc(ecs_entities_result_entities(r3));
+    let i4 = ecs_entities_result_index(r4);
+    let g4 = ecs_entities_result_generation(r4);
+    if i4 != i2 { panic(136244); };
+    if g4 != g2 + 1 { panic(136245); };
+    if ecs_entities_count_spawned(ecs_entities_result_entities(r4)) != 2 { panic(136246); };
+}
+
+@test "Entities set_location then get_spawned retrieves it"() {
+    let e = ecs_entities_new();
+    let r = ecs_entities_alloc(e);
+    let idx = ecs_entities_result_index(r);
+    let gen = ecs_entities_result_generation(r);
+    let e1 = ecs_entities_result_entities(r);
+    let e2 = ecs_entities_set_location(e1, idx, gen, 5, 7, 9);
+    let gr = ecs_entities_get_spawned(e2, idx, gen);
+    if ecs_entities_get_result_valid(gr) != 1 { panic(136250); };
+    if ecs_entities_get_result_spawned(gr) != 1 { panic(136251); };
+    if ecs_entities_get_result_archetype_id(gr) != 5 { panic(136252); };
+    if ecs_entities_get_result_table_id(gr) != 7 { panic(136253); };
+    if ecs_entities_get_result_table_row(gr) != 9 { panic(136254); };
+}
+
+@test "Entities get returns valid+spawned for alive, not spawned for despawned"() {
+    let e = ecs_entities_new();
+    let r = ecs_entities_alloc(e);
+    let idx = ecs_entities_result_index(r);
+    let gen = ecs_entities_result_generation(r);
+    let e1 = ecs_entities_result_entities(r);
+    let alive = ecs_entities_get(e1, idx, gen);
+    if ecs_entities_get_result_valid(alive) != 1 { panic(136260); };
+    if ecs_entities_get_result_spawned(alive) != 1 { panic(136261); };
+    let e2 = ecs_entities_free(e1, idx, gen);
+    let desp = ecs_entities_get(e2, idx, gen);
+    if ecs_entities_get_result_valid(desp) != 1 { panic(136262); };
+    if ecs_entities_get_result_spawned(desp) != 0 { panic(136263); };
+    // Never-allocated index is invalid.
+    let unallocated = ecs_entities_get(e2, idx + 1, 0);
+    if ecs_entities_get_result_valid(unallocated) != 0 { panic(136264); };
+}
+
+@test "Entities spawn and despawn ticks tracked"() {
+    let e = ecs_entities_new();
+    let e1 = ecs_entities_tick(e);
+    let e2 = ecs_entities_tick(e1);
+    // current_tick is now 2.
+    if ecs_entities_current_tick(e2) != 2 { panic(136270); };
+    let r = ecs_entities_alloc(e2);
+    let idx = ecs_entities_result_index(r);
+    let gen = ecs_entities_result_generation(r);
+    let e3 = ecs_entities_result_entities(r);
+    let spres = ecs_entities_get_spawn_tick(e3, idx, gen);
+    if ecs_entities_tick_result_valid(spres) != 1 { panic(136271); };
+    if ecs_entities_tick_result_tick(spres) != 2 { panic(136272); };
+    let e4 = ecs_entities_tick(e3);
+    let e5 = ecs_entities_free(e4, idx, gen);
+    let dpres = ecs_entities_get_despawn_tick(e5, idx, gen);
+    if ecs_entities_tick_result_valid(dpres) != 1 { panic(136273); };
+    if ecs_entities_tick_result_tick(dpres) != 3 { panic(136274); };
+}
+
+@test "Entities resolve_from_index returns current generation or -1"() {
+    let e = ecs_entities_new();
+    let r1 = ecs_entities_alloc(e);
+    let e1 = ecs_entities_result_entities(r1);
+    let i1 = ecs_entities_result_index(r1);
+    let pair1 = ecs_entities_resolve_from_index(e1, i1);
+    if pair1.0 != i1 { panic(136280); };
+    if pair1.1 != 0 { panic(136281); };
+    // Free then re-spawn bumps gen.
+    let e2 = ecs_entities_free(e1, i1, 0);
+    let r2 = ecs_entities_alloc(e2);
+    let i2 = ecs_entities_result_index(r2);
+    let g2 = ecs_entities_result_generation(r2);
+    let e3 = ecs_entities_result_entities(r2);
+    if i2 != i1 { panic(136282); };
+    if g2 != 1 { panic(136283); };
+    let pair2 = ecs_entities_resolve_from_index(e3, i2);
+    if pair2.1 != 1 { panic(136284); };
+    let pair3 = ecs_entities_resolve_from_index(e3, 99);
+    if pair3.0 != -1 { panic(136285); };
+}
+
+@test "Entities clear resets counters and frees"() {
+    let e = ecs_entities_new();
+    let r1 = ecs_entities_alloc(e);
+    let e1 = ecs_entities_result_entities(r1);
+    let r2 = ecs_entities_alloc(e1);
+    let e2 = ecs_entities_result_entities(r2);
+    if ecs_entities_len(e2) != 2 { panic(136290); };
+    let e3 = ecs_entities_clear(e2);
+    if ecs_entities_len(e3) != 0 { panic(136291); };
+    if ecs_entities_free_count(e3) != 0 { panic(136292); };
+    if ecs_entities_count_spawned(e3) != 0 { panic(136293); };
+    // Re-allocs after clear produce fresh sequential ids.
+    let r4 = ecs_entities_alloc(e3);
+    let e4 = ecs_entities_result_entities(r4);
+    if ecs_entities_result_index(r4) != 0 { panic(136294); };
+    if ecs_entities_result_generation(r4) != 0 { panic(136295); };
+}

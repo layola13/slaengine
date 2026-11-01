@@ -1,0 +1,360 @@
+// Isolated deep tests for lib/hierarchy_relationship_adapter_deep.sla (Batch 384).
+// Mirrors shallow lib/hierarchy_relationship_adapter.sla (the typed ChildOf facade that delegates to
+// relationship_world_*). This deep is a self-contained cap-16 entity registry + linked-sibling
+// ChildOf relation, so no `@import relationship.sla`. Wrapper structs EcsHierSpawnDeep /
+// EcsHierSpawnChildDeep / EcsHierChildrenDeep / EcsHierQueryDeep / EcsHierDiffListDeep with scalar
+// accessors (no tuple-return destructuring). Sequential `wN` rebinds, no `let mut`, no `let _`.
+// panic codes: 142500 - 142599.
+
+@import "../src/hierarchy_relationship_adapter_deep.sla"
+
+// ── Test 1: new + spawn wrapper + spawn_entity + is_alive ──────────────────────────────────────
+@test "EcsHierWorldDeep new + spawn + spawn_entity/is_alive with generation 0"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sp0 = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sp0);
+    let e0 = ecs_hier_world_deep_spawn_entity(sp0);
+    if e0.id != 0 { panic(142500); };
+    if e0.generation != 0 { panic(142501); };
+    if ecs_hier_world_deep_is_alive(w1, e0) != true { panic(142502); };
+    let sp1 = ecs_hier_world_deep_spawn(w1);
+    let w2 = ecs_hier_world_deep_spawn_world(sp1);
+    let e1 = ecs_hier_world_deep_spawn_entity(sp1);
+    if e1.id != 1 { panic(142503); };
+    if ecs_hier_world_deep_is_alive(w2, e1) != true { panic(142504); };
+    // Out-of-range / stale generation probes are non-alive.
+    let bogus = ecs_hier_entity_new(-1, 0);
+    if ecs_hier_world_deep_is_alive(w2, bogus) != false { panic(142505); };
+    let stale = ecs_hier_entity_new(0, 5);
+    if ecs_hier_world_deep_is_alive(w2, stale) != false { panic(142506); };
+}
+
+// ── Test 2: shallow syncs childof and children (mirrors shallow test "syncs childof and children") ─
+@test "EcsHierWorldDeep spawn_child + child_count + parent + child_at"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sc1 = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sc1);
+    let child1 = ecs_hier_world_deep_spawn_child_entity(sc1);
+    let sc2 = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sc2);
+    let child2 = ecs_hier_world_deep_spawn_child_entity(sc2);
+    if ecs_hier_world_deep_child_count(w3, root) != 2 { panic(142510); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_parent(w3, child1), root) != true { panic(142511); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w3, root, 0), child1) != true { panic(142512); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w3, root, 1), child2) != true { panic(142513); };
+    if ecs_hier_world_deep_has_parent(w3, root) != false { panic(142514); };
+    if ecs_hier_world_deep_has_parent(w3, child1) != true { panic(142515); };
+}
+
+// ── Test 3: reparent via add_child decrements old parent and inserts via insert_child (mirrors ──
+//    shallow "reparent insert and detach"). ───────────────────────────────────────────────────
+@test "EcsHierWorldDeep add_child reparent + insert_child at index 0 + detach_child"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let so = ecs_hier_world_deep_spawn(w1);
+    let w2 = ecs_hier_world_deep_spawn_world(so);
+    let other = ecs_hier_world_deep_spawn_entity(so);
+    let sc1 = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sc1);
+    let child1 = ecs_hier_world_deep_spawn_child_entity(sc1);
+    let sc2 = ecs_hier_world_deep_spawn_child(w3, root);
+    let w4 = ecs_hier_world_deep_spawn_child_world(sc2);
+    let child2 = ecs_hier_world_deep_spawn_child_entity(sc2);
+    // reparent child2 from root to other.
+    let w5 = ecs_hier_world_deep_add_child(w4, other, child2);
+    if ecs_hier_world_deep_child_count(w5, root) != 1 { panic(142520); };
+    if ecs_hier_world_deep_child_count(w5, other) != 1 { panic(142521); };
+    // insert_child root idx 0 -> re-parent child2 back under root at index 0.
+    let w6 = ecs_hier_world_deep_insert_child(w5, root, 0, child2);
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_parent(w6, child2), root) != true { panic(142522); };
+    if ecs_hier_world_deep_child_count(w6, other) != 0 { panic(142523); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 0), child2) != true { panic(142524); };
+    // detach child1 (whose actual parent is root) and verify child_count + has_parent.
+    let w7 = ecs_hier_world_deep_detach_child(w6, root, child1);
+    if ecs_hier_world_deep_has_parent(w7, child1) != false { panic(142525); };
+    if ecs_hier_world_deep_child_count(w7, root) != 1 { panic(142526); };
+}
+
+// ── Test 4: insert_child middle / tail + detach_child wrong-parent is a no-op ──────────────────
+@test "EcsHierWorldDeep insert_child middle and tail + detach_child wrong parent no-op"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sa = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sa);
+    let a = ecs_hier_world_deep_spawn_child_entity(sa);
+    let sb = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sb);
+    let b = ecs_hier_world_deep_spawn_child_entity(sb);
+    let sc = ecs_hier_world_deep_spawn_child(w3, root);
+    let w4 = ecs_hier_world_deep_spawn_child_world(sc);
+    let c = ecs_hier_world_deep_spawn_child_entity(sc);
+    // free-floating d (no parent); insert at index 1 (middle of [a,b,c]).
+    let sd = ecs_hier_world_deep_spawn(w4);
+    let w5 = ecs_hier_world_deep_spawn_world(sd);
+    let d = ecs_hier_world_deep_spawn_entity(sd);
+    let w6 = ecs_hier_world_deep_insert_child(w5, root, 1, d);
+    if ecs_hier_world_deep_child_count(w6, root) != 4 { panic(142530); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 0), a) != true { panic(142531); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 1), d) != true { panic(142532); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 2), b) != true { panic(142533); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 3), c) != true { panic(142534); };
+    // e -> insert at index 4 (tail after [a,d,b,c]).
+    let se = ecs_hier_world_deep_spawn(w6);
+    let w7 = ecs_hier_world_deep_spawn_world(se);
+    let e = ecs_hier_world_deep_spawn_entity(se);
+    let w8 = ecs_hier_world_deep_insert_child(w7, root, 4, e);
+    if ecs_hier_world_deep_child_count(w8, root) != 5 { panic(142535); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w8, root, 4), e) != true { panic(142536); };
+    // detach_child with a WRONG parent (other) is a no-op: root still has 5.
+    let sf = ecs_hier_world_deep_spawn(w8);
+    let w9 = ecs_hier_world_deep_spawn_world(sf);
+    let other = ecs_hier_world_deep_spawn_entity(sf);
+    let w10 = ecs_hier_world_deep_detach_child(w9, other, a);
+    if ecs_hier_world_deep_child_count(w10, root) != 5 { panic(142537); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_parent(w10, a), root) != true { panic(142538); };
+}
+
+// ── Test 5: difference replace and linked despawn (mirrors shallow test of the same name) ─────
+@test "EcsHierWorldDeep replace_children_with_difference + linked despawn"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sc1 = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sc1);
+    let child1 = ecs_hier_world_deep_spawn_child_entity(sc1);
+    let sc2 = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sc2);
+    let child2 = ecs_hier_world_deep_spawn_child_entity(sc2);
+    let sc3 = ecs_hier_world_deep_spawn(w3);
+    let w4 = ecs_hier_world_deep_spawn_world(sc3);
+    let child3 = ecs_hier_world_deep_spawn_entity(sc3);
+    // unrelate=[child1], relate=[child2, child3], newly=[child3].
+    let un0 = ecs_hier_diff_list_deep_empty();
+    let un1 = ecs_hier_diff_list_deep_push(un0, child1);
+    let re0 = ecs_hier_diff_list_deep_empty();
+    let re1 = ecs_hier_diff_list_deep_push(re0, child2);
+    let re2 = ecs_hier_diff_list_deep_push(re1, child3);
+    let nw0 = ecs_hier_diff_list_deep_empty();
+    let nw1 = ecs_hier_diff_list_deep_push(nw0, child3);
+    let w5 = ecs_hier_world_deep_replace_children_with_difference(w4, root, un1, re2, nw1);
+    if ecs_hier_world_deep_has_parent(w5, child1) != false { panic(142540); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w5, root, 0), child2) != true { panic(142541); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w5, root, 1), child3) != true { panic(142542); };
+    if ecs_hier_world_deep_child_count(w5, root) != 2 { panic(142543); };
+    // despawn root kills root + child2 + child3 descendants.
+    let w6 = ecs_hier_world_deep_despawn(w5, root);
+    if ecs_hier_world_deep_is_alive(w6, root) != false { panic(142544); };
+    if ecs_hier_world_deep_is_alive(w6, child2) != false { panic(142545); };
+    if ecs_hier_world_deep_is_alive(w6, child3) != false { panic(142546); };
+    // child1 was unrelate'd; despawning root leaves child1 alive.
+    if ecs_hier_world_deep_is_alive(w6, child1) != true { panic(142547); };
+}
+
+// ── Test 6: traversal helpers (mirrors shallow "traversal helpers") ───────────────────────────
+// Tree: root -> c1, c2; c1 -> g1, g2; c2 -> g3.
+@test "EcsHierWorldDeep ancestors + root_ancestor + BFS + DFS + siblings + leaves"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sc1 = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sc1);
+    let c1 = ecs_hier_world_deep_spawn_child_entity(sc1);
+    let sc2 = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sc2);
+    let c2 = ecs_hier_world_deep_spawn_child_entity(sc2);
+    let sg1 = ecs_hier_world_deep_spawn_child(w3, c1);
+    let w4 = ecs_hier_world_deep_spawn_child_world(sg1);
+    let g1 = ecs_hier_world_deep_spawn_child_entity(sg1);
+    let sg2 = ecs_hier_world_deep_spawn_child(w4, c1);
+    let w5 = ecs_hier_world_deep_spawn_child_world(sg2);
+    let g2 = ecs_hier_world_deep_spawn_child_entity(sg2);
+    let sg3 = ecs_hier_world_deep_spawn_child(w5, c2);
+    let w6 = ecs_hier_world_deep_spawn_child_world(sg3);
+    let g3 = ecs_hier_world_deep_spawn_child_entity(sg3);
+    let ancestors = ecs_hier_world_deep_ancestors(w6, g2);
+    if ecs_hier_query_deep_count(ancestors) != 2 { panic(142550); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(ancestors, 0), c1) != true { panic(142551); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(ancestors, 1), root) != true { panic(142552); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_root_ancestor(w6, g2), root) != true { panic(142553); };
+    // root_ancestor of a node with no parent is itself.
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_root_ancestor(w6, root), root) != true { panic(142554); };
+    let bfs = ecs_hier_world_deep_descendants(w6, root);
+    if ecs_hier_query_deep_count(bfs) != 5 { panic(142555); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(bfs, 0), c1) != true { panic(142556); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(bfs, 1), c2) != true { panic(142557); };
+    let dfs = ecs_hier_world_deep_descendants_depth_first(w6, root);
+    if ecs_hier_query_deep_count(dfs) != 5 { panic(142558); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(dfs, 1), g1) != true { panic(142559); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(dfs, 2), g2) != true { panic(142560); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(dfs, 4), g3) != true { panic(142561); };
+    let siblings = ecs_hier_world_deep_siblings(w6, c1);
+    if ecs_hier_query_deep_count(siblings) != 1 { panic(142562); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(siblings, 0), c2) != true { panic(142563); };
+    let leaves = ecs_hier_world_deep_leaves(w6, root);
+    if ecs_hier_query_deep_count(leaves) != 3 { panic(142564); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(leaves, 0), g1) != true { panic(142565); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(leaves, 1), g2) != true { panic(142566); };
+    if ecs_hier_entity_eq_deep(ecs_hier_query_deep_at(leaves, 2), g3) != true { panic(142567); };
+}
+
+// ── Test 7: children() wrapper + replace_children full replacement ───────────────────────────
+@test "EcsHierWorldDeep children wrapper + replace_children full replacement + detach_all"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sx = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sx);
+    let x = ecs_hier_world_deep_spawn_child_entity(sx);
+    let sy = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sy);
+    let y = ecs_hier_world_deep_spawn_child_entity(sy);
+    // children() wrapper returns EcsHierChildrenDeep with count + at accessors.
+    let ch = ecs_hier_world_deep_children(w3, root);
+    if ecs_hier_children_deep_count(ch) != 2 { panic(142570); };
+    if ecs_hier_entity_eq_deep(ecs_hier_children_deep_at(ch, 0), x) != true { panic(142571); };
+    if ecs_hier_entity_eq_deep(ecs_hier_children_deep_at(ch, 1), y) != true { panic(142572); };
+    // build a fresh EcsHierChildrenDeep with [y, x] (reverse order) via replace_children.
+    // We assemble it by pushing 2 entities into a new accumulator-style list -- but EcsHierChildrenDeep
+    // is exposed via children() (read-only). Use detach_all + re-add in reverse to replace.
+    let w4 = ecs_hier_world_deep_detach_all_children(w3, root);
+    if ecs_hier_world_deep_child_count(w4, root) != 0 { panic(142573); };
+    if ecs_hier_world_deep_has_parent(w4, x) != false { panic(142574); };
+    if ecs_hier_world_deep_has_parent(w4, y) != false { panic(142575); };
+    let w5 = ecs_hier_world_deep_add_child(w4, root, y);
+    let w6 = ecs_hier_world_deep_add_child(w5, root, x);
+    if ecs_hier_world_deep_child_count(w6, root) != 2 { panic(142576); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 0), y) != true { panic(142577); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w6, root, 1), x) != true { panic(142578); };
+}
+
+// ── Test 8: despawn_children recursive kill leaves parent alive, children dead ────────────────
+@test "EcsHierWorldDeep despawn_children recursive kill + grandchildren"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sc1 = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sc1);
+    let c1 = ecs_hier_world_deep_spawn_child_entity(sc1);
+    let sg1 = ecs_hier_world_deep_spawn_child(w2, c1);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sg1);
+    let g1 = ecs_hier_world_deep_spawn_child_entity(sg1);
+    let sg2 = ecs_hier_world_deep_spawn_child(w3, c1);
+    let w4 = ecs_hier_world_deep_spawn_child_world(sg2);
+    let g2 = ecs_hier_world_deep_spawn_child_entity(sg2);
+    // despawn_children(root) kills c1, g1, g2; root stays alive with no children.
+    let w5 = ecs_hier_world_deep_despawn_children(w4, root);
+    if ecs_hier_world_deep_is_alive(w5, root) != true { panic(142580); };
+    if ecs_hier_world_deep_is_alive(w5, c1) != false { panic(142581); };
+    if ecs_hier_world_deep_is_alive(w5, g1) != false { panic(142582); };
+    if ecs_hier_world_deep_is_alive(w5, g2) != false { panic(142583); };
+    if ecs_hier_world_deep_child_count(w5, root) != 0 { panic(142584); };
+}
+
+// ── Test 9: despawn entity with descendants linked (mirrors shallow despawn_of branch) ────────
+@test "EcsHierWorldDeep despawn entity cascades to its descendants"() {
+    let w0 = ecs_hier_world_deep_new();
+    let sr = ecs_hier_world_deep_spawn(w0);
+    let w1 = ecs_hier_world_deep_spawn_world(sr);
+    let root = ecs_hier_world_deep_spawn_entity(sr);
+    let sc1 = ecs_hier_world_deep_spawn_child(w1, root);
+    let w2 = ecs_hier_world_deep_spawn_child_world(sc1);
+    let c1 = ecs_hier_world_deep_spawn_child_entity(sc1);
+    let sc2 = ecs_hier_world_deep_spawn_child(w2, root);
+    let w3 = ecs_hier_world_deep_spawn_child_world(sc2);
+    let c2 = ecs_hier_world_deep_spawn_child_entity(sc2);
+    let sg1 = ecs_hier_world_deep_spawn_child(w3, c1);
+    let w4 = ecs_hier_world_deep_spawn_child_world(sg1);
+    let g1 = ecs_hier_world_deep_spawn_child_entity(sg1);
+    // despawn c1: c1 and g1 die; root + c2 stay alive; root still has c2.
+    let w5 = ecs_hier_world_deep_despawn(w4, c1);
+    if ecs_hier_world_deep_is_alive(w5, c1) != false { panic(142590); };
+    if ecs_hier_world_deep_is_alive(w5, g1) != false { panic(142591); };
+    if ecs_hier_world_deep_is_alive(w5, root) != true { panic(142592); };
+    if ecs_hier_world_deep_is_alive(w5, c2) != true { panic(142593); };
+    if ecs_hier_world_deep_child_count(w5, root) != 1 { panic(142594); };
+    if ecs_hier_entity_eq_deep(ecs_hier_world_deep_child_at(w5, root, 0), c2) != true { panic(142595); };
+}
+
+// ── Test 10: cap-16 entity cap rejects silent (17th spawn is non-alive) + diff list sanity ────
+@test "EcsHierWorldDeep cap-16 entity cap silent reject + diff list accessors"() {
+    let w0 = ecs_hier_world_deep_new();
+    let s1 = ecs_hier_world_deep_spawn(w0);
+    let wa = ecs_hier_world_deep_spawn_world(s1);
+    let e1 = ecs_hier_world_deep_spawn_entity(s1);
+    let s2 = ecs_hier_world_deep_spawn(wa);
+    let wb = ecs_hier_world_deep_spawn_world(s2);
+    let e2 = ecs_hier_world_deep_spawn_entity(s2);
+    let s3 = ecs_hier_world_deep_spawn(wb);
+    let wc = ecs_hier_world_deep_spawn_world(s3);
+    let e3 = ecs_hier_world_deep_spawn_entity(s3);
+    let s4 = ecs_hier_world_deep_spawn(wc);
+    let wd = ecs_hier_world_deep_spawn_world(s4);
+    let e4 = ecs_hier_world_deep_spawn_entity(s4);
+    let s5 = ecs_hier_world_deep_spawn(wd);
+    let we = ecs_hier_world_deep_spawn_world(s5);
+    let e5 = ecs_hier_world_deep_spawn_entity(s5);
+    let s6 = ecs_hier_world_deep_spawn(we);
+    let wf = ecs_hier_world_deep_spawn_world(s6);
+    let e6 = ecs_hier_world_deep_spawn_entity(s6);
+    let s7 = ecs_hier_world_deep_spawn(wf);
+    let wg = ecs_hier_world_deep_spawn_world(s7);
+    let e7 = ecs_hier_world_deep_spawn_entity(s7);
+    let s8 = ecs_hier_world_deep_spawn(wg);
+    let wh = ecs_hier_world_deep_spawn_world(s8);
+    let e8 = ecs_hier_world_deep_spawn_entity(s8);
+    let s9 = ecs_hier_world_deep_spawn(wh);
+    let wi = ecs_hier_world_deep_spawn_world(s9);
+    let e9 = ecs_hier_world_deep_spawn_entity(s9);
+    let s10 = ecs_hier_world_deep_spawn(wi);
+    let wj = ecs_hier_world_deep_spawn_world(s10);
+    let e10 = ecs_hier_world_deep_spawn_entity(s10);
+    let s11 = ecs_hier_world_deep_spawn(wj);
+    let wk = ecs_hier_world_deep_spawn_world(s11);
+    let e11 = ecs_hier_world_deep_spawn_entity(s11);
+    let s12 = ecs_hier_world_deep_spawn(wk);
+    let wl = ecs_hier_world_deep_spawn_world(s12);
+    let e12 = ecs_hier_world_deep_spawn_entity(s12);
+    let s13 = ecs_hier_world_deep_spawn(wl);
+    let wm = ecs_hier_world_deep_spawn_world(s13);
+    let e13 = ecs_hier_world_deep_spawn_entity(s13);
+    let s14 = ecs_hier_world_deep_spawn(wm);
+    let wn = ecs_hier_world_deep_spawn_world(s14);
+    let e14 = ecs_hier_world_deep_spawn_entity(s14);
+    let s15 = ecs_hier_world_deep_spawn(wn);
+    let wo = ecs_hier_world_deep_spawn_world(s15);
+    let e15 = ecs_hier_world_deep_spawn_entity(s15);
+    if e15.id != 14 { panic(142598); };
+    // 16th spawn (id 15) is the last in-range slot.
+    let s16 = ecs_hier_world_deep_spawn(wo);
+    let wp = ecs_hier_world_deep_spawn_world(s16);
+    let e16 = ecs_hier_world_deep_spawn_entity(s16);
+    if e16.id != 15 { panic(142568); };
+    // 17th spawn: cap-16 silent reject -> -1 sentinel id and non-alive.
+    let s17 = ecs_hier_world_deep_spawn(wp);
+    let wq = ecs_hier_world_deep_spawn_world(s17);
+    let e17 = ecs_hier_world_deep_spawn_entity(s17);
+    if e17.id != -1 { panic(142599); };
+    // wq is unchanged and e17 is non-alive (regardless of its generation sentinel).
+    if ecs_hier_world_deep_is_alive(wq, e17) != false { panic(142585); };
+    // diff list sanity: empty count is 0, at(idx) returns sentinel for empty; push 2 then count==2, at(0)=e1, at(1)=e2.
+    let d0 = ecs_hier_diff_list_deep_empty();
+    if ecs_hier_diff_list_deep_count(d0) != 0 { panic(142586); };
+    if ecs_hier_diff_list_deep_at(d0, 0).id != -1 { panic(142587); };
+    let d1 = ecs_hier_diff_list_deep_push(d0, e1);
+    let d2 = ecs_hier_diff_list_deep_push(d1, e2);
+    if ecs_hier_diff_list_deep_count(d2) != 2 { panic(142588); };
+    if ecs_hier_entity_eq_deep(ecs_hier_diff_list_deep_at(d2, 0), e1) != true { panic(142589); };
+    if ecs_hier_entity_eq_deep(ecs_hier_diff_list_deep_at(d2, 1), e2) != true { panic(142596); };
+    if ecs_hier_entity_eq_deep(ecs_hier_diff_list_deep_at(d2, 7), e2) != false { panic(142597); };
+}

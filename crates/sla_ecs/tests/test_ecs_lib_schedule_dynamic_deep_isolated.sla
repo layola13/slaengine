@@ -1,0 +1,117 @@
+// Isolated deep tests for lib/schedule_dynamic_deep.sla (Batch 357).
+// panic codes: 137400 - 137599.
+
+@import "../src/schedule_dynamic_deep.sla"
+
+@test "Schedule default starts empty with zero conflicts"() {
+    let s = ecs_schedule_default();
+    if ecs_schedule_len(s) != 0 { panic(137400); };
+    if ecs_schedule_conflict_count(s) != 0 { panic(137401); };
+}
+
+@test "SystemAccess none and all accessors"() {
+    let n = ecs_dynamic_system_access_none();
+    if ecs_dyn_access_reads_a(n) != 0 { panic(137410); };
+    if ecs_dyn_access_writes_a(n) != 0 { panic(137411); };
+    if ecs_dyn_access_writes_resource(n) != 0 { panic(137412); };
+    let a = ecs_dynamic_system_access_all();
+    if ecs_dyn_access_reads_a(a) != 1 { panic(137413); };
+    if ecs_dyn_access_writes_a(a) != 1 { panic(137414); };
+    if ecs_dyn_access_writes_resource(a) != 1 { panic(137415); };
+    if ecs_dyn_access_reads_messages(a) != 1 { panic(137416); };
+}
+
+@test "SystemAccess scalars via builder"() {
+    let a = ecs_dynamic_system_access(1, 1, 1, 0, 0, 0, 0, 0);
+    if ecs_dyn_access_reads_a(a) != 1 { panic(137420); };
+    if ecs_dyn_access_writes_a(a) != 1 { panic(137421); };
+    if ecs_dyn_access_reads_b(a) != 1 { panic(137422); };
+    if ecs_dyn_access_writes_b(a) != 0 { panic(137423); };
+    if ecs_dyn_access_reads_resource(a) != 0 { panic(137424); };
+}
+
+@test "Conflict: write-A vs read-A"() {
+    let w = ecs_dynamic_system_access(0, 1, 0, 0, 0, 0, 0, 0);
+    let r = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    if ecs_dynamic_access_conflicts(w, r) != true { panic(137430); };
+    if ecs_dynamic_access_conflicts(r, w) != true { panic(137431); };
+}
+
+@test "No conflict: separate resources"() {
+    let a_only = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    let b_only = ecs_dynamic_system_access(0, 0, 1, 0, 0, 0, 0, 0);
+    if ecs_dynamic_access_conflicts(a_only, b_only) != false { panic(137440); };
+    let both_read = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    let other_read = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    if ecs_dynamic_access_conflicts(both_read, other_read) != false { panic(137441); };
+}
+
+@test "Add systems records conflict_count for prior systems"() {
+    let s0 = ecs_schedule_default();
+    let w_a = ecs_dynamic_system_access(1, 1, 0, 0, 0, 0, 0, 0);
+    let s1 = ecs_schedule_add_systems(s0, w_a);
+    if ecs_schedule_conflict_count(s1) != 0 { panic(137450); };
+    // Add second write-A system: conflicts with first (write-write) -> count 1.
+    let s2 = ecs_schedule_add_systems(s1, w_a);
+    if ecs_schedule_conflict_count(s2) != 1 { panic(137451); };
+    // Add read-A system: conflicts with both prior -> count +2 = total 3.
+    let r_a = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    let s3 = ecs_schedule_add_systems(s2, r_a);
+    if ecs_schedule_conflict_count(s3) != 3 { panic(137452); };
+}
+
+@test "Schedule add rejects at cap-8 and keep counts unchanged"() {
+    let s0 = ecs_schedule_default();
+    let any = ecs_dynamic_system_access(0, 0, 0, 0, 1, 0, 0, 0);
+    let i: i32 = 0;
+    let s = s0;
+    while i < 8 {
+        s = ecs_schedule_add_systems(s, any);
+        i = i + 1;
+    }
+    if ecs_schedule_len(s) != 8 { panic(137460); };
+    let s_full = ecs_schedule_add_systems(s, any);
+    if ecs_schedule_len(s_full) != 8 { panic(137461); };
+}
+
+@test "Schedule conflict_count track messages write vs messages read"() {
+    let s0 = ecs_schedule_default();
+    let m_write = ecs_dynamic_system_access(0, 0, 0, 0, 0, 0, 0, 1);
+    let m_read = ecs_dynamic_system_access(0, 0, 0, 0, 0, 0, 1, 0);
+    let s1 = ecs_schedule_add_systems(s0, m_write);
+    let s2 = ecs_schedule_add_systems(s1, m_read);
+    if ecs_schedule_conflict_count(s2) != 1 { panic(137470); };
+}
+
+@test "Schedule access_at readout matches what was added"() {
+    let s0 = ecs_schedule_default();
+    let a = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    let s1 = ecs_schedule_add_systems(s0, a);
+    let acc = ecs_schedule_access_at(s1, 0);
+    if ecs_dyn_access_reads_a(acc) != 1 { panic(137480); };
+    if ecs_dyn_access_writes_a(acc) != 0 { panic(137481); };
+    let b = ecs_dynamic_system_access(0, 0, 1, 1, 0, 0, 0, 0);
+    let s2 = ecs_schedule_add_systems(s1, b);
+    let acc1 = ecs_schedule_access_at(s2, 1);
+    if ecs_dyn_access_writes_b(acc1) != 1 { panic(137482); };
+}
+
+@test "Schedule clear resets count and conflicts"() {
+    let s0 = ecs_schedule_default();
+    let w_a = ecs_dynamic_system_access(0, 1, 0, 0, 0, 0, 0, 0);
+    let s1 = ecs_schedule_add_systems(s0, w_a);
+    let s2 = ecs_schedule_add_systems(s1, w_a);
+    if ecs_schedule_len(s2) != 2 { panic(137490); };
+    if ecs_schedule_conflict_count(s2) != 1 { panic(137491); };
+    let s3 = ecs_schedule_clear(s2);
+    if ecs_schedule_len(s3) != 0 { panic(137492); };
+    if ecs_schedule_conflict_count(s3) != 0 { panic(137493); };
+}
+
+@test "Schedule system_default + one read system has zero conflicts"() {
+    let s0 = ecs_schedule_default();
+    let r = ecs_dynamic_system_access(1, 0, 0, 0, 0, 0, 0, 0);
+    let s1 = ecs_schedule_add_systems(s0, r);
+    if ecs_schedule_len(s1) != 1 { panic(137500); };
+    if ecs_schedule_conflict_count(s1) != 0 { panic(137501); };
+}

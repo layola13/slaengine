@@ -1,0 +1,119 @@
+@import "../src/bundle_writer_deep.sla"
+
+// Batch 229: bundle writer deep (src/bundle/writer.rs).
+// panic codes: 111800 – 111999.
+
+@test "scratch_empty_and_writer_clears"() {
+    let s = ecs_bw_scratch_new();
+    if ecs_bw_scratch_is_empty(s) != true { panic(111800); };
+    s = ecs_bw_scratch_push_by_id(s, 1, 10, 8);
+    if ecs_bw_scratch_len(s) != 1 { panic(111801); };
+    if ecs_bw_scratch_alloc_used(s) != 8 { panic(111802); };
+    // writer() clears lists but keeps allocator used
+    s = ecs_bw_scratch_writer(s);
+    if ecs_bw_scratch_is_empty(s) != true { panic(111803); };
+    if ecs_bw_scratch_alloc_used(s) != 8 { panic(111804); };
+}
+
+@test "push_component_registers"() {
+    let s = ecs_bw_scratch_new();
+    let c = ecs_bw_components_new();
+    let r = ecs_bw_scratch_push_component(s, c, 100, 42, 4, true);
+    s = r.0;
+    c = r.1;
+    if ecs_bw_components_len(c) != 1 { panic(111810); };
+    if ecs_bw_scratch_len(s) != 1 { panic(111811); };
+    if ecs_bw_scratch_component_at(s, 0) != 1 { panic(111812); };
+    if ecs_bw_scratch_value_at(s, 0) != 42 { panic(111813); };
+    // re-register same type_id reuses id
+    let r2 = ecs_bw_scratch_push_component(s, c, 100, 43, 4, true);
+    if ecs_bw_components_len(r2.1) != 1 { panic(111814); };
+    if ecs_bw_scratch_len(r2.0) != 2 { panic(111815); };
+}
+
+@test "manual_drop_drops_and_resets_alloc"() {
+    let s = ecs_bw_scratch_new();
+    let c = ecs_bw_components_new();
+    let r = ecs_bw_scratch_push_component(s, c, 1, 10, 8, true);
+    s = r.0; c = r.1;
+    let r2 = ecs_bw_scratch_push_component(s, c, 2, 20, 8, false);
+    s = r2.0; c = r2.1;
+    if ecs_bw_scratch_alloc_used(s) != 16 { panic(111820); };
+    s = ecs_bw_scratch_manual_drop(s, c);
+    if ecs_bw_scratch_is_empty(s) != true { panic(111821); };
+    if ecs_bw_scratch_alloc_used(s) != 0 { panic(111822); };
+    // only droppable component counted
+    if ecs_bw_scratch_drop_count(s) != 1 { panic(111823); };
+}
+
+@test "write_inserts_and_clears_scratch"() {
+    let s = ecs_bw_scratch_new();
+    s = ecs_bw_scratch_push_by_id(s, 5, 50, 4);
+    s = ecs_bw_scratch_push_by_id(s, 6, 60, 4);
+    let e = ecs_bw_entity_new(9);
+    let w = ecs_bw_write_default(s, e);
+    s = w.0; e = w.1;
+    if ecs_bw_scratch_is_empty(s) != true { panic(111830); };
+    if ecs_bw_scratch_alloc_used(s) != 0 { panic(111831); };
+    if ecs_bw_entity_len(e) != 2 { panic(111832); };
+    if ecs_bw_entity_has(e, 5) != true { panic(111833); };
+    if ecs_bw_entity_value(e, 6) != 60 { panic(111834); };
+    if ecs_bw_entity_write_count(e) != 1 { panic(111835); };
+    if ecs_bw_entity_last_rel_mode(e) != ECS_BW_REL_RUN { panic(111836); };
+}
+
+@test "write_with_relationship_mode"() {
+    let s = ecs_bw_scratch_push_by_id(ecs_bw_scratch_new(), 1, 1, 1);
+    let e = ecs_bw_entity_new(1);
+    let w = ecs_bw_write(s, e, ECS_BW_REL_SKIP);
+    if ecs_bw_entity_last_rel_mode(w.1) != ECS_BW_REL_SKIP { panic(111840); };
+    let w2 = ecs_bw_write(ecs_bw_scratch_push_by_id(ecs_bw_scratch_new(), 2, 2, 1), w.1, ECS_BW_REL_RUN_IF_REPLACING);
+    if ecs_bw_entity_last_rel_mode(w2.1) != ECS_BW_REL_RUN_IF_REPLACING { panic(111841); };
+    if ecs_bw_entity_write_count(w2.1) != 2 { panic(111842); };
+}
+
+@test "write_replaces_existing_component"() {
+    let e = ecs_bw_entity_new(1);
+    let s = ecs_bw_scratch_push_by_id(ecs_bw_scratch_new(), 3, 30, 4);
+    let w = ecs_bw_write_default(s, e);
+    e = w.1;
+    let s2 = ecs_bw_scratch_push_by_id(ecs_bw_scratch_new(), 3, 99, 4);
+    let w2 = ecs_bw_write_default(s2, e);
+    e = w2.1;
+    if ecs_bw_entity_len(e) != 1 { panic(111850); };
+    if ecs_bw_entity_value(e, 3) != 99 { panic(111851); };
+}
+
+@test "rel_mode_constants"() {
+    if ecs_bw_rel_run() != 0 { panic(111860); };
+    if ecs_bw_rel_skip() != 1 { panic(111861); };
+    if ecs_bw_rel_run_if_replacing() != 2 { panic(111862); };
+}
+
+@test "scratch_reuse_after_write"() {
+    let s = ecs_bw_scratch_push_by_id(ecs_bw_scratch_new(), 1, 1, 8);
+    let total_before = ecs_bw_scratch_alloc_total(s);
+    let w = ecs_bw_write_default(s, ecs_bw_entity_new(1));
+    s = w.0;
+    if ecs_bw_scratch_can_reuse(s) != true { panic(111870); };
+    if ecs_bw_scratch_alloc_total(s) != total_before { panic(111871); };
+    s = ecs_bw_scratch_push_by_id(s, 2, 2, 8);
+    if ecs_bw_scratch_len(s) != 1 { panic(111872); };
+    if ecs_bw_scratch_alloc_total(s) != total_before + 8 { panic(111873); };
+}
+
+@test "components_find_missing"() {
+    let c = ecs_bw_components_new();
+    let f = ecs_bw_components_find(c, 99);
+    if f.0 != false { panic(111880); };
+}
+
+@test "push_multiple_layouts"() {
+    let s = ecs_bw_scratch_new();
+    s = ecs_bw_scratch_push_by_id(s, 1, 1, 1);
+    s = ecs_bw_scratch_push_by_id(s, 2, 2, 3);
+    s = ecs_bw_scratch_push_by_id(s, 3, 3, 5);
+    if ecs_bw_scratch_len(s) != 3 { panic(111890); };
+    if ecs_bw_scratch_alloc_used(s) != 9 { panic(111891); };
+    if ecs_bw_scratch_component_at(s, 2) != 3 { panic(111892); };
+}

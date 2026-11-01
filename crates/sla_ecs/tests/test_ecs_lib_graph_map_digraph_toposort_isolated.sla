@@ -1,0 +1,246 @@
+@import "../src/graph_map_digragh_toposort.sla"
+
+// Batch 174 tests for deepened graph_map DiGraph toposort + Direction + DAG cache surface.
+
+@test "direction_opposite"() {
+    if ecs_graph_direction_opposite(0) != 1 { panic(98000); };
+    if ecs_graph_direction_opposite(1) != 0 { panic(98001); };
+    if ecs_graph_direction_opposite(7) != 7 { panic(98002); };
+}
+
+@test "direction_predicates"() {
+    if ecs_graph_direction_is_incoming(0) != true { panic(98010); };
+    if ecs_graph_direction_is_outgoing(1) != true { panic(98011); };
+    if ecs_graph_direction_is_incoming(1) != false { panic(98012); };
+    if ecs_graph_direction_is_outgoing(0) != false { panic(98013); };
+}
+
+@test "toposort_result_ok_builder_and_accessors"() {
+    let order: Vec<i32> = Vec::new();
+    order.push(2);
+    order.push(1);
+    order.push(0);
+    let r = ecs_digraph_toposort_ok(order);
+    if ecs_digraph_toposort_is_ok(r) != true { panic(98020); };
+    if ecs_digraph_toposort_is_loop(r) != false { panic(98021); };
+    if ecs_digraph_toposort_is_cycle(r) != false { panic(98022); };
+    let out = ecs_digraph_toposort_order(r);
+    if out[0] != 2 { panic(98023); };
+    if out[2] != 0 { panic(98024); };
+    if ecs_digraph_toposort_loop_node(r) != -1 { panic(98025); };
+}
+
+@test "toposort_result_loop_builder"() {
+    let r = ecs_digraph_toposort_loop(5);
+    if ecs_digraph_toposort_is_loop(r) != true { panic(98030); };
+    if ecs_digraph_toposort_is_ok(r) != false { panic(98031); };
+    if ecs_digraph_toposort_loop_node(r) != 5 { panic(98032); };
+    if ecs_digraph_toposort_cycle_count(r) != 0 { panic(98033); };
+}
+
+@test "toposort_result_cycle_builder_and_at_accessor"() {
+    let cycles: Vec<Vec<i32>> = Vec::new();
+    let c1: Vec<i32> = Vec::new();
+    c1.push(0);
+    c1.push(1);
+    cycles.push(c1);
+    let r = ecs_digraph_toposort_cycle(cycles);
+    if ecs_digraph_toposort_is_cycle(r) != true { panic(98040); };
+    if ecs_digraph_toposort_cycle_count(r) != 1 { panic(98041); };
+    let got = ecs_digraph_toposort_cycle_at(r, 0);
+    if got[0] != 0 { panic(98042); };
+    if got[1] != 1 { panic(98043); };
+    // out-of-range returns empty
+    let empty = ecs_digraph_toposort_cycle_at(r, 5);
+    if len(empty) != 0 { panic(98044); };
+}
+
+@test "digraph_basic_edge_surface"() {
+    let g = ecs_digraph_new(3);
+    let g1 = ecs_digraph_add_edge(g, 0, 1);
+    let g2 = ecs_digraph_add_edge(g1, 1, 2);
+    if ecs_digraph_node_count(g2) != 3 { panic(98050); };
+    if ecs_digraph_edge_count(g2) != 2 { panic(98051); };
+    if ecs_digraph_contains_edge(g2, 0, 1) != true { panic(98052); };
+    if ecs_digraph_contains_edge(g2, 1, 2) != true { panic(98053); };
+    if ecs_digraph_contains_edge(g2, 0, 2) != false { panic(98054); };
+}
+
+@test "digraph_neighbors_and_all_edges"() {
+    let g = ecs_digraph_new(4);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 0, 2);
+    g = ecs_digraph_add_edge(g, 2, 3);
+    let nb = ecs_digraph_neighbors(g, 0);
+    if len(nb) != 2 { panic(98060); };
+    if nb[0] != 1 { panic(98061); };
+    if nb[1] != 2 { panic(98062); };
+    let nb2 = ecs_digraph_neighbors(g, 2);
+    if len(nb2) != 1 || nb2[0] != 3 { panic(98063); };
+    let ae = ecs_digraph_all_edges(g);
+    if len(ae) != 6 { panic(98064); };
+    if ae[0] != 0 || ae[1] != 1 { panic(98065); };
+    if ae[4] != 2 || ae[5] != 3 { panic(98066); };
+}
+
+@test "iter_sccs_singletons_in_acyclic"() {
+    // 0 -> 1 -> 2: three singleton SCCs in reverse topo order (Tarjan).
+    let g = ecs_digraph_new(3);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 1, 2);
+    let sccs = ecs_digraph_iter_sccs(g);
+    if len(sccs) != 3 { panic(98070); };
+    // each SCC is a singleton
+    let i: i64 = 0;
+    while i < (len(sccs) as i64) {
+        if len(sccs[i]) != 1 { panic(98071); };
+        i = i + 1;
+    }
+}
+
+@test "iter_sccs_detects_two_node_cycle"() {
+    // 0 <-> 1: a single SCC of size 2, plus node 2 singleton.
+    let g = ecs_digraph_new(3);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 1, 0);
+    g = ecs_digraph_add_edge(g, 1, 2);
+    let sccs = ecs_digraph_iter_sccs(g);
+    let total_size: i64 = 0;
+    let has_cycle_scc: bool = false;
+    let i: i64 = 0;
+    while i < (len(sccs) as i64) {
+        let s = sccs[i];
+        total_size = total_size + (len(s) as i64);
+        if len(s) == 2 { has_cycle_scc = true; };
+        i = i + 1;
+    }
+    if total_size != 3 { panic(98080); };
+    if has_cycle_scc != true { panic(98081); };
+}
+
+@test "toposort_self_loop_returns_loop_error"() {
+    let g = ecs_digraph_new(3);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 1, 1);
+    let r = ecs_digraph_toposort(g);
+    if ecs_digraph_toposort_is_loop(r) != true { panic(98090); };
+    if ecs_digraph_toposort_loop_node(r) != 1 { panic(98091); };
+    if ecs_digraph_toposort_is_ok(r) != false { panic(98092); };
+}
+
+@test "toposort_dag_returns_topological_order"() {
+    // 0 -> 1 -> 2: ok toposort should reverse the reverse-topo SCC order -> [0,1,2].
+    let g = ecs_digraph_new(3);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 1, 2);
+    let r = ecs_digraph_toposort(g);
+    if ecs_digraph_toposort_is_ok(r) != true { panic(98100); };
+    let order = ecs_digraph_toposort_order(r);
+    if len(order) != 3 { panic(98101); };
+    if order[0] != 0 { panic(98102); };
+    if order[1] != 1 { panic(98103); };
+    if order[2] != 2 { panic(98104); };
+}
+
+@test "toposort_dag_parallel_roots"() {
+    // 0 -> 2, 1 -> 2 (both roots before 2). Ok topo order has both roots first.
+    let g = ecs_digraph_new(3);
+    g = ecs_digraph_add_edge(g, 0, 2);
+    g = ecs_digraph_add_edge(g, 1, 2);
+    let r = ecs_digraph_toposort(g);
+    if ecs_digraph_toposort_is_ok(r) != true { panic(98110); };
+    let order = ecs_digraph_toposort_order(r);
+    if len(order) != 3 { panic(98111); };
+    // node 2 must come last
+    if order[2] != 2 { panic(98112); };
+}
+
+@test "toposort_cycle_returns_cycle_error"() {
+    // 0 <-> 1: a two-node SCC -> Cycle error.
+    let g = ecs_digraph_new(2);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 1, 0);
+    let r = ecs_digraph_toposort(g);
+    if ecs_digraph_toposort_is_cycle(r) != true { panic(98120); };
+    if ecs_digraph_toposort_is_ok(r) != false { panic(98121); };
+    if ecs_digraph_toposort_cycle_count(r) < 1 { panic(98122); };
+}
+
+@test "dag_cache_new_dirty"() {
+    let d = ecs_dag_cache_new(3);
+    if ecs_dag_cache_is_dirty(d) != true { panic(98130); };
+    if ecs_dag_cache_is_toposorted(d) != false { panic(98131); };
+}
+
+@test "dag_cache_add_edge_marks_dirty"() {
+    let d = ecs_dag_cache_new(3);
+    d = ecs_dag_cache_ensure_toposorted(d);
+    if ecs_dag_cache_is_toposorted(d) != true { panic(98140); };
+    d = ecs_dag_cache_add_edge(d, 0, 1);
+    if ecs_dag_cache_is_dirty(d) != true { panic(98141); };
+}
+
+@test "dag_cache_ensure_toposorted_ok_caches_order"() {
+    let d = ecs_dag_cache_new(3);
+    d = ecs_dag_cache_add_edge(d, 0, 1);
+    d = ecs_dag_cache_add_edge(d, 1, 2);
+    d = ecs_dag_cache_ensure_toposorted(d);
+    if ecs_dag_cache_is_toposorted(d) != true { panic(98150); };
+    if ecs_dag_cache_cached_error_kind(d) != 0 { panic(98151); };
+    let order = ecs_dag_cache_cached_toposort(d);
+    if len(order) != 3 { panic(98152); };
+    if order[0] != 0 { panic(98153); };
+    if order[2] != 2 { panic(98154); };
+}
+
+@test "dag_cache_ensure_toposorted_loop_records_loop_node"() {
+    let d = ecs_dag_cache_new(3);
+    d = ecs_dag_cache_add_edge(d, 0, 1);
+    d = ecs_dag_cache_add_edge(d, 2, 2);
+    d = ecs_dag_cache_ensure_toposorted(d);
+    if ecs_dag_cache_is_dirty(d) != true { panic(98160); };
+    if ecs_dag_cache_cached_error_kind(d) != 1 { panic(98161); };
+    if ecs_dag_cache_cached_loop_node(d) != 2 { panic(98162); };
+}
+
+@test "dag_cache_ensure_toposorted_cycle_records_cycle_kind"() {
+    let d = ecs_dag_cache_new(2);
+    d = ecs_dag_cache_add_edge(d, 0, 1);
+    d = ecs_dag_cache_add_edge(d, 1, 0);
+    d = ecs_dag_cache_ensure_toposorted(d);
+    if ecs_dag_cache_cached_error_kind(d) != 2 { panic(98170); };
+    if len(ecs_dag_cache_cached_toposort(d)) != 0 { panic(98171); };
+}
+
+@test "dag_cache_cached_toposort_empty_when_dirty"() {
+    let d = ecs_dag_cache_new(3);
+    d = ecs_dag_cache_add_edge(d, 0, 1);
+    // dirty without ensure_toposorted -> cached_toposort returns empty
+    if len(ecs_dag_cache_cached_toposort(d)) != 0 { panic(98180); };
+}
+
+@test "digraph_remove_node_drops_node_edges"() {
+    let g = ecs_digraph_new(4);
+    g = ecs_digraph_add_edge(g, 0, 1);
+    g = ecs_digraph_add_edge(g, 1, 2);
+    g = ecs_digraph_add_edge(g, 2, 3);
+    let sub = ecs_digraph_remove_node(g, 2);
+    if ecs_digraph_edge_count(sub) != 1 { panic(98190); };
+    if ecs_digraph_contains_edge(sub, 0, 1) != true { panic(98191); };
+    if ecs_digraph_contains_edge(sub, 1, 2) != false { panic(98192); };
+    if ecs_digraph_contains_edge(sub, 2, 3) != false { panic(98193); };
+}
+
+@test "vec_i32_helpers"() {
+    let v: Vec<i32> = Vec::new();
+    v.push(1);
+    v.push(3);
+    v.push(2);
+    if ecs_vec_i32_contains(v, 3) != true { panic(98200); };
+    if ecs_vec_i32_contains(v, 9) != false { panic(98201); };
+    let c = ecs_vec_i32_clone(v);
+    if len(c) != 3 { panic(98202); };
+    if c[0] != 1 { panic(98203); };
+    if c[2] != 2 { panic(98204); };
+    if ecs_vec_i32_max_plus_one(v) != 4 { panic(98205); };
+}

@@ -1,0 +1,211 @@
+@import "../src/message_mutator_deep.sla"
+
+// Batch 215: MessageMutator deep (src/message/message_mutator.rs).
+// panic codes: 109000 – 109099.
+
+@test "new_empty"() {
+    let mu = ecs_mm_mutator_new();
+    if ecs_mm_mutator_len(mu) != 0 { panic(109000); };
+    if ecs_mm_mutator_is_empty(mu) != true { panic(109001); };
+    if ecs_mm_mutator_write_ops(mu) != 0 { panic(109002); };
+    if ecs_mm_messages_message_count(ecs_mm_mutator_messages(mu)) != 0 { panic(109003); };
+}
+
+@test "write_returns_id_and_len"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 10);
+    mu = w.0;
+    if w.1 != 0 { panic(109010); };
+    w = ecs_mm_mutator_write(mu, 20);
+    mu = w.0;
+    if w.1 != 1 { panic(109011); };
+    if ecs_mm_mutator_len(mu) != 2 { panic(109012); };
+    if ecs_mm_mutator_is_empty(mu) != false { panic(109013); };
+    if ecs_mm_mutator_write_ops(mu) != 2 { panic(109014); };
+}
+
+@test "write_default"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write_default(mu);
+    mu = w.0;
+    if w.1 != 0 { panic(109020); };
+    if ecs_mm_mutator_len(mu) != 1 { panic(109021); };
+}
+
+@test "write_batch4"() {
+    let mu = ecs_mm_mutator_new();
+    let b = ecs_mm_mutator_write_batch4(mu, 1, 2, 3, 4, 4);
+    mu = b.0;
+    if b.1 != 0 { panic(109030); };
+    if b.2 != 4 { panic(109031); };
+    if ecs_mm_mutator_len(mu) != 4 { panic(109032); };
+    if ecs_mm_messages_message_count(ecs_mm_mutator_messages(mu)) != 4 { panic(109033); };
+}
+
+@test "write_visible_to_same_system_read"() {
+    // Bevy docs: write then read sees the message immediately in same system
+    let mu = ecs_mm_mutator_new();
+    let r = ecs_mm_run_write_then_read(mu, 42);
+    mu = r.0;
+    if r.1 != true { panic(109040); };
+    if r.2 != 42 { panic(109041); };
+    if r.3 != 0 { panic(109042); };
+    if ecs_mm_mutator_is_empty(mu) != true { panic(109043); };
+}
+
+@test "read_with_id_advances_cursor"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 5);
+    mu = w.0;
+    w = ecs_mm_mutator_write(mu, 6);
+    mu = w.0;
+    let r = ecs_mm_mutator_read_with_id(mu);
+    mu = r.0;
+    let it = r.1;
+    if ecs_mm_iter_unread(it) != 2 { panic(109050); };
+    if ecs_mm_iter_is_mut(it) != true { panic(109051); };
+    let n = ecs_mm_iter_next(it);
+    if n.0 != true { panic(109052); };
+    if n.1 != 5 { panic(109053); };
+    if n.2 != 0 { panic(109054); };
+    it = n.3;
+    n = ecs_mm_iter_next(it);
+    if n.1 != 6 { panic(109055); };
+    if n.2 != 1 { panic(109056); };
+    it = n.3;
+    n = ecs_mm_iter_next(it);
+    if n.0 != false { panic(109057); };
+    mu.cursor = ecs_mm_cursor_from_iter(it);
+    if ecs_mm_mutator_is_empty(mu) != true { panic(109058); };
+}
+
+@test "second_read_skips_consumed"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 1);
+    mu = w.0;
+    w = ecs_mm_mutator_write(mu, 2);
+    mu = w.0;
+    let r = ecs_mm_mutator_read_with_id(mu);
+    mu = r.0;
+    let it = r.1;
+    let n = ecs_mm_iter_next(it);
+    it = n.3;
+    // leave second unread — sync partial
+    mu.cursor = ecs_mm_cursor_from_iter(it);
+    if ecs_mm_mutator_len(mu) != 1 { panic(109060); };
+    r = ecs_mm_mutator_read_with_id(mu);
+    mu = r.0;
+    it = r.1;
+    n = ecs_mm_iter_next(it);
+    if n.1 != 2 { panic(109061); };
+    if n.2 != 1 { panic(109062); };
+}
+
+@test "clear_consumes_without_iter"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 9);
+    mu = w.0;
+    w = ecs_mm_mutator_write(mu, 8);
+    mu = w.0;
+    if ecs_mm_mutator_is_empty(mu) != false { panic(109070); };
+    mu = ecs_mm_mutator_clear(mu);
+    if ecs_mm_mutator_is_empty(mu) != true { panic(109071); };
+    if ecs_mm_mutator_len(mu) != 0 { panic(109072); };
+}
+
+@test "mutate_unread_in_place"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 10);
+    mu = w.0;
+    w = ecs_mm_mutator_write(mu, 20);
+    mu = w.0;
+    let r = ecs_mm_run_read_and_increment_all(mu);
+    mu = r.0;
+    if r.1 != 2 { panic(109080); };
+    // values stored in B should be 11, 21
+    let m = ecs_mm_mutator_messages(mu);
+    if ecs_mm_b_get(m, 0) != 11 { panic(109081); };
+    if ecs_mm_b_get(m, 1) != 21 { panic(109082); };
+}
+
+@test "write_after_read_deferred_to_next_system_run"() {
+    // Bevy docs: write after read is seen next run of same system
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 1);
+    mu = w.0;
+    let r = ecs_mm_mutator_read_with_id(mu);
+    mu = r.0;
+    let it = r.1;
+    let n = ecs_mm_iter_next(it);
+    mu.cursor = ecs_mm_cursor_from_iter(n.3);
+    // write after read
+    w = ecs_mm_mutator_write(mu, 99);
+    mu = w.0;
+    // still unread for this cursor
+    if ecs_mm_mutator_len(mu) != 1 { panic(109090); };
+    r = ecs_mm_mutator_read_with_id(mu);
+    mu = r.0;
+    n = ecs_mm_iter_next(r.1);
+    if n.1 != 99 { panic(109091); };
+}
+
+@test "frame_update_swaps_buffers"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 7);
+    mu = w.0;
+    mu = ecs_mm_mutator_messages_update(mu);
+    let m = ecs_mm_mutator_messages(mu);
+    if m.a_len != 1 { panic(109100); };
+    if ecs_mm_a_get(m, 0) != 7 { panic(109101); };
+    if m.b_len != 0 { panic(109102); };
+    // cursor default still sees A message
+    if ecs_mm_mutator_len(mu) != 1 { panic(109103); };
+}
+
+@test "par_read_drains"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 1);
+    mu = w.0;
+    w = ecs_mm_mutator_write(mu, 2);
+    mu = w.0;
+    w = ecs_mm_mutator_write(mu, 3);
+    mu = w.0;
+    let p = ecs_mm_mutator_par_read(mu);
+    mu = p.0;
+    if ecs_mm_par_unread(p.1) != 3 { panic(109110); };
+    if ecs_mm_par_is_mut(p.1) != true { panic(109111); };
+    if ecs_mm_mutator_is_empty(mu) != true { panic(109112); };
+}
+
+@test "concurrency_markers"() {
+    if ecs_mm_exclusive_same_type() != true { panic(109120); };
+    if ecs_mm_conflicts_with_reader() != true { panic(109121); };
+    if ecs_mm_conflicts_with_writer() != true { panic(109122); };
+}
+
+@test "missed_after_update_without_read"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 1);
+    mu = w.0;
+    // two frame updates drop the message from both buffers
+    mu = ecs_mm_mutator_messages_update(mu);
+    mu = ecs_mm_mutator_messages_update(mu);
+    let c = ecs_mm_mutator_cursor(mu);
+    let m = ecs_mm_mutator_messages(mu);
+    if ecs_mm_cursor_missed(c, m) != 1 { panic(109130); };
+    if ecs_mm_mutator_len(mu) != 0 { panic(109131); };
+}
+
+@test "validation_ok"() {
+    let mu = ecs_mm_mutator_new();
+    if ecs_mm_mutator_validation_ok(mu) != true { panic(109140); };
+}
+
+@test "read_after_clear_empty"() {
+    let mu = ecs_mm_mutator_new();
+    let w = ecs_mm_mutator_write(mu, 3);
+    mu = w.0;
+    mu = ecs_mm_mutator_clear(mu);
+    let r = ecs_mm_mutator_read_with_id(mu);
+    if ecs_mm_iter_unread(r.1) != 0 { panic(109150); };
+}

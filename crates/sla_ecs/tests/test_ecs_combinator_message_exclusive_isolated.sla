@@ -1,0 +1,496 @@
+// CombinatorSystem (And/Or/Not/Pipe) + Message API (Reader/Writer/Cursor/Mutator) + ExclusiveSystem.
+// Bevy system/combinator.rs: CombinatorSystem, Combine trait (And/Or).
+// Bevy system/adapter_system.rs: AdapterSystem, adapt.
+// Bevy message/: MessageReader (read, read_with_id, len, is_empty, clear, par_read),
+// MessageWriter (write, write_batch, write_default), MessageCursor (read, len, missed, clear),
+// MessageMutator (read, write, len, is_empty, clear).
+// Bevy system/exclusive_function_system.rs: ExclusiveFunctionSystem.
+
+// --- CombinatorSystem: And / Or / Not ---
+struct EcsCombinatorSystem {
+    a_result: bool,
+    b_result: bool,
+    kind: i32,  // 0=And, 1=Or, 2=Not, 3=Pipe
+}
+
+fn combinator_and(a: bool, b: bool) -> EcsCombinatorSystem {
+    return EcsCombinatorSystem { a_result: a, b_result: b, kind: 0 };
+}
+
+fn combinator_or(a: bool, b: bool) -> EcsCombinatorSystem {
+    return EcsCombinatorSystem { a_result: a, b_result: b, kind: 1 };
+}
+
+fn combinator_not(a: bool) -> EcsCombinatorSystem {
+    return EcsCombinatorSystem { a_result: a, b_result: false, kind: 2 };
+}
+
+fn combinator_run(c: EcsCombinatorSystem) -> bool {
+    if c.kind == 0 { return c.a_result && c.b_result; };
+    if c.kind == 1 { return c.a_result || c.b_result; };
+    if c.kind == 2 { return c.a_result != true; };
+    return false;
+}
+
+// --- Pipe system: A output -> B input ---
+struct EcsPipeSystem {
+    a_output: i32,
+    b_output: i32,
+}
+
+fn pipe_new(a_output: i32) -> EcsPipeSystem {
+    return EcsPipeSystem { a_output: a_output, b_output: 0 };
+}
+
+fn pipe_run(p: EcsPipeSystem, b_fn: fn(i32) -> i32) -> EcsPipeSystem {
+    // Chain: if b_output already set, use it as input; otherwise use a_output
+    if p.b_output != 0 {
+        p.b_output = b_fn(p.b_output);
+    } else {
+        p.b_output = b_fn(p.a_output);
+    };
+    return p;
+}
+
+fn pipe_result(p: EcsPipeSystem) -> i32 { return p.b_output; }
+
+// Pipe test functions
+fn pipe_double(x: i32) -> i32 { return x * 2; }
+fn pipe_add_one(x: i32) -> i32 { return x + 1; }
+
+// --- Adapter system: adapt output ---
+struct EcsAdapterSystem {
+    input: i32,
+    output: i32,
+}
+
+fn adapter_new(input: i32) -> EcsAdapterSystem {
+    return EcsAdapterSystem { input: input, output: 0 };
+}
+
+fn adapter_run(a: EcsAdapterSystem, adapt_fn: fn(i32) -> i32) -> EcsAdapterSystem {
+    a.output = adapt_fn(a.input);
+    return a;
+}
+
+fn adapter_result(a: EcsAdapterSystem) -> i32 { return a.output; }
+
+fn adapt_to_string(x: i32) -> i32 { return x + 1000; }
+
+// --- Messages queue ---
+struct EcsMessage {
+    id: i32,
+    value: i32,
+}
+
+struct EcsMessages {
+    messages: Vec<EcsMessage>,
+    next_id: i32,
+}
+
+fn messages_new() -> EcsMessages {
+    return EcsMessages { messages: Vec::new(), next_id: 0 };
+}
+
+fn messages_len(m: EcsMessages) -> i64 { return len(m.messages) as i64; }
+fn messages_is_empty(m: EcsMessages) -> bool { return len(m.messages) == 0; }
+
+fn messages_write(m: EcsMessages, value: i32) -> (EcsMessages, i32) {
+    let id = m.next_id;
+    m.messages.push(EcsMessage { id: id, value: value });
+    m.next_id = id + 1;
+    return (m, id);
+}
+
+fn messages_write_batch(m: EcsMessages, values: Vec<i32>) -> (EcsMessages, Vec<i32>) {
+    return messages_write_batch_rec(m, values, Vec::new(), 0);
+}
+
+fn messages_write_batch_rec(m: EcsMessages, values: Vec<i32>, ids: Vec<i32>, i: i64) -> (EcsMessages, Vec<i32>) {
+    if i >= (len(values) as i64) { return (m, ids); };
+    let (m2, id) = messages_write(m, values[i]);
+    ids.push(id);
+    return messages_write_batch_rec(m2, values, ids, i + 1);
+}
+
+fn messages_write_default(m: EcsMessages) -> (EcsMessages, i32) {
+    return messages_write(m, 0);
+}
+
+fn messages_clear(m: EcsMessages) -> EcsMessages {
+    let empty: Vec<EcsMessage> = Vec::new();
+    m.messages = empty;
+    return m;
+}
+
+// --- MessageReader ---
+struct EcsMessageReader {
+    cursor: i32,  // index of next unread message
+}
+
+fn reader_new() -> EcsMessageReader {
+    return EcsMessageReader { cursor: 0 };
+}
+
+fn reader_read(reader: EcsMessageReader, messages: EcsMessages) -> (EcsMessageReader, i32, bool) {
+    if reader.cursor >= (len(messages.messages) as i32) {
+        return (reader, 0, false);
+    };
+    let msg = messages.messages[reader.cursor];
+    reader.cursor = reader.cursor + 1;
+    return (reader, msg.value, true);
+}
+
+fn reader_read_with_id(reader: EcsMessageReader, messages: EcsMessages) -> (EcsMessageReader, i32, i32, bool) {
+    if reader.cursor >= (len(messages.messages) as i32) {
+        return (reader, 0, 0, false);
+    };
+    let msg = messages.messages[reader.cursor];
+    reader.cursor = reader.cursor + 1;
+    return (reader, msg.id, msg.value, true);
+}
+
+fn reader_len(reader: EcsMessageReader, messages: EcsMessages) -> i64 {
+    let total = len(messages.messages) as i64;
+    let read_count = reader.cursor as i64;
+    if total < read_count { return 0; };
+    return total - read_count;
+}
+
+fn reader_is_empty(reader: EcsMessageReader, messages: EcsMessages) -> bool {
+    return reader_len(reader, messages) == 0;
+}
+
+fn reader_clear(reader: EcsMessageReader, messages: EcsMessages) -> (EcsMessageReader, EcsMessages) {
+    let m2 = messages_clear(messages);
+    reader.cursor = 0;
+    return (reader, m2);
+}
+
+// --- MessageCursor ---
+struct EcsMessageCursor {
+    last_read: i32,  // id of last read message
+}
+
+fn cursor_new() -> EcsMessageCursor {
+    return EcsMessageCursor { last_read: -1 };
+}
+
+fn cursor_len(cursor: EcsMessageCursor, messages: EcsMessages) -> i64 {
+    return cursor_len_rec(cursor, messages, 0, 0);
+}
+
+fn cursor_len_rec(cursor: EcsMessageCursor, messages: EcsMessages, i: i64, count: i64) -> i64 {
+    if i >= (len(messages.messages) as i64) { return count; };
+    if messages.messages[i].id > cursor.last_read {
+        return cursor_len_rec(cursor, messages, i + 1, count + 1);
+    };
+    return cursor_len_rec(cursor, messages, i + 1, count);
+}
+
+fn cursor_missed(cursor: EcsMessageCursor, messages: EcsMessages) -> i64 {
+    // Count messages that were never read (gap between last_read and current)
+    return cursor_len(cursor, messages);
+}
+
+fn cursor_is_empty(cursor: EcsMessageCursor, messages: EcsMessages) -> bool {
+    return cursor_len(cursor, messages) == 0;
+}
+
+fn cursor_clear(cursor: EcsMessageCursor) -> EcsMessageCursor {
+    cursor.last_read = 999999;  // Mark all as read
+    return cursor;
+}
+
+// --- MessageMutator (read + write) ---
+struct EcsMessageMutator {
+    cursor: i32,
+}
+
+fn mutator_new() -> EcsMessageMutator {
+    return EcsMessageMutator { cursor: 0 };
+}
+
+fn mutator_read(mutator: EcsMessageMutator, messages: EcsMessages) -> (EcsMessageMutator, i32, bool) {
+    if mutator.cursor >= (len(messages.messages) as i32) {
+        return (mutator, 0, false);
+    };
+    let msg = messages.messages[mutator.cursor];
+    mutator.cursor = mutator.cursor + 1;
+    return (mutator, msg.value, true);
+}
+
+fn mutator_write(mutator: EcsMessageMutator, messages: EcsMessages, value: i32) -> (EcsMessageMutator, EcsMessages, i32) {
+    let (m2, id) = messages_write(messages, value);
+    return (mutator, m2, id);
+}
+
+fn mutator_len(mutator: EcsMessageMutator, messages: EcsMessages) -> i64 {
+    let total = len(messages.messages) as i64;
+    let read_count = mutator.cursor as i64;
+    if total < read_count { return 0; };
+    return total - read_count;
+}
+
+fn mutator_is_empty(mutator: EcsMessageMutator, messages: EcsMessages) -> bool {
+    return mutator_len(mutator, messages) == 0;
+}
+
+// --- ExclusiveSystem ---
+struct EcsExclusiveSystem {
+    name: Vec<i32>,
+    run_count: i32,
+    last_result: i32,
+}
+
+fn exclusive_new(name: Vec<i32>) -> EcsExclusiveSystem {
+    return EcsExclusiveSystem { name: name, run_count: 0, last_result: 0 };
+}
+
+fn exclusive_run(sys: EcsExclusiveSystem, input: i32) -> EcsExclusiveSystem {
+    sys.run_count = sys.run_count + 1;
+    sys.last_result = input * 10;
+    return sys;
+}
+
+fn exclusive_run_count(sys: EcsExclusiveSystem) -> i32 { return sys.run_count; }
+fn exclusive_last_result(sys: EcsExclusiveSystem) -> i32 { return sys.last_result; }
+
+fn exclusive_with_name(sys: EcsExclusiveSystem, name: Vec<i32>) -> EcsExclusiveSystem {
+    sys.name = name;
+    return sys;
+}
+
+fn exclusive_name_len(sys: EcsExclusiveSystem) -> i64 { return len(sys.name) as i64; }
+
+// --- Populated wrapper ---
+struct EcsPopulatedReader {
+    inner: EcsMessageReader,
+    is_populated: bool,
+}
+
+fn populated_new(messages: EcsMessages) -> EcsPopulatedReader {
+    return EcsPopulatedReader {
+        inner: reader_new(),
+        is_populated: messages_len(messages) > 0,
+    };
+}
+
+fn populated_is_populated(p: EcsPopulatedReader) -> bool { return p.is_populated; }
+
+@test "combinator And true true"() {
+    let c = combinator_and(true, true);
+    if combinator_run(c) != true { panic(16001); };
+}
+
+@test "combinator And true false"() {
+    let c = combinator_and(true, false);
+    if combinator_run(c) { panic(16002); };
+}
+
+@test "combinator Or false true"() {
+    let c = combinator_or(false, true);
+    if combinator_run(c) != true { panic(16003); };
+}
+
+@test "combinator Or false false"() {
+    let c = combinator_or(false, false);
+    if combinator_run(c) { panic(16004); };
+}
+
+@test "combinator Not true"() {
+    let c = combinator_not(true);
+    if combinator_run(c) { panic(16005); };
+}
+
+@test "combinator Not false"() {
+    let c = combinator_not(false);
+    if combinator_run(c) != true { panic(16006); };
+}
+
+@test "pipe system chains output"() {
+    let p = pipe_new(5);
+    let p2 = pipe_run(p, pipe_double);
+    if pipe_result(p2) != 10 { panic(16007); };
+}
+
+@test "pipe system double then add_one"() {
+    let p = pipe_new(5);
+    let p2 = pipe_run(p, pipe_double);
+    let p3 = pipe_run(p2, pipe_add_one);
+    if pipe_result(p3) != 11 { panic(16008); };
+}
+
+@test "adapter system transforms output"() {
+    let a = adapter_new(42);
+    let a2 = adapter_run(a, adapt_to_string);
+    if adapter_result(a2) != 1042 { panic(16009); };
+}
+
+@test "messages write returns id"() {
+    let m = messages_new();
+    let (m2, id) = messages_write(m, 100);
+    if id != 0 { panic(16010); };
+    if messages_len(m2) != 1 { panic(16011); };
+}
+
+@test "messages write_batch returns ids"() {
+    let m = messages_new();
+    let vals: Vec<i32> = Vec::new();
+    vals.push(10);
+    vals.push(20);
+    vals.push(30);
+    let (m2, ids) = messages_write_batch(m, vals);
+    if len(ids) != 3 { panic(16012); };
+    if ids[0] != 0 { panic(16013); };
+    if ids[2] != 2 { panic(16014); };
+}
+
+@test "messages write_default writes zero"() {
+    let m = messages_new();
+    let (m2, _) = messages_write_default(m);
+    let (_r_def, val, _has_def) = reader_read(reader_new(), m2);
+    if val != 0 { panic(16015); };
+}
+
+@test "messages is_empty"() {
+    let m = messages_new();
+    if messages_is_empty(m) != true { panic(16016); };
+    let (m2, _) = messages_write(m, 1);
+    if messages_is_empty(m2) { panic(16017); };
+}
+
+@test "messages clear"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let m3 = messages_clear(m2);
+    if messages_is_empty(m3) != true { panic(16018); };
+}
+
+@test "reader read yields messages"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 10);
+    let (m3, _) = messages_write(m2, 20);
+    let reader = reader_new();
+    let (r2, val1, has1) = reader_read(reader, m3);
+    if has1 != true { panic(16019); };
+    if val1 != 10 { panic(16020); };
+    let (_, val2, has2) = reader_read(r2, m3);
+    if has2 != true { panic(16021); };
+    if val2 != 20 { panic(16022); };
+}
+
+@test "reader read returns false when exhausted"() {
+    let m = messages_new();
+    let reader = reader_new();
+    let (_r_ex, _v_ex, has) = reader_read(reader, m);
+    if has { panic(16023); };
+}
+
+@test "reader read_with_id returns id and value"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 42);
+    let (r2, id, val, has) = reader_read_with_id(reader_new(), m2);
+    if has != true { panic(16024); };
+    if id != 0 { panic(16025); };
+    if val != 42 { panic(16026); };
+}
+
+@test "reader len counts unread"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let (m3, _) = messages_write(m2, 2);
+    let reader = reader_new();
+    if reader_len(reader, m3) != 2 { panic(16027); };
+    let (r2, _, _) = reader_read(reader, m3);
+    if reader_len(r2, m3) != 1 { panic(16028); };
+}
+
+@test "reader is_empty"() {
+    let m = messages_new();
+    if reader_is_empty(reader_new(), m) != true { panic(16029); };
+}
+
+@test "reader clear resets"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let (_, m3) = reader_clear(reader_new(), m2);
+    if messages_is_empty(m3) != true { panic(16030); };
+}
+
+@test "cursor len counts new messages"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let (m3, _) = messages_write(m2, 2);
+    let cursor = cursor_new();
+    if cursor_len(cursor, m3) != 2 { panic(16031); };
+}
+
+@test "cursor missed_messages"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let cursor = cursor_new();
+    if cursor_missed(cursor, m2) != 1 { panic(16032); };
+}
+
+@test "cursor clear marks all read"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let cursor = cursor_new();
+    let cursor2 = cursor_clear(cursor);
+    if cursor_is_empty(cursor2, m2) != true { panic(16033); };
+}
+
+@test "mutator read and write"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 10);
+    let mutator = mutator_new();
+    let (mut2, val, has) = mutator_read(mutator, m2);
+    if has != true { panic(16034); };
+    if val != 10 { panic(16035); };
+    let (mut3, m3, _) = mutator_write(mut2, m2, 99);
+    if mutator_len(mut3, m3) != 1 { panic(16036); };  // one new message
+}
+
+@test "mutator is_empty"() {
+    let m = messages_new();
+    let mutator = mutator_new();
+    if mutator_is_empty(mutator, m) != true { panic(16037); };
+}
+
+@test "exclusive system runs"() {
+    let sys = exclusive_new(Vec::new());
+    let sys2 = exclusive_run(sys, 5);
+    if exclusive_run_count(sys2) != 1 { panic(16038); };
+    if exclusive_last_result(sys2) != 50 { panic(16039); };
+}
+
+@test "exclusive system runs multiple times"() {
+    let sys = exclusive_new(Vec::new());
+    let sys2 = exclusive_run(sys, 1);
+    let sys3 = exclusive_run(sys2, 2);
+    if exclusive_run_count(sys3) != 2 { panic(16040); };
+    if exclusive_last_result(sys3) != 20 { panic(16041); };
+}
+
+@test "exclusive with_name"() {
+    let sys = exclusive_new(Vec::new());
+    let name: Vec<i32> = Vec::new();
+    name.push(65);
+    name.push(66);
+    let sys2 = exclusive_with_name(sys, name);
+    if exclusive_name_len(sys2) != 2 { panic(16042); };
+}
+
+@test "populated reader detects non-empty"() {
+    let m = messages_new();
+    let (m2, _) = messages_write(m, 1);
+    let p = populated_new(m2);
+    if populated_is_populated(p) != true { panic(16043); };
+}
+
+@test "populated reader detects empty"() {
+    let m = messages_new();
+    let p = populated_new(m);
+    if populated_is_populated(p) { panic(16044); };
+}

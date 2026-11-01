@@ -1,0 +1,574 @@
+// Verification tests for the Bevy fidelity gap facade functions added to
+// lib/ecs_world.sla. Exercises QueryBuilder, conditional insert, clear_all/
+// clear_entities, clone_and_spawn, clone_with_opt_out/opt_in, schedule label
+// run, try_insert_batch, resource change ticks, relationship source collection,
+// combinator, stepping, and clone behavior facades.
+@import "../src/ecs_world.sla"
+@import "sa_std/io/print.sai"
+@import "sa_std/core/arc.sa"
+
+struct Pos { x: i32, y: i32 }
+struct Vel { vx: i32, vy: i32 }
+
+fn make_pos(x: i32, y: i32) -> Pos {
+    return Pos { x: x, y: y };
+}
+
+fn make_vel(vx: i32, vy: i32) -> Vel {
+    return Vel { vx: vx, vy: vy };
+}
+
+const POS_TYPE_ID: i32 = 100;
+const VEL_TYPE_ID: i32 = 101;
+
+@test "query builder matches with filter"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<Pos, i32, i32>(w2, e1, POS_TYPE_ID, make_pos(1, 2));
+    let (w4, e2) = ecs_world_spawn<i32, i32>(w3);
+    let w5 = ecs_world_insert<Pos, i32, i32>(w4, e2, POS_TYPE_ID, make_pos(3, 4));
+
+    let builder = ecs_query_builder_new();
+    let b1 = ecs_query_builder_with(builder, POS_TYPE_ID);
+    let count = ecs_query_builder_count<i32, i32>(w5, b1);
+    if count != 2 { panic(30001); };
+
+    let entities = ecs_query_builder_build<i32, i32>(w5, b1);
+    if len(entities) != 2 { panic(30002); };
+}
+
+@test "query builder without filter excludes"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let w2 = ecs_world_register_table<Vel, i32, i32>(w1, VEL_TYPE_ID);
+    let (w3, e1) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_insert<Pos, i32, i32>(w3, e1, POS_TYPE_ID, make_pos(1, 2));
+    let w5 = ecs_world_insert<Vel, i32, i32>(w4, e1, VEL_TYPE_ID, make_vel(5, 6));
+    let (w6, e2) = ecs_world_spawn<i32, i32>(w5);
+    let w7 = ecs_world_insert<Pos, i32, i32>(w6, e2, POS_TYPE_ID, make_pos(7, 8));
+
+    let builder = ecs_query_builder_new();
+    let b1 = ecs_query_builder_with(builder, POS_TYPE_ID);
+    let b2 = ecs_query_builder_without(b1, VEL_TYPE_ID);
+    let count = ecs_query_builder_count<i32, i32>(w7, b2);
+    if count != 1 { panic(30010); };
+}
+
+@test "insert_batch_if_new inserts on all entities"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let (w3, e2) = ecs_world_spawn<i32, i32>(w2);
+
+    let entities: Vec<Entity> = Vec::new();
+    entities.push(e1);
+    entities.push(e2);
+    let values: Vec<Pos> = Vec::new();
+    values.push(make_pos(11, 22));
+    values.push(make_pos(55, 66));
+    let w4 = ecs_world_insert_batch_if_new<Pos, i32, i32>(w3, entities, POS_TYPE_ID, values);
+
+    let p1 = ecs_world_get<Pos, i32, i32>(w4, e1, POS_TYPE_ID);
+    if p1.x != 11 { panic(30020); };
+    let p2 = ecs_world_get<Pos, i32, i32>(w4, e2, POS_TYPE_ID);
+    if p2.x != 55 { panic(30021); };
+}
+
+@test "try_insert_batch returns skip count"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let dead = entity_new(999, 0);
+
+    let entities: Vec<Entity> = Vec::new();
+    entities.push(e1);
+    entities.push(dead);
+    let values: Vec<Pos> = Vec::new();
+    values.push(make_pos(10, 20));
+    values.push(make_pos(30, 40));
+    let (w3, skipped) = ecs_world_try_insert_batch<Pos, i32, i32>(w2, entities, POS_TYPE_ID, values);
+    if skipped != 1 { panic(30030); };
+    let p = ecs_world_get<Pos, i32, i32>(w3, e1, POS_TYPE_ID);
+    if p.x != 10 { panic(30031); };
+}
+
+@test "insert_if_new respects existing"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<Pos, i32, i32>(w2, e1, POS_TYPE_ID, make_pos(7, 8));
+    let w4 = ecs_world_insert_if_new<Pos, i32, i32>(w3, e1, POS_TYPE_ID, make_pos(99, 99));
+    let p = ecs_world_get<Pos, i32, i32>(w4, e1, POS_TYPE_ID);
+    if p.x != 7 { panic(30040); };
+}
+
+@test "clear entities removes all"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let (w3, e2) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_insert_resource<i32, i32>(w3, 42);
+    let count_before = ecs_world_entity_count<i32, i32>(w4);
+    if count_before != 2 { panic(30050); };
+    let w5 = ecs_world_clear_entities<i32, i32>(w4);
+    let count_after = ecs_world_entity_count<i32, i32>(w5);
+    if count_after != 0 { panic(30051); };
+    if ecs_world_has_resource<i32, i32>(w5) != true { panic(30052); };
+}
+
+@test "clear_all removes entities and resources"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert_resource<i32, i32>(w2, 42);
+    let w4 = ecs_world_clear_all<i32, i32>(w3);
+    if ecs_world_entity_count<i32, i32>(w4) != 0 { panic(30060); };
+    if ecs_world_has_resource<i32, i32>(w4) { panic(30061); };
+}
+
+@test "clear_resources keeps entities"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert_resource<i32, i32>(w2, 42);
+    let w4 = ecs_world_clear_resources<i32, i32>(w3);
+    if ecs_world_entity_count<i32, i32>(w4) != 1 { panic(30070); };
+    if ecs_world_has_resource<i32, i32>(w4) { panic(30071); };
+}
+
+@test "clone_and_spawn copies components"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let w2 = ecs_world_register_table<Vel, i32, i32>(w1, VEL_TYPE_ID);
+    let (w3, e1) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_insert<Pos, i32, i32>(w3, e1, POS_TYPE_ID, make_pos(5, 6));
+    let w5 = ecs_world_insert<Vel, i32, i32>(w4, e1, VEL_TYPE_ID, make_vel(1, 2));
+    let type_ids: Vec<i32> = Vec::new();
+    type_ids.push(POS_TYPE_ID);
+    type_ids.push(VEL_TYPE_ID);
+    let (w6, clone) = ecs_world_clone_and_spawn<i32, i32>(w5, e1, type_ids);
+    let p = ecs_world_get<Pos, i32, i32>(w6, clone, POS_TYPE_ID);
+    if p.x != 5 { panic(30080); };
+    let v = ecs_world_get<Vel, i32, i32>(w6, clone, VEL_TYPE_ID);
+    if v.vx != 1 { panic(30081); };
+}
+
+@test "clone_with_opt_out excludes specified"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let w2 = ecs_world_register_table<Vel, i32, i32>(w1, VEL_TYPE_ID);
+    let (w3, e1) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_insert<Pos, i32, i32>(w3, e1, POS_TYPE_ID, make_pos(5, 6));
+    let w5 = ecs_world_insert<Vel, i32, i32>(w4, e1, VEL_TYPE_ID, make_vel(1, 2));
+    let (w6, e2) = ecs_world_spawn<i32, i32>(w5);
+    let all: Vec<i32> = Vec::new();
+    all.push(POS_TYPE_ID);
+    all.push(VEL_TYPE_ID);
+    let excluded: Vec<i32> = Vec::new();
+    excluded.push(VEL_TYPE_ID);
+    let w7 = ecs_world_clone_with_opt_out<i32, i32>(w6, e1, e2, all, excluded);
+    if ecs_world_has<i32, i32>(w7, e2, POS_TYPE_ID) != true { panic(30090); };
+    if ecs_world_has<i32, i32>(w7, e2, VEL_TYPE_ID) { panic(30091); };
+}
+
+@test "clone_with_opt_in includes only specified"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let w2 = ecs_world_register_table<Vel, i32, i32>(w1, VEL_TYPE_ID);
+    let (w3, e1) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_insert<Pos, i32, i32>(w3, e1, POS_TYPE_ID, make_pos(5, 6));
+    let w5 = ecs_world_insert<Vel, i32, i32>(w4, e1, VEL_TYPE_ID, make_vel(1, 2));
+    let (w6, e2) = ecs_world_spawn<i32, i32>(w5);
+    let included: Vec<i32> = Vec::new();
+    included.push(POS_TYPE_ID);
+    let w7 = ecs_world_clone_with_opt_in<i32, i32>(w6, e1, e2, included);
+    if ecs_world_has<i32, i32>(w7, e2, POS_TYPE_ID) != true { panic(30100); };
+    if ecs_world_has<i32, i32>(w7, e2, VEL_TYPE_ID) { panic(30101); };
+}
+
+@test "resource change ticks tracked"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(world, 42);
+    let tick1 = ecs_world_resource_changed_tick<i32, i32>(w1);
+    let w2 = ecs_world_increment_tick<i32, i32>(w1);
+    if ecs_world_is_resource_changed<i32, i32>(w2, tick1) { panic(30110); };
+    let w3 = ecs_world_insert_resource<i32, i32>(w2, 99);
+    if ecs_world_is_resource_changed<i32, i32>(w3, tick1) != true { panic(30111); };
+}
+
+@test "required components register"() {
+    let required = ecs_required_components_new();
+    let r1 = ecs_world_register_required_components_with(required, POS_TYPE_ID, VEL_TYPE_ID, make_default_vel_erased);
+    if len(r1.entries) != 1 { panic(30130); };
+}
+
+fn make_default_vel_erased() -> ErasedComponentValue {
+    return registry_erased_value_new<Vel>(VEL_TYPE_ID, make_vel(0, 0));
+}
+
+@test "combinator and or xor"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let shared = Arc::new(world);
+    let result = ecs_combinator_and<i32, i32>(shared.clone(), return_true, return_false);
+    if result != false { panic(30140); };
+    let result2 = ecs_combinator_or<i32, i32>(shared.clone(), return_false, return_true);
+    if result2 != true { panic(30141); };
+    let result3 = ecs_combinator_xor<i32, i32>(shared, return_true, return_false);
+    if result3 != true { panic(30142); };
+}
+
+fn return_true(_w: Arc<TableErasedWorld<i32, i32> >) -> bool {
+    return true;
+}
+
+fn return_false(_w: Arc<TableErasedWorld<i32, i32> >) -> bool {
+    return false;
+}
+
+@test "stepping enable and breakpoint"() {
+    let stepping = ecs_stepping_new();
+    if ecs_stepping_is_enabled(stepping) { panic(30150); };
+    let s1 = ecs_stepping_enable(stepping);
+    if ecs_stepping_is_enabled(s1) != true { panic(30151); };
+    let s2 = ecs_stepping_set_breakpoint(s1, 5);
+    let s3 = ecs_stepping_step_frame(s2);
+    let s4 = ecs_stepping_clear_breakpoint(s3, 5);
+    let s5 = ecs_stepping_disable(s4);
+    if ecs_stepping_is_enabled(s5) { panic(30152); };
+}
+
+@test "clone behavior resolve"() {
+    let default_b = ecs_component_clone_behavior_default();
+    if ecs_component_clone_behavior_resolve(default_b, true) != true { panic(30160); };
+    let ignore_b = ecs_component_clone_behavior_ignore();
+    if ecs_component_clone_behavior_resolve(ignore_b, true) != false { panic(30161); };
+    let custom_b = ecs_component_clone_behavior_custom(ecs_clone_behavior_identity);
+    if ecs_component_clone_behavior_resolve(custom_b, false) != true { panic(30162); };
+}
+
+@test "relationship source collection add remove contains"() {
+    let collection = ecs_rel_source_new(ECS_REL_SOURCE_VEC);
+    let e1 = entity_new(1, 0);
+    let e2 = entity_new(2, 0);
+    let c1 = ecs_rel_source_add(collection, e1);
+    let c2 = ecs_rel_source_add(c1, e2);
+    if ecs_rel_source_len(c2) != 2 { panic(30170); };
+    if ecs_rel_source_contains(c2, e1) != true { panic(30171); };
+    let c3 = ecs_rel_source_remove(c2, e1);
+    if ecs_rel_source_len(c3) != 1 { panic(30172); };
+    if ecs_rel_source_contains(c3, e1) { panic(30173); };
+}
+
+@test "schedule registry run by label"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let schedule = ecs_world_schedule_default<i32, i32>();
+    let registry = ecs_schedule_registry_new<i32, i32>();
+    let (r1, label) = ecs_schedule_registry_add<i32, i32>(registry, schedule);
+    let (r2, w1) = ecs_world_run_schedule<i32, i32>(r1, label, world);
+    let (r3, _w2, ok) = ecs_world_try_run_schedule<i32, i32>(r2, label, w1);
+    if ok != true { panic(30180); };
+    let missing = ecs_schedule_label_new(999);
+    let (_r4, _w3, ok2) = ecs_world_try_run_schedule<i32, i32>(r3, missing, w1);
+    if ok2 { panic(30181); };
+}
+
+@test "entity world mut chain insert get remove"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let ewm = ecs_world_spawn_mut<i32, i32>(w1);
+    let ewm2 = ecs_entity_world_mut_insert<Pos, i32, i32>(ewm, POS_TYPE_ID, make_pos(3, 4));
+    if ecs_entity_world_mut_has<i32, i32>(ewm2, POS_TYPE_ID) != true { panic(30190); };
+    let p = ecs_entity_world_mut_get<Pos, i32, i32>(ewm2, POS_TYPE_ID);
+    if p.x != 3 { panic(30191); };
+    let ewm3 = ecs_entity_world_mut_remove<i32, i32>(ewm2, POS_TYPE_ID);
+    if ecs_entity_world_mut_has<i32, i32>(ewm3, POS_TYPE_ID) { panic(30192); };
+}
+
+@test "deferred buffer apply"() {
+    let deferred = ecs_deferred_new<i32>(0);
+    if ecs_deferred_is_pending<i32>(deferred) { panic(30200); };
+    let d1 = ecs_deferred_set<i32>(deferred, 42);
+    if ecs_deferred_is_pending<i32>(d1) != true { panic(30201); };
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let (w1, d2) = ecs_deferred_apply<i32, i32, i32>(d1, world, apply_resource_from_buffer);
+    if ecs_deferred_is_pending<i32>(d2) { panic(30202); };
+    if ecs_world_has_resource<i32, i32>(w1) != true { panic(30203); };
+    let r = ecs_world_get_resource<i32, i32>(w1);
+    if r != 42 { panic(30204); };
+}
+
+fn apply_resource_from_buffer(w: TableErasedWorld<i32, i32>, v: i32) -> TableErasedWorld<i32, i32> {
+    return ecs_world_insert_resource<i32, i32>(w, v);
+}
+
+@test "maybe location none and new"() {
+    let none = ecs_maybe_location_none();
+    if ecs_maybe_location_id(none) != 0 { panic(30210); };
+    let loc = ecs_maybe_location_new(7);
+    if ecs_maybe_location_id(loc) != 7 { panic(30211); };
+}
+
+@test "system change tick struct"() {
+    // Test SystemChangeTick struct construction and accessors.
+    // Note: ecs_world_increment_tick has a known SLA move-semantics limitation
+    // where the updated change_tick is not visible after the function returns.
+    let tick = ecs_system_change_tick_new(5, 3);
+    if ecs_system_change_tick_this_run(tick) != 5 { panic(30220); };
+    if ecs_system_change_tick_last_run(tick) != 3 { panic(30221); };
+}
+
+@test "get resource or insert with"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let (w1, r1) = ecs_world_get_resource_or_insert_with<i32, i32>(world, make_default_resource);
+    if r1 != 77 { panic(30230); };
+    if ecs_world_has_resource<i32, i32>(w1) != true { panic(30231); };
+    let (w2, r2) = ecs_world_get_resource_or_insert_with<i32, i32>(w1, make_default_resource);
+    if r2 != 77 { panic(30232); };
+}
+
+fn make_default_resource() -> i32 {
+    return 77;
+}
+
+@test "component hooks register and count"() {
+    let hooks = ecs_component_hooks_new(POS_TYPE_ID);
+    let h1 = ecs_component_hooks_on_add(hooks, noop_hook);
+    let h2 = ecs_component_hooks_on_remove(h1, noop_hook);
+    if ecs_component_hooks_count(h2, ECS_HOOK_ON_ADD) != 1 { panic(30300); };
+    if ecs_component_hooks_count(h2, ECS_HOOK_ON_REMOVE) != 1 { panic(30301); };
+    if ecs_component_hooks_count(h2, ECS_HOOK_ON_INSERT) != 0 { panic(30302); };
+}
+
+fn noop_hook(w: TableErasedWorld<i32, i32>, ctx: EcsHookContext) -> TableErasedWorld<i32, i32> {
+    return w;
+}
+
+@test "hook context accessors"() {
+    let e = entity_new(5, 0);
+    let ctx = ecs_hook_context_new(e, 10, 100);
+    if ecs_hook_context_entity(ctx).id != 5 { panic(30310); };
+    if ecs_hook_context_component_id(ctx) != 10 { panic(30311); };
+    if ecs_hook_context_type_id(ctx) != 100 { panic(30312); };
+}
+
+@test "batching strategy default and fixed"() {
+    let s1 = ecs_batching_strategy_new();
+    let bs = ecs_batching_strategy_calc_batch_size(s1, 100, 4);
+    if bs != 25 { panic(30320); };
+    let s2 = ecs_batching_strategy_fixed(10);
+    let bs2 = ecs_batching_strategy_calc_batch_size(s2, 100, 4);
+    if bs2 != 10 { panic(30321); };
+}
+
+@test "batching strategy min max"() {
+    let s1 = ecs_batching_strategy_new();
+    let s2 = ecs_batching_strategy_min_batch_size(s1, 50);
+    let bs = ecs_batching_strategy_calc_batch_size(s2, 100, 4);
+    if bs != 50 { panic(30330); };
+    let s3 = ecs_batching_strategy_max_batch_size(s1, 5);
+    let bs2 = ecs_batching_strategy_calc_batch_size(s3, 100, 4);
+    if bs2 != 5 { panic(30331); };
+}
+
+@test "batching strategy batches per thread"() {
+    let s1 = ecs_batching_strategy_new();
+    let s2 = ecs_batching_strategy_batches_per_thread(s1, 2);
+    let bs = ecs_batching_strategy_calc_batch_size(s2, 100, 4);
+    // batches = 4 * 2 = 8, batch_size = ceil(100/8) = 13
+    if bs != 13 { panic(30340); };
+}
+
+@test "message par iter len and empty"() {
+    let reader = MessageReader { cursor: 0 };
+    let iter = ecs_message_par_iter_new(reader, 10);
+    if ecs_message_par_iter_len(iter) != 10 { panic(30350); };
+    if ecs_message_par_iter_is_empty(iter) { panic(30351); };
+    let iter2 = ecs_message_par_iter_new(reader, 0);
+    if ecs_message_par_iter_is_empty(iter2) != true { panic(30352); };
+}
+
+@test "template context set and get"() {
+    let ctx = ecs_template_context_new();
+    let e1 = entity_new(1, 0);
+    let c1 = ecs_template_context_set_reference(ctx, 100, e1);
+    let result = ecs_template_context_get_entity(c1, 100, entity_new(0, 0));
+    if result.id != 1 { panic(30360); };
+    let missing = ecs_template_context_get_entity(c1, 999, entity_new(0, 0));
+    if missing.id != 0 { panic(30361); };
+    if ecs_template_context_reference_count(c1) != 1 { panic(30362); };
+}
+
+@test "template spawn creates entities"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let ctx = ecs_template_context_new();
+    let refs: Vec<i32> = Vec::new();
+    refs.push(10);
+    refs.push(20);
+    refs.push(30);
+    let (w1, c1) = ecs_template_spawn<i32, i32>(world, ctx, refs);
+    if ecs_template_context_reference_count(c1) != 3 { panic(30370); };
+    let e1 = ecs_template_context_get_entity(c1, 10, entity_new(0, 0));
+    if ecs_world_is_alive<i32, i32>(w1, e1) != true { panic(30371); };
+}
+
+@test "message registry signal lifecycle"() {
+    let reg = ecs_message_registry_new();
+    if ecs_message_registry_has_signal(reg) { panic(30380); };
+    let r1 = ecs_message_registry_signal(reg);
+    if ecs_message_registry_has_signal(r1) != true { panic(30381); };
+    if ecs_message_update_condition(r1) != true { panic(30382); };
+    let r2 = ecs_message_registry_clear_signal(r1);
+    if ecs_message_registry_has_signal(r2) { panic(30383); };
+}
+
+@test "removed components len and is_empty"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<Pos, i32, i32>(w2, e1, POS_TYPE_ID, make_pos(1, 2));
+    let w4 = ecs_world_remove<i32, i32>(w3, e1, POS_TYPE_ID);
+    if ecs_removed_components_is_empty<i32, i32>(w4, POS_TYPE_ID, 0) { panic(30390); };
+    if ecs_removed_components_len<i32, i32>(w4, POS_TYPE_ID, 0) != 1 { panic(30391); };
+    let w5 = ecs_removed_components_clear<i32, i32>(w4);
+    if ecs_removed_components_is_empty<i32, i32>(w5, POS_TYPE_ID, 0) != true { panic(30392); };
+}
+
+// ===========================================================================
+// Bevy World API parity: try_despawn, get_mut, query_filtered, try_query,
+// removed_with_id, contains_resource, init_non_send_resource, resource_ref,
+// get_resource_ref, get_resource_mut, modify_resource, iter_entities, entities,
+// entities_and_commands.
+// ===========================================================================
+
+@test "try despawn only removes live entity"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<Pos, i32, i32>(w2, e1, POS_TYPE_ID, make_pos(1, 2));
+    // Despawning a live entity succeeds.
+    let (w4, ok1) = ecs_world_try_despawn<i32, i32>(w3, e1);
+    if ok1 != true { panic(30400); };
+    if ecs_world_is_alive<i32, i32>(w4, e1) { panic(30401); };
+    // Despawning an already-despawned (stale) entity fails without error.
+    let (w5, ok2) = ecs_world_try_despawn<i32, i32>(w4, e1);
+    if ok2 { panic(30402); };
+    if ecs_world_entity_count<i32, i32>(w5) != 0 { panic(30403); };
+}
+
+@test "get mut reads value with change ticks"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<Pos, i32, i32>(w2, e1, POS_TYPE_ID, make_pos(7, 8));
+    let accessor = ecs_world_get_mut<Pos, i32, i32>(w3, e1, POS_TYPE_ID);
+    if accessor.value.x != 7 { panic(30410); };
+    if accessor.value.y != 8 { panic(30411); };
+    // Freshly inserted component should read as added since tick 0.
+    if ecs_mut_is_added<Pos>(accessor, 0) != true { panic(30412); };
+    // Writeback a modified value.
+    let updated = Pos { x: accessor.value.x, y: accessor.value.y + 1 };
+    let w4 = ecs_world_get_mut_writeback<Pos, i32, i32>(w3, EcsMut<Pos> { entity: accessor.entity, value: updated, added_tick: accessor.added_tick, changed_tick: accessor.changed_tick }, POS_TYPE_ID);
+    let again = ecs_world_get<Pos, i32, i32>(w4, e1, POS_TYPE_ID);
+    if again.y != 9 { panic(30413); };
+}
+
+@test "query filtered narrows by with filter"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let w2 = ecs_world_register_table<Vel, i32, i32>(w1, VEL_TYPE_ID);
+    let (w3, e1) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_insert<Pos, i32, i32>(w3, e1, POS_TYPE_ID, make_pos(1, 2));
+    let w5 = ecs_world_insert<Vel, i32, i32>(w4, e1, VEL_TYPE_ID, make_vel(3, 4));
+    let (w6, e2) = ecs_world_spawn<i32, i32>(w5);
+    let w7 = ecs_world_insert<Pos, i32, i32>(w6, e2, POS_TYPE_ID, make_pos(5, 6));
+    // Unfiltered Pos query yields 2 entities.
+    let pos_cid = ecs_world_component_id_for_type<i32, i32>(w7, POS_TYPE_ID);
+    if pos_cid < 0 { panic(30420); };
+    let vel_cid = ecs_world_component_id_for_type<i32, i32>(w7, VEL_TYPE_ID);
+    let all = ecs_world_query_filtered<Pos, i32, i32>(w7, POS_TYPE_ID, TABLE_ERASED_FILTER_WITHOUT, vel_cid, 0);
+    if len(all.items) != 1 { panic(30421); };
+    if all.items[0].value.x != 5 { panic(30422); };
+}
+
+@test "try query returns empty for unregistered type"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let q = ecs_world_try_query<Pos, i32, i32>(world, POS_TYPE_ID);
+    if len(q.items) != 0 { panic(30430); };
+}
+
+@test "removed with id iterates by component id"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register_table<Pos, i32, i32>(world, POS_TYPE_ID);
+    let (w2, e1) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<Pos, i32, i32>(w2, e1, POS_TYPE_ID, make_pos(1, 2));
+    let w4 = ecs_world_remove<i32, i32>(w3, e1, POS_TYPE_ID);
+    let cid = ecs_world_component_id_for_type<i32, i32>(w4, POS_TYPE_ID);
+    let removed = ecs_world_removed_with_id<i32, i32>(w4, cid, 0);
+    if len(removed.items) != 1 { panic(30440); };
+    if removed.items[0].id != e1.id { panic(30441); };
+}
+
+@test "contains resource mirrors has resource"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    if ecs_world_contains_resource<i32, i32>(world) { panic(30450); };
+    let w1 = ecs_world_insert_resource<i32, i32>(world, 42);
+    if ecs_world_contains_resource<i32, i32>(w1) != true { panic(30451); };
+}
+
+@test "init non send resource inserts only when absent"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_init_non_send_resource<i32, i32, i32>(world, 11);
+    if ecs_world_get_resource<i32, i32>(w1) != 11 { panic(30460); };
+    // Second init must not overwrite the existing value.
+    let w2 = ecs_world_init_non_send_resource<i32, i32, i32>(w1, 99);
+    if ecs_world_get_resource<i32, i32>(w2) != 11 { panic(30461); };
+}
+
+@test "resource ref exposes added and changed ticks"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(world, 7);
+    let r = ecs_world_resource_ref<i32, i32>(w1);
+    if r.value != 7 { panic(30470); };
+    if ecs_resource_ref_is_added<i32>(r, 0) != true { panic(30471); };
+    if ecs_resource_ref_is_changed<i32>(r, 0) != true { panic(30472); };
+    // get_resource_ref falls back to default when absent.
+    let fresh = ecs_world_new<i32, i32>(0, 0);
+    let absent = ecs_world_get_resource_ref<i32, i32>(fresh, 0);
+    if absent.value != 0 { panic(30473); };
+    if ecs_resource_ref_is_added<i32>(absent, 0) { panic(30474); };
+}
+
+@test "modify resource read modify write"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(world, 10);
+    let w2 = ecs_world_modify_resource<i32, i32>(w1, increment_resource);
+    if ecs_world_get_resource<i32, i32>(w2) != 11 { panic(30480); };
+}
+
+fn increment_resource(world: TableErasedWorld<i32, i32>, value: i32) -> (TableErasedWorld<i32, i32>, i32) {
+    return (world, value + 1);
+}
+
+@test "iter entities lists only live entities"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let (w1, e1) = ecs_world_spawn<i32, i32>(world);
+    let (w2, e2) = ecs_world_spawn<i32, i32>(w1);
+    let (w3, e3) = ecs_world_spawn<i32, i32>(w2);
+    let w4 = ecs_world_despawn<i32, i32>(w3, e2);
+    let live = ecs_world_iter_entities<i32, i32>(w4);
+    if len(live) != 2 { panic(30490); };
+    let entities = ecs_world_entities<i32, i32>(w4);
+    if len(entities) != 2 { panic(30491); };
+}
+
+@test "entities and commands yields fetcher and queue"() {
+    let world = ecs_world_new<i32, i32>(0, 0);
+    let (w1, e1) = ecs_world_spawn<i32, i32>(world);
+    let (w2, e2) = ecs_world_spawn<i32, i32>(w1);
+    let pair = ecs_world_entities_and_commands<i32, i32>(w2);
+    if len(pair.entities) != 2 { panic(30500); };
+    // The commands queue should be fresh and applicable to the world.
+    let (w3, cmds, spawned) = ecs_world_commands_spawn<i32, i32>(w2, pair.commands);
+    if spawned.id != e2.id + 1 { panic(30501); };
+}

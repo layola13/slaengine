@@ -1,0 +1,217 @@
+@import "../src/resource_deep.sla"
+
+// Batch 196: Resource / IsResource / ResourceEntities deep.
+
+@test "is_resource_marker"() {
+    let m = ecs_rd_is_resource_new(7);
+    if ecs_rd_is_resource_id(m) != 7 { panic(105000); };
+}
+
+@test "insert_resource_registers_cache"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 1, 42);
+    w = r.0;
+    if r.1 < 0 { panic(105010); };
+    if ecs_rd_cache_len(w) != 1 { panic(105011); };
+    let g = ecs_rd_get_resource(w, 1);
+    if g.0 != true { panic(105012); };
+    if g.2 != 42 { panic(105013); };
+    if g.1 != r.1 { panic(105014); };
+}
+
+@test "insert_resource_overwrites_same"() {
+    let w = ecs_rd_world_new();
+    let r1 = ecs_rd_insert_resource(w, 2, 1);
+    w = r1.0;
+    let r2 = ecs_rd_insert_resource(w, 2, 99);
+    w = r2.0;
+    if r1.1 != r2.1 { panic(105020); };
+    let g = ecs_rd_get_resource(w, 2);
+    if g.2 != 99 { panic(105021); };
+    if ecs_rd_cache_len(w) != 1 { panic(105022); };
+}
+
+@test "duplicate_spawn_strips_new_entity"() {
+    let w = ecs_rd_world_new();
+    let r1 = ecs_rd_insert_resource(w, 3, 10);
+    w = r1.0;
+    let first = r1.1;
+    let r2 = ecs_rd_spawn_resource_entity(w, 3, 20);
+    w = r2.0;
+    let second = r2.1;
+    if second == first { panic(105030); };
+    if ecs_rd_last_warn(w) != ECS_RD_WARN_DUPLICATE_INSERT { panic(105031); };
+    if ecs_rd_warn_count(w) != 1 { panic(105032); };
+    // second stripped
+    if ecs_rd_has_value(w, second) != false { panic(105033); };
+    if ecs_rd_has_is_resource(w, second) != false { panic(105034); };
+    // canonical remains
+    let g = ecs_rd_get_resource(w, 3);
+    if g.0 != true { panic(105035); };
+    if g.1 != first { panic(105036); };
+    if g.2 != 10 { panic(105037); };
+    if ecs_rd_command_remove_count(w) >= 1 { };
+    if ecs_rd_command_remove_count(w) < 1 { panic(105038); };
+}
+
+@test "remove_is_resource_invalidates"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 4, 5);
+    w = r.0;
+    let ent = r.1;
+    w = ecs_rd_remove_is_resource(w, ent);
+    if ecs_rd_contains_resource(w, 4) != false { panic(105040); };
+    if ecs_rd_has_value(w, ent) != false { panic(105041); };
+    if ecs_rd_cache_len(w) != 0 { panic(105042); };
+}
+
+@test "reinit_after_invalidate_new_entity"() {
+    let w = ecs_rd_world_new();
+    let r1 = ecs_rd_insert_resource(w, 5, 1);
+    w = r1.0;
+    let first = r1.1;
+    w = ecs_rd_remove_is_resource(w, first);
+    let r2 = ecs_rd_init_resource(w, 5, 7);
+    w = r2.0;
+    if r2.1 == first { panic(105050); };
+    let g = ecs_rd_get_resource(w, 5);
+    if g.0 != true { panic(105051); };
+    if g.2 != 7 { panic(105052); };
+}
+
+@test "init_resource_idempotent"() {
+    let w = ecs_rd_world_new();
+    let r1 = ecs_rd_init_resource(w, 6, 11);
+    w = r1.0;
+    let r2 = ecs_rd_init_resource(w, 6, 22);
+    w = r2.0;
+    if r1.1 != r2.1 { panic(105060); };
+    let g = ecs_rd_get_resource(w, 6);
+    if g.2 != 11 { panic(105061); };
+}
+
+@test "remove_resource_api"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 7, 3);
+    w = r.0;
+    let rr = ecs_rd_remove_resource(w, 7);
+    w = rr.0;
+    if rr.1 != true { panic(105070); };
+    if ecs_rd_contains_resource(w, 7) != false { panic(105071); };
+    let rr2 = ecs_rd_remove_resource(w, 7);
+    if rr2.1 != false { panic(105072); };
+}
+
+@test "despawn_resource_entity_warns"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 1, 1);
+    w = r.0;
+    w = ecs_rd_on_despawn_is_resource(w, r.1);
+    if ecs_rd_despawn_warn_count(w) != 1 { panic(105080); };
+    if ecs_rd_last_warn(w) != ECS_RD_WARN_DESPAWN { panic(105081); };
+    if ecs_rd_entity_occupied(w, r.1) != false { panic(105082); };
+}
+
+@test "despawned_canonical_then_insert_errors"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 2, 1);
+    w = r.0;
+    // second entity attempts to become the resource while cache still points at
+    // a despawned canonical entity (cache not cleaned) — Bevy panics here.
+    let sp = ecs_rd_spawn_entity(w);
+    w = sp.0;
+    w = ecs_rd_set_occupied(w, r.1, false);
+    w = ecs_rd_set_value(w, sp.1, true, 9);
+    w = ecs_rd_set_is_resource(w, sp.1, true, 2);
+    w = ecs_rd_on_insert_is_resource(w, sp.1, 2);
+    if ecs_rd_last_error(w) != ECS_RD_ERR_DESPAWNED_CANONICAL { panic(105090); };
+}
+
+@test "cache_iter"() {
+    let w = ecs_rd_world_new();
+    let a = ecs_rd_insert_resource(w, 1, 1); w = a.0;
+    let b = ecs_rd_insert_resource(w, 2, 2); w = b.0;
+    if ecs_rd_cache_len(w) != 2 { panic(105100); };
+    let i0 = ecs_rd_cache_iter_at(w, 0);
+    let i1 = ecs_rd_cache_iter_at(w, 1);
+    if i0.0 != true { panic(105101); };
+    if i1.0 != true { panic(105102); };
+    let i2 = ecs_rd_cache_iter_at(w, 2);
+    if i2.0 != false { panic(105103); };
+}
+
+@test "count_entities_with_resource_value"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 3, 1); w = r.0;
+    if ecs_rd_count_entities_with_resource_value(w, 3) != 1 { panic(105110); };
+    // conflicting spawn stripped -> still 1
+    let s = ecs_rd_spawn_resource_entity(w, 3, 2); w = s.0;
+    if ecs_rd_count_entities_with_resource_value(w, 3) != 1 { panic(105111); };
+}
+
+@test "multiple_resource_types"() {
+    let w = ecs_rd_world_new();
+    let a = ecs_rd_insert_resource(w, 10, 100); w = a.0;
+    let b = ecs_rd_insert_resource(w, 11, 200); w = b.0;
+    let ga = ecs_rd_get_resource(w, 10);
+    let gb = ecs_rd_get_resource(w, 11);
+    if ga.2 != 100 { panic(105120); };
+    if gb.2 != 200 { panic(105121); };
+    if ga.1 == gb.1 { panic(105122); };
+}
+
+@test "resource_trait_marker"() {
+    if ecs_rd_resource_trait_marker() != 1 { panic(105130); };
+}
+
+@test "lifecycle_insert_remove_init"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 8, 1); w = r.0;
+    if ecs_rd_contains_resource(w, 8) != true { panic(105140); };
+    let rr = ecs_rd_remove_resource(w, 8); w = rr.0;
+    if ecs_rd_contains_resource(w, 8) != false { panic(105141); };
+    let i = ecs_rd_init_resource(w, 8, 5); w = i.0;
+    let g = ecs_rd_get_resource(w, 8);
+    if g.0 != true { panic(105142); };
+    if g.2 != 5 { panic(105143); };
+}
+
+@test "get_missing_resource"() {
+    let w = ecs_rd_world_new();
+    let g = ecs_rd_get_resource(w, 99);
+    if g.0 != false { panic(105150); };
+}
+
+@test "remove_is_resource_missing"() {
+    let w = ecs_rd_world_new();
+    let sp = ecs_rd_spawn_entity(w); w = sp.0;
+    w = ecs_rd_remove_is_resource(w, sp.1);
+    if ecs_rd_last_error(w) != ECS_RD_ERR_NOT_FOUND { panic(105160); };
+}
+
+@test "cache_remove_swap"() {
+    let w = ecs_rd_world_new();
+    let a = ecs_rd_insert_resource(w, 1, 1); w = a.0;
+    let b = ecs_rd_insert_resource(w, 2, 2); w = b.0;
+    let c = ecs_rd_insert_resource(w, 3, 3); w = c.0;
+    w = ecs_rd_cache_remove(w, 1);
+    if ecs_rd_cache_len(w) != 2 { panic(105170); };
+    if ecs_rd_contains_resource(w, 1) != false { panic(105171); };
+    // note: cache_remove alone doesn't strip entity components; used by discard path
+}
+
+@test "insert_same_entity_reinsert_ok"() {
+    let w = ecs_rd_world_new();
+    let r = ecs_rd_insert_resource(w, 4, 1); w = r.0;
+    // on_insert again for same entity
+    w = ecs_rd_on_insert_is_resource(w, r.1, 4);
+    if ecs_rd_last_error(w) != ECS_RD_OK { panic(105180); };
+    if ecs_rd_warn_count(w) != 0 { panic(105181); };
+}
+
+@test "world_new_defaults"() {
+    let w = ecs_rd_world_new();
+    if ecs_rd_cache_len(w) != 0 { panic(105190); };
+    if ecs_rd_warn_count(w) != 0 { panic(105191); };
+    if ecs_rd_last_error(w) != ECS_RD_OK { panic(105192); };
+}

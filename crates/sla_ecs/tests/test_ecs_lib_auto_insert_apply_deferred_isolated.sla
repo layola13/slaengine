@@ -1,0 +1,236 @@
+@import "../src/auto_insert_apply_deferred.sla"
+
+// Isolated tests for lib/auto_insert_apply_deferred.sla — AutoInsertApplyDeferredPass + IgnoreDeferred
+// + get_sync_point cache + compute_distances algorithm. Bevy: src/schedule/auto_insert_apply_deferred.rs.
+// panic codes: 92285 – 92330.
+
+@test "pass_new_starts_empty"() {
+    let p = ecs_auto_insert_pass_new();
+    if ecs_auto_insert_no_sync_edge_count(p) != 0 { panic(92285); };
+    if ecs_auto_insert_sync_point_count(p) != 0 { panic(92286); };
+}
+
+@test "add_dependency_ignore_adds_no_sync_edge"() {
+    let p0 = ecs_auto_insert_pass_new();
+    let p1 = ecs_auto_insert_add_dependency(p0, 10, 11, true);
+    if ecs_auto_insert_no_sync_edge_count(p1) != 1 { panic(92287); };
+    if !ecs_auto_insert_is_no_sync(p1, 10, 11) { panic(92288); };
+    if ecs_auto_insert_is_no_sync(p1, 10, 12) { panic(92289); };
+}
+
+@test "add_dependency_without_ignore_adds_nothing"() {
+    let p0 = ecs_auto_insert_pass_new();
+    let p1 = ecs_auto_insert_add_dependency(p0, 1, 2, false);
+    if ecs_auto_insert_no_sync_edge_count(p1) != 0 { panic(92290); };
+    if ecs_auto_insert_is_no_sync(p1, 1, 2) { panic(92291); };
+}
+
+@test "get_sync_point_miss_mints_new_key"() {
+    let p0 = ecs_auto_insert_pass_new();
+    let r = ecs_auto_insert_get_sync_point(p0, 0);
+    if ecs_spr_hit(r) { panic(92292); };
+    if ecs_spr_key(r) != 1 { panic(92293); };
+    let p1 = ecs_spr_pass(r);
+    if ecs_auto_insert_sync_point_count(p1) != 1 { panic(92294); };
+}
+
+@test "get_sync_point_hit_returns_cached_key"() {
+    let p0 = ecs_auto_insert_pass_new();
+    let r0 = ecs_auto_insert_get_sync_point(p0, 5);
+    let p1 = ecs_spr_pass(r0);
+    let key0 = ecs_spr_key(r0);
+    let r1 = ecs_auto_insert_get_sync_point(p1, 5);
+    if !ecs_spr_hit(r1) { panic(92295); };
+    if ecs_spr_key(r1) != key0 { panic(92296); };
+    let p2 = ecs_spr_pass(r1);
+    if ecs_auto_insert_sync_point_count(p2) != 1 { panic(92297); };
+}
+
+@test "get_sync_point_mints_distinct_keys_per_distance"() {
+    let p0 = ecs_auto_insert_pass_new();
+    let r0 = ecs_auto_insert_get_sync_point(p0, 0);
+    let p1 = ecs_spr_pass(r0);
+    let r1 = ecs_auto_insert_get_sync_point(p1, 1);
+    let p2 = ecs_spr_pass(r1);
+    if ecs_auto_insert_sync_point_count(p2) != 2 { panic(92298); };
+    if ecs_spr_key(r0) == ecs_spr_key(r1) { panic(92299); };
+}
+
+@test "compute_distances_no_edges_all_zero"() {
+    let p = ecs_auto_insert_pass_new();
+    let topo = Vec::new();
+    topo.push(0);
+    topo.push(1);
+    topo.push(2);
+    let has_def = Vec::new();
+    has_def.push(false);
+    has_def.push(false);
+    has_def.push(false);
+    let excl = Vec::new();
+    excl.push(false);
+    excl.push(false);
+    excl.push(false);
+    let appl = Vec::new();
+    appl.push(false);
+    appl.push(false);
+    appl.push(false);
+    let ef = Vec::new();
+    let et = Vec::new();
+    let out = ecs_auto_insert_compute_distances(p, topo, has_def, excl, appl, ef, et);
+    if len(out) as i32 != 3 { panic(92300); };
+    let e0 = out[0];
+    if ecs_aid_de_key(e0) != 0 { panic(92301); };
+    if ecs_aid_de_distance(e0) != 0 { panic(92302); };
+}
+
+@test "compute_distances_deferred_source_raises_target_distance"() {
+    let p = ecs_auto_insert_pass_new();
+    let topo = Vec::new();
+    topo.push(0);
+    topo.push(1);
+    let has_def = Vec::new();
+    has_def.push(true);
+    has_def.push(false);
+    let excl = Vec::new();
+    excl.push(false);
+    excl.push(false);
+    let appl = Vec::new();
+    appl.push(false);
+    appl.push(false);
+    let ef = Vec::new();
+    ef.push(0);
+    let et = Vec::new();
+    et.push(1);
+    let out = ecs_auto_insert_compute_distances(p, topo, has_def, excl, appl, ef, et);
+    if ecs_aid_de_distance(out[0]) != 0 { panic(92303); };
+    if ecs_aid_de_distance(out[1]) != 1 { panic(92304); };
+}
+
+@test "compute_distances_ignored_edge_deferred_no_weight"() {
+    // from=0 has_deferred; edge (0,1) ignored + target not exclusive -> weight 0.
+    let p0 = ecs_auto_insert_pass_new();
+    let p1 = ecs_auto_insert_add_dependency(p0, 0, 1, true);
+    let topo = Vec::new();
+    topo.push(0);
+    topo.push(1);
+    let has_def = Vec::new();
+    has_def.push(true);
+    has_def.push(false);
+    let excl = Vec::new();
+    excl.push(false);
+    excl.push(false);
+    let appl = Vec::new();
+    appl.push(false);
+    appl.push(false);
+    let ef = Vec::new();
+    ef.push(0);
+    let et = Vec::new();
+    et.push(1);
+    let out = ecs_auto_insert_compute_distances(p1, topo, has_def, excl, appl, ef, et);
+    if ecs_aid_de_distance(out[1]) != 0 { panic(92305); };
+}
+
+@test "compute_distances_ignored_edge_exclusive_target_still_weights"() {
+    // from=0 deferred; edge (0,1) ignored + target EXCLUSIVE -> Bevy keeps the apply_deferred on
+    // exclusive targets (Commands apply deferred before exclusive systems) -> weight 1.
+    let p0 = ecs_auto_insert_pass_new();
+    let p1 = ecs_auto_insert_add_dependency(p0, 0, 1, true);
+    let topo = Vec::new();
+    topo.push(0);
+    topo.push(1);
+    let has_def = Vec::new();
+    has_def.push(true);
+    has_def.push(false);
+    let excl = Vec::new();
+    excl.push(false);
+    excl.push(true);
+    let appl = Vec::new();
+    appl.push(false);
+    appl.push(false);
+    let ef = Vec::new();
+    ef.push(0);
+    let et = Vec::new();
+    et.push(1);
+    let out = ecs_auto_insert_compute_distances(p1, topo, has_def, excl, appl, ef, et);
+    if ecs_aid_de_distance(out[1]) != 1 { panic(92306); };
+}
+
+@test "compute distances_target_apply_deferred_raises_distance"() {
+    let p = ecs_auto_insert_pass_new();
+    let topo = Vec::new();
+    topo.push(0);
+    topo.push(1);
+    topo.push(2);
+    let has_def = Vec::new();
+    has_def.push(false);
+    has_def.push(false);
+    has_def.push(false);
+    let excl = Vec::new();
+    excl.push(false);
+    excl.push(false);
+    excl.push(false);
+    let appl = Vec::new();
+    appl.push(false);
+    appl.push(true);
+    appl.push(false);
+    let ef = Vec::new();
+    ef.push(0);
+    ef.push(1);
+    let et = Vec::new();
+    et.push(1);
+    et.push(2);
+    let out = ecs_auto_insert_compute_distances(p, topo, has_def, excl, appl, ef, et);
+    if ecs_aid_de_distance(out[0]) != 0 { panic(92307); };
+    if ecs_aid_de_distance(out[1]) != 1 { panic(92308); };
+    if ecs_aid_de_distance(out[2]) != 1 { panic(92309); };
+}
+
+@test "is_apply_deferred_by_id_lookup"() {
+    let flags = Vec::new();
+    flags.push(false);
+    flags.push(true);
+    flags.push(false);
+    if ecs_auto_insert_is_apply_deferred_by_id(flags, 0) { panic(92310); };
+    if !ecs_auto_insert_is_apply_deferred_by_id(flags, 1) { panic(92311); };
+    if ecs_auto_insert_is_apply_deferred_by_id(flags, 2) { panic(92312); };
+    if ecs_auto_insert_is_apply_deferred_by_id(flags, 99) { panic(92313); };
+    if ecs_auto_insert_is_apply_deferred_by_id(flags, (0 - 1)) { panic(92314); };
+}
+
+@test "compute_distances_chain_propagates"() {
+    // 0(deferred) -> 1 -> 2(deferred) -> 3; expect distances 0,1,1,2.
+    let p = ecs_auto_insert_pass_new();
+    let topo = Vec::new();
+    topo.push(0);
+    topo.push(1);
+    topo.push(2);
+    topo.push(3);
+    let has_def = Vec::new();
+    has_def.push(true);
+    has_def.push(false);
+    has_def.push(true);
+    has_def.push(false);
+    let excl = Vec::new();
+    excl.push(false);
+    excl.push(false);
+    excl.push(false);
+    excl.push(false);
+    let appl = Vec::new();
+    appl.push(false);
+    appl.push(false);
+    appl.push(false);
+    appl.push(false);
+    let ef = Vec::new();
+    ef.push(0);
+    ef.push(1);
+    ef.push(2);
+    let et = Vec::new();
+    et.push(1);
+    et.push(2);
+    et.push(3);
+    let out = ecs_auto_insert_compute_distances(p, topo, has_def, excl, appl, ef, et);
+    if ecs_aid_de_distance(out[0]) != 0 { panic(92315); };
+    if ecs_aid_de_distance(out[1]) != 1 { panic(92316); };
+    if ecs_aid_de_distance(out[2]) != 1 { panic(92317); };
+    if ecs_aid_de_distance(out[3]) != 2 { panic(92318); };
+}

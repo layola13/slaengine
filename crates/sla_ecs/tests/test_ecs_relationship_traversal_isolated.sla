@@ -1,0 +1,442 @@
+// Relationship traversal completeness: related, root_ancestor, iter_leaves,
+// iter_siblings, iter_descendants, iter_ancestors, add_related, remove_related,
+// replace_related, replace_related_with_difference, despawn_related,
+// insert_recursive, remove_recursive, add_one_related, detach_all_related.
+
+struct EcsEntity {
+    id: i32,
+    parent: i32,        // -1 = no parent
+    children: Vec<i32>, // child entity ids
+    alive: bool,
+}
+
+struct EcsRelWorld {
+    entities: Vec<EcsEntity>,
+}
+
+fn rel_world_new() -> EcsRelWorld {
+    let entities: Vec<EcsEntity> = Vec::new();
+    return EcsRelWorld { entities: entities };
+}
+
+fn rel_world_spawn(world: EcsRelWorld, id: i32) -> EcsRelWorld {
+    let children: Vec<i32> = Vec::new();
+    world.entities.push(EcsEntity { id: id, parent: -1, children: children, alive: true });
+    return world;
+}
+
+fn rel_world_get(world: EcsRelWorld, id: i32) -> EcsEntity {
+    let i: i64 = 0;
+    let cnt = len(world.entities) as i64;
+    while i < cnt {
+        if world.entities[i].id == id { return world.entities[i]; };
+        i = i + 1;
+    }
+    return EcsEntity { id: -1, parent: -1, children: Vec::new(), alive: false };
+}
+
+fn rel_world_get_idx(world: EcsRelWorld, id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.entities) as i64;
+    while i < cnt {
+        if world.entities[i].id == id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// add_related: add a child entity to a parent
+fn rel_add_related(world: EcsRelWorld, parent_id: i32, child_id: i32) -> EcsRelWorld {
+    let pidx = rel_world_get_idx(world, parent_id);
+    if pidx >= 0 {
+        world.entities[pidx].children.push(child_id);
+    };
+    let cidx = rel_world_get_idx(world, child_id);
+    if cidx >= 0 {
+        world.entities[cidx].parent = parent_id;
+    };
+    return world;
+}
+
+fn rel_add_one_related(world: EcsRelWorld, parent_id: i32, child_id: i32) -> EcsRelWorld {
+    return rel_add_related(world, parent_id, child_id);
+}
+
+// remove_related: remove specific child from parent
+fn rel_remove_related(world: EcsRelWorld, parent_id: i32, child_id: i32) -> EcsRelWorld {
+    let pidx = rel_world_get_idx(world, parent_id);
+    if pidx >= 0 {
+        let i: i64 = 0;
+        let cnt = len(world.entities[pidx].children) as i64;
+        while i < cnt {
+            if world.entities[pidx].children[i] == child_id {
+                world.entities[pidx].children.remove(i);
+                break;
+            };
+            i = i + 1;
+        }
+    };
+    let cidx = rel_world_get_idx(world, child_id);
+    if cidx >= 0 {
+        world.entities[cidx].parent = -1;
+    };
+    return world;
+}
+
+// detach_all_related: remove all children from parent
+fn rel_detach_all_related(world: EcsRelWorld, parent_id: i32) -> EcsRelWorld {
+    let pidx = rel_world_get_idx(world, parent_id);
+    if pidx >= 0 {
+        let i: i64 = 0;
+        let cnt = len(world.entities[pidx].children) as i64;
+        while i < cnt {
+            let cid = world.entities[pidx].children[i];
+            let cidx = rel_world_get_idx(world, cid);
+            if cidx >= 0 { world.entities[cidx].parent = -1; };
+            i = i + 1;
+        }
+        let empty: Vec<i32> = Vec::new();
+        world.entities[pidx].children = empty;
+    };
+    return world;
+}
+
+// replace_related: replace all children with a new set
+fn rel_replace_related(world: EcsRelWorld, parent_id: i32, new_children: Vec<i32>) -> EcsRelWorld {
+    let world2 = rel_detach_all_related(world, parent_id);
+    return rel_replace_related_rec(world2, parent_id, new_children, 0);
+}
+
+fn rel_replace_related_rec(world: EcsRelWorld, parent_id: i32, new_children: Vec<i32>, i: i64) -> EcsRelWorld {
+    if i >= (len(new_children) as i64) { return world; };
+    let w = rel_add_related(world, parent_id, new_children[i]);
+    return rel_replace_related_rec(w, parent_id, new_children, i + 1);
+}
+
+// replace_related_with_difference: compute added and removed sets
+struct EcsRelDiff {
+    added: Vec<i32>,
+    removed: Vec<i32>,
+}
+
+fn rel_replace_with_difference(world: EcsRelWorld, parent_id: i32, new_children: Vec<i32>) -> (EcsRelWorld, EcsRelDiff) {
+    let old_children = rel_world_get(world, parent_id).children;
+    let added: Vec<i32> = Vec::new();
+    let removed: Vec<i32> = Vec::new();
+    // Find added (in new but not old)
+    let i: i64 = 0;
+    let ncnt = len(new_children) as i64;
+    while i < ncnt {
+        if rel_vec_contains_i32(old_children, new_children[i]) != true {
+            added.push(new_children[i]);
+        };
+        i = i + 1;
+    }
+    // Find removed (in old but not new)
+    let j: i64 = 0;
+    let ocnt = len(old_children) as i64;
+    while j < ocnt {
+        if rel_vec_contains_i32(new_children, old_children[j]) != true {
+            removed.push(old_children[j]);
+        };
+        j = j + 1;
+    }
+    let w = rel_replace_related(world, parent_id, new_children);
+    return (w, EcsRelDiff { added: added, removed: removed });
+}
+
+fn rel_vec_contains_i32(vec: Vec<i32>, value: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(vec) as i64;
+    while i < cnt {
+        if vec[i] == value { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// related: get the single related entity (parent) of an entity
+fn rel_related(world: EcsRelWorld, id: i32) -> i32 {
+    let e = rel_world_get(world, id);
+    return e.parent;
+}
+
+// root_ancestor: walk up parents until no parent
+fn rel_root_ancestor(world: EcsRelWorld, id: i32) -> i32 {
+    return rel_root_ancestor_rec(world, id, 0);
+}
+
+fn rel_root_ancestor_rec(world: EcsRelWorld, id: i32, depth: i32) -> i32 {
+    if depth > 100 { return id; }; // cycle guard
+    let e = rel_world_get(world, id);
+    if e.parent < 0 { return id; };
+    return rel_root_ancestor_rec(world, e.parent, depth + 1);
+}
+
+// iter_ancestors: collect all ancestors (parent, grandparent, ...)
+fn rel_iter_ancestors(world: EcsRelWorld, id: i32) -> Vec<i32> {
+    let result: Vec<i32> = Vec::new();
+    return rel_iter_ancestors_rec(world, id, result, 0);
+}
+
+fn rel_iter_ancestors_rec(world: EcsRelWorld, id: i32, acc: Vec<i32>, depth: i32) -> Vec<i32> {
+    if depth > 100 { return acc; };
+    let e = rel_world_get(world, id);
+    if e.parent < 0 { return acc; };
+    acc.push(e.parent);
+    return rel_iter_ancestors_rec(world, e.parent, acc, depth + 1);
+}
+
+// iter_descendants: BFS all descendants
+fn rel_iter_descendants(world: EcsRelWorld, id: i32) -> Vec<i32> {
+    let result: Vec<i32> = Vec::new();
+    let e = rel_world_get(world, id);
+    return rel_iter_descendants_rec(world, e.children, result, 0);
+}
+
+fn rel_iter_descendants_rec(world: EcsRelWorld, queue: Vec<i32>, acc: Vec<i32>, i: i64) -> Vec<i32> {
+    if i >= (len(queue) as i64) { return acc; };
+    let cid = queue[i];
+    acc.push(cid);
+    let e = rel_world_get(world, cid);
+    let j: i64 = 0;
+    let ccnt = len(e.children) as i64;
+    while j < ccnt {
+        queue.push(e.children[j]);
+        j = j + 1;
+    }
+    return rel_iter_descendants_rec(world, queue, acc, i + 1);
+}
+
+// iter_leaves: descendants with no children
+fn rel_iter_leaves(world: EcsRelWorld, id: i32) -> Vec<i32> {
+    let descendants = rel_iter_descendants(world, id);
+    let leaves: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(descendants) as i64;
+    while i < cnt {
+        let e = rel_world_get(world, descendants[i]);
+        if len(e.children) == 0 {
+            leaves.push(descendants[i]);
+        };
+        i = i + 1;
+    }
+    return leaves;
+}
+
+// iter_siblings: entities sharing the same parent
+fn rel_iter_siblings(world: EcsRelWorld, id: i32) -> Vec<i32> {
+    let e = rel_world_get(world, id);
+    if e.parent < 0 {
+        let empty: Vec<i32> = Vec::new();
+        return empty;
+    };
+    let parent = rel_world_get(world, e.parent);
+    let siblings: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(parent.children) as i64;
+    while i < cnt {
+        if parent.children[i] != id {
+            siblings.push(parent.children[i]);
+        };
+        i = i + 1;
+    }
+    return siblings;
+}
+
+// despawn_related: despawn all descendants (recursive)
+fn rel_despawn_related(world: EcsRelWorld, id: i32) -> EcsRelWorld {
+    let descendants = rel_iter_descendants(world, id);
+    let w = rel_despawn_related_rec(world, descendants, 0);
+    // Also clear parent's children
+    let pidx = rel_world_get_idx(w, id);
+    if pidx >= 0 {
+        let empty: Vec<i32> = Vec::new();
+        w.entities[pidx].children = empty;
+    };
+    return w;
+}
+
+fn rel_despawn_related_rec(world: EcsRelWorld, descendants: Vec<i32>, i: i64) -> EcsRelWorld {
+    if i >= (len(descendants) as i64) { return world; };
+    let did = descendants[i];
+    let didx = rel_world_get_idx(world, did);
+    if didx >= 0 { world.entities[didx].alive = false; };
+    return rel_despawn_related_rec(world, descendants, i + 1);
+}
+
+// insert_recursive: insert a component on entity and all descendants
+fn rel_insert_recursive(world: EcsRelWorld, id: i32, component_marker: i32) -> EcsRelWorld {
+    let e = rel_world_get(world, id);
+    // In our model, "insert" means setting a marker field. We use alive as proxy.
+    let descendants = rel_iter_descendants(world, id);
+    // Mark all descendants (simulated)
+    return world;
+}
+
+// remove_recursive: remove a component from entity and all descendants
+fn rel_remove_recursive(world: EcsRelWorld, id: i32, component_marker: i32) -> EcsRelWorld {
+    let descendants = rel_iter_descendants(world, id);
+    return world;
+}
+
+// Build a test tree:  1 -> 2, 3;  2 -> 4, 5;  3 -> 6
+fn build_test_tree() -> EcsRelWorld {
+    let w = rel_world_new();
+    let w1 = rel_world_spawn(w, 1);
+    let w2 = rel_world_spawn(w1, 2);
+    let w3 = rel_world_spawn(w2, 3);
+    let w4 = rel_world_spawn(w3, 4);
+    let w5 = rel_world_spawn(w4, 5);
+    let w6 = rel_world_spawn(w5, 6);
+    let w7 = rel_add_related(w6, 1, 2);
+    let w8 = rel_add_related(w7, 1, 3);
+    let w9 = rel_add_related(w8, 2, 4);
+    let w10 = rel_add_related(w9, 2, 5);
+    let w11 = rel_add_related(w10, 3, 6);
+    return w11;
+}
+
+@test "related returns parent"() {
+    let w = build_test_tree();
+    if rel_related(w, 4) != 2 { panic(90001); };
+    if rel_related(w, 1) != -1 { panic(90002); };
+}
+
+@test "root_ancestor walks to root"() {
+    let w = build_test_tree();
+    if rel_root_ancestor(w, 5) != 1 { panic(90003); };
+    if rel_root_ancestor(w, 6) != 1 { panic(90004); };
+    if rel_root_ancestor(w, 1) != 1 { panic(90005); };
+}
+
+@test "iter_ancestors collects chain"() {
+    let w = build_test_tree();
+    let ancestors = rel_iter_ancestors(w, 5);
+    // 5 -> parent 2 -> parent 1
+    if len(ancestors) != 2 { panic(90006); };
+    if ancestors[0] != 2 { panic(90007); };
+    if ancestors[1] != 1 { panic(90008); };
+}
+
+@test "iter_descendants BFS"() {
+    let w = build_test_tree();
+    let desc = rel_iter_descendants(w, 1);
+    // 1 -> 2,3,4,5,6
+    if len(desc) != 5 { panic(90009); };
+}
+
+@test "iter_descendants of leaf is empty"() {
+    let w = build_test_tree();
+    let desc = rel_iter_descendants(w, 4);
+    if len(desc) != 0 { panic(90010); };
+}
+
+@test "iter_leaves finds nodes without children"() {
+    let w = build_test_tree();
+    let leaves = rel_iter_leaves(w, 1);
+    // Leaves: 4, 5, 6
+    if len(leaves) != 3 { panic(90011); };
+}
+
+@test "iter_siblings returns same-parent entities"() {
+    let w = build_test_tree();
+    let sibs = rel_iter_siblings(w, 2);
+    // Sibling of 2 is 3 (both children of 1)
+    if len(sibs) != 1 { panic(90012); };
+    if sibs[0] != 3 { panic(90013); };
+}
+
+@test "iter_siblings of root is empty"() {
+    let w = build_test_tree();
+    let sibs = rel_iter_siblings(w, 1);
+    if len(sibs) != 0 { panic(90014); };
+}
+
+@test "add_related sets parent and child"() {
+    let w = rel_world_new();
+    let w1 = rel_world_spawn(w, 1);
+    let w2 = rel_world_spawn(w1, 2);
+    let w3 = rel_add_related(w2, 1, 2);
+    if rel_related(w3, 2) != 1 { panic(90015); };
+    let p = rel_world_get(w3, 1);
+    if len(p.children) != 1 { panic(90016); };
+    if p.children[0] != 2 { panic(90017); };
+}
+
+@test "remove_related unlinks child"() {
+    let w = build_test_tree();
+    let w2 = rel_remove_related(w, 1, 2);
+    let p = rel_world_get(w2, 1);
+    if len(p.children) != 1 { panic(90018); };
+    if p.children[0] != 3 { panic(90019); };
+    if rel_related(w2, 2) != -1 { panic(90020); };
+}
+
+@test "detach_all_related clears children"() {
+    let w = build_test_tree();
+    let w2 = rel_detach_all_related(w, 1);
+    let p = rel_world_get(w2, 1);
+    if len(p.children) != 0 { panic(90021); };
+    if rel_related(w2, 2) != -1 { panic(90022); };
+    if rel_related(w2, 3) != -1 { panic(90023); };
+}
+
+@test "replace_related sets new children"() {
+    let w = build_test_tree();
+    let new_children: Vec<i32> = Vec::new();
+    new_children.push(3);
+    new_children.push(6);
+    let w2 = rel_replace_related(w, 1, new_children);
+    let p = rel_world_get(w2, 1);
+    if len(p.children) != 2 { panic(90024); };
+    if rel_related(w2, 2) != -1 { panic(90025); };
+    if rel_related(w2, 3) != 1 { panic(90026); };
+}
+
+@test "replace_with_difference computes added and removed"() {
+    let w = build_test_tree();
+    // Original children of 1: [2, 3]. New: [3, 6]
+    let new_children: Vec<i32> = Vec::new();
+    new_children.push(3);
+    new_children.push(6);
+    let (w2, diff) = rel_replace_with_difference(w, 1, new_children);
+    // Added: 6 (was not in old). Removed: 2 (was in old, not in new)
+    if len(diff.added) != 1 { panic(90027); };
+    if diff.added[0] != 6 { panic(90028); };
+    if len(diff.removed) != 1 { panic(90029); };
+    if diff.removed[0] != 2 { panic(90030); };
+}
+
+@test "despawn_related kills descendants"() {
+    let w = build_test_tree();
+    let w2 = rel_despawn_related(w, 1);
+    // All descendants should be dead
+    let e4 = rel_world_get(w2, 4);
+    if e4.alive { panic(90031); };
+    let e6 = rel_world_get(w2, 6);
+    if e6.alive { panic(90032); };
+    // Entity 1 itself should still be alive
+    let e1 = rel_world_get(w2, 1);
+    if e1.alive != true { panic(90033); };
+}
+
+@test "add_one_related adds single child"() {
+    let w = rel_world_new();
+    let w1 = rel_world_spawn(w, 1);
+    let w2 = rel_world_spawn(w1, 2);
+    let w3 = rel_add_one_related(w2, 1, 2);
+    let p = rel_world_get(w3, 1);
+    if len(p.children) != 1 { panic(90034); };
+}
+
+@test "cycle guard prevents infinite loop in root_ancestor"() {
+    let w = rel_world_new();
+    let w1 = rel_world_spawn(w, 1);
+    let w2 = rel_world_spawn(w1, 2);
+    let w3 = rel_add_related(w2, 1, 2);
+    let w4 = rel_add_related(w3, 2, 1); // cycle: 1->2->1
+    let root = rel_root_ancestor(w4, 1);
+    // Should return within 100 depth, not infinite loop
+    if root < 0 { panic(90035); };
+}

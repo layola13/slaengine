@@ -1,0 +1,519 @@
+// Storage internals: ThinArrayPtr, BlobArray, Table, Column, TableRow, TableId +
+// FilteredResources + FilteredResourcesMut + FilteredResourcesBuilder.
+// Bevy storage/thin_array_ptr.rs + blob_array.rs + table/mod.rs + world/filtered_resource.rs.
+
+// --- ThinArrayPtr (type-erased array with capacity) ---
+struct EcsThinArrayPtr {
+    capacity: i64,
+    len: i64,
+    data: Vec<i32>,  // simplified: stores i32 values
+}
+
+fn thin_array_new() -> EcsThinArrayPtr {
+    return EcsThinArrayPtr { capacity: 0, len: 0, data: Vec::new() };
+}
+
+fn thin_array_with_capacity(cap: i64) -> EcsThinArrayPtr {
+    return EcsThinArrayPtr { capacity: cap, len: 0, data: Vec::new() };
+}
+
+fn thin_array_alloc(ta: EcsThinArrayPtr, cap: i64) -> EcsThinArrayPtr {
+    ta.capacity = cap;
+    return ta;
+}
+
+fn thin_array_push(ta: EcsThinArrayPtr, value: i32) -> EcsThinArrayPtr {
+    ta.data.push(value);
+    ta.len = ta.len + 1;
+    return ta;
+}
+
+fn thin_array_get(ta: EcsThinArrayPtr, index: i64) -> i32 {
+    if index < 0 || index >= ta.len { return 0; };
+    return ta.data[index];
+}
+
+fn thin_array_len(ta: EcsThinArrayPtr) -> i64 { return ta.len; }
+fn thin_array_capacity(ta: EcsThinArrayPtr) -> i64 { return ta.capacity; }
+fn thin_array_is_empty(ta: EcsThinArrayPtr) -> bool { return ta.len == 0; }
+
+// --- BlobArray (type-erased byte storage with drop fn) ---
+struct EcsBlobArray {
+    element_size: i64,
+    capacity: i64,
+    len: i64,
+    is_zst: bool,
+    has_drop: bool,
+}
+
+fn blob_array_new(element_size: i64) -> EcsBlobArray {
+    return EcsBlobArray {
+        element_size: element_size, capacity: 0, len: 0,
+        is_zst: element_size == 0, has_drop: false,
+    };
+}
+
+fn blob_array_with_capacity(element_size: i64, cap: i64) -> EcsBlobArray {
+    return EcsBlobArray {
+        element_size: element_size, capacity: cap, len: 0,
+        is_zst: element_size == 0, has_drop: false,
+    };
+}
+
+fn blob_array_is_zst(ba: EcsBlobArray) -> bool { return ba.is_zst; }
+fn blob_array_element_size(ba: EcsBlobArray) -> i64 { return ba.element_size; }
+fn blob_array_capacity(ba: EcsBlobArray) -> i64 { return ba.capacity; }
+fn blob_array_len(ba: EcsBlobArray) -> i64 { return ba.len; }
+fn blob_array_has_drop(ba: EcsBlobArray) -> bool { return ba.has_drop; }
+
+fn blob_array_set_drop(ba: EcsBlobArray) -> EcsBlobArray { ba.has_drop = true; return ba; }
+fn blob_array_push(ba: EcsBlobArray) -> EcsBlobArray { ba.len = ba.len + 1; return ba; }
+
+// --- Table (columnar storage) ---
+struct EcsTableId {
+    id: i32,
+}
+
+fn table_id_new(id: i32) -> EcsTableId { return EcsTableId { id: id }; }
+fn table_id_index(tid: EcsTableId) -> i32 { return tid.id; }
+
+struct EcsTableRow {
+    row: i32,
+}
+
+fn table_row_new(row: i32) -> EcsTableRow { return EcsTableRow { row: row }; }
+fn table_row_index(tr: EcsTableRow) -> i32 { return tr.row; }
+
+struct EcsColumn {
+    component_id: i32,
+    data: Vec<i32>,
+    added_ticks: Vec<i32>,
+    changed_ticks: Vec<i32>,
+}
+
+fn column_new(component_id: i32) -> EcsColumn {
+    return EcsColumn {
+        component_id: component_id, data: Vec::new(),
+        added_ticks: Vec::new(), changed_ticks: Vec::new(),
+    };
+}
+
+fn column_len(c: EcsColumn) -> i64 { return len(c.data) as i64; }
+fn column_component_id(c: EcsColumn) -> i32 { return c.component_id; }
+
+fn column_push(c: EcsColumn, value: i32, tick: i32) -> EcsColumn {
+    c.data.push(value);
+    c.added_ticks.push(tick);
+    c.changed_ticks.push(tick);
+    return c;
+}
+
+fn column_get(c: EcsColumn, row: i32) -> i32 {
+    if row < 0 || row >= (len(c.data) as i32) { return 0; };
+    return c.data[row];
+}
+
+fn column_get_added_tick(c: EcsColumn, row: i32) -> i32 {
+    if row < 0 || row >= (len(c.added_ticks) as i32) { return 0; };
+    return c.added_ticks[row];
+}
+
+fn column_get_changed_tick(c: EcsColumn, row: i32) -> i32 {
+    if row < 0 || row >= (len(c.changed_ticks) as i32) { return 0; };
+    return c.changed_ticks[row];
+}
+
+fn column_set_changed_tick(c: EcsColumn, row: i32, tick: i32) -> EcsColumn {
+    if row >= 0 && row < (len(c.changed_ticks) as i32) {
+        c.changed_ticks[row] = tick;
+    };
+    return c;
+}
+
+struct EcsTable {
+    id: i32,
+    columns: Vec<EcsColumn>,
+    entity_count: i32,
+    capacity: i32,
+}
+
+fn table_new(id: i32, capacity: i32) -> EcsTable {
+    return EcsTable { id: id, columns: Vec::new(), entity_count: 0, capacity: capacity };
+}
+
+fn table_add_column(t: EcsTable, component_id: i32) -> EcsTable {
+    t.columns.push(column_new(component_id));
+    return t;
+}
+
+fn table_has_column(t: EcsTable, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(t.columns) as i64;
+    while i < cnt {
+        if t.columns[i].component_id == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn table_get_column(t: EcsTable, component_id: i32) -> EcsColumn {
+    let i: i64 = 0;
+    let cnt = len(t.columns) as i64;
+    while i < cnt {
+        if t.columns[i].component_id == component_id { return t.columns[i]; };
+        i = i + 1;
+    }
+    return column_new(-1);
+}
+
+fn table_column_count(t: EcsTable) -> i64 { return len(t.columns) as i64; }
+fn table_entity_count(t: EcsTable) -> i32 { return t.entity_count; }
+fn table_capacity(t: EcsTable) -> i32 { return t.capacity; }
+fn table_is_empty(t: EcsTable) -> bool { return t.entity_count == 0; }
+
+fn table_add_row(t: EcsTable, tick: i32) -> EcsTable {
+    let i: i64 = 0;
+    let cnt = len(t.columns) as i64;
+    while i < cnt {
+        t.columns[i] = column_push(t.columns[i], 0, tick);
+        i = i + 1;
+    }
+    t.entity_count = t.entity_count + 1;
+    return t;
+}
+
+// --- Tables registry ---
+struct EcsTables {
+    tables: Vec<EcsTable>,
+}
+
+fn tables_new() -> EcsTables {
+    return EcsTables { tables: Vec::new() };
+}
+
+fn tables_len(t: EcsTables) -> i64 { return len(t.tables) as i64; }
+
+fn tables_get(t: EcsTables, id: i32) -> EcsTable {
+    let i: i64 = 0;
+    let cnt = len(t.tables) as i64;
+    while i < cnt {
+        if t.tables[i].id == id { return t.tables[i]; };
+        i = i + 1;
+    }
+    return table_new(-1, 0);
+}
+
+fn tables_add(t: EcsTables, table: EcsTable) -> EcsTables {
+    t.tables.push(table);
+    return t;
+}
+
+// --- FilteredResources (read-only filtered resource access) ---
+struct EcsFilteredResources {
+    has_read_access: Vec<i32>,  // resource type_ids with read access
+    resource_values: Vec<i32>,  // parallel resource values
+    resource_type_ids: Vec<i32>,  // all resource type_ids
+}
+
+fn filtered_resources_new() -> EcsFilteredResources {
+    return EcsFilteredResources {
+        has_read_access: Vec::new(), resource_values: Vec::new(), resource_type_ids: Vec::new(),
+    };
+}
+
+fn filtered_resources_add_read(fr: EcsFilteredResources, type_id: i32) -> EcsFilteredResources {
+    fr.has_read_access.push(type_id);
+    return fr;
+}
+
+fn filtered_resources_has_read(fr: EcsFilteredResources, type_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(fr.has_read_access) as i64;
+    while i < cnt {
+        if fr.has_read_access[i] == type_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn filtered_resources_get(fr: EcsFilteredResources, type_id: i32, default: i32) -> (i32, bool) {
+    if filtered_resources_has_read(fr, type_id) != true { return (default, false); };
+    let i: i64 = 0;
+    let cnt = len(fr.resource_type_ids) as i64;
+    while i < cnt {
+        if fr.resource_type_ids[i] == type_id { return (fr.resource_values[i], true); };
+        i = i + 1;
+    }
+    return (default, false);
+}
+
+fn filtered_resources_set_resource(fr: EcsFilteredResources, type_id: i32, value: i32) -> EcsFilteredResources {
+    let i: i64 = 0;
+    let cnt = len(fr.resource_type_ids) as i64;
+    while i < cnt {
+        if fr.resource_type_ids[i] == type_id {
+            fr.resource_values[i] = value;
+            return fr;
+        };
+        i = i + 1;
+    }
+    fr.resource_type_ids.push(type_id);
+    fr.resource_values.push(value);
+    return fr;
+}
+
+// --- FilteredResourcesMut (read-write filtered resource access) ---
+struct EcsFilteredResourcesMut {
+    inner: EcsFilteredResources,
+    has_write_access: Vec<i32>,
+}
+
+fn filtered_resources_mut_new() -> EcsFilteredResourcesMut {
+    return EcsFilteredResourcesMut {
+        inner: filtered_resources_new(), has_write_access: Vec::new(),
+    };
+}
+
+fn filtered_resources_mut_add_read(fr: EcsFilteredResourcesMut, type_id: i32) -> EcsFilteredResourcesMut {
+    fr.inner = filtered_resources_add_read(fr.inner, type_id);
+    return fr;
+}
+
+fn filtered_resources_mut_add_write(fr: EcsFilteredResourcesMut, type_id: i32) -> EcsFilteredResourcesMut {
+    fr.inner = filtered_resources_add_read(fr.inner, type_id);
+    fr.has_write_access.push(type_id);
+    return fr;
+}
+
+fn filtered_resources_mut_has_read(fr: EcsFilteredResourcesMut, type_id: i32) -> bool {
+    return filtered_resources_has_read(fr.inner, type_id);
+}
+
+fn filtered_resources_mut_has_write(fr: EcsFilteredResourcesMut, type_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(fr.has_write_access) as i64;
+    while i < cnt {
+        if fr.has_write_access[i] == type_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn filtered_resources_mut_get(fr: EcsFilteredResourcesMut, type_id: i32, default: i32) -> (i32, bool) {
+    return filtered_resources_get(fr.inner, type_id, default);
+}
+
+fn filtered_resources_mut_get_mut(fr: EcsFilteredResourcesMut, type_id: i32, default: i32) -> (EcsFilteredResourcesMut, i32, bool) {
+    if filtered_resources_mut_has_write(fr, type_id) != true { return (fr, default, false); };
+    let (val, ok) = filtered_resources_get(fr.inner, type_id, default);
+    return (fr, val, ok);
+}
+
+fn filtered_resources_mut_as_readonly(fr: EcsFilteredResourcesMut) -> EcsFilteredResources { return fr.inner; }
+
+// --- FilteredResourcesBuilder ---
+struct EcsFilteredResourcesBuilder {
+    read_access: Vec<i32>,
+    write_access: Vec<i32>,
+}
+
+fn filtered_resources_builder_new() -> EcsFilteredResourcesBuilder {
+    return EcsFilteredResourcesBuilder { read_access: Vec::new(), write_access: Vec::new() };
+}
+
+fn builder_add_read(b: EcsFilteredResourcesBuilder, type_id: i32) -> EcsFilteredResourcesBuilder {
+    b.read_access.push(type_id);
+    return b;
+}
+
+fn builder_add_write(b: EcsFilteredResourcesBuilder, type_id: i32) -> EcsFilteredResourcesBuilder {
+    b.write_access.push(type_id);
+    b.read_access.push(type_id);
+    return b;
+}
+
+fn builder_read_count(b: EcsFilteredResourcesBuilder) -> i64 { return len(b.read_access) as i64; }
+fn builder_write_count(b: EcsFilteredResourcesBuilder) -> i64 { return len(b.write_access) as i64; }
+
+const COMP_A: i32 = 19001;
+const COMP_B: i32 = 19002;
+
+@test "thin_array with_capacity"() {
+    let ta = thin_array_with_capacity(10);
+    if thin_array_capacity(ta) != 10 { panic(19001); };
+    if thin_array_is_empty(ta) != true { panic(19002); };
+}
+
+@test "thin_array push and get"() {
+    let ta = thin_array_new();
+    let ta2 = thin_array_push(ta, 42);
+    if thin_array_len(ta2) != 1 { panic(19003); };
+    if thin_array_get(ta2, 0) != 42 { panic(19004); };
+}
+
+@test "thin_array alloc sets capacity"() {
+    let ta = thin_array_new();
+    let ta2 = thin_array_alloc(ta, 100);
+    if thin_array_capacity(ta2) != 100 { panic(19005); };
+}
+
+@test "blob_array is_zst for zero size"() {
+    let ba = blob_array_new(0);
+    if blob_array_is_zst(ba) != true { panic(19006); };
+}
+
+@test "blob_array not zst for nonzero"() {
+    let ba = blob_array_new(4);
+    if blob_array_is_zst(ba) { panic(19007); };
+}
+
+@test "blob_array element_size"() {
+    let ba = blob_array_new(8);
+    if blob_array_element_size(ba) != 8 { panic(19008); };
+}
+
+@test "blob_array with_capacity"() {
+    let ba = blob_array_with_capacity(4, 16);
+    if blob_array_capacity(ba) != 16 { panic(19009); };
+}
+
+@test "blob_array set_drop"() {
+    let ba = blob_array_new(4);
+    let ba2 = blob_array_set_drop(ba);
+    if blob_array_has_drop(ba2) != true { panic(19010); };
+}
+
+@test "table_id and table_row"() {
+    let tid = table_id_new(5);
+    let tr = table_row_new(3);
+    if table_id_index(tid) != 5 { panic(19011); };
+    if table_row_index(tr) != 3 { panic(19012); };
+}
+
+@test "table add_column"() {
+    let t = table_new(0, 100);
+    let t2 = table_add_column(t, COMP_A);
+    if table_column_count(t2) != 1 { panic(19013); };
+    if table_has_column(t2, COMP_A) != true { panic(19014); };
+}
+
+@test "table has_column false for absent"() {
+    let t = table_new(0, 100);
+    if table_has_column(t, COMP_A) { panic(19015); };
+}
+
+@test "table get_column returns column"() {
+    let t = table_new(0, 100);
+    let t2 = table_add_column(t, COMP_A);
+    let col = table_get_column(t2, COMP_A);
+    if column_component_id(col) != COMP_A { panic(19016); };
+}
+
+@test "table add_row increments entity_count"() {
+    let t = table_new(0, 100);
+    let t2 = table_add_column(t, COMP_A);
+    let t3 = table_add_row(t2, 1);
+    if table_entity_count(t3) != 1 { panic(19017); };
+    if table_is_empty(t3) { panic(19018); };
+}
+
+@test "table add_row adds to columns"() {
+    let t = table_new(0, 100);
+    let t2 = table_add_column(t, COMP_A);
+    let t3 = table_add_row(t2, 5);
+    let col = table_get_column(t3, COMP_A);
+    if column_len(col) != 1 { panic(19019); };
+    if column_get_added_tick(col, 0) != 5 { panic(19020); };
+}
+
+@test "column push and get"() {
+    let c = column_new(COMP_A);
+    let c2 = column_push(c, 42, 7);
+    if column_get(c2, 0) != 42 { panic(19021); };
+    if column_get_added_tick(c2, 0) != 7 { panic(19022); };
+    if column_get_changed_tick(c2, 0) != 7 { panic(19023); };
+}
+
+@test "column set_changed_tick"() {
+    let c = column_new(COMP_A);
+    let c2 = column_push(c, 42, 7);
+    let c3 = column_set_changed_tick(c2, 0, 10);
+    if column_get_changed_tick(c3, 0) != 10 { panic(19024); };
+    if column_get_added_tick(c3, 0) != 7 { panic(19025); };
+}
+
+@test "table capacity"() {
+    let t = table_new(0, 256);
+    if table_capacity(t) != 256 { panic(19026); };
+}
+
+@test "tables registry add and get"() {
+    let tables = tables_new();
+    let t = table_new(5, 100);
+    let tables2 = tables_add(tables, t);
+    if tables_len(tables2) != 1 { panic(19027); };
+    let retrieved = tables_get(tables2, 5);
+    if retrieved.id != 5 { panic(19028); };
+}
+
+@test "filtered_resources add_read and has_read"() {
+    let fr = filtered_resources_new();
+    let fr2 = filtered_resources_add_read(fr, COMP_A);
+    if filtered_resources_has_read(fr2, COMP_A) != true { panic(19029); };
+    if filtered_resources_has_read(fr2, COMP_B) { panic(19030); };
+}
+
+@test "filtered_resources get returns value"() {
+    let fr = filtered_resources_new();
+    let fr2 = filtered_resources_add_read(fr, COMP_A);
+    let fr3 = filtered_resources_set_resource(fr2, COMP_A, 42);
+    let (val, ok) = filtered_resources_get(fr3, COMP_A, 0);
+    if ok != true { panic(19031); };
+    if val != 42 { panic(19032); };
+}
+
+@test "filtered_resources get fails without access"() {
+    let fr = filtered_resources_new();
+    let fr2 = filtered_resources_set_resource(fr, COMP_A, 42);
+    let (_, ok) = filtered_resources_get(fr2, COMP_A, 0);
+    if ok { panic(19033); };
+}
+
+@test "filtered_resources_mut add_write"() {
+    let fr = filtered_resources_mut_new();
+    let fr2 = filtered_resources_mut_add_write(fr, COMP_A);
+    if filtered_resources_mut_has_write(fr2, COMP_A) != true { panic(19034); };
+    if filtered_resources_mut_has_read(fr2, COMP_A) != true { panic(19035); };
+}
+
+@test "filtered_resources_mut get_mut requires write"() {
+    let fr = filtered_resources_mut_new();
+    let fr2 = filtered_resources_mut_add_write(fr, COMP_A);
+    let fr3 = fr2.inner;
+    let fr4 = EcsFilteredResourcesMut { inner: filtered_resources_set_resource(fr3, COMP_A, 42), has_write_access: fr2.has_write_access };
+    let (_, val, ok) = filtered_resources_mut_get_mut(fr4, COMP_A, 0);
+    if ok != true { panic(19036); };
+    if val != 42 { panic(19037); };
+}
+
+@test "filtered_resources_mut get_mut fails without write"() {
+    let fr = filtered_resources_mut_new();
+    let fr2 = filtered_resources_mut_add_read(fr, COMP_A);
+    let (_fr_nw, _val_nw, ok) = filtered_resources_mut_get_mut(fr2, COMP_A, 0);
+    if ok { panic(19038); };
+}
+
+@test "filtered_resources_mut as_readonly"() {
+    let fr = filtered_resources_mut_new();
+    let fr2 = filtered_resources_mut_add_read(fr, COMP_A);
+    let readonly = filtered_resources_mut_as_readonly(fr2);
+    if filtered_resources_has_read(readonly, COMP_A) != true { panic(19039); };
+}
+
+@test "filtered_resources_builder add_read and add_write"() {
+    let b = filtered_resources_builder_new();
+    let b2 = builder_add_read(b, COMP_A);
+    let b3 = builder_add_write(b2, COMP_B);
+    if builder_read_count(b3) != 2 { panic(19040); };
+    if builder_write_count(b3) != 1 { panic(19041); };
+}

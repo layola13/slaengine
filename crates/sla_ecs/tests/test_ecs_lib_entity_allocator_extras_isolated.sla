@@ -1,0 +1,176 @@
+@import "../src/entity_allocator_extras.sla"
+
+// Isolated tests for lib/entity_allocator_extras.sla — EntityAllocator pub-surface
+// (alloc / free / free_many / alloc_many / build_remote_allocator / has_remote_allocator / restart).
+// Bevy: src/entity/mod.rs 706-810.
+
+@test "alloc_new_starts_at_first_entity"() {
+    let a = ecs_entity_allocator_new();
+    if ecs_entity_allocator_next_entity_id(a) != 1 { panic(92068); };
+    if ecs_entity_allocator_allocated_count(a) != 0 { panic(92069); };
+    if ecs_entity_allocator_pending_free_count(a) != 0 { panic(92070); };
+}
+
+@test "alloc_returns_fresh_entity_then_increments"() {
+    let a0 = ecs_entity_allocator_new();
+    let (a1, e1) = ecs_entity_allocator_alloc(a0);
+    if e1 != 1 { panic(92071); };
+    if ecs_entity_allocator_next_entity_id(a1) != 2 { panic(92072); };
+    let (a2, e2) = ecs_entity_allocator_alloc(a1);
+    if e2 != 2 { panic(92073); };
+    if ecs_entity_allocator_next_entity_id(a2) != 3 { panic(92074); };
+    if ecs_entity_allocator_allocated_count(a2) != 2 { panic(92075); };
+}
+
+@test "free_then_alloc_recycles_freed_id"() {
+    let a0 = ecs_entity_allocator_new();
+    let (a1, _) = ecs_entity_allocator_alloc(a0);
+    // entity 1 was allocated; free it and recycle.
+    let a2 = ecs_entity_allocator_free(a1, 1);
+    if ecs_entity_allocator_pending_free_count(a2) != 1 { panic(92076); };
+    let (a3, e) = ecs_entity_allocator_alloc(a2);
+    if e != 1 { panic(92077); };
+    if ecs_entity_allocator_pending_free_count(a3) != 0 { panic(92078); };
+}
+
+@test "free_many_pushes_all_entities"() {
+    let a0 = ecs_entity_allocator_new();
+    let freed = Vec::new();
+    freed.push(5);
+    freed.push(6);
+    freed.push(7);
+    let a1 = ecs_entity_allocator_free_many(a0, freed);
+    if ecs_entity_allocator_pending_free_count(a1) != 3 { panic(92079); };
+}
+
+@test "free_many_recycles_via_alloc_lifo"() {
+    let a0 = ecs_entity_allocator_new();
+    let freed = Vec::new();
+    freed.push(5);
+    freed.push(6);
+    freed.push(7);
+    let a1 = ecs_entity_allocator_free_many(a0, freed);
+    let (a2, e1) = ecs_entity_allocator_alloc(a1);
+    if e1 != 7 { panic(92080); };
+    let (a3, e2) = ecs_entity_allocator_alloc(a2);
+    if e2 != 6 { panic(92081); };
+    let (a4, e3) = ecs_entity_allocator_alloc(a3);
+    if e3 != 5 { panic(92082); };
+    let _ = a4;
+}
+
+@test "alloc_many_returns_count_and_first"() {
+    let a0 = ecs_entity_allocator_new();
+    let (a1, res) = ecs_entity_allocator_alloc_many(a0, 3);
+    if ecs_eam_count(res) != 3 { panic(92083); };
+    if ecs_eam_first(res) != 1 { panic(92084); };
+    let next = ecs_eam_next(res);
+    if next.has != 1 { panic(92108); };
+    if next.entity != 1 { panic(92109); };
+    if ecs_eam_count(next.iter) != 2 { panic(92110); };
+    if ecs_eam_size_hint(next.iter).lower != 2 { panic(92111); };
+    if ecs_entity_allocator_allocated_count(a1) != 3 { panic(92085); };
+}
+
+@test "alloc_many_zero_count_returns_empty"() {
+    let a0 = ecs_entity_allocator_new();
+    let (a1, res) = ecs_entity_allocator_alloc_many(a0, 0);
+    if ecs_eam_count(res) != 0 { panic(92086); };
+    if ecs_eam_first(res) != -1 { panic(92087); };
+    if ecs_eam_next(res).has != 0 { panic(92112); };
+    if ecs_entity_allocator_allocated_count(a1) != 0 { panic(92088); };
+}
+
+@test "alloc_many_negative_returns_empty"() {
+    let a0 = ecs_entity_allocator_new();
+    let (_, res) = ecs_entity_allocator_alloc_many(a0, 0 - 5);
+    if ecs_eam_count(res) != 0 { panic(92089); };
+}
+
+@test "alloc_many_exhausts_freed_then_fresh"() {
+    let a0 = ecs_entity_allocator_new();
+    let a1 = ecs_entity_allocator_free(a0, 42);
+    let (a2, res) = ecs_entity_allocator_alloc_many(a1, 3);
+    // first entity 42 (recycled), then fresh 1, 2
+    if ecs_eam_first(res) != 42 { panic(92090); };
+    if ecs_entity_allocator_next_entity_id(a2) != 3 { panic(92091); };
+}
+
+@test "build_remote_allocator_snapshot_matches_allocator"() {
+    let a0 = ecs_entity_allocator_new();
+    let a1 = ecs_entity_allocator_free(a0, 7);
+    let p = ecs_entity_allocator_build_remote_allocator(a1);
+    if ecs_rap_generation(p) != 1 { panic(92092); };
+    if ecs_rap_next(p) != 1 { panic(92093); };
+    if ecs_rap_freed_len(p) != 1 { panic(92094); };
+}
+
+@test "has_remote_allocator_true_after_build"() {
+    let a0 = ecs_entity_allocator_new();
+    let p = ecs_entity_allocator_build_remote_allocator(a0);
+    if !ecs_entity_allocator_has_remote_allocator(a0, p) { panic(92095); };
+}
+
+@test "has_remote_allocator_false_after_restart"() {
+    let a0 = ecs_entity_allocator_new();
+    let p = ecs_entity_allocator_build_remote_allocator(a0);
+    let a1 = ecs_entity_allocator_restart(a0);
+    if ecs_entity_allocator_has_remote_allocator(a1, p) { panic(92096); };
+}
+
+@test "restart_resets_entity_id_and_freed"() {
+    let a0 = ecs_entity_allocator_new();
+    let a1 = ecs_entity_allocator_free(a0, 10);
+    let (a2, _) = ecs_entity_allocator_alloc(a1);
+    let a3 = ecs_entity_allocator_restart(a2);
+    if ecs_entity_allocator_next_entity_id(a3) != 1 { panic(92097); };
+    if ecs_entity_allocator_pending_free_count(a3) != 0 { panic(92098); };
+    if ecs_entity_allocator_allocated_count(a3) != 0 { panic(92099); };
+}
+
+@test "restart_bumps_generation"() {
+    let a0 = ecs_entity_allocator_new();
+    let a1 = ecs_entity_allocator_restart(a0);
+    let p1 = ecs_entity_allocator_build_remote_allocator(a1);
+    if ecs_rap_generation(p1) != 2 { panic(92100); };
+}
+
+@test "remote_allocator_proxy_after_alloc_uses_snapshot"() {
+    // snapshot is taken BEFORE further mutations; subsequent alloc does not affect HAS check
+    let a0 = ecs_entity_allocator_new();
+    let p = ecs_entity_allocator_build_remote_allocator(a0);
+    let (a1, _) = ecs_entity_allocator_alloc(a0);
+    if !ecs_entity_allocator_has_remote_allocator(a1, p) { panic(92101); };
+    // The snapshot's NEXT entity stayed at 1, even though allocator advanced
+    if ecs_rap_next(p) != 1 { panic(92102); };
+}
+
+@test "free_recycle_after_restart_drops_old_freed"() {
+    let a0 = ecs_entity_allocator_new();
+    let a1 = ecs_entity_allocator_free(a0, 100);
+    let a2 = ecs_entity_allocator_restart(a1);
+    // after restart, no pending frees; next alloc returns 1
+    let (a3, e) = ecs_entity_allocator_alloc(a2);
+    if e != 1 { panic(92103); };
+    if ecs_entity_allocator_pending_free_count(a3) != 0 { panic(92104); };
+}
+
+@test "alloc_many_then_free_many_returns_some"() {
+    let a0 = ecs_entity_allocator_new();
+    let (a1, res) = ecs_entity_allocator_alloc_many(a0, 3);
+    if ecs_eam_count(res) != 3 { panic(92105); };
+    let freed = Vec::new();
+    freed.push(1);
+    freed.push(2);
+    freed.push(3);
+    let a2 = ecs_entity_allocator_free_many(a1, freed);
+    if ecs_entity_allocator_pending_free_count(a2) != 3 { panic(92106); };
+}
+
+@test "build_remote_snapshot_after_free_includes_freed_len"() {
+    let a0 = ecs_entity_allocator_new();
+    let a1 = ecs_entity_allocator_free(a0, 9);
+    let a2 = ecs_entity_allocator_free(a1, 11);
+    let p = ecs_entity_allocator_build_remote_allocator(a2);
+    if ecs_rap_freed_len(p) != 2 { panic(92107); };
+}

@@ -1,0 +1,281 @@
+// Isolated deep tests for lib/storage_internals_deep.sla (Batch 375).
+// Mirror shallow lib/storage_internals.sla BlobArray / ThinArrayPtr / Column on cap-16
+// parallel-array storage. No tuple-return callsites — swap_remove wrappers expose scalar accessors
+// (Batch 373 observation: let (a, b) = tuple_fn() retroactively corrupts prior assertions on SA).
+// panic codes: 141000 - 141199.
+
+@import "../src/storage_internals_deep.sla"
+
+@test "EcsBlobArrayDeep layout, push, get, len, drop semantics"() {
+    let b0 = ecs_blob_array_deep_new(8, 4, false);
+    if ecs_blob_array_deep_layout_size(b0) != 8 { panic(141000); };
+    if ecs_blob_array_deep_layout_align(b0) != 4 { panic(141001); };
+    if ecs_blob_array_deep_is_zst(b0) != false { panic(141002); };
+    if ecs_blob_array_deep_len(b0) != 0 { panic(141003); };
+    if ecs_blob_array_deep_get_drop(b0) != 1 { panic(141004); };
+    // ZST path: drop fn id 0.
+    let bz = ecs_blob_array_deep_new(0, 1, true);
+    if ecs_blob_array_deep_is_zst(bz) != true { panic(141005); };
+    if ecs_blob_array_deep_get_drop(bz) != 0 { panic(141006); };
+    // push 3 entries then verify retrievals.
+    let b1 = ecs_blob_array_deep_push(b0, 100);
+    let b2 = ecs_blob_array_deep_push(b1, 200);
+    let b3 = ecs_blob_array_deep_push(b2, 300);
+    if ecs_blob_array_deep_len(b3) != 3 { panic(141010); };
+    if ecs_blob_array_deep_get(b3, 0) != 100 { panic(141011); };
+    if ecs_blob_array_deep_get(b3, 1) != 200 { panic(141012); };
+    if ecs_blob_array_deep_get(b3, 2) != 300 { panic(141013); };
+    if ecs_blob_array_deep_get_mut(b3, 2) != 300 { panic(141014); };
+    // out-of-range index returns 0.
+    if ecs_blob_array_deep_get(b3, 3) != 0 { panic(141015); };
+}
+
+@test "EcsBlobArrayDeep cap-16 reject on push"() {
+    let b0 = ecs_blob_array_deep_new(8, 4, false);
+    // Builder chain fill 16 i64 values 1..16 — sequential names (no Redeclaration).
+    let b1 = ecs_blob_array_deep_push(b0, 1);
+    let b2 = ecs_blob_array_deep_push(b1, 2);
+    let b3 = ecs_blob_array_deep_push(b2, 3);
+    let b4 = ecs_blob_array_deep_push(b3, 4);
+    let b5 = ecs_blob_array_deep_push(b4, 5);
+    let b6 = ecs_blob_array_deep_push(b5, 6);
+    let b7 = ecs_blob_array_deep_push(b6, 7);
+    let b8 = ecs_blob_array_deep_push(b7, 8);
+    let b9 = ecs_blob_array_deep_push(b8, 9);
+    let b10 = ecs_blob_array_deep_push(b9, 10);
+    let b11 = ecs_blob_array_deep_push(b10, 11);
+    let b12 = ecs_blob_array_deep_push(b11, 12);
+    let b13 = ecs_blob_array_deep_push(b12, 13);
+    let b14 = ecs_blob_array_deep_push(b13, 14);
+    let b15 = ecs_blob_array_deep_push(b14, 15);
+    let b16 = ecs_blob_array_deep_push(b15, 16);
+    if ecs_blob_array_deep_len(b16) != 16 { panic(141020); };
+    if ecs_blob_array_deep_get(b16, 15) != 16 { panic(141021); };
+    // 17th push rejected (slice-NOT-grow) — len stays 16, slot 15 still holds 16.
+    let b17 = ecs_blob_array_deep_push(b16, 99);
+    if ecs_blob_array_deep_len(b17) != 16 { panic(141022); };
+    if ecs_blob_array_deep_get(b17, 15) != 16 { panic(141023); };
+}
+
+@test "EcsBlobArrayDeep swap_remove returns correct removed and shrinks tail"() {
+    let b0 = ecs_blob_array_deep_new(8, 4, false);
+    let b1 = ecs_blob_array_deep_push(b0, 10);
+    let b2 = ecs_blob_array_deep_push(b1, 20);
+    let b3 = ecs_blob_array_deep_push(b2, 30);
+    let b4 = ecs_blob_array_deep_push(b3, 40);
+    // swap_remove idx=1: removed=20, last (40) moved into idx=1, len=3, slot 3 zeroed.
+    let r0 = ecs_blob_array_deep_swap_remove(b4, 1);
+    if ecs_blob_swap_remove_removed(r0) != 20 { panic(141030); };
+    let b5 = ecs_blob_swap_remove_new_arr(r0);
+    if ecs_blob_array_deep_len(b5) != 3 { panic(141031); };
+    if ecs_blob_array_deep_get(b5, 0) != 10 { panic(141032); };
+    if ecs_blob_array_deep_get(b5, 1) != 40 { panic(141033); };
+    if ecs_blob_array_deep_get(b5, 2) != 30 { panic(141034); };
+    if ecs_blob_array_deep_get(b5, 3) != 0 { panic(141035); };
+    // swap_remove single-element last_idx=idx clears it and yields that value.
+    let b6 = ecs_blob_array_deep_push(ecs_blob_array_deep_new(8, 4, false), 555);
+    let r1 = ecs_blob_array_deep_swap_remove(b6, 0);
+    if ecs_blob_swap_remove_removed(r1) != 555 { panic(141036); };
+    let b7 = ecs_blob_swap_remove_new_arr(r1);
+    if ecs_blob_array_deep_len(b7) != 0 { panic(141037); };
+    if ecs_blob_array_deep_get(b7, 0) != 0 { panic(141038); };
+    // out-of-range idx: returns 0, no change.
+    let r2 = ecs_blob_array_deep_swap_remove(b7, 5);
+    if ecs_blob_swap_remove_removed(r2) != 0 { panic(141039); };
+    let b8 = ecs_blob_swap_remove_new_arr(r2);
+    if ecs_blob_array_deep_len(b8) != 0 { panic(141040); };
+}
+
+@test "EcsThinArrayPtrDeep capacity, push, get, len, clear"() {
+    let t0 = ecs_thin_array_ptr_deep_with_capacity(4);
+    if ecs_thin_array_ptr_deep_capacity(t0) != 4 { panic(141050); };
+    if ecs_thin_array_ptr_deep_len(t0) != 0 { panic(141051); };
+    if ecs_thin_array_ptr_deep_is_empty(t0) != true { panic(141052); };
+    // alloc increases capacity.
+    let t1 = ecs_thin_array_ptr_deep_alloc(t0, 32);
+    if ecs_thin_array_ptr_deep_capacity(t1) != 32 { panic(141053); };
+    // push 3 elements.
+    let t2 = ecs_thin_array_ptr_deep_push(t1, 11);
+    let t3 = ecs_thin_array_ptr_deep_push(t2, 22);
+    let t4 = ecs_thin_array_ptr_deep_push(t3, 33);
+    if ecs_thin_array_ptr_deep_len(t4) != 3 { panic(141054); };
+    if ecs_thin_array_ptr_deep_is_empty(t4) != false { panic(141055); };
+    if ecs_thin_array_ptr_deep_get(t4, 0) != 11 { panic(141056); };
+    if ecs_thin_array_ptr_deep_get(t4, 1) != 22 { panic(141057); };
+    if ecs_thin_array_ptr_deep_get(t4, 2) != 33 { panic(141058); };
+    if ecs_thin_array_ptr_deep_get_mut(t4, 2) != 33 { panic(141059); };
+    // cap-16 push reject (32 capacity but cap-16 slot buffer).
+    let t5 = ecs_thin_array_ptr_deep_with_capacity(64);
+    let t6 = ecs_thin_array_ptr_deep_push(t5, 1);
+    let t7 = ecs_thin_array_ptr_deep_push(t6, 2);
+    let t8 = ecs_thin_array_ptr_deep_push(t7, 3);
+    let t9 = ecs_thin_array_ptr_deep_push(t8, 4);
+    let t10 = ecs_thin_array_ptr_deep_push(t9, 5);
+    let t11 = ecs_thin_array_ptr_deep_push(t10, 6);
+    let t12 = ecs_thin_array_ptr_deep_push(t11, 7);
+    let t13 = ecs_thin_array_ptr_deep_push(t12, 8);
+    let t14 = ecs_thin_array_ptr_deep_push(t13, 9);
+    let t15 = ecs_thin_array_ptr_deep_push(t14, 10);
+    let t16 = ecs_thin_array_ptr_deep_push(t15, 11);
+    let t17 = ecs_thin_array_ptr_deep_push(t16, 12);
+    let t18 = ecs_thin_array_ptr_deep_push(t17, 13);
+    let t19 = ecs_thin_array_ptr_deep_push(t18, 14);
+    let t20 = ecs_thin_array_ptr_deep_push(t19, 15);
+    let t21 = ecs_thin_array_ptr_deep_push(t20, 16);
+    if ecs_thin_array_ptr_deep_len(t21) != 16 { panic(141060); };
+    let t22 = ecs_thin_array_ptr_deep_push(t21, 17);
+    if ecs_thin_array_ptr_deep_len(t22) != 16 { panic(141061); };
+}
+
+@test "EcsThinArrayPtrDeep clear resets len (data may stay stale)"() {
+    let t0 = ecs_thin_array_ptr_deep_with_capacity(8);
+    let t1 = ecs_thin_array_ptr_deep_push(t0, 100);
+    let t2 = ecs_thin_array_ptr_deep_push(t1, 200);
+    let t3 = ecs_thin_array_ptr_deep_push(t2, 300);
+    if ecs_thin_array_ptr_deep_len(t3) != 3 { panic(141070); };
+    let t4 = ecs_thin_array_ptr_deep_clear(t3);
+    if ecs_thin_array_ptr_deep_len(t4) != 0 { panic(141071); };
+    if ecs_thin_array_ptr_deep_is_empty(t4) != true { panic(141072); };
+    if ecs_thin_array_ptr_deep_capacity(t4) != 8 { panic(141073); };
+    // data slots stay stale (only len was reset by the shallow — mirror exactly).
+    if ecs_thin_array_ptr_deep_get(t4, 0) != 100 { panic(141074); };
+}
+
+@test "EcsColumnDeep component_id + capacity gets reported"() {
+    let c0 = ecs_column_deep_with_capacity(7, 8);
+    if ecs_column_deep_component_id(c0) != 7 { panic(141080); };
+    if ecs_column_deep_capacity(c0) != 8 { panic(141081); };
+    if ecs_column_deep_len(c0) != 0 { panic(141082); };
+    if ecs_column_deep_is_empty(c0) != true { panic(141083); };
+    if ecs_column_deep_get_drop(c0) != 1 { panic(141084); };
+}
+
+@test "EcsColumnDeep push, get, swap, cap-16 reject"() {
+    let c0 = ecs_column_deep_with_capacity(3, 16);
+    let c1 = ecs_column_deep_push(c0, 100);
+    let c2 = ecs_column_deep_push(c1, 200);
+    let c3 = ecs_column_deep_push(c2, 300);
+    if ecs_column_deep_len(c3) != 3 { panic(141090); };
+    if ecs_column_deep_get(c3, 0) != 100 { panic(141091); };
+    if ecs_column_deep_get(c3, 1) != 200 { panic(141092); };
+    if ecs_column_deep_get(c3, 2) != 300 { panic(141093); };
+    if ecs_column_deep_get_mut(c3, 2) != 300 { panic(141094); };
+    // swap indices 0 and 2: the column reorders.
+    let c4 = ecs_column_deep_swap(c3, 0, 2);
+    if ecs_column_deep_get(c4, 0) != 300 { panic(141095); };
+    if ecs_column_deep_get(c4, 1) != 200 { panic(141096); };
+    if ecs_column_deep_get(c4, 2) != 100 { panic(141097); };
+    // cap-16 reject: fill 16 then the 17th push is dropped.
+    let base = ecs_column_deep_with_capacity(16, 16);
+    let f1 = ecs_column_deep_push(base, 1);
+    let f2 = ecs_column_deep_push(f1, 2);
+    let f3 = ecs_column_deep_push(f2, 3);
+    let f4 = ecs_column_deep_push(f3, 4);
+    let f5 = ecs_column_deep_push(f4, 5);
+    let f6 = ecs_column_deep_push(f5, 6);
+    let f7 = ecs_column_deep_push(f6, 7);
+    let f8 = ecs_column_deep_push(f7, 8);
+    let f9 = ecs_column_deep_push(f8, 9);
+    let f10 = ecs_column_deep_push(f9, 10);
+    let f11 = ecs_column_deep_push(f10, 11);
+    let f12 = ecs_column_deep_push(f11, 12);
+    let f13 = ecs_column_deep_push(f12, 13);
+    let f14 = ecs_column_deep_push(f13, 14);
+    let f15 = ecs_column_deep_push(f14, 15);
+    let f16 = ecs_column_deep_push(f15, 16);
+    if ecs_column_deep_len(f16) != 16 { panic(141100); };
+    let f17 = ecs_column_deep_push(f16, 99);
+    if ecs_column_deep_len(f17) != 16 { panic(141101); };
+    if ecs_column_deep_get(f17, 15) != 16 { panic(141102); };
+}
+
+@test "EcsColumnDeep swap_remove and clear"() {
+    let c0 = ecs_column_deep_with_capacity(0, 16);
+    let c1 = ecs_column_deep_push(c0, 10);
+    let c2 = ecs_column_deep_push(c1, 20);
+    let c3 = ecs_column_deep_push(c2, 30);
+    let c4 = ecs_column_deep_push(c3, 40);
+    // swap_remove idx=1: removed=20, last (40) moved into idx=1, len=3, slot 3 zeroed.
+    let r0 = ecs_column_deep_swap_remove(c4, 1);
+    if ecs_column_swap_remove_removed(r0) != 20 { panic(141110); };
+    let c5 = ecs_column_swap_remove_new_col(r0);
+    if ecs_column_deep_len(c5) != 3 { panic(141111); };
+    if ecs_column_deep_get(c5, 0) != 10 { panic(141112); };
+    if ecs_column_deep_get(c5, 1) != 40 { panic(141113); };
+    if ecs_column_deep_get(c5, 2) != 30 { panic(141114); };
+    if ecs_column_deep_get(c5, 3) != 0 { panic(141115); };
+    // out-of-range idx: no change, removed=0.
+    let r1 = ecs_column_deep_swap_remove(c5, -1);
+    if ecs_column_swap_remove_removed(r1) != 0 { panic(141116); };
+    let c6 = ecs_column_swap_remove_new_col(r1);
+    if ecs_column_deep_len(c6) != 3 { panic(141117); };
+    // empty column: swap_remove produces 0 removed.
+    let cn = ecs_column_deep_with_capacity(0, 16);
+    let r2 = ecs_column_deep_swap_remove(cn, 0);
+    if ecs_column_swap_remove_removed(r2) != 0 { panic(141118); };
+    let cn2 = ecs_column_swap_remove_new_col(r2);
+    if ecs_column_deep_len(cn2) != 0 { panic(141119); };
+    // clear: len 0, all slots zeroed out (the deep mirrors Vec::new()).
+    let cleared = ecs_column_deep_clear(c5);
+    if ecs_column_deep_len(cleared) != 0 { panic(141120); };
+    if ecs_column_deep_get(cleared, 0) != 0 { panic(141121); };
+    if ecs_column_deep_get(cleared, 1) != 0 { panic(141122); };
+    if ecs_column_deep_is_empty(cleared) != true { panic(141123); };
+}
+
+@test "EcsColumnDeep survives mixed push/swap_remove/sort-by-swap order"() {
+    // Build 4 entries, swap_remove the middle, push extra, then swap_remove the tail.
+    let c0 = ecs_column_deep_with_capacity(0, 16);
+    let c1 = ecs_column_deep_push(c0, 1000);
+    let c2 = ecs_column_deep_push(c1, 2000);
+    let c3 = ecs_column_deep_push(c2, 3000);
+    let c4 = ecs_column_deep_push(c3, 4000);
+    let r0 = ecs_column_deep_swap_remove(c4, 1);
+    if ecs_column_swap_remove_removed(r0) != 2000 { panic(141130); };
+    let c5 = ecs_column_swap_remove_new_col(r0);
+    // After swap_remove idx=1: layout [1000, 4000, 3000, 0], len 3.
+    if ecs_column_deep_get(c5, 1) != 4000 { panic(141131); };
+    if ecs_column_deep_get(c5, 2) != 3000 { panic(141132); };
+    // push extra at the new tail (slot 3).
+    let c6 = ecs_column_deep_push(c5, 5000);
+    if ecs_column_deep_len(c6) != 4 { panic(141133); };
+    if ecs_column_deep_get(c6, 3) != 5000 { panic(141134); };
+    // swap_remove idx=3 again (the just-pushed slot).
+    let r1 = ecs_column_deep_swap_remove(c6, 3);
+    if ecs_column_swap_remove_removed(r1) != 5000 { panic(141135); };
+    let c7 = ecs_column_swap_remove_new_col(r1);
+    if ecs_column_deep_len(c7) != 3 { panic(141136); };
+    if ecs_column_deep_get(c7, 3) != 0 { panic(141137); };
+    // swap the two survivors.
+    let c8 = ecs_column_deep_swap(c7, 0, 2);
+    if ecs_column_deep_get(c8, 0) != 3000 { panic(141138); };
+    if ecs_column_deep_get(c8, 2) != 1000 { panic(141139); };
+    // clear and confirm drained.
+    let c9 = ecs_column_deep_clear(c8);
+    if ecs_column_deep_len(c9) != 0 { panic(141140); };
+    if ecs_column_deep_get(c9, 0) != 0 { panic(141141); };
+}
+
+@test "EcsBlobArrayDeep ZST swap_remove uses same semantics as real component"() {
+    // ZST BlobArray (item_size=0, is_zst=true): drop is 0 (no destructor needed). Push/swap_remove
+    // still operate on the same cap-16 slot buffer.
+    let b0 = ecs_blob_array_deep_new(0, 1, true);
+    if ecs_blob_array_deep_get_drop(b0) != 0 { panic(141150); };
+    let b1 = ecs_blob_array_deep_push(b0, 777);
+    let b2 = ecs_blob_array_deep_push(b1, 888);
+    if ecs_blob_array_deep_len(b2) != 2 { panic(141151); };
+    let r0 = ecs_blob_array_deep_swap_remove(b2, 0);
+    if ecs_blob_swap_remove_removed(r0) != 777 { panic(141152); };
+    let b3 = ecs_blob_swap_remove_new_arr(r0);
+    if ecs_blob_array_deep_len(b3) != 1 { panic(141153); };
+    if ecs_blob_array_deep_get(b3, 0) != 888 { panic(141154); };
+    if ecs_blob_array_deep_get(b3, 1) != 0 { panic(141155); };
+    // drop fn id reads from is_zst still 0 after swap_remove.
+    if ecs_blob_array_deep_get_drop(b3) != 0 { panic(141156); };
+    // swap_remove on the now-1-element buffer yields the last (888), then empty.
+    let r1 = ecs_blob_array_deep_swap_remove(b3, 0);
+    if ecs_blob_swap_remove_removed(r1) != 888 { panic(141157); };
+    let b4 = ecs_blob_swap_remove_new_arr(r1);
+    if ecs_blob_array_deep_len(b4) != 0 { panic(141158); };
+    if ecs_blob_array_deep_is_zst(b4) != true { panic(141159); };
+}

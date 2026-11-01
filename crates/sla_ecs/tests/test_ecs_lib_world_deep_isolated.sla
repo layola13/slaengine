@@ -1,0 +1,279 @@
+// Isolated deep tests for lib/world_deep.sla (Batch 389).
+// Mirrors shallow lib/world.sla's `World<A, B, R, M>` as a SELF-CONTAINED fixed-cap variant
+// (no @import -- stacked-component-store owner: EntityAllocator + 2 ComponentStores + a resource
+// slot + a cap-16 message queue + per-slot added/changed tick arrays, all flattened to scalar
+// slot families). Concrete typed plugs `WorldPos{x,y}`, `WorldVel{x,y}`, `WorldTime{tick}`,
+// `WorldDamage{amount}`. Wrapper structs `EcsWdSpawn`/`EcsWdPairQuery`/`EcsWdRead`/`EcsWdEntity`
+// expose scalar accessors so tests NEVER destructure tuple returns (`let (w, e) = spawn`) — the
+// wrapper-first style established in Batch 386/388.
+// panic codes: 143200 - 143231 (Batch 389 band; the previous Batch 388 used 143000-143112).
+
+@import "../src/world_deep.sla"
+
+// ── convenience helpers: spawn wrapper decomposition (idiomatic in every test). ─────────────
+fn sw_world(s: EcsWdSpawn) -> EcsWdWorld { return ecs_wd_spawn_world(s); }
+fn sw_entity(s: EcsWdSpawn) -> EcsWdEntity { return ecs_wd_spawn_entity(s); }
+
+// ── Test 1: shallow test 1 — spawn + is_alive + stale reject + generation bump on reuse. ────
+@test "EcsWdWorld spawn despawn rejects stale entity + bumps generation"() {
+    let w0 = ecs_wd_world_new();
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    if ecs_wd_is_alive(w1, e1) != true { panic(143200); };
+    let w2 = ecs_wd_despawn(w1, e1);
+    if ecs_wd_is_alive(w2, e1) != false { panic(143201); };
+    let s2 = ecs_wd_world_spawn(w2);
+    let w3 = sw_world(s2);
+    let e2 = sw_entity(s2);
+    if e2.id != e1.id { panic(143202); };
+    if e2.generation != e1.generation + 1 { panic(143203); };
+    if ecs_wd_has_a(w3, e1) != false { panic(143204); };
+    if ecs_wd_has_b(w3, e1) != false { panic(143205); };
+}
+
+// ── Test 2: shallow test 2 — insert_a/b + query_a_b + remove_a swap-remove. ─────────────────
+@test "EcsWdWorld insert remove components and query pair"() {
+    let w0 = ecs_wd_world_new();
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    let s2 = ecs_wd_world_spawn(w1);
+    let w2 = sw_world(s2);
+    let e2 = sw_entity(s2);
+    let w3 = ecs_wd_insert_a(w2, e1, 1, 2);
+    let w4 = ecs_wd_insert_b(w3, e1, 10, 20);
+    let w5 = ecs_wd_insert_a(w4, e2, 5, 6);
+    if ecs_wd_has_a(w5, e1) != true { panic(143206); };
+    if ecs_wd_has_b(w5, e1) != true { panic(143207); };
+    let q = ecs_wd_query_a_b(w5);
+    if ecs_wd_pair_query_count(q) != 1 { panic(143208); };
+    let paired_entity = ecs_wd_pair_query_entity_at(q, 0);
+    if paired_entity.id != e1.id { panic(143209); };
+    let a_value = ecs_wd_pair_query_a_at(q, 0);
+    if a_value.x != 1 { panic(143210); };
+    let b_value = ecs_wd_pair_query_b_at(q, 0);
+    if b_value.x != 10 { panic(143211); };
+    let w6 = ecs_wd_remove_a(w5, e1);
+    if ecs_wd_has_a(w6, e1) != false { panic(143212); };
+    if ecs_wd_has_b(w6, e1) != true { panic(143213); };
+    let q2 = ecs_wd_query_a_b(w6);
+    if ecs_wd_pair_query_count(q2) != 0 { panic(143214); };
+}
+
+// ── Test 3: shallow test 3 — pair writeback marks changed tick (strict-greater-than). ───────
+@test "EcsWdWorld pair writeback marks changed tick"() {
+    let w0 = ecs_wd_world_new();
+    if ecs_wd_world_change_tick(w0) != 1 { panic(143215); };
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    let w2 = ecs_wd_insert_a(w1, e1, 1, 2);
+    let w3 = ecs_wd_insert_b(w2, e1, 3, 4);
+    // The shallow test captures `baseline = world.change_tick` after the inserts (=1 here).
+    let baseline = ecs_wd_world_change_tick(w3);
+    let w4 = ecs_wd_increment_tick(w3);
+    if ecs_wd_world_change_tick(w4) != baseline + 1 { panic(143216); };
+    let q = ecs_wd_query_a_b(w4);
+    if ecs_wd_pair_query_count(q) != 1 { panic(143217); };
+    let a_before = ecs_wd_pair_query_a_at(q, 0);
+    let b_before = ecs_wd_pair_query_b_at(q, 0);
+    let moved_x = a_before.x + b_before.x;
+    let moved_y = a_before.y + b_before.y;
+    let a_slot = ecs_wd_pair_query_a_slot_at(q, 0);
+    let paired_entity = ecs_wd_pair_query_entity_at(q, 0);
+    let w5 = ecs_wd_pair_write_a(w4, paired_entity, a_slot, moved_x, moved_y);
+    let p = ecs_wd_get_a(w5, e1);
+    if p.x != 4 { panic(143218); };
+    if p.y != 6 { panic(143219); };
+    // `changed_since(baseline=1)` is strictly `changed_t(=2) > 1` = true.
+    if ecs_wd_a_changed_since(w5, e1, baseline) != true { panic(143220); };
+    // `added_since(baseline=1)` is strictly `added_t(=1) > 1` = false (change_tick started at 1).
+    if ecs_wd_a_added_since(w5, e1, baseline) != false { panic(143221); };
+}
+
+// ── Test 4: shallow test 4 — resource and messages are owned by world. ──────────────────────
+@test "EcsWdWorld resource and messages are owned by world"() {
+    let w0 = ecs_wd_world_new();
+    if ecs_wd_has_resource(w0) != false { panic(143222); };
+    let w1 = ecs_wd_insert_resource(w0, 9);
+    if ecs_wd_has_resource(w1) != true { panic(143223); };
+    let t = ecs_wd_get_resource(w1);
+    if t.tick != 9 { panic(143224); };
+    let w2 = ecs_wd_write_message(w1, 5);
+    if ecs_wd_message_count(w2) != 1 { panic(143225); };
+    let reader0 = ecs_wd_message_reader_new();
+    let read1 = ecs_wd_read_message(w2, reader0);
+    if ecs_wd_read_has_value(read1) != 1 { panic(143226); };
+    if ecs_wd_read_amount(read1) != 5 { panic(143227); };
+    // A second read with the advanced cursor exhausts the queue (has_value=0).
+    let reader1 = ecs_wd_message_reader_with_cursor(ecs_wd_read_cursor(read1));
+    let read2 = ecs_wd_read_message(w2, reader1);
+    if ecs_wd_read_has_value(read2) != 0 { panic(143228); };
+    let w3 = ecs_wd_remove_resource(w2);
+    if ecs_wd_has_resource(w3) != false { panic(143229); };
+}
+
+// ── Test 5: cap-16 spawn rejects the 17th spawn (entity allocator's next_id >= 16). ─────────
+@test "EcsWdWorld cap-16 spawn rejects 17th entity"() {
+    let w0 = ecs_wd_world_new();
+    let w1 = sw_world(ecs_wd_world_spawn(w0));
+    let w2 = sw_world(ecs_wd_world_spawn(w1));
+    let w3 = sw_world(ecs_wd_world_spawn(w2));
+    let w4 = sw_world(ecs_wd_world_spawn(w3));
+    let w5 = sw_world(ecs_wd_world_spawn(w4));
+    let w6 = sw_world(ecs_wd_world_spawn(w5));
+    let w7 = sw_world(ecs_wd_world_spawn(w6));
+    let w8 = sw_world(ecs_wd_world_spawn(w7));
+    let w9 = sw_world(ecs_wd_world_spawn(w8));
+    let w10 = sw_world(ecs_wd_world_spawn(w9));
+    let w11 = sw_world(ecs_wd_world_spawn(w10));
+    let w12 = sw_world(ecs_wd_world_spawn(w11));
+    let w13 = sw_world(ecs_wd_world_spawn(w12));
+    let w14 = sw_world(ecs_wd_world_spawn(w13));
+    let w15 = sw_world(ecs_wd_world_spawn(w14));
+    let w16 = sw_world(ecs_wd_world_spawn(w15));
+    if ecs_wd_allocator_next_id(w16) != 16 { panic(143230); };
+    // The 17th spawn at cap-16 returns a sentinel EcsWdEntity { id = -1 } (mirrors Batch 388's
+    // cap-at-16 spawn convention: cap-reject returns id -1, NOT a panic, so the test runner
+    // counts it PASSING rather than catching an unexpected panic exit).
+    let sp17 = ecs_wd_world_spawn(w16);
+    let e17 = sw_entity(sp17);
+    if e17.id != -1 { panic(143231); };
+    // The capped world state is unchanged: next_id stays 16 and the sentinel entity is not alive.
+    let w17 = sw_world(sp17);
+    if ecs_wd_allocator_next_id(w17) != 16 { panic(143263); };
+    if ecs_wd_is_alive(w17, e17) != false { panic(143264); };
+}
+
+// ── Test 6: remove_a swap-remove moves the last slot's value into the removed slot. ────────
+@test "EcsWdWorld remove_a swap-remove moves last value into removed slot"() {
+    let w0 = ecs_wd_world_new();
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    let s2 = ecs_wd_world_spawn(w1);
+    let w2 = sw_world(s2);
+    let e2 = sw_entity(s2);
+    let s3 = ecs_wd_world_spawn(w2);
+    let w3 = sw_world(s3);
+    let e3 = sw_entity(s3);
+    let w4 = ecs_wd_insert_a(w3, e1, 100, 101);
+    let w5 = ecs_wd_insert_a(w4, e2, 200, 201);
+    let w6 = ecs_wd_insert_a(w5, e3, 300, 301);
+    // remove_a(e2): slot==1; last==2 copies e3's value into slot 1.
+    let w7 = ecs_wd_remove_a(w6, e2);
+    if ecs_wd_has_a(w7, e2) != false { panic(143232); };
+    if ecs_wd_has_a(w7, e3) != true { panic(143233); };
+    // e3 is now in slot 1 (the moved-from slot of e2); its a value should still be 300/301.
+    let p_e3 = ecs_wd_get_a(w7, e3);
+    if p_e3.x != 300 { panic(143234); };
+    if p_e3.y != 301 { panic(143235); };
+    // e1 untouched (its slot 0 was the front; not the last, so not copied down).
+    let p_e1 = ecs_wd_get_a(w7, e1);
+    if p_e1.x != 100 { panic(143236); };
+    if p_e1.y != 101 { panic(143237); };
+}
+
+// ── Test 7: dump two gens on the same id via despawn twice; freshness probed by re-spawn. ──
+@test "EcsWdWorld despawn twice bumps registry generation by 2"() {
+    let w0 = ecs_wd_world_new();
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    if e1.generation != 0 { panic(143238); };
+    let w2 = ecs_wd_despawn(w1, e1);
+    let w3 = ecs_wd_despawn(w2, e1); // second despawn is a no-op: e1 not alive after first free.
+    // Re-spawn reuses id=1 with generation bumped by exactly 1 (only the first despawn freed it).
+    let s2 = ecs_wd_world_spawn(w3);
+    let w4 = sw_world(s2);
+    let e2 = sw_entity(s2);
+    if e2.id != e1.id { panic(143239); };
+    if e2.generation != e1.generation + 1 { panic(143240); };
+    let s3 = ecs_wd_world_spawn(w4);
+    let w5 = sw_world(s3);
+    let e3 = sw_entity(s3);
+    // Spawn a fresh distinct id=2 (next_id bumps to 2 from first spawn).
+    if e3.id != 2 { panic(143241); };
+    if ecs_wd_is_alive(w5, e2) != true { panic(143242); };
+    let w6 = ecs_wd_despawn(w5, e2);
+    let s4 = ecs_wd_world_spawn(w6);
+    let w7 = sw_world(s4);
+    let e4 = sw_entity(s4);
+    if e4.id != e2.id { panic(143243); };
+    if e4.generation != e2.generation + 1 { panic(143244); };
+}
+
+// ── Test 8: tick arithmetic strict-greater boundary on inserted-at-1 component. ────────────
+@test "EcsWdWorld added_since/changed_since strict greater boundary at tick 1"() {
+    let w0 = ecs_wd_world_new();
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    // insert_a at change_tick=1 stamps added_t=1, changed_t=1.
+    let w2 = ecs_wd_insert_a(w1, e1, 7, 8);
+    // added_since(tick=1) means `added_t(=1) > 1 = false`; boundary tick == stamp returns false.
+    if ecs_wd_a_added_since(w2, e1, 1) != false { panic(143245); };
+    // added_since(tick=0) means `added_t(=1) > 0 = true`; strictly before the stamp passes.
+    if ecs_wd_a_added_since(w2, e1, 0) != true { panic(143246); };
+    // changed_since(tick=1) means `changed_t(=1) > 1 = false` (no later tick write has happened).
+    if ecs_wd_a_changed_since(w2, e1, 1) != false { panic(143247); };
+    // Now write_a at change_tick=1 (no increment yet) → changed_t stays 1; still false.
+    let w3 = ecs_wd_write_a(w2, e1, 11, 12);
+    if ecs_wd_a_changed_since(w3, e1, 1) != false { panic(143248); };
+    // increment ticks to 2 then write_a → changed_t=2 where 2 > 1 = true.
+    let w4 = ecs_wd_increment_tick(w3);
+    let w5 = ecs_wd_write_a(w4, e1, 13, 14);
+    if ecs_wd_a_changed_since(w5, e1, 1) != true { panic(143249); };
+    // added_t is still 1 (write_a never rewrites added); added_since(1) stays false.
+    if ecs_wd_a_added_since(w5, e1, 1) != false { panic(143250); };
+}
+
+// ── Test 9: insert_a replace path bumps changed-tick only (added stays). ─────────────────────
+@test "EcsWdWorld insert_a replace bumps changed only at increment"() {
+    let w0 = ecs_wd_world_new();
+    let s1 = ecs_wd_world_spawn(w0);
+    let w1 = sw_world(s1);
+    let e1 = sw_entity(s1);
+    let w2 = ecs_wd_insert_a(w1, e1, 1, 2);
+    // capture before-increment baseline=1.
+    let baseline = ecs_wd_world_change_tick(w2);
+    // increment tick to 2, then replace via insert_a (same entity) → changed=2, added stays 1.
+    let w3 = ecs_wd_increment_tick(w2);
+    let w4 = ecs_wd_insert_a(w3, e1, 9, 9);
+    if ecs_wd_a_added_since(w4, e1, baseline) != false { panic(143251); };
+    if ecs_wd_a_changed_since(w4, e1, baseline) != true { panic(143252); };
+    let p = ecs_wd_get_a(w4, e1);
+    if p.x != 9 { panic(143253); };
+    if p.y != 9 { panic(143254); };
+}
+
+// ── Test 10: multi-message drain through cursor-chained reads. ──────────────────────────────
+@test "EcsWdWorld multi message drain via cursor-chained reads"() {
+    let w0 = ecs_wd_world_new();
+    let w1 = ecs_wd_write_message(w0, 11);
+    let w2 = ecs_wd_write_message(w1, 22);
+    let w3 = ecs_wd_write_message(w2, 33);
+    if ecs_wd_message_count(w3) != 3 { panic(143255); };
+    let r0 = ecs_wd_message_reader_new();
+    let rd1 = ecs_wd_read_message(w3, r0);
+    if ecs_wd_read_amount(rd1) != 11 { panic(143256); };
+    let r1 = ecs_wd_message_reader_with_cursor(ecs_wd_read_cursor(rd1));
+    let rd2 = ecs_wd_read_message(w3, r1);
+    if ecs_wd_read_amount(rd2) != 22 { panic(143257); };
+    let r2 = ecs_wd_message_reader_with_cursor(ecs_wd_read_cursor(rd2));
+    let rd3 = ecs_wd_read_message(w3, r2);
+    if ecs_wd_read_amount(rd3) != 33 { panic(143258); };
+    let r3 = ecs_wd_message_reader_with_cursor(ecs_wd_read_cursor(rd3));
+    let rd4 = ecs_wd_read_message(w3, r3);
+    if ecs_wd_read_has_value(rd4) != 0 { panic(143259); };
+    // A fresh reader from cursor=0 still sees all three (readers are independent).
+    let rd_replay = ecs_wd_read_message(w3, r0);
+    if ecs_wd_read_amount(rd_replay) != 11 { panic(143260); };
+    // Remove_resource + reinsert proves the resource value can be overwritten.
+    let w4 = ecs_wd_remove_resource(w3);
+    if ecs_wd_has_resource(w4) != false { panic(143261); };
+    let w5 = ecs_wd_insert_resource(w4, 42);
+    let t = ecs_wd_get_resource(w5);
+    if t.tick != 42 { panic(143262); };
+}

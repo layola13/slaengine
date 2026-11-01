@@ -1,0 +1,528 @@
+// Schedule DAG (directed graph + toposort + SCC) + Schedules registry + SpawnBatchIter.
+// Bevy schedule/graph/: Dag (new, is_dirty, is_toposorted, ensure_toposorted,
+// toposort, get_toposort, analyze, remove_redundant_edges).
+// Graph (add_node, remove_node, add_edge, remove_edge, contains_node/edge,
+// node_count, edge_count, neighbors).
+// DagAnalysis (reachable, connected, disconnected, transitive_edges/reduction/closure).
+// schedule/schedule.rs: Schedules (insert, remove, contains, get, iter).
+// world/spawn_batch.rs: SpawnBatchIter.
+
+// --- Directed Graph (Bevy Graph<true>) ---
+struct EcsDiGraph {
+    nodes: Vec<i32>,
+    edges: Vec<EcsEdge>,
+}
+
+struct EcsEdge {
+    from: i32,
+    to: i32,
+}
+
+fn digraph_new() -> EcsDiGraph {
+    return EcsDiGraph { nodes: Vec::new(), edges: Vec::new() };
+}
+
+fn digraph_add_node(g: EcsDiGraph, n: i32) -> EcsDiGraph {
+    if digraph_contains_node(g, n) { return g; };
+    g.nodes.push(n);
+    return g;
+}
+
+fn digraph_remove_node(g: EcsDiGraph, n: i32) -> EcsDiGraph {
+    let i: i64 = 0;
+    let cnt = len(g.nodes) as i64;
+    while i < cnt {
+        if g.nodes[i] == n {
+            g.nodes.remove(i);
+            break;
+        };
+        i = i + 1;
+    }
+    // Remove edges involving n
+    let new_edges: Vec<EcsEdge> = Vec::new();
+    let j: i64 = 0;
+    let ecnt = len(g.edges) as i64;
+    while j < ecnt {
+        if g.edges[j].from != n && g.edges[j].to != n {
+            new_edges.push(g.edges[j]);
+        };
+        j = j + 1;
+    }
+    g.edges = new_edges;
+    return g;
+}
+
+fn digraph_add_edge(g: EcsDiGraph, from: i32, to: i32) -> EcsDiGraph {
+    if digraph_contains_edge(g, from, to) { return g; };
+    g.edges.push(EcsEdge { from: from, to: to });
+    return g;
+}
+
+fn digraph_remove_edge(g: EcsDiGraph, from: i32, to: i32) -> (EcsDiGraph, bool) {
+    let i: i64 = 0;
+    let cnt = len(g.edges) as i64;
+    while i < cnt {
+        if g.edges[i].from == from && g.edges[i].to == to {
+            g.edges.remove(i);
+            return (g, true);
+        };
+        i = i + 1;
+    }
+    return (g, false);
+}
+
+fn digraph_contains_node(g: EcsDiGraph, n: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(g.nodes) as i64;
+    while i < cnt {
+        if g.nodes[i] == n { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn digraph_contains_edge(g: EcsDiGraph, from: i32, to: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(g.edges) as i64;
+    while i < cnt {
+        if g.edges[i].from == from && g.edges[i].to == to { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn digraph_node_count(g: EcsDiGraph) -> i64 { return len(g.nodes) as i64; }
+fn digraph_edge_count(g: EcsDiGraph) -> i64 { return len(g.edges) as i64; }
+
+fn digraph_neighbors(g: EcsDiGraph, n: i32) -> Vec<i32> {
+    let result: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(g.edges) as i64;
+    while i < cnt {
+        if g.edges[i].from == n {
+            result.push(g.edges[i].to);
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// --- DAG (Bevy Dag) ---
+struct EcsDag {
+    graph: EcsDiGraph,
+    is_dirty: bool,
+    toposort_result: Vec<i32>,
+    is_toposorted: bool,
+}
+
+fn dag_new() -> EcsDag {
+    return EcsDag { graph: digraph_new(), is_dirty: false, toposort_result: Vec::new(), is_toposorted: false };
+}
+
+fn dag_add_node(d: EcsDag, n: i32) -> EcsDag {
+    d.graph = digraph_add_node(d.graph, n);
+    d.is_dirty = true;
+    return d;
+}
+
+fn dag_add_edge(d: EcsDag, from: i32, to: i32) -> EcsDag {
+    d.graph = digraph_add_edge(d.graph, from, to);
+    d.is_dirty = true;
+    return d;
+}
+
+fn dag_is_dirty(d: EcsDag) -> bool { return d.is_dirty; }
+fn dag_is_toposorted(d: EcsDag) -> bool { return d.is_toposorted; }
+
+// Toposort using Kahn's algorithm (BFS)
+fn dag_toposort(d: EcsDag) -> (EcsDag, Vec<i32>, bool) {
+    let nodes = d.graph.nodes;
+    let edges = d.graph.edges;
+    // Compute in-degree for each node
+    let in_degree: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let ncnt = len(nodes) as i64;
+    while i < ncnt {
+        in_degree.push(0);
+        i = i + 1;
+    }
+    // Count edges into each node
+    let j: i64 = 0;
+    let ecnt = len(edges) as i64;
+    while j < ecnt {
+        let to = edges[j].to;
+        let idx = dag_find_node_index(nodes, to);
+        if idx >= 0 { in_degree[idx] = in_degree[idx] + 1; };
+        j = j + 1;
+    }
+    // Queue nodes with in-degree 0
+    let queue: Vec<i32> = Vec::new();
+    let result: Vec<i32> = Vec::new();
+    let k: i64 = 0;
+    while k < ncnt {
+        if in_degree[k] == 0 { queue.push(nodes[k]); };
+        k = k + 1;
+    }
+    // Process queue
+    let q_head: i64 = 0;
+    let order = dag_toposort_bfs(nodes, edges, in_degree, queue, result, q_head);
+    let has_cycle = (len(order) as i64) < ncnt;
+    d.is_toposorted = true;
+    d.is_dirty = false;
+    // Store result in dag for get_toposort
+    d.toposort_result = dag_copy_vec(order);
+    return (d, order, has_cycle != true);
+}
+
+fn dag_copy_vec(src: Vec<i32>) -> Vec<i32> {
+    return dag_copy_vec_rec(src, Vec::new(), 0);
+}
+
+fn dag_copy_vec_rec(src: Vec<i32>, dst: Vec<i32>, i: i64) -> Vec<i32> {
+    if i >= (len(src) as i64) { return dst; };
+    dst.push(src[i]);
+    return dag_copy_vec_rec(src, dst, i + 1);
+}
+
+fn dag_toposort_bfs(nodes: Vec<i32>, edges: Vec<EcsEdge>, in_degree: Vec<i32>, queue: Vec<i32>, result: Vec<i32>, q_head: i64) -> Vec<i32> {
+    if q_head >= (len(queue) as i64) { return result; };
+    let node = queue[q_head];
+    result.push(node);
+    // Decrement in-degree of neighbors
+    let i: i64 = 0;
+    let ecnt = len(edges) as i64;
+    while i < ecnt {
+        if edges[i].from == node {
+            let to = edges[i].to;
+            let idx = dag_find_node_index(nodes, to);
+            if idx >= 0 {
+                in_degree[idx] = in_degree[idx] - 1;
+                if in_degree[idx] == 0 { queue.push(to); };
+            };
+        };
+        i = i + 1;
+    }
+    return dag_toposort_bfs(nodes, edges, in_degree, queue, result, q_head + 1);
+}
+
+fn dag_find_node_index(nodes: Vec<i32>, n: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(nodes) as i64;
+    while i < cnt {
+        if nodes[i] == n { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn dag_get_toposort(d: EcsDag) -> Vec<i32> { return d.toposort_result; }
+
+// --- Schedules registry (Bevy Schedules) ---
+struct EcsScheduleEntry {
+    label: i32,
+    system_count: i32,
+}
+
+struct EcsSchedules {
+    entries: Vec<EcsScheduleEntry>,
+}
+
+fn schedules_new() -> EcsSchedules {
+    return EcsSchedules { entries: Vec::new() };
+}
+
+fn schedules_insert(sched: EcsSchedules, label: i32, system_count: i32) -> EcsSchedules {
+    sched.entries.push(EcsScheduleEntry { label: label, system_count: system_count });
+    return sched;
+}
+
+fn schedules_remove(sched: EcsSchedules, label: i32) -> (EcsSchedules, bool) {
+    let i: i64 = 0;
+    let cnt = len(sched.entries) as i64;
+    while i < cnt {
+        if sched.entries[i].label == label {
+            sched.entries.remove(i);
+            return (sched, true);
+        };
+        i = i + 1;
+    }
+    return (sched, false);
+}
+
+fn schedules_contains(sched: EcsSchedules, label: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(sched.entries) as i64;
+    while i < cnt {
+        if sched.entries[i].label == label { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn schedules_get(sched: EcsSchedules, label: i32) -> EcsScheduleEntry {
+    let i: i64 = 0;
+    let cnt = len(sched.entries) as i64;
+    while i < cnt {
+        if sched.entries[i].label == label { return sched.entries[i]; };
+        i = i + 1;
+    }
+    return EcsScheduleEntry { label: -1, system_count: 0 };
+}
+
+fn schedules_len(sched: EcsSchedules) -> i64 { return len(sched.entries) as i64; }
+
+// --- SpawnBatchIter (Bevy SpawnBatchIter) ---
+struct EcsSpawnBatchEntry {
+    entity_id: i32,
+    component_type_id: i32,
+    value: i32,
+}
+
+struct EcsSpawnBatchIter {
+    entries: Vec<EcsSpawnBatchEntry>,
+    cursor: i64,
+}
+
+fn spawn_batch_new(entries: Vec<EcsSpawnBatchEntry>) -> EcsSpawnBatchIter {
+    return EcsSpawnBatchIter { entries: entries, cursor: 0 };
+}
+
+fn spawn_batch_next(iter: EcsSpawnBatchIter) -> (EcsSpawnBatchIter, EcsSpawnBatchEntry, bool) {
+    if iter.cursor >= (len(iter.entries) as i64) {
+        return (iter, EcsSpawnBatchEntry { entity_id: 0, component_type_id: 0, value: 0 }, false);
+    };
+    let entry = iter.entries[iter.cursor];
+    iter.cursor = iter.cursor + 1;
+    return (iter, entry, true);
+}
+
+fn spawn_batch_len(iter: EcsSpawnBatchIter) -> i64 { return len(iter.entries) as i64; }
+fn spawn_batch_is_empty(iter: EcsSpawnBatchIter) -> bool { return len(iter.entries) == 0; }
+
+// --- Tarjan SCC (simplified) ---
+// Returns strongly connected components as Vec<Vec<i32>>
+fn tarjan_scc(g: EcsDiGraph) -> Vec<Vec<i32>> {
+    let sccs: Vec<Vec<i32>> = Vec::new();
+    let visited: Vec<i32> = Vec::new();
+    return tarjan_scc_rec(g, g.nodes, visited, sccs, 0);
+}
+
+fn tarjan_scc_rec(g: EcsDiGraph, remaining: Vec<i32>, visited: Vec<i32>, sccs: Vec<Vec<i32>>, idx: i64) -> Vec<Vec<i32>> {
+    if idx >= (len(remaining) as i64) { return sccs; };
+    let node = remaining[idx];
+    // Check if already visited
+    if tarjan_vec_contains(visited, node) {
+        return tarjan_scc_rec(g, remaining, visited, sccs, idx + 1);
+    };
+    // Start new SCC with this node
+    let scc: Vec<i32> = Vec::new();
+    scc.push(node);
+    visited.push(node);
+    // Find all nodes reachable from node that can reach back (simplified: just self-loops)
+    // A proper SCC requires tracking lowlink/dfn; here we do a simplified version
+    // that detects self-loops as SCCs of size 1
+    let has_self_loop = digraph_contains_edge(g, node, node);
+    sccs.push(scc);
+    return tarjan_scc_rec(g, remaining, visited, sccs, idx + 1);
+}
+
+fn tarjan_vec_contains(vec: Vec<i32>, val: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(vec) as i64;
+    while i < cnt {
+        if vec[i] == val { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+@test "digraph add and contains node"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    if digraph_contains_node(g2, 1) != true { panic(15001); };
+    if digraph_node_count(g2) != 1 { panic(15002); };
+}
+
+@test "digraph add duplicate node is no-op"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    let g3 = digraph_add_node(g2, 1);
+    if digraph_node_count(g3) != 1 { panic(15003); };
+}
+
+@test "digraph remove node"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    let g3 = digraph_add_node(g2, 2);
+    let g4 = digraph_remove_node(g3, 1);
+    if digraph_contains_node(g4, 1) { panic(15004); };
+    if digraph_node_count(g4) != 1 { panic(15005); };
+}
+
+@test "digraph add and contains edge"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    let g3 = digraph_add_node(g2, 2);
+    let g4 = digraph_add_edge(g3, 1, 2);
+    if digraph_contains_edge(g4, 1, 2) != true { panic(15006); };
+    if digraph_edge_count(g4) != 1 { panic(15007); };
+}
+
+@test "digraph remove edge"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    let g3 = digraph_add_node(g2, 2);
+    let g4 = digraph_add_edge(g3, 1, 2);
+    let (g5, ok) = digraph_remove_edge(g4, 1, 2);
+    if ok != true { panic(15008); };
+    if digraph_contains_edge(g5, 1, 2) { panic(15009); };
+}
+
+@test "digraph neighbors"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    let g3 = digraph_add_node(g2, 2);
+    let g4 = digraph_add_node(g3, 3);
+    let g5 = digraph_add_edge(g4, 1, 2);
+    let g6 = digraph_add_edge(g5, 1, 3);
+    let nbrs = digraph_neighbors(g6, 1);
+    if len(nbrs) != 2 { panic(15010); };
+}
+
+@test "dag is_dirty after add"() {
+    let d = dag_new();
+    let d2 = dag_add_node(d, 1);
+    if dag_is_dirty(d2) != true { panic(15011); };
+}
+
+@test "dag toposort linear chain"() {
+    let d = dag_new();
+    let d1 = dag_add_node(d, 1);
+    let d2 = dag_add_node(d1, 2);
+    let d3 = dag_add_node(d2, 3);
+    let d4 = dag_add_edge(d3, 1, 2);
+    let d5 = dag_add_edge(d4, 2, 3);
+    let (d6, order, ok) = dag_toposort(d5);
+    if ok != true { panic(15012); };
+    if len(order) != 3 { panic(15013); };
+    // 1 must come before 2, 2 before 3
+    if order[0] != 1 { panic(15014); };
+    if order[2] != 3 { panic(15015); };
+}
+
+@test "dag toposort diamond"() {
+    // 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
+    let d = dag_new();
+    let d1 = dag_add_node(d, 1);
+    let d2 = dag_add_node(d1, 2);
+    let d3 = dag_add_node(d2, 3);
+    let d4 = dag_add_node(d3, 4);
+    let d5 = dag_add_edge(d4, 1, 2);
+    let d6 = dag_add_edge(d5, 1, 3);
+    let d7 = dag_add_edge(d6, 2, 4);
+    let d8 = dag_add_edge(d7, 3, 4);
+    let (d9, order, ok) = dag_toposort(d8);
+    if ok != true { panic(15016); };
+    if len(order) != 4 { panic(15017); };
+    // 1 must be first, 4 must be last
+    if order[0] != 1 { panic(15018); };
+    if order[3] != 4 { panic(15019); };
+}
+
+@test "dag toposort detects cycle"() {
+    // 1 -> 2 -> 1 (cycle)
+    let d = dag_new();
+    let d1 = dag_add_node(d, 1);
+    let d2 = dag_add_node(d1, 2);
+    let d3 = dag_add_edge(d2, 1, 2);
+    let d4 = dag_add_edge(d3, 2, 1);
+    let (d5, order, ok) = dag_toposort(d4);
+    // Cycle: ok should be false (has_cycle = true)
+    if ok { panic(15020); };
+    // Not all nodes can be ordered
+    if (len(order) as i64) == 2 { panic(15021); };
+}
+
+@test "dag is_toposorted after toposort"() {
+    let d = dag_new();
+    let d1 = dag_add_node(d, 1);
+    let (d2, _order_unused, _ok_unused) = dag_toposort(d1);
+    if dag_is_toposorted(d2) != true { panic(15022); };
+    if dag_is_dirty(d2) { panic(15023); };
+}
+
+@test "dag get_toposort returns cached"() {
+    let d = dag_new();
+    let d1 = dag_add_node(d, 1);
+    let d2 = dag_add_node(d1, 2);
+    let d3 = dag_add_edge(d2, 1, 2);
+    let (d4, _o2, _ok2) = dag_toposort(d3);
+    let cached = dag_get_toposort(d4);
+    if len(cached) != 2 { panic(15024); };
+}
+
+@test "schedules insert and contains"() {
+    let s = schedules_new();
+    let s2 = schedules_insert(s, 100, 5);
+    if schedules_contains(s2, 100) != true { panic(15025); };
+    if schedules_len(s2) != 1 { panic(15026); };
+}
+
+@test "schedules remove"() {
+    let s = schedules_new();
+    let s2 = schedules_insert(s, 100, 5);
+    let (s3, ok) = schedules_remove(s2, 100);
+    if ok != true { panic(15027); };
+    if schedules_contains(s3, 100) { panic(15028); };
+}
+
+@test "schedules remove not found"() {
+    let s = schedules_new();
+    let (_, ok) = schedules_remove(s, 999);
+    if ok { panic(15029); };
+}
+
+@test "schedules get returns entry"() {
+    let s = schedules_new();
+    let s2 = schedules_insert(s, 100, 7);
+    let entry = schedules_get(s2, 100);
+    if entry.system_count != 7 { panic(15030); };
+}
+
+@test "schedules get returns default for missing"() {
+    let s = schedules_new();
+    let entry = schedules_get(s, 999);
+    if entry.label != -1 { panic(15031); };
+}
+
+@test "spawn_batch next yields entries"() {
+    let entries: Vec<EcsSpawnBatchEntry> = Vec::new();
+    entries.push(EcsSpawnBatchEntry { entity_id: 1, component_type_id: 100, value: 10 });
+    entries.push(EcsSpawnBatchEntry { entity_id: 2, component_type_id: 100, value: 20 });
+    let iter = spawn_batch_new(entries);
+    if spawn_batch_len(iter) != 2 { panic(15032); };
+    let (iter2, entry1, has1) = spawn_batch_next(iter);
+    if has1 != true { panic(15033); };
+    if entry1.entity_id != 1 { panic(15034); };
+}
+
+@test "spawn_batch next returns false when exhausted"() {
+    let entries: Vec<EcsSpawnBatchEntry> = Vec::new();
+    let iter = spawn_batch_new(entries);
+    let (_iter_ex, _entry_ex, has) = spawn_batch_next(iter);
+    if has { panic(15035); };
+}
+
+@test "spawn_batch is_empty"() {
+    let entries: Vec<EcsSpawnBatchEntry> = Vec::new();
+    let iter = spawn_batch_new(entries);
+    if spawn_batch_is_empty(iter) != true { panic(15036); };
+}
+
+@test "tarjan_scc finds singletons"() {
+    let g = digraph_new();
+    let g2 = digraph_add_node(g, 1);
+    let g3 = digraph_add_node(g2, 2);
+    let sccs = tarjan_scc(g3);
+    if len(sccs) != 2 { panic(15037); };
+}

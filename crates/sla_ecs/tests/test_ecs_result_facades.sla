@@ -1,0 +1,90 @@
+// Verification tests for the Result<T> try_* facades added to lib/ecs_world.sla.
+@import "../src/ecs_world.sla"
+
+struct ResultCompA { v: i32 }
+struct ResultCompB { v: i32 }
+
+fn drop_result_comp_a(x: ResultCompA) {}
+fn drop_result_comp_b(x: ResultCompB) {}
+
+const RCA_TYPE_ID: i32 = 1701;
+const RCB_TYPE_ID: i32 = 1702;
+
+@test "ecs_world_try_get returns ok for present component"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register<ResultCompA, i32, i32>(w0, RCA_TYPE_ID, 0);
+    let (w2, e) = ecs_world_spawn<i32, i32>(w1);
+    let w3 = ecs_world_insert<ResultCompA, i32, i32>(w2, e, RCA_TYPE_ID, ResultCompA { v: 11 });
+    let r = ecs_world_try_get<ResultCompA, i32, i32>(w3, e, RCA_TYPE_ID, ResultCompA { v: -1 });
+    if result_is_ok<ResultCompA>(r) != true { panic(17001); };
+    let got = result_unwrap<ResultCompA>(r);
+    if got.v != 11 { panic(17002); };
+}
+
+@test "ecs_world_try_get returns err for missing component"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register<ResultCompB, i32, i32>(w0, RCB_TYPE_ID, 0);
+    let (w2, e) = ecs_world_spawn<i32, i32>(w1);
+    let r = ecs_world_try_get<ResultCompB, i32, i32>(w2, e, RCB_TYPE_ID, ResultCompB { v: -1 });
+    if result_is_err<ResultCompB>(r) != true { panic(17003); };
+    if result_error_code<ResultCompB>(r) != ERR_COMPONENT_NOT_FOUND() { panic(17004); };
+}
+
+@test "ecs_world_try_get_resource returns ok then err"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 4242);
+    let r1 = ecs_world_try_get_resource<i32, i32>(w1, -1);
+    if result_is_ok<i32>(r1) != true { panic(17005); };
+    if result_unwrap<i32>(r1) != 4242 { panic(17006); };
+    let w2 = ecs_world_remove_resource<i32, i32>(w1);
+    let r2 = ecs_world_try_get_resource<i32, i32>(w2, -1);
+    if result_is_err<i32>(r2) != true { panic(17007); };
+    if result_error_code<i32>(r2) != ERR_RESOURCE_NOT_FOUND() { panic(17008); };
+}
+
+@test "ecs_world_try_despawn_result returns world result"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let (w1, e) = ecs_world_spawn<i32, i32>(w0);
+    let ok = ecs_world_try_despawn_result<i32, i32>(w1, e);
+    if result_is_ok<TableErasedWorld<i32, i32>>(ok) != true { panic(17015); };
+    let w2 = result_unwrap<TableErasedWorld<i32, i32>>(ok);
+    if ecs_world_is_alive<i32, i32>(w2, e) { panic(17016); };
+    let miss = ecs_world_try_despawn_result<i32, i32>(w2, e);
+    if result_is_err<TableErasedWorld<i32, i32>>(miss) != true { panic(17017); };
+    if result_error_code<TableErasedWorld<i32, i32>>(miss) != ERR_ENTITY_NOT_FOUND() { panic(17018); };
+}
+
+@test "ecs_world_try_get_mut returns mut accessor or component error"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_register<ResultCompA, i32, i32>(w0, RCA_TYPE_ID, 0);
+    let (w2, e) = ecs_world_spawn<i32, i32>(w1);
+    let missing = ecs_world_try_get_mut<ResultCompA, i32, i32>(w2, e, RCA_TYPE_ID, ResultCompA { v: -1 });
+    if result_is_err<EcsMut<ResultCompA>>(missing) != true { panic(17019); };
+    if result_error_code<EcsMut<ResultCompA>>(missing) != ERR_COMPONENT_NOT_FOUND() { panic(17020); };
+    let w3 = ecs_world_insert<ResultCompA, i32, i32>(w2, e, RCA_TYPE_ID, ResultCompA { v: 31 });
+    let got = ecs_world_try_get_mut<ResultCompA, i32, i32>(w3, e, RCA_TYPE_ID, ResultCompA { v: -1 });
+    if result_is_ok<EcsMut<ResultCompA>>(got) != true { panic(17021); };
+    let mut_access = result_unwrap<EcsMut<ResultCompA>>(got);
+    if mut_access.value.v != 31 { panic(17022); };
+}
+
+fn bump_result_resource(world: TableErasedWorld<i32, i32>, value: i32) -> (TableErasedWorld<i32, i32>, i32) {
+    return (world, value + 5);
+}
+
+@test "ecs_world_try_resource_ref_and_modify use Result"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let missing_ref = ecs_world_try_get_resource_ref<i32, i32>(w0, -1);
+    if result_is_err<EcsResourceRef<i32>>(missing_ref) != true { panic(17023); };
+    if result_error_code<EcsResourceRef<i32>>(missing_ref) != ERR_RESOURCE_NOT_FOUND() { panic(17024); };
+    let missing_modify = ecs_world_try_modify_resource<i32, i32>(w0, bump_result_resource);
+    if result_is_err<TableErasedWorld<i32, i32>>(missing_modify) != true { panic(17025); };
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 10);
+    let ref_ok = ecs_world_try_get_resource_mut<i32, i32>(w1, -1);
+    if result_is_ok<EcsResourceRef<i32>>(ref_ok) != true { panic(17026); };
+    if result_unwrap<EcsResourceRef<i32>>(ref_ok).value != 10 { panic(17027); };
+    let modified = ecs_world_try_modify_resource<i32, i32>(w1, bump_result_resource);
+    if result_is_ok<TableErasedWorld<i32, i32>>(modified) != true { panic(17028); };
+    let w2 = result_unwrap<TableErasedWorld<i32, i32>>(modified);
+    if ecs_world_get_resource<i32, i32>(w2) != 15 { panic(17029); };
+}

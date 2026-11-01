@@ -1,0 +1,57 @@
+// Verification tests for system adapters (map / pipe / chain).
+@import "../src/ecs_world.sla"
+
+struct AdapterPos { x: i32 }
+
+fn drop_adapter_pos(x: AdapterPos) {}
+
+const APOS_TYPE_ID: i32 = 1801;
+
+// A world->world system that increments a resource counter.
+fn adapter_inc_system(world: TableErasedWorld<i32, i32>) -> TableErasedWorld<i32, i32> {
+    let r = ecs_world_get_resource<i32, i32>(world);
+    return ecs_world_insert_resource<i32, i32>(world, r + 1);
+}
+
+// A typed-input system returning the resource value as output.
+fn adapter_read_system(input: i32, world: TableErasedWorld<i32, i32>) -> i32 {
+    return ecs_world_get_resource<i32, i32>(world);
+}
+
+// map function: double an i32.
+fn adapter_double(x: i32) -> i32 {
+    return x * 2;
+}
+
+// A typed-input pipe second stage: writes its In<i32> value into the resource.
+fn adapter_write_stage(input: EcsIn<i32>, world: TableErasedWorld<i32, i32>) -> TableErasedWorld<i32, i32> {
+    return ecs_world_insert_resource<i32, i32>(world, input.value);
+}
+
+@test "map system adapts output through map fn"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 42);
+    let (mapped, _w) = ecs_world_map_system<i32, i32, i32, i32, i32>(w1, 0, adapter_read_system, adapter_double);
+    if mapped != 84 { panic(18001); };
+}
+
+@test "chain systems run sequentially mutating world"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 0);
+    let systems: Vec<fn(TableErasedWorld<i32, i32>) -> TableErasedWorld<i32, i32>> = Vec::new();
+    systems.push(adapter_inc_system);
+    systems.push(adapter_inc_system);
+    systems.push(adapter_inc_system);
+    let w2 = ecs_world_chain_systems<i32, i32>(w1, systems);
+    let r = ecs_world_get_resource<i32, i32>(w2);
+    if r != 3 { panic(18002); };
+}
+
+@test "pipe typed system feeds output into second stage"() {
+    let w0 = ecs_world_new<i32, i32>(0, 0);
+    let w1 = ecs_world_insert_resource<i32, i32>(w0, 7);
+    // first reads resource (7), second writes In<7> into resource.
+    let w2 = ecs_world_pipe_typed_system<i32, i32, i32, i32>(w1, 0, adapter_read_system, adapter_write_stage);
+    let r = ecs_world_get_resource<i32, i32>(w2);
+    if r != 7 { panic(18003); };
+}

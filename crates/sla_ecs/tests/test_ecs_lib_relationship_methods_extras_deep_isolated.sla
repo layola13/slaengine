@@ -1,0 +1,217 @@
+// Isolated deep tests for lib/relationship_methods_extras_deep.sla (Batch 379).
+// Mirror shallow lib/relationship_methods_extras.sla on cap-8 related × cap-4 descendants-per-
+// related parallel-array storage. Recursive BFS (insert_recursive / remove_recursive) rewritten
+// via flat count-ladder (Batch 378 rule). No tuple-return destructuring; no `let m = fn(m, ...)`
+// chained rebinding — sequential names. panic codes: 141800 - 141999.
+
+@import "../src/relationship_methods_extras_deep.sla"
+
+@test "EcsRelExtrasDeep new + add_one_related + related_count + cap-8 reject"() {
+    let r0 = ecs_rel_extras_deep_new(99);
+    if ecs_rel_extras_deep_entity(r0) != 99 { panic(141800); };
+    if ecs_rel_extras_deep_related_count(r0) != 0 { panic(141801); };
+    let r1 = ecs_rel_extras_deep_add_one_related(r0, 5, 11);
+    if ecs_rel_extras_deep_related_count(r1) != 1 { panic(141802); };
+    if ecs_rel_extras_deep_related_at(r1, 0) != 11 { panic(141803); };
+    // Deduplicate: adding 11 again leaves the list unchanged.
+    let r2 = ecs_rel_extras_deep_add_one_related(r1, 5, 11);
+    if ecs_rel_extras_deep_related_count(r2) != 1 { panic(141804); };
+    // Add 6 more distinct to reach r_count = 7.
+    let r3 = ecs_rel_extras_deep_add_one_related(r2, 5, 12);
+    let r4 = ecs_rel_extras_deep_add_one_related(r3, 5, 13);
+    let r5 = ecs_rel_extras_deep_add_one_related(r4, 5, 14);
+    let r6 = ecs_rel_extras_deep_add_one_related(r5, 5, 15);
+    let r7 = ecs_rel_extras_deep_add_one_related(r6, 5, 16);
+    let r8 = ecs_rel_extras_deep_add_one_related(r7, 5, 17);
+    if ecs_rel_extras_deep_related_count(r8) != 7 { panic(141805); };
+    // related_at out-of-range returns -1.
+    if ecs_rel_extras_deep_related_at(r8, 7) != -1 { panic(141806); };
+    if ecs_rel_extras_deep_related_at(r8, -1) != -1 { panic(141807); };
+    // Push an 8th then a 9th should hit cap-8 reject silently.
+    let r9 = ecs_rel_extras_deep_add_one_related(r8, 5, 18);
+    if ecs_rel_extras_deep_related_count(r9) != 8 { panic(141808); };
+    let r10 = ecs_rel_extras_deep_add_one_related(r9, 5, 19);
+    if ecs_rel_extras_deep_related_count(r10) != 8 { panic(141809); };
+}
+
+@test "EcsRelExtrasDeep detach_all_related"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    let r1 = ecs_rel_extras_deep_add_one_related(r0, 5, 11);
+    let r2 = ecs_rel_extras_deep_add_one_related(r1, 5, 12);
+    let r3 = ecs_rel_extras_deep_add_one_related(r2, 5, 13);
+    if ecs_rel_extras_deep_related_count(r3) != 3 { panic(141820); };
+    let cleared = ecs_rel_extras_deep_detach_all_related(r3, 5);
+    if ecs_rel_extras_deep_related_count(cleared) != 0 { panic(141821); };
+    if ecs_rel_extras_deep_related_at(cleared, 0) != -1 { panic(141822); };
+    // Empty detach works.
+    let r_empty = ecs_rel_extras_deep_new(0);
+    let cleared_e = ecs_rel_extras_deep_detach_all_related(r_empty, 5);
+    if ecs_rel_extras_deep_related_count(cleared_e) != 0 { panic(141823); };
+}
+
+@test "EcsRelExtrasDeep add_descendant + descendant read-back via r_count growth"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    // slot 0 = add parent entity 11 as related (since not yet present), then push descendant 111.
+    let r1 = ecs_rel_extras_deep_add_descendant(r0, 11, 111);
+    if ecs_rel_extras_deep_related_count(r1) != 1 { panic(141830); };
+    if ecs_rel_extras_deep_related_at(r1, 0) != 11 { panic(141831); };
+    // Add a second descendant to slot 0 — r_count must NOT grow (slot 0 already exists).
+    let r2 = ecs_rel_extras_deep_add_descendant(r1, 11, 112);
+    if ecs_rel_extras_deep_related_count(r2) != 1 { panic(141832); };
+    // Total visits over a BFS = related (1) + descendants (2) = 3.
+    let vis = ecs_rel_extras_deep_insert_recursive(r2, 5, 0);
+    if ecs_rel_extras_rec_count(vis) != 3 { panic(141833); };
+    if ecs_rel_extras_rec_first(vis) != 11 { panic(141834); };
+    // Push descendants to slot 0 until cap-4 (silent reject beyond).
+    let r3 = ecs_rel_extras_deep_add_descendant(r2, 11, 113);
+    let r4 = ecs_rel_extras_deep_add_descendant(r3, 11, 114);
+    let r5 = ecs_rel_extras_deep_add_descendant(r4, 11, 115);  // cap-4 reject — pushed: no.
+    if ecs_rel_extras_deep_related_count(r5) != 1 { panic(141835); };
+    let vis2 = ecs_rel_extras_deep_insert_recursive(r5, 5, 0);
+    if ecs_rel_extras_rec_count(vis2) != 5 { panic(141836); };
+}
+
+@test "EcsRelExtrasDeep despawn_related returns queued count + first id, empty → 0/-1"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    let r1 = ecs_rel_extras_deep_add_one_related(r0, 5, 21);
+    let r2 = ecs_rel_extras_deep_add_one_related(r1, 5, 22);
+    let r3 = ecs_rel_extras_deep_add_one_related(r2, 5, 23);
+    let dr = ecs_rel_extras_deep_despawn_related(r3, 5);
+    if ecs_rel_extras_despawn_count(dr) != 3 { panic(141840); };
+    if ecs_rel_extras_despawn_first(dr) != 21 { panic(141841); };
+    // Empty despawn returns 0 count and -1 first.
+    let r_empty = ecs_rel_extras_deep_new(0);
+    let de = ecs_rel_extras_deep_despawn_related(r_empty, 5);
+    if ecs_rel_extras_despawn_count(de) != 0 { panic(141842); };
+    if ecs_rel_extras_despawn_first(de) != -1 { panic(141843); };
+}
+
+@test "EcsRelExtrasDeep despawn_children equivalent to despawn_related(id 0)"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    let r1 = ecs_rel_extras_deep_add_one_related(r0, 5, 31);
+    let r2 = ecs_rel_extras_deep_add_one_related(r1, 5, 32);
+    let r3 = ecs_rel_extras_deep_add_one_related(r2, 5, 33);
+    let dc = ecs_rel_extras_deep_despawn_children(r3);
+    if ecs_rel_extras_despawn_count(dc) != 3 { panic(141850); };
+    if ecs_rel_extras_despawn_first(dc) != 31 { panic(141851); };
+    // Then attach an explicit detach_all_related after despawn_children and observe cleared → 0.
+    let cleared = ecs_rel_extras_deep_detach_all_related(r3, 0);
+    if ecs_rel_extras_deep_related_count(cleared) != 0 { panic(141852); };
+}
+
+@test "EcsRelExtrasDeep with_related + spawned_with_related"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    if ecs_rel_extras_deep_spawned_with_related(r0) != 0 { panic(141860); };
+    let r1 = ecs_rel_extras_deep_with_related(r0, 5, 7, 41);
+    if ecs_rel_extras_deep_related_count(r1) != 1 { panic(141861); };
+    if ecs_rel_extras_deep_related_at(r1, 0) != 41 { panic(141862); };
+    if ecs_rel_extras_deep_spawned_with_related(r1) != 1 { panic(141863); };
+    let r2 = ecs_rel_extras_deep_with_related(r1, 5, 8, 42);
+    if ecs_rel_extras_deep_related_count(r2) != 2 { panic(141864); };
+    if ecs_rel_extras_deep_spawned_with_related(r2) != 2 { panic(141865); };
+    // Deduplicate raises count? with_related always inserts (not dedup) — matches shallow.
+    let r3 = ecs_rel_extras_deep_with_related(r2, 5, 9, 41);
+    if ecs_rel_extras_deep_related_count(r3) != 3 { panic(141866); };
+    if ecs_rel_extras_deep_spawned_with_related(r3) != 3 { panic(141867); };
+    // Fill cap-8 with cap-reject test.
+    let r4 = ecs_rel_extras_deep_with_related(r3, 5, 10, 43);
+    let r5 = ecs_rel_extras_deep_with_related(r4, 5, 11, 44);
+    let r6 = ecs_rel_extras_deep_with_related(r5, 5, 12, 45);
+    let r7 = ecs_rel_extras_deep_with_related(r6, 5, 13, 46);
+    let r8 = ecs_rel_extras_deep_with_related(r7, 5, 14, 47);
+    let r9 = ecs_rel_extras_deep_with_related(r8, 5, 15, 99);  // cap-8 reject — r_count stays at 8.
+    if ecs_rel_extras_deep_related_count(r9) != 8 { panic(141868); };
+    if ecs_rel_extras_deep_spawned_with_related(r9) != 8 { panic(141869); };
+}
+
+@test "EcsRelExtrasDeep with_related_entities spawns N (cap-8 reject at boundary)"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    // Spawn 3 entities starting at 100 — r_count grows to 3, spawned_with_related = 3.
+    let r1 = ecs_rel_extras_deep_with_related_entities(r0, 5, 3, 100);
+    if ecs_rel_extras_deep_related_count(r1) != 3 { panic(141870); };
+    if ecs_rel_extras_deep_related_at(r1, 0) != 100 { panic(141871); };
+    if ecs_rel_extras_deep_related_at(r1, 1) != 101 { panic(141872); };
+    if ecs_rel_extras_deep_related_at(r1, 2) != 102 { panic(141873); };
+    if ecs_rel_extras_deep_spawned_with_related(r1) != 3 { panic(141874); };
+    // Spawn 5 more → would exceed cap-8 by 0 (3 + 5 = 8 just fits).
+    let r2 = ecs_rel_extras_deep_with_related_entities(r1, 5, 5, 200);
+    if ecs_rel_extras_deep_related_count(r2) != 8 { panic(141875); };
+    if ecs_rel_extras_deep_spawned_with_related(r2) != 8 { panic(141876); };
+    // Spawn 2 more — cap-8 reject, no new entities spawned.
+    let r3 = ecs_rel_extras_deep_with_related_entities(r2, 5, 2, 300);
+    if ecs_rel_extras_deep_related_count(r3) != 8 { panic(141877); };
+    if ecs_rel_extras_deep_spawned_with_related(r3) != 8 { panic(141878); };
+}
+
+@test "EcsRelExtrasDeep insert_recursive BFS visits across multi-slot descendants"() {
+    let r0 = ecs_rel_extras_deep_new(1);
+    // Tree: parent = 1's related list of [11, 12], with descendants 111/112 (slot 0) and 121 (slot 1).
+    let r1 = ecs_rel_extras_deep_add_one_related(r0, 5, 11);
+    let r2 = ecs_rel_extras_deep_add_one_related(r1, 5, 12);
+    let r3 = ecs_rel_extras_deep_add_descendant(r2, 11, 111);
+    let r4 = ecs_rel_extras_deep_add_descendant(r3, 11, 112);
+    let r5 = ecs_rel_extras_deep_add_descendant(r4, 12, 121);
+    // BFS visits = related (2) + descendants (3) = 5.
+    let vis = ecs_rel_extras_deep_insert_recursive(r5, 5, 0);
+    if ecs_rel_extras_rec_count(vis) != 5 { panic(141880); };
+    if ecs_rel_extras_rec_first(vis) != 11 { panic(141881); };
+    // remove_recursive mirrors insert_recursive semantics.
+    let rem = ecs_rel_extras_deep_remove_recursive(r5, 5, 0);
+    if ecs_rel_extras_rec_count(rem) != 5 { panic(141882); };
+    if ecs_rel_extras_rec_first(rem) != 11 { panic(141883); };
+    // Empty BFS returns 0 count and -1 first.
+    let empty = ecs_rel_extras_deep_new(1);
+    let vis_empty = ecs_rel_extras_deep_insert_recursive(empty, 5, 0);
+    if ecs_rel_extras_rec_count(vis_empty) != 0 { panic(141884); };
+    if ecs_rel_extras_rec_first(vis_empty) != -1 { panic(141885); };
+}
+
+@test "EcsRelExtrasDeep result-struct accessors via library paths"() {
+    // Build the empty state of each result struct via library function paths (no direct struct
+    // literal in tests — SA-DSL convention asserts). Each library returned struct supports both
+    // its accessors.
+    let r_empty = ecs_rel_extras_deep_new(0);
+    let dz = ecs_rel_extras_deep_despawn_related(r_empty, 0);
+    if ecs_rel_extras_despawn_count(dz) != 0 { panic(141890); };
+    if ecs_rel_extras_despawn_first(dz) != -1 { panic(141891); };
+    let tz = ecs_rel_extras_deep_insert_recursive(r_empty, 0, 0);
+    if ecs_rel_extras_rec_count(tz) != 0 { panic(141892); };
+    if ecs_rel_extras_rec_first(tz) != -1 { panic(141893); };
+    // Non-zero state accessor check via a populated despawn.
+    let r_pop = ecs_rel_extras_deep_new(1);
+    let r_pop1 = ecs_rel_extras_deep_add_one_related(r_pop, 5, 70);
+    let r_pop2 = ecs_rel_extras_deep_add_one_related(r_pop1, 5, 71);
+    let dz2 = ecs_rel_extras_deep_despawn_related(r_pop2, 0);
+    if ecs_rel_extras_despawn_count(dz2) != 2 { panic(141894); };
+    if ecs_rel_extras_despawn_first(dz2) != 70 { panic(141895); };
+    // Non-zero traverse accessor check via a populated BFS.
+    let dz3 = ecs_rel_extras_deep_insert_recursive(r_pop2, 0, 0);
+    if ecs_rel_extras_rec_count(dz3) != 2 { panic(141896); };
+    if ecs_rel_extras_rec_first(dz3) != 70 { panic(141897); };
+}
+
+@test "EcsRelExtrasDeep full-cycle migration: add → descendants → recursive then detach"() {
+    let r0 = ecs_rel_extras_deep_new(7);
+    if ecs_rel_extras_deep_related_count(r0) != 0 { panic(141980); };
+    let r1 = ecs_rel_extras_deep_add_one_related(r0, 5, 50);
+    let r2 = ecs_rel_extras_deep_add_one_related(r1, 5, 60);
+    let r3 = ecs_rel_extras_deep_add_descendant(r2, 50, 150);
+    let r4 = ecs_rel_extras_deep_add_descendant(r3, 50, 160);
+    let r5 = ecs_rel_extras_deep_add_descendant(r4, 60, 260);
+    // BFS visits = 2 related + 3 descendants = 5.
+    let vis = ecs_rel_extras_deep_insert_recursive(r5, 5, 99);
+    if ecs_rel_extras_rec_count(vis) != 5 { panic(141981); };
+    if ecs_rel_extras_rec_first(vis) != 50 { panic(141982); };
+    // detach → r_count == 0, related_at returns -1.
+    let cleared = ecs_rel_extras_deep_detach_all_related(r5, 5);
+    if ecs_rel_extras_deep_related_count(cleared) != 0 { panic(141983); };
+    if ecs_rel_extras_deep_related_at(cleared, 0) != -1 { panic(141984); };
+    // After clear, BFS returns 0/-1.
+    let vis2 = ecs_rel_extras_deep_insert_recursive(cleared, 5, 99);
+    if ecs_rel_extras_rec_count(vis2) != 0 { panic(141985); };
+    if ecs_rel_extras_rec_first(vis2) != -1 { panic(141986); };
+    // Rebuild after detach: detach cleared descendants so cap-4 retrial repopulates from sratch.
+    let r6 = ecs_rel_extras_deep_add_one_related(cleared, 5, 99);
+    if ecs_rel_extras_deep_related_count(r6) != 1 { panic(141987); };
+    if ecs_rel_extras_deep_related_at(r6, 0) != 99 { panic(141988); };
+}

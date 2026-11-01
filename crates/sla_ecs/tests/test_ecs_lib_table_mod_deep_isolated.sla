@@ -1,0 +1,244 @@
+// Isolated deep tests for lib/table_mod_deep.sla (Batch 377).
+// Mirror shallow lib/table_mod.sla on cap-4 cols × cap-8 entities parallel-array storage,
+// plus the Tables collection (cap-8). No tuple-return callsites — allocate/get/set/
+// get_added_tick/get_changed_tick/get_entity_at_row/tables_get/tables_create all return wrapper
+// structs exposed via scalar accessors (Batch 373 observation: `let (a,b) = tuple_fn()` corrupts
+// prior assertions on SA). No `let m = fn(m, ...)` chained rebinding — use sequential names.
+// panic codes: 141400 - 141599.
+
+@import "../src/table_mod_deep.sla"
+
+@test "EcsTableIdDeep / EcsTableRowDeep scalar wrappers"() {
+    let tid = ecs_table_id_deep_new(7);
+    if ecs_table_id_deep_value(tid) != 7 { panic(141400); };
+    if ecs_table_id_deep_index(tid) != 7 { panic(141401); };
+    let tr = ecs_table_row_deep_new(12);
+    if ecs_table_row_deep_value(tr) != 12 { panic(141402); };
+    if ecs_table_row_deep_index(tr) != 12 { panic(141403); };
+}
+
+@test "EcsTableDeep new + add_column cap-4 + has_column + get_column_index"() {
+    let t0 = ecs_table_deep_new(3, 16);
+    if ecs_table_deep_id(t0) != 3 { panic(141410); };
+    if ecs_table_deep_entity_capacity(t0) != 16 { panic(141411); };
+    if ecs_table_deep_component_count(t0) != 0 { panic(141412); };
+    if ecs_table_deep_is_empty(t0) != true { panic(141413); };
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    let t2 = ecs_table_deep_add_column(t1, 200);
+    let t3 = ecs_table_deep_add_column(t2, 300);
+    let t4 = ecs_table_deep_add_column(t3, 400);
+    if ecs_table_deep_component_count(t4) != 4 { panic(141414); };
+    // cap-4 reject: add_column again must leave the table unchanged at 4 columns.
+    let t5 = ecs_table_deep_add_column(t4, 500);
+    if ecs_table_deep_component_count(t5) != 4 { panic(141415); };
+    if ecs_table_deep_has_column(t4, 100) != true { panic(141416); };
+    if ecs_table_deep_has_column(t4, 200) != true { panic(141417); };
+    if ecs_table_deep_has_column(t4, 999) != false { panic(141418); };
+    if ecs_table_deep_get_column_index(t4, 100) != 0 { panic(141419); };
+    if ecs_table_deep_get_column_index(t4, 400) != 3 { panic(141420); };
+    if ecs_table_deep_get_column_index(t4, 999) != -1 { panic(141421); };
+}
+
+@test "EcsTableDeep allocate adds entity + initialises column ticks"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    let t2 = ecs_table_deep_add_column(t1, 200);
+    // Allocate entity 101 at tick 7 → row 0.
+    let a0 = ecs_table_allocate_deep(t2, 101, 7);
+    if ecs_table_allocate_deep_ok(a0) != true { panic(141430); };
+    if ecs_table_allocate_deep_row(a0) != 0 { panic(141431); };
+    let t3 = ecs_table_allocate_deep_new_table(a0);
+    if ecs_table_deep_entity_count(t3) != 1 { panic(141432); };
+    if ecs_table_deep_is_empty(t3) != false { panic(141433); };
+    // The entity row should be retrievable and data should be 0 (default).
+    let g_e = ecs_table_get_entity_at_row_deep(t3, 0);
+    if ecs_table_get_entity_at_row_deep_valid(g_e) != true { panic(141434); };
+    if ecs_table_get_entity_at_row_deep_value(g_e) != 101 { panic(141435); };
+    // get data on col 100 @ row 0 should be valid=true, value=0.
+    let gd0 = ecs_table_get_deep(t3, 100, 0);
+    if ecs_table_get_deep_valid(gd0) != true { panic(141436); };
+    if ecs_table_get_deep_value(gd0) != 0 { panic(141437); };
+    // added & changed ticks should both be 7 at allocation.
+    let at0 = ecs_table_get_added_tick_deep(t3, 100, 0);
+    if ecs_table_get_deep_valid(at0) != true { panic(141438); };
+    if ecs_table_get_deep_value(at0) != 7 { panic(141439); };
+    let ct0 = ecs_table_get_changed_tick_deep(t3, 100, 0);
+    if ecs_table_get_deep_value(ct0) != 7 { panic(141440); };
+    // Place a second entity at tick 9 → row 1.
+    let a1 = ecs_table_allocate_deep(t3, 102, 9);
+    let t4 = ecs_table_allocate_deep_new_table(a1);
+    if ecs_table_deep_entity_count(t4) != 2 { panic(141441); };
+}
+
+@test "EcsTableDeep get after set; out-of-range returns valid=false"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    let a0 = ecs_table_allocate_deep(t1, 50, 3);
+    let t2 = ecs_table_allocate_deep_new_table(a0);
+    // Set col 100 @ row 0 to data 70, tick 11.
+    let s0 = ecs_table_set_deep(t2, 100, 0, 70, 11);
+    if ecs_table_set_deep_ok(s0) != true { panic(141450); };
+    let t3 = ecs_table_set_deep_new_table(s0);
+    let g0 = ecs_table_get_deep(t3, 100, 0);
+    if ecs_table_get_deep_valid(g0) != true { panic(141451); };
+    if ecs_table_get_deep_value(g0) != 70 { panic(141452); };
+    // changed tick bumped to 11; added tick preserved at 3.
+    let ct = ecs_table_get_changed_tick_deep(t3, 100, 0);
+    if ecs_table_get_deep_value(ct) != 11 { panic(141453); };
+    let at = ecs_table_get_added_tick_deep(t3, 100, 0);
+    if ecs_table_get_deep_value(at) != 3 { panic(141454); };
+    // Out-of-range column id 999 returns valid=false.
+    let g_bad_col = ecs_table_get_deep(t3, 999, 0);
+    if ecs_table_get_deep_valid(g_bad_col) != false { panic(141455); };
+    // Out-of-range row 3 returns valid=false.
+    let g_bad_row = ecs_table_get_deep(t3, 100, 3);
+    if ecs_table_get_deep_valid(g_bad_row) != false { panic(141456); };
+    // Negative row returns valid=false.
+    let g_neg_row = ecs_table_get_deep(t3, 100, -1);
+    if ecs_table_get_deep_valid(g_neg_row) != false { panic(141457); };
+}
+
+@test "EcsTableDeep set out-of-range returns ok=false, table unchanged"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    let a0 = ecs_table_allocate_deep(t1, 50, 3);
+    let t2 = ecs_table_allocate_deep_new_table(a0);
+    // Set on unknown column id 999 → ok=false, no value at row 0 (should stay 0 — never changed)
+    let s_bad_col = ecs_table_set_deep(t2, 999, 0, 999, 12);
+    if ecs_table_set_deep_ok(s_bad_col) != false { panic(141460); };
+    // Set out-of-range row → ok=false.
+    let s_bad_row = ecs_table_set_deep(t2, 100, 9, 999, 12);
+    if ecs_table_set_deep_ok(s_bad_row) != false { panic(141461); };
+    // Set negative row → ok=false.
+    let s_neg_row = ecs_table_set_deep(t2, 100, -1, 999, 12);
+    if ecs_table_set_deep_ok(s_neg_row) != false { panic(141462); };
+}
+
+@test "EcsTableDeep get_added_tick + get_changed_tick read back"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    let a0 = ecs_table_allocate_deep(t1, 5, 100);
+    let t2 = ecs_table_allocate_deep_new_table(a0);
+    // After allocate tick=100: added=100, changed=100.
+    let at = ecs_table_get_added_tick_deep(t2, 100, 0);
+    if ecs_table_get_deep_valid(at) != true { panic(141470); };
+    if ecs_table_get_deep_value(at) != 100 { panic(141471); };
+    let ct = ecs_table_get_changed_tick_deep(t2, 100, 0);
+    if ecs_table_get_deep_value(ct) != 100 { panic(141472); };
+    // Write at tick 200 → changed bumps to 200, added preserved at 100.
+    let s0 = ecs_table_set_deep(t2, 100, 0, 1, 200);
+    let t3 = ecs_table_set_deep_new_table(s0);
+    let at2 = ecs_table_get_added_tick_deep(t3, 100, 0);
+    if ecs_table_get_deep_value(at2) != 100 { panic(141473); };
+    let ct2 = ecs_table_get_changed_tick_deep(t3, 100, 0);
+    if ecs_table_get_deep_value(ct2) != 200 { panic(141474); };
+    // get_added_tick on missing column → valid=false, value=0.
+    let at_bad = ecs_table_get_added_tick_deep(t3, 999, 0);
+    if ecs_table_get_deep_valid(at_bad) != false { panic(141475); };
+    if ecs_table_get_deep_value(at_bad) != 0 { panic(141476); };
+    // get_changed_tick on out-of-range row → valid=false, value=0.
+    let ct_bad = ecs_table_get_changed_tick_deep(t3, 100, 9);
+    if ecs_table_get_deep_valid(ct_bad) != false { panic(141477); };
+}
+
+@test "EcsTableDeep get_drop_for only true when column exists"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    // Empty table: no columns → drop report false.
+    if ecs_table_get_drop_for_deep(t0, 100) != false { panic(141480); };
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    if ecs_table_get_drop_for_deep(t1, 100) != true { panic(141481); };
+    if ecs_table_get_drop_for_deep(t1, 200) != false { panic(141482); };
+    let t2 = ecs_table_deep_add_column(t1, 200);
+    if ecs_table_get_drop_for_deep(t2, 200) != true { panic(141483); };
+    if ecs_table_get_drop_for_deep(t2, 999) != false { panic(141484); };
+}
+
+@test "EcsTableDeep swap_remove: tail no-op + middle row relocation"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    let t1 = ecs_table_deep_add_column(t0, 100);
+    let t2 = ecs_table_deep_add_column(t1, 200);
+    // Allocate three entities at tick 1, 2, 3 — sequential.
+    let a0 = ecs_table_allocate_deep(t2, 11, 1);
+    let t3 = ecs_table_allocate_deep_new_table(a0);
+    let a1 = ecs_table_allocate_deep(t3, 22, 2);
+    let t4 = ecs_table_allocate_deep_new_table(a1);
+    let a2 = ecs_table_allocate_deep(t4, 33, 3);
+    let t5 = ecs_table_allocate_deep_new_table(a2);
+    if ecs_table_deep_entity_count(t5) != 3 { panic(141490); };
+    // Populate col 200 with distinguishable values per row (data per row).
+    let sv0 = ecs_table_set_deep(t5, 200, 0, 2000, 10);
+    let t6 = ecs_table_set_deep_new_table(sv0);
+    let sv1 = ecs_table_set_deep(t6, 200, 1, 2001, 11);
+    let t7 = ecs_table_set_deep_new_table(sv1);
+    let sv2 = ecs_table_set_deep(t7, 200, 2, 2002, 12);
+    let t8 = ecs_table_set_deep_new_table(sv2);
+    // swap_remove the middle row (row 1) — expect entity relocated from tail (row 2) → row 1.
+    let sr0 = ecs_table_swap_remove_deep(t8, 1);
+    if ecs_table_swap_remove_deep_ok(sr0) != true { panic(141491); };
+    let t9 = ecs_table_swap_remove_deep_new_table(sr0);
+    if ecs_table_deep_entity_count(t9) != 2 { panic(141492); };
+    // Row 1 now holds entity 33 (was tail) — read through get_entity_at_row.
+    let g1 = ecs_table_get_entity_at_row_deep(t9, 1);
+    if ecs_table_get_entity_at_row_deep_valid(g1) != true { panic(141493); };
+    if ecs_table_get_entity_at_row_deep_value(g1) != 33 { panic(141494); };
+    // Row 1 col 200 data should be 2002 (relocated from tail row 2).
+    let g_col = ecs_table_get_deep(t9, 200, 1);
+    if ecs_table_get_deep_value(g_col) != 2002 { panic(141495); };
+    // Row 0 unchanged: entity 11, data 2000.
+    let g0 = ecs_table_get_entity_at_row_deep(t9, 0);
+    if ecs_table_get_entity_at_row_deep_value(g0) != 11 { panic(141496); };
+    // out-of-range row returns ok=false.
+    let sr_bad = ecs_table_swap_remove_deep(t9, 9);
+    if ecs_table_swap_remove_deep_ok(sr_bad) != false { panic(141497); };
+}
+
+@test "EcsTableDeep get_entity_at_row valid/invalid"() {
+    let t0 = ecs_table_deep_new(0, 16);
+    let a0 = ecs_table_allocate_deep(t0, 21, 1);
+    let t1 = ecs_table_allocate_deep_new_table(a0);
+    let a1 = ecs_table_allocate_deep(t1, 22, 2);
+    let t2 = ecs_table_allocate_deep_new_table(a1);
+    let v0 = ecs_table_get_entity_at_row_deep(t2, 0);
+    if ecs_table_get_entity_at_row_deep_valid(v0) != true { panic(141500); };
+    if ecs_table_get_entity_at_row_deep_value(v0) != 21 { panic(141501); };
+    let v1 = ecs_table_get_entity_at_row_deep(t2, 1);
+    if ecs_table_get_entity_at_row_deep_value(v1) != 22 { panic(141502); };
+    // Out-of-range returns valid=false.
+    let v2 = ecs_table_get_entity_at_row_deep(t2, 2);
+    if ecs_table_get_entity_at_row_deep_valid(v2) != false { panic(141503); };
+    // Negative row returns valid=false.
+    let vn = ecs_table_get_entity_at_row_deep(t2, -1);
+    if ecs_table_get_entity_at_row_deep_valid(vn) != false { panic(141504); };
+}
+
+@test "EcsTablesDeep new + create + len/count/is_empty + get"() {
+    let ts0 = ecs_tables_deep_new();
+    if ecs_tables_deep_is_empty(ts0) != true { panic(141510); };
+    if ecs_tables_deep_len(ts0) != 0 { panic(141511); };
+    if ecs_tables_deep_count(ts0) != 0 { panic(141512); };
+    let c0 = ecs_tables_deep_create(ts0, 32);
+    if ecs_tables_deep_create_ok(c0) != true { panic(141513); };
+    if ecs_tables_deep_create_id(c0) != 0 { panic(141514); };
+    let ts1 = ecs_tables_deep_create_new_tables(c0);
+    if ecs_tables_deep_len(ts1) != 1 { panic(141515); };
+    let c1 = ecs_tables_deep_create(ts1, 32);
+    let ts2 = ecs_tables_deep_create_new_tables(c1);
+    if ecs_tables_deep_len(ts2) != 2 { panic(141516); };
+    // Get table id=0 — valid, capacity 32.
+    let g0 = ecs_tables_deep_get(ts2, 0);
+    if ecs_tables_deep_get_valid(g0) != true { panic(141517); };
+    let t0 = ecs_tables_deep_get_table(g0);
+    if ecs_table_deep_id(t0) != 0 { panic(141518); };
+    if ecs_table_deep_entity_capacity(t0) != 32 { panic(141519); };
+    // Get a table id=1 — valid.
+    let g1 = ecs_tables_deep_get(ts2, 1);
+    if ecs_tables_deep_get_valid(g1) != true { panic(141520); };
+    let t1 = ecs_tables_deep_get_table(g1);
+    if ecs_table_deep_id(t1) != 1 { panic(141521); };
+    // Get a missing id=42 — valid=false + returns a default-empty EcsTableDeep.
+    let g_missing = ecs_tables_deep_get(ts2, 42);
+    if ecs_tables_deep_get_valid(g_missing) != false { panic(141522); };
+    let grd = ecs_tables_deep_get_table(g_missing);
+    if ecs_table_deep_id(grd) != 0 { panic(141523); };
+    if ecs_table_deep_entity_count(grd) != 0 { panic(141524); };
+}

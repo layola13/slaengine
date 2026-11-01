@@ -1,0 +1,128 @@
+@import "../src/change_detection_deep.sla"
+
+// Batch 292: change_detection composite deep facade.
+// panic codes: 124400 – 124599.
+
+@test "tick_wrap_and_relative"() {
+    let t = ecs_cd_tick_new(5);
+    if ecs_cd_tick_get(t) != 5 { panic(124400); };
+    t = ecs_cd_tick_set(t, -1);
+    // wrap: -1 % 2^32 => 4294967295
+    if ecs_cd_tick_get(t) != 4294967295 { panic(124401); };
+    let a = ecs_cd_tick_new(10);
+    let b = ecs_cd_tick_new(3);
+    let r = ecs_cd_tick_relative_to(a, b);
+    if ecs_cd_tick_get(r) != 7 { panic(124402); };
+}
+
+@test "is_newer_than_basic"() {
+    // last_run=0, this_run=10, tick=5 => newer
+    if ecs_cd_is_newer_than(5, 0, 10) != true { panic(124410); };
+    // tick=0 not newer than last_run=0
+    if ecs_cd_is_newer_than(0, 0, 10) != false { panic(124411); };
+    // tick after this_run not newer
+    if ecs_cd_is_newer_than(11, 0, 10) != false { panic(124412); };
+    let self_t = ecs_cd_tick_new(5);
+    let last = ecs_cd_tick_new(0);
+    let this = ecs_cd_tick_new(10);
+    if ecs_cd_tick_is_newer_than(self_t, last, this) != true { panic(124413); };
+}
+
+@test "component_ticks_added_changed"() {
+    let ct = ecs_cd_ct_new(3);
+    if ecs_cd_ct_added(ct) != 3 { panic(124420); };
+    if ecs_cd_ct_changed(ct) != 3 { panic(124421); };
+    if ecs_cd_ct_is_added(ct, 0, 5) != true { panic(124422); };
+    ct = ecs_cd_ct_set_changed(ct, 7);
+    if ecs_cd_ct_changed(ct) != 7 { panic(124423); };
+    if ecs_cd_ct_added(ct) != 3 { panic(124424); };
+    if ecs_cd_ct_is_changed(ct, 5, 8) != true { panic(124425); };
+    ct = ecs_cd_ct_set_both(ct, 9);
+    if ecs_cd_ct_added(ct) != 9 { panic(124426); };
+    if ecs_cd_ct_changed(ct) != 9 { panic(124427); };
+}
+
+@test "detect_changes_mut_set_and_bypass"() {
+    // last_run=0 this_run=5, added/changed=0 => not changed yet
+    let m = ecs_cd_mut_new(10, 0, 0, 0, 5);
+    if ecs_cd_mut_is_changed(m) != false { panic(124430); };
+    m = ecs_cd_mut_set_changed(m);
+    if ecs_cd_mut_is_changed(m) != true { panic(124431); };
+    if ecs_cd_mut_changed(m) != 5 { panic(124432); };
+    if ecs_cd_mut_set_changed_count(m) != 1 { panic(124433); };
+    m = ecs_cd_mut_bypass(m, 99);
+    if ecs_cd_mut_value(m) != 99 { panic(124434); };
+    if ecs_cd_mut_bypass_count(m) != 1 { panic(124435); };
+    // bypass does not bump changed
+    if ecs_cd_mut_changed(m) != 5 { panic(124436); };
+}
+
+@test "set_if_neq_and_set_added"() {
+    let m = ecs_cd_mut_new(1, 0, 0, 0, 4);
+    m = ecs_cd_mut_set_if_neq(m, 1);
+    if ecs_cd_mut_set_changed_count(m) != 0 { panic(124440); };
+    m = ecs_cd_mut_set_if_neq(m, 2);
+    if ecs_cd_mut_value(m) != 2 { panic(124441); };
+    if ecs_cd_mut_changed(m) != 4 { panic(124442); };
+    if ecs_cd_mut_set_changed_count(m) != 1 { panic(124443); };
+    m = ecs_cd_mut_set_added(m);
+    if ecs_cd_mut_added(m) != 4 { panic(124444); };
+    if ecs_cd_mut_is_added(m) != true { panic(124445); };
+}
+
+@test "set_changed_by_location"() {
+    let m = ecs_cd_mut_new(0, 0, 0, 0, 2);
+    m = ecs_cd_mut_set_changed_by(m, 12345);
+    if ecs_cd_mut_has_changed_by(m) != true { panic(124450); };
+    if ecs_cd_mut_changed_by(m) != 12345 { panic(124451); };
+    if ecs_cd_mut_is_changed(m) != true { panic(124452); };
+}
+
+@test "maybe_location_ops"() {
+    let n = ecs_cd_loc_none();
+    if ecs_cd_loc_has(n) != false { panic(124460); };
+    if ecs_cd_loc_unwrap_or_default(n) != 0 { panic(124461); };
+    let s = ecs_cd_loc_some(7);
+    if ecs_cd_loc_value(s) != 7 { panic(124462); };
+    let m = ecs_cd_loc_map_add(s, 3);
+    if ecs_cd_loc_value(m) != 10 { panic(124463); };
+    let z = ecs_cd_loc_zip_add(s, ecs_cd_loc_some(2));
+    if ecs_cd_loc_value(z) != 9 { panic(124464); };
+    let z2 = ecs_cd_loc_zip_add(s, n);
+    if ecs_cd_loc_has(z2) != false { panic(124465); };
+    let a = ecs_cd_loc_assign(n, s);
+    if ecs_cd_loc_value(a) != 7 { panic(124466); };
+}
+
+@test "tick_check_clamp"() {
+    let present = ecs_cd_tick_new(ecs_cd_max_change_age() + 100);
+    let old = ecs_cd_tick_new(0);
+    let clamped = ecs_cd_tick_check(old, present);
+    // age of 0 vs present is present; > MAX => clamp to present-MAX = 100
+    if ecs_cd_tick_get(clamped) != 100 { panic(124470); };
+    let recent = ecs_cd_tick_new(ecs_cd_tick_get(present) - 10);
+    let same = ecs_cd_tick_check(recent, present);
+    if ecs_cd_tick_get(same) != ecs_cd_tick_get(recent) { panic(124471); };
+}
+
+@test "cells_mark_changed"() {
+    // last_run=5 so ticks at 5 are not newer; this_run=10
+    let c = ecs_cd_cells_new(5, 10);
+    c = ecs_cd_cells_push(c, 5, 5);
+    c = ecs_cd_cells_push(c, 5, 5);
+    if ecs_cd_cells_len(c) != 2 { panic(124480); };
+    if ecs_cd_cells_is_changed_at(c, 0) != false { panic(124481); };
+    c = ecs_cd_cells_mark_changed(c, 0);
+    if ecs_cd_cells_changed_at(c, 0) != 10 { panic(124482); };
+    if ecs_cd_cells_is_changed_at(c, 0) != true { panic(124483); };
+    if ecs_cd_cells_is_changed_at(c, 1) != false { panic(124484); };
+}
+
+@test "constants_and_check_struct"() {
+    if ecs_cd_check_tick_threshold() != 518400000 { panic(124490); };
+    if ecs_cd_max_change_age() != 3258167296 { panic(124491); };
+    let ch = ecs_cd_check_new(42);
+    if ecs_cd_check_present(ch) != 42 { panic(124492); };
+    if ecs_cd_tick_eq(ecs_cd_tick_new(1), ecs_cd_tick_new(1)) != true { panic(124493); };
+    if ecs_cd_tick_eq(ecs_cd_tick_new(1), ecs_cd_tick_new(2)) != false { panic(124494); };
+}

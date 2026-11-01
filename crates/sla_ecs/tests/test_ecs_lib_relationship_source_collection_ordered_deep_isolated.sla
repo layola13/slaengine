@@ -1,0 +1,230 @@
+// Isolated deep tests for lib/relationship_source_collection_ordered_deep.sla (Batch 361).
+// Mirrors Bevy Vec<Entity> impl of OrderedRelationshipSourceCollection + base RelationshipSourceCollection.
+// panic codes: 138200 - 138399.
+
+@import "../src/relationship_source_collection_ordered_deep.sla"
+
+@test "EcsRscOrderedDeep new empty and cap accessors"() {
+    let c = ecs_rsc_new();
+    if ecs_rsc_len(c) != 0 { panic(138200); };
+    if ecs_rsc_is_empty(c) != true { panic(138201); };
+    if ecs_rsc_count(c) != 0 { panic(138202); };
+    if ecs_rsc_at(c, 0) != 0 { panic(138203); };
+    if ecs_rsc_at(c, 7) != 0 { panic(138204); };
+    if ecs_rsc_at(c, 8) != -1 { panic(138205); };
+    if ecs_rsc_source_to_remove_before_add(c) != -1 { panic(138206); };
+}
+
+@test "add pushes entities onto tail and rejects at cap"() {
+    let c0 = ecs_rsc_new();
+    let (c1, ok1) = ecs_rsc_add(c0, 11);
+    if ok1 != true { panic(138210); };
+    if ecs_rsc_len(c1) != 1 { panic(138211); };
+    if ecs_rsc_at(c1, 0) != 11 { panic(138212); };
+    let c2 = c1;
+    let i: i32 = 1;
+    while i < 8 {
+        let (nxt, _) = ecs_rsc_add(c2, 100 + i);
+        c2 = nxt;
+        i = i + 1;
+    }
+    if ecs_rsc_len(c2) != 8 { panic(138213); };
+    let (c3, ok3) = ecs_rsc_add(c2, 999);
+    if ok3 != false { panic(138214); };
+    if ecs_rsc_len(c3) != 8 { panic(138215); };
+}
+
+@test "insert push+swap reorders trailing slots"() {
+    // seed [10, 20, 30]
+    let c0 = ecs_rsc_new();
+    let c1 = ecs_rsc_insert(c0, 0, 10);
+    let c2 = ecs_rsc_insert(c1, 0, 20);
+    let c3 = ecs_rsc_insert(c2, 0, 30);
+    // After three inserts at 0: push+swap puts newest at front each time.
+    // insert(c,0,10) -> [10]; insert(c,0,20) push+[swap(0,1)] -> [20,10];
+    // insert(c,0,30) push+[swap(0,2)] -> [30,10,20]
+    if ecs_rsc_len(c3) != 3 { panic(138220); };
+    if ecs_rsc_at(c3, 0) != 30 { panic(138221); };
+    if ecs_rsc_at(c3, 1) != 10 { panic(138222); };
+    if ecs_rsc_at(c3, 2) != 20 { panic(138223); };
+    // insert at index 1 of a 4th entity: push to tail then swap with index 1
+    let c4 = ecs_rsc_insert(c3, 1, 99);
+    // push gave [30,10,20,99]; swap(1,3) -> [30,99,20,10]
+    if ecs_rsc_at(c4, 0) != 30 { panic(138224); };
+    if ecs_rsc_at(c4, 1) != 99 { panic(138225); };
+    if ecs_rsc_at(c4, 2) != 20 { panic(138226); };
+    if ecs_rsc_at(c4, 3) != 10 { panic(138227); };
+}
+
+@test "remove_at swap_remove reorders via tail-move"() {
+    // seed via insert chain -> [30,99,20,10]
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_insert(c0, 0, 10);
+    c0 = ecs_rsc_insert(c0, 0, 20);
+    c0 = ecs_rsc_insert(c0, 0, 30);
+    c0 = ecs_rsc_insert(c0, 1, 99);
+    if ecs_rsc_at(c0, 0) != 30 { panic(138230); };
+    if ecs_rsc_at(c0, 1) != 99 { panic(138231); };
+    if ecs_rsc_at(c0, 2) != 20 { panic(138232); };
+    if ecs_rsc_at(c0, 3) != 10 { panic(138233); };
+    let (c1, r) = ecs_rsc_remove_at(c0, 1);
+    if ecs_rsc_rr_found(r) != 1 { panic(138234); };
+    if ecs_rsc_rr_entity(r) != 99 { panic(138235); };
+    // swap_remove: index 1 takes tail (10), count drops 4->3 -> [30, 10, 20]
+    if ecs_rsc_len(c1) != 3 { panic(138236); };
+    if ecs_rsc_at(c1, 0) != 30 { panic(138237); };
+    if ecs_rsc_at(c1, 1) != 10 { panic(138238); };
+    if ecs_rsc_at(c1, 2) != 20 { panic(138239); };
+    // OOB remove
+    let (c2, r2) = ecs_rsc_remove_at(c1, 5);
+    if ecs_rsc_rr_found(r2) != 0 { panic(138240); };
+    if ecs_rsc_len(c2) != 3 { panic(138241); };
+}
+
+@test "insert_stable and remove_at_stable preserve order"() {
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_insert_stable(c0, 0, 5);
+    c0 = ecs_rsc_insert_stable(c0, 0, 3);
+    c0 = ecs_rsc_insert_stable(c0, 1, 4);
+    // [3, 4, 5]
+    if ecs_rsc_at(c0, 0) != 3 { panic(138250); };
+    if ecs_rsc_at(c0, 1) != 4 { panic(138251); };
+    if ecs_rsc_at(c0, 2) != 5 { panic(138252); };
+    // insert_stable OOB -> append to end
+    c0 = ecs_rsc_insert_stable(c0, 99, 7);
+    // [3, 4, 5, 7]
+    if ecs_rsc_at(c0, 3) != 7 { panic(138253); };
+    if ecs_rsc_len(c0) != 4 { panic(138254); };
+    let (c1, r) = ecs_rsc_remove_at_stable(c0, 1);
+    if ecs_rsc_rr_entity(r) != 4 { panic(138255); };
+    // stable remove shifts: [3, 5, 7]
+    if ecs_rsc_at(c1, 0) != 3 { panic(138256); };
+    if ecs_rsc_at(c1, 1) != 5 { panic(138257); };
+    if ecs_rsc_at(c1, 2) != 7 { panic(138258); };
+}
+
+@test "sort ascending and insert_sorted maintain order"() {
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_insert(c0, 0, 50);
+    c0 = ecs_rsc_insert(c0, 0, 20);
+    c0 = ecs_rsc_insert(c0, 0, 80);
+    c0 = ecs_rsc_insert(c0, 0, 10);
+    // sort
+    let s = ecs_rsc_sort(c0);
+    if ecs_rsc_at(s, 0) != 10 { panic(138260); };
+    if ecs_rsc_at(s, 1) != 20 { panic(138261); };
+    if ecs_rsc_at(s, 2) != 50 { panic(138262); };
+    if ecs_rsc_at(s, 3) != 80 { panic(138263); };
+    // insert_sorted(40) should slot between 20 and 50
+    let s2 = ecs_rsc_insert_sorted(s, 40);
+    if ecs_rsc_len(s2) != 5 { panic(138264); };
+    if ecs_rsc_at(s2, 0) != 10 { panic(138265); };
+    if ecs_rsc_at(s2, 1) != 20 { panic(138266); };
+    if ecs_rsc_at(s2, 2) != 40 { panic(138267); };
+    if ecs_rsc_at(s2, 3) != 50 { panic(138268); };
+    if ecs_rsc_at(s2, 4) != 80 { panic(138269); };
+}
+
+@test "place relocates entity to clamped index"() {
+    // seed [A, B, C, D] = [1, 2, 3, 4] via insert_stable so order is known
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_insert_stable(c0, 0, 1);
+    c0 = ecs_rsc_insert_stable(c0, 0, 2);
+    c0 = ecs_rsc_insert_stable(c0, 0, 3);
+    c0 = ecs_rsc_insert_stable(c0, 0, 4);
+    // Actually insert_stable at 0 shifts: [4, 3, 2, 1]
+    if ecs_rsc_at(c0, 0) != 4 { panic(138270); };
+    // place entity 2 to index 0: remove(2) stable, then insert(0, 2)
+    let c1 = ecs_rsc_place(c0, 2, 0);
+    // start [4,3,2,1]; remove value 2 -> [4,3,1]; insert(0,2) push+swap(0,2) -> [2,3,4]? wait
+    // push gives [4,3,1,2]; swap(0,3) -> [2,3,1,4]
+    if ecs_rsc_len(c1) != 4 { panic(138271); };
+    if ecs_rsc_at(c1, 0) != 2 { panic(138272); };
+    // place entity not present -> no-op
+    let c2 = ecs_rsc_place(c1, 999, 0);
+    if ecs_rsc_len(c2) != 4 { panic(138273); };
+    if ecs_rsc_at(c2, 0) != 2 { panic(138274); };
+    // place to oob index -> clamp to end
+    let c3 = ecs_rsc_place(c2, 4, 99);
+    // remove value 4 -> [2,3,1]; insert(99) -> push+no swap (99>=3) -> [2,3,1,4]
+    if ecs_rsc_len(c3) != 4 { panic(138275); };
+    if ecs_rsc_at(c3, 3) != 4 { panic(138276); };
+}
+
+@test "place_most_recent moves tail to target index"() {
+    // seed via insert_stable at 0 -> [30,20,10]
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_insert_stable(c0, 0, 10);
+    c0 = ecs_rsc_insert_stable(c0, 0, 20);
+    c0 = ecs_rsc_insert_stable(c0, 0, 30);
+    if ecs_rsc_at(c0, 2) != 10 { panic(138280); };
+    // place_most_recent(0): pop tail=10, insert(0,10) push+swap(0,2) -> [10,20,30]? wait: pop gives [30,20], push [30,20,10], swap(0,2) -> [10,20,30]
+    let c1 = ecs_rsc_place_most_recent(c0, 0);
+    if ecs_rsc_len(c1) != 3 { panic(138281); };
+    if ecs_rsc_at(c1, 0) != 10 { panic(138282); };
+    if ecs_rsc_at(c1, 1) != 20 { panic(138283); };
+    if ecs_rsc_at(c1, 2) != 30 { panic(138284); };
+    // place_most_recent on empty -> no-op
+    let empty = ecs_rsc_new();
+    let c2 = ecs_rsc_place_most_recent(empty, 0);
+    if ecs_rsc_len(c2) != 0 { panic(138285); };
+}
+
+@test "remove by value via rposition and extend_from_iter"() {
+    // seed [1, 2, 3, 2] via insert_stable
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_insert_stable(c0, 0, 1);
+    c0 = ecs_rsc_insert_stable(c0, 1, 2);
+    c0 = ecs_rsc_insert_stable(c0, 2, 3);
+    c0 = ecs_rsc_insert_stable(c0, 3, 2);
+    if ecs_rsc_len(c0) != 4 { panic(138290); };
+    // rposition finds last 2 (index 3); stable remove shifts -> [1,2,3]
+    let (c1, ok) = ecs_rsc_remove(c0, 2);
+    if ok != true { panic(138291); };
+    if ecs_rsc_len(c1) != 3 { panic(138292); };
+    if ecs_rsc_at(c1, 0) != 1 { panic(138293); };
+    if ecs_rsc_at(c1, 1) != 2 { panic(138294); };
+    if ecs_rsc_at(c1, 2) != 3 { panic(138295); };
+    // remove of not-present
+    let (c2, ok2) = ecs_rsc_remove(c1, 999);
+    if ok2 != false { panic(138296); };
+    if ecs_rsc_len(c2) != 3 { panic(138297); };
+    // extend_from_iter
+    let more: Vec<i64> = Vec::new();
+    more.push(7);
+    more.push(8);
+    let c3 = ecs_rsc_extend_from_iter(c2, more);
+    if ecs_rsc_len(c3) != 5 { panic(138298); };
+    if ecs_rsc_at(c3, 3) != 7 { panic(138299); };
+}
+
+@test "push/pop front+back and clear"() {
+    let c0 = ecs_rsc_new();
+    c0 = ecs_rsc_push_back(c0, 1);
+    c0 = ecs_rsc_push_back(c0, 2);
+    c0 = ecs_rsc_push_back(c0, 3);
+    if ecs_rsc_at(c0, 0) != 1 { panic(138300); };
+    if ecs_rsc_at(c0, 1) != 2 { panic(138301); };
+    if ecs_rsc_at(c0, 2) != 3 { panic(138302); };
+    let c1 = ecs_rsc_push_front(c0, 9);
+    // push_front = insert(0,9): push [1,2,3,9], swap(0,3) -> [9,2,3,1]
+    if ecs_rsc_at(c1, 0) != 9 { panic(138303); };
+    if ecs_rsc_at(c1, 3) != 1 { panic(138304); };
+    let (c2, r) = ecs_rsc_pop_front(c1);
+    if ecs_rsc_rr_entity(r) != 9 { panic(138305); };
+    // swap_remove front: index 0 takes tail (1) -> [1,2,3]
+    if ecs_rsc_at(c2, 0) != 1 { panic(138306); };
+    if ecs_rsc_at(c2, 1) != 2 { panic(138307); };
+    if ecs_rsc_at(c2, 2) != 3 { panic(138308); };
+    let (c3, r2) = ecs_rsc_pop_back(c2);
+    if ecs_rsc_rr_entity(r2) != 3 { panic(138309); };
+    if ecs_rsc_len(c3) != 2 { panic(138310); };
+    if ecs_rsc_at(c3, 1) != 2 { panic(138311); };
+    let (c4, r3) = ecs_rsc_pop_back(ecs_rsc_new());
+    if ecs_rsc_rr_found(r3) != 0 { panic(138312); };
+    let _ = c4;
+    // clear
+    let c5 = ecs_rsc_clear(c3);
+    if ecs_rsc_len(c5) != 0 { panic(138313); };
+    if ecs_rsc_is_empty(c5) != true { panic(138314); };
+}
