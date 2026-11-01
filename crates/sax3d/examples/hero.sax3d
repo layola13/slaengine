@@ -1,0 +1,95 @@
+// hero.sax3d — SAX3D 第二工作例：蒙皮网格 + 骨骼 + morph + 双通道动画。
+// 4 顶点小面片、2 关节骨骼、1 个 morph 目标；clip Wave 同时驱动
+// 关节旋转（rotation 通道）与 morph 权重（weights 通道）。
+// HeroTexImg 是路径源图像（外部文件），打包合并形时内嵌为段——
+// 用以演练 F-2 补定的「拆分形引用外部文件」一面。
+
+asset HeroDemo version 1;
+
+binary "hero.saxb3d" {
+    section hero_pos       48;
+    section hero_nrm       48;
+    section hero_uv        32;
+    section hero_joints    32;
+    section hero_weights   64;
+    section hero_idx       12;
+    section hero_morph_pos 48;
+    section rig_ib        128;
+    section wave_times     12;
+    section wave_rots      48;
+    section wave_weights   12;
+}
+
+mesh Hero {
+    vertices 4;
+    channel position : f32x3 @ hero_pos;
+    channel normal   : f32x3 @ hero_nrm;
+    channel uv0      : f32x2 @ hero_uv;
+    channel joints0  : u16x4 @ hero_joints;
+    channel weights0 : f32x4 @ hero_weights;
+    morph Smile {
+        channel position : f32x3 @ hero_morph_pos;
+    }
+    indices u16 @ hero_idx count 6;
+    primitive body { material: HeroMat; }
+}
+
+skeleton Rig {
+    joint Root {
+        parent: none;
+        bind: { t: [0.0, 0.0, 0.0]; r: [0.0, 0.0, 0.0, 1.0]; s: [1.0, 1.0, 1.0]; }
+    }
+    joint Tip {
+        parent: Root;
+        bind: { t: [0.0, 0.5, 0.0]; r: [0.0, 0.0, 0.0, 1.0]; s: [1.0, 1.0, 1.0]; }
+    }
+    inverse_bind @ rig_ib;
+}
+
+image HeroTexImg {
+    source "hero_tex.png";     // 外部文件（格式层不透明载荷，不解码）
+    format png;
+    color_space srgb;
+}
+
+texture HeroTex {
+    image: HeroTexImg;
+    sampler { mag: nearest; min: linear; mipmap: nearest; wrap_u: clamp; wrap_v: clamp; }
+}
+
+shader Skinned: slasl "skinned.slasl";
+
+material HeroMat {
+    shader: Skinned;
+    param tint = [0.9, 0.8, 0.7, 1.0];
+    texture skin_map: HeroTex;
+    state { alpha: opaque; depth_write: true; }
+}
+
+scene HeroScene {
+    node HeroNode {
+        mesh: Hero;
+        skin: Rig;
+        node Root {
+            transform { t: [0.0, 1.0, 0.0]; }
+            node Tip {
+                transform { t: [0.0, 0.5, 0.0]; r: [0.0, 0.0, 0.0, 1.0]; }
+            }
+        }
+    }
+}
+
+clip Wave {
+    sampler T0 {
+        input:  f32  @ wave_times count 3;
+        output: quat @ wave_rots  count 3;
+        interpolation: linear;
+    }
+    sampler W0 {
+        input:  f32 @ wave_times  count 3;
+        output: f32 @ wave_weights count 3;
+        interpolation: linear;
+    }
+    channel { node: Tip;      path: rotation; sampler: T0; }
+    channel { node: HeroNode; path: weights;  sampler: W0; }
+}
