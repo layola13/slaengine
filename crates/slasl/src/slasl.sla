@@ -1559,6 +1559,9 @@ fn chk_expr(c: &Ctx, sh: i32, e: i32, stage: i32, out_ty: &i32) -> bool {
                 return true;
             };
         };
+        if callee.kind == 2 {
+            return chk_call_named(c, sh, e, stage, out_ty);
+        };
         err_lit(c, STR_PTR("unsupported call in prototype subset (only sampler .get)"), STR_LEN("unsupported call in prototype subset (only sampler .get)"));
         c.failed = true;
         return false;
@@ -1566,6 +1569,171 @@ fn chk_expr(c: &Ctx, sh: i32, e: i32, stage: i32, out_ty: &i32) -> bool {
     err_lit(c, STR_PTR("unsupported expression"), STR_LEN("unsupported expression"));
     c.failed = true;
     return false;
+}
+
+// ------------------------------------------------------------------
+// named calls (DESIGN 5.4): portable math builtins + the standard
+// constructs principled / probe_sphere / probe_volume / agx.
+// Signatures are pinned here; anything else stays a loud error.
+// ------------------------------------------------------------------
+
+fn ty_floaty(ty: i32) -> bool {
+    return ty == 0 || ty == 4 || ty == 5 || ty == 6;
+}
+
+fn call_fail_arity(c: &Ctx, noff: i32, nlen: i32, want: i32, got: i32) -> bool {
+    err_lit(c, STR_PTR("ShaderConstructError: call '"), STR_LEN("ShaderConstructError: call '"));
+    err_span(c, noff, nlen);
+    err_lit(c, STR_PTR("' takes "), STR_LEN("' takes "));
+    err_num(c, want);
+    err_lit(c, STR_PTR(" argument(s), got "), STR_LEN(" argument(s), got "));
+    err_num(c, got);
+    c.failed = true;
+    return false;
+}
+
+fn call_fail_ty(c: &Ctx, noff: i32, nlen: i32) -> bool {
+    err_lit(c, STR_PTR("ShaderDimensionMismatch: argument type(s) do not match the signature of '"), STR_LEN("ShaderDimensionMismatch: argument type(s) do not match the signature of '"));
+    err_span(c, noff, nlen);
+    err_lit(c, STR_PTR("'"), STR_LEN("'"));
+    c.failed = true;
+    return false;
+}
+
+fn chk_call_named(c: &Ctx, sh: i32, e: i32, stage: i32, out_ty: &i32) -> bool {
+    let x = c.exprs[e];
+    let callee = c.exprs[x.a];
+    let noff = callee.name_off;
+    let nlen = callee.name_len;
+    let tys: Vec<i32> = Vec::new();
+    let ai: i32 = 0;
+    while ai < x.args_len {
+        let at: i32 = -1;
+        if !chk_expr(c, sh, c.pool[x.args_off + ai], stage, &at) { return false; };
+        tys.push(at);
+        ai = ai + 1;
+    }
+    let n = x.args_len;
+    let t0: i32 = -1;
+    let t1: i32 = -1;
+    let t2: i32 = -1;
+    if n > 0 { t0 = tys[0]; };
+    if n > 1 { t1 = tys[1]; };
+    if n > 2 { t2 = tys[2]; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("dot"), STR_LEN("dot")) {
+        if n != 2 { return call_fail_arity(c, noff, nlen, 2, n); };
+        if t0 == t1 && ty_is_vec(t0) { *out_ty = 0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("cross"), STR_LEN("cross")) {
+        if n != 2 { return call_fail_arity(c, noff, nlen, 2, n); };
+        if t0 == 5 && t1 == 5 { *out_ty = 5; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("normalize"), STR_LEN("normalize")) {
+        if n != 1 { return call_fail_arity(c, noff, nlen, 1, n); };
+        if ty_is_vec(t0) { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("length"), STR_LEN("length")) {
+        if n != 1 { return call_fail_arity(c, noff, nlen, 1, n); };
+        if ty_is_vec(t0) { *out_ty = 0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("reflect"), STR_LEN("reflect")) {
+        if n != 2 { return call_fail_arity(c, noff, nlen, 2, n); };
+        if t0 == t1 && ty_is_vec(t0) { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("pow"), STR_LEN("pow")) {
+        if n != 2 { return call_fail_arity(c, noff, nlen, 2, n); };
+        if t0 == t1 && ty_floaty(t0) { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("sqrt"), STR_LEN("sqrt")) || span_eq_lit(c, noff, nlen, STR_PTR("log2"), STR_LEN("log2")) || span_eq_lit(c, noff, nlen, STR_PTR("exp2"), STR_LEN("exp2")) || span_eq_lit(c, noff, nlen, STR_PTR("abs"), STR_LEN("abs")) || span_eq_lit(c, noff, nlen, STR_PTR("floor"), STR_LEN("floor")) || span_eq_lit(c, noff, nlen, STR_PTR("sin"), STR_LEN("sin")) || span_eq_lit(c, noff, nlen, STR_PTR("cos"), STR_LEN("cos")) || span_eq_lit(c, noff, nlen, STR_PTR("sign"), STR_LEN("sign")) {
+        if n != 1 { return call_fail_arity(c, noff, nlen, 1, n); };
+        if ty_floaty(t0) { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("clamp"), STR_LEN("clamp")) {
+        if n != 3 { return call_fail_arity(c, noff, nlen, 3, n); };
+        if t0 == t1 && t1 == t2 && ty_floaty(t0) { *out_ty = t0; return true; };
+        if ty_is_vec(t0) && t1 == 0 && t2 == 0 { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("mix"), STR_LEN("mix")) {
+        if n != 3 { return call_fail_arity(c, noff, nlen, 3, n); };
+        if t0 == t1 && ty_floaty(t0) && (t2 == 0 || t2 == t0) { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("max"), STR_LEN("max")) || span_eq_lit(c, noff, nlen, STR_PTR("min"), STR_LEN("min")) {
+        if n != 2 { return call_fail_arity(c, noff, nlen, 2, n); };
+        if t0 == t1 && ty_floaty(t0) { *out_ty = t0; return true; };
+        if ty_is_vec(t0) && t1 == 0 { *out_ty = t0; return true; };
+        return call_fail_ty(c, noff, nlen);
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("principled"), STR_LEN("principled")) {
+        if n != 7 {
+            err_lit(c, STR_PTR("ShaderConstructError: 'principled' expects (vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color)"), STR_LEN("ShaderConstructError: 'principled' expects (vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color)"));
+            c.failed = true;
+            return false;
+        };
+        if t0 == 5 && t1 == 0 && t2 == 0 && tys[3] == 5 && tys[4] == 5 && tys[5] == 5 && tys[6] == 5 {
+            *out_ty = 5;
+            return true;
+        };
+        err_lit(c, STR_PTR("ShaderConstructError: 'principled' expects (vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color)"), STR_LEN("ShaderConstructError: 'principled' expects (vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color)"));
+        c.failed = true;
+        return false;
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("probe_sphere"), STR_LEN("probe_sphere")) || span_eq_lit(c, noff, nlen, STR_PTR("probe_volume"), STR_LEN("probe_volume")) {
+        if n != 2 { return call_fail_arity(c, noff, nlen, 2, n); };
+        if t0 != 9 || t1 != 5 {
+            err_lit(c, STR_PTR("ShaderConstructError: probe constructs expect (sampler2D, vec3 direction)"), STR_LEN("ShaderConstructError: probe constructs expect (sampler2D, vec3 direction)"));
+            c.failed = true;
+            return false;
+        };
+        if c.exprs[c.pool[x.args_off]].kind != 2 {
+            err_lit(c, STR_PTR("ShaderConstructError: probe sampler argument must be a plain sampler identifier"), STR_LEN("ShaderConstructError: probe sampler argument must be a plain sampler identifier"));
+            c.failed = true;
+            return false;
+        };
+        *out_ty = 6;
+        return true;
+    };
+    if span_eq_lit(c, noff, nlen, STR_PTR("agx"), STR_LEN("agx")) {
+        if n != 1 { return call_fail_arity(c, noff, nlen, 1, n); };
+        if t0 == 5 { *out_ty = 5; return true; };
+        err_lit(c, STR_PTR("ShaderConstructError: 'agx' expects (vec3 color)"), STR_LEN("ShaderConstructError: 'agx' expects (vec3 color)"));
+        c.failed = true;
+        return false;
+    };
+    err_lit(c, STR_PTR("ShaderUnknownCall: unsupported call '"), STR_LEN("ShaderUnknownCall: unsupported call '"));
+    err_span(c, noff, nlen);
+    err_lit(c, STR_PTR("' (not a builtin or standard construct)"), STR_LEN("' (not a builtin or standard construct)"));
+    c.failed = true;
+    return false;
+}
+
+// shape-only result type of a named call (no checking; mirrors
+// chk_call_named). Falls back to vec4 for .get / unknown callees.
+fn call_result_ty(c: &Ctx, e: i32) -> i32 {
+    let x = c.exprs[e];
+    let callee = c.exprs[x.a];
+    if callee.kind != 2 { return 6; };
+    let noff = callee.name_off;
+    let nlen = callee.name_len;
+    if span_eq_lit(c, noff, nlen, STR_PTR("dot"), STR_LEN("dot")) { return 0; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("length"), STR_LEN("length")) { return 0; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("cross"), STR_LEN("cross")) { return 5; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("agx"), STR_LEN("agx")) { return 5; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("principled"), STR_LEN("principled")) { return 5; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("probe_sphere"), STR_LEN("probe_sphere")) { return 6; };
+    if span_eq_lit(c, noff, nlen, STR_PTR("probe_volume"), STR_LEN("probe_volume")) { return 6; };
+    if x.args_len > 0 {
+        return type_of_expr(c, c.pool[x.args_off]);
+    };
+    return 6;
 }
 
 fn binop_ty(c: &Ctx, lt: i32, rt: i32, le: i32, re: i32, out_ty: &i32) -> bool {
@@ -3065,6 +3233,9 @@ fn type_of_expr(c: &Ctx, e: i32) -> i32 {
     if x.kind == 7 {
         return x.ty;
     };
+    if x.kind == 6 {
+        return call_result_ty(c, e);
+    };
     return 6;
 }
 
@@ -3330,6 +3501,10 @@ fn print_expr(c: &Ctx, e: i32, dialect: i32, stage: i32, out: &Buf) {
     };
     if x.kind == 6 {
         let callee = c.exprs[x.a];
+        if callee.kind == 2 {
+            print_call_named(c, e, dialect, stage, out);
+            return;
+        };
         let cbase = c.exprs[callee.a];
         if dialect == 0 {
             buf_push_lit(out, STR_PTR("texture("), STR_LEN("texture("));
@@ -3382,6 +3557,58 @@ fn print_expr(c: &Ctx, e: i32, dialect: i32, stage: i32, out: &Buf) {
         buf_push_byte(out, 41);
         return;
     };
+}
+
+// named calls (DESIGN 5.4): builtins print under their own name
+// (mix -> lerp on the HLSL family); constructs print as slasl_*
+// helper calls; probe sampler arguments expand to the dialect's
+// sampler pair, mirroring the .get rules above.
+fn print_call_named(c: &Ctx, e: i32, dialect: i32, stage: i32, out: &Buf) {
+    let x = c.exprs[e];
+    let callee = c.exprs[x.a];
+    let noff = callee.name_off;
+    let nlen = callee.name_len;
+    let is_probe = span_eq_lit(c, noff, nlen, STR_PTR("probe_sphere"), STR_LEN("probe_sphere")) || span_eq_lit(c, noff, nlen, STR_PTR("probe_volume"), STR_LEN("probe_volume"));
+    let is_construct = is_probe || span_eq_lit(c, noff, nlen, STR_PTR("principled"), STR_LEN("principled")) || span_eq_lit(c, noff, nlen, STR_PTR("agx"), STR_LEN("agx"));
+    if is_construct {
+        buf_push_lit(out, STR_PTR("slasl_"), STR_LEN("slasl_"));
+        out_span(c, out, noff, nlen);
+    } else {
+        if (dialect == 2 || dialect == 5 || dialect == 7) && span_eq_lit(c, noff, nlen, STR_PTR("mix"), STR_LEN("mix")) {
+            buf_push_lit(out, STR_PTR("lerp"), STR_LEN("lerp"));
+        } else {
+            out_span(c, out, noff, nlen);
+        };
+    };
+    buf_push_byte(out, 40);
+    let i: i32 = 0;
+    while i < x.args_len {
+        if i > 0 {
+            buf_push_lit(out, STR_PTR(", "), STR_LEN(", "));
+        };
+        if is_probe && i == 0 {
+            let a0x = c.exprs[c.pool[x.args_off]];
+            out_span(c, out, a0x.name_off, a0x.name_len);
+            if dialect == 2 || dialect == 3 || dialect == 4 {
+                buf_push_lit(out, STR_PTR(", "), STR_LEN(", "));
+                out_span(c, out, a0x.name_off, a0x.name_len);
+                buf_push_lit(out, STR_PTR("_sampler"), STR_LEN("_sampler"));
+            };
+            if dialect == 5 {
+                buf_push_lit(out, STR_PTR(", sampler"), STR_LEN(", sampler"));
+                out_span(c, out, a0x.name_off, a0x.name_len);
+            };
+            if dialect == 7 {
+                buf_push_lit(out, STR_PTR(", "), STR_LEN(", "));
+                out_span(c, out, a0x.name_off, a0x.name_len);
+                buf_push_lit(out, STR_PTR("Sampler"), STR_LEN("Sampler"));
+            };
+        } else {
+            print_expr(c, c.pool[x.args_off + i], dialect, stage, out);
+        };
+        i = i + 1;
+    }
+    buf_push_byte(out, 41);
 }
 
 fn print_pad(out: &Buf, indent: i32) {
@@ -3459,6 +3686,169 @@ fn live_samplers(c: &Ctx) -> Vec<i32> {
         i = i + 1;
     }
     return out;
+}
+
+// ------------------------------------------------------------------
+// standard construct helpers (DESIGN 5.4): usage scan over the woven
+// + linked statement lists of the requested stages, then per-dialect
+// helper bodies, emitted only when the construct is actually used.
+// ------------------------------------------------------------------
+
+fn scan_expr_constructs(c: &Ctx, e: i32, up: &bool, ups: &bool, upv: &bool, uagx: &bool) {
+    let x = c.exprs[e];
+    if x.kind == 6 {
+        let callee = c.exprs[x.a];
+        if callee.kind == 2 {
+            if span_eq_lit(c, callee.name_off, callee.name_len, STR_PTR("principled"), STR_LEN("principled")) { *up = true; };
+            if span_eq_lit(c, callee.name_off, callee.name_len, STR_PTR("probe_sphere"), STR_LEN("probe_sphere")) { *ups = true; };
+            if span_eq_lit(c, callee.name_off, callee.name_len, STR_PTR("probe_volume"), STR_LEN("probe_volume")) { *upv = true; };
+            if span_eq_lit(c, callee.name_off, callee.name_len, STR_PTR("agx"), STR_LEN("agx")) { *uagx = true; };
+        };
+        let i: i32 = 0;
+        while i < x.args_len {
+            scan_expr_constructs(c, c.pool[x.args_off + i], up, ups, upv, uagx);
+            i = i + 1;
+        }
+        return;
+    };
+    if x.kind == 4 {
+        scan_expr_constructs(c, x.a, up, ups, upv, uagx);
+        scan_expr_constructs(c, x.b, up, ups, upv, uagx);
+        return;
+    };
+    if x.kind == 5 || x.kind == 3 {
+        scan_expr_constructs(c, x.a, up, ups, upv, uagx);
+        return;
+    };
+    if x.kind == 7 {
+        let i: i32 = 0;
+        while i < x.args_len {
+            scan_expr_constructs(c, c.pool[x.args_off + i], up, ups, upv, uagx);
+            i = i + 1;
+        }
+        return;
+    };
+}
+
+fn scan_stmts_constructs(c: &Ctx, off: i32, len: i32, up: &bool, ups: &bool, upv: &bool, uagx: &bool) {
+    let i: i32 = 0;
+    while i < len {
+        let s = c.pool[off + i];
+        if c.needed[s] {
+            let x = c.stmts[s];
+            if x.kind == 0 {
+                scan_expr_constructs(c, x.target, up, ups, upv, uagx);
+                scan_expr_constructs(c, x.value, up, ups, upv, uagx);
+            };
+            if x.kind == 1 {
+                scan_expr_constructs(c, x.cond, up, ups, upv, uagx);
+                scan_stmts_constructs(c, x.body_off, x.body_len, up, ups, upv, uagx);
+            };
+            if x.kind == 2 {
+                scan_stmts_constructs(c, x.body_off, x.body_len, up, ups, upv, uagx);
+            };
+        };
+        i = i + 1;
+    }
+}
+
+fn push_principled_body(out: &Buf, dialect: i32) {
+    if dialect == 3 {
+        buf_push_lit(out, STR_PTR("fn slasl_principled(base_color: vec3<f32>, metallic: f32, roughness: f32, normal: vec3<f32>, view_dir: vec3<f32>, light_dir: vec3<f32>, light_color: vec3<f32>) -> vec3<f32>\n{\n    let n = normalize(normal);\n    let v = normalize(view_dir);\n    let l = normalize(light_dir);\n    let h = normalize(l + v);\n    let ndv = max(dot(n, v), 0.0001);\n    let ndl = max(dot(n, l), 0.0);\n    let ndh = max(dot(n, h), 0.0);\n    let vdh = max(dot(v, h), 0.0);\n    let a = max(roughness * roughness, 0.0001);\n    let a2 = a * a;\n    let denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    let nd = a2 / (3.14159265 * denom * denom);\n    let f0 = mix(vec3<f32>(0.04, 0.04, 0.04), base_color, metallic);\n    let f = f0 + (vec3<f32>(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    let gv = ndv / (ndv * (1.0 - k) + k);\n    let gl = ndl / (ndl * (1.0 - k) + k);\n    let spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    let diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"), STR_LEN("fn slasl_principled(base_color: vec3<f32>, metallic: f32, roughness: f32, normal: vec3<f32>, view_dir: vec3<f32>, light_dir: vec3<f32>, light_color: vec3<f32>) -> vec3<f32>\n{\n    let n = normalize(normal);\n    let v = normalize(view_dir);\n    let l = normalize(light_dir);\n    let h = normalize(l + v);\n    let ndv = max(dot(n, v), 0.0001);\n    let ndl = max(dot(n, l), 0.0);\n    let ndh = max(dot(n, h), 0.0);\n    let vdh = max(dot(v, h), 0.0);\n    let a = max(roughness * roughness, 0.0001);\n    let a2 = a * a;\n    let denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    let nd = a2 / (3.14159265 * denom * denom);\n    let f0 = mix(vec3<f32>(0.04, 0.04, 0.04), base_color, metallic);\n    let f = f0 + (vec3<f32>(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    let gv = ndv / (ndv * (1.0 - k) + k);\n    let gl = ndl / (ndl * (1.0 - k) + k);\n    let spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    let diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"));
+        return;
+    };
+    if dialect == 2 || dialect == 5 || dialect == 7 {
+        buf_push_lit(out, STR_PTR("float3 slasl_principled(float3 base_color, float metallic, float roughness, float3 normal, float3 view_dir, float3 light_dir, float3 light_color)\n{\n    float3 n = normalize(normal);\n    float3 v = normalize(view_dir);\n    float3 l = normalize(light_dir);\n    float3 h = normalize(l + v);\n    float ndv = max(dot(n, v), 0.0001);\n    float ndl = max(dot(n, l), 0.0);\n    float ndh = max(dot(n, h), 0.0);\n    float vdh = max(dot(v, h), 0.0);\n    float a = max(roughness * roughness, 0.0001);\n    float a2 = a * a;\n    float denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    float nd = a2 / (3.14159265 * denom * denom);\n    float3 f0 = lerp(float3(0.04, 0.04, 0.04), base_color, metallic);\n    float3 f = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    float gv = ndv / (ndv * (1.0 - k) + k);\n    float gl = ndl / (ndl * (1.0 - k) + k);\n    float3 spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    float3 diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"), STR_LEN("float3 slasl_principled(float3 base_color, float metallic, float roughness, float3 normal, float3 view_dir, float3 light_dir, float3 light_color)\n{\n    float3 n = normalize(normal);\n    float3 v = normalize(view_dir);\n    float3 l = normalize(light_dir);\n    float3 h = normalize(l + v);\n    float ndv = max(dot(n, v), 0.0001);\n    float ndl = max(dot(n, l), 0.0);\n    float ndh = max(dot(n, h), 0.0);\n    float vdh = max(dot(v, h), 0.0);\n    float a = max(roughness * roughness, 0.0001);\n    float a2 = a * a;\n    float denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    float nd = a2 / (3.14159265 * denom * denom);\n    float3 f0 = lerp(float3(0.04, 0.04, 0.04), base_color, metallic);\n    float3 f = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    float gv = ndv / (ndv * (1.0 - k) + k);\n    float gl = ndl / (ndl * (1.0 - k) + k);\n    float3 spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    float3 diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"));
+        return;
+    };
+    if dialect == 4 {
+        buf_push_lit(out, STR_PTR("float3 slasl_principled(float3 base_color, float metallic, float roughness, float3 normal, float3 view_dir, float3 light_dir, float3 light_color)\n{\n    float3 n = normalize(normal);\n    float3 v = normalize(view_dir);\n    float3 l = normalize(light_dir);\n    float3 h = normalize(l + v);\n    float ndv = max(dot(n, v), 0.0001);\n    float ndl = max(dot(n, l), 0.0);\n    float ndh = max(dot(n, h), 0.0);\n    float vdh = max(dot(v, h), 0.0);\n    float a = max(roughness * roughness, 0.0001);\n    float a2 = a * a;\n    float denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    float nd = a2 / (3.14159265 * denom * denom);\n    float3 f0 = mix(float3(0.04, 0.04, 0.04), base_color, metallic);\n    float3 f = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    float gv = ndv / (ndv * (1.0 - k) + k);\n    float gl = ndl / (ndl * (1.0 - k) + k);\n    float3 spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    float3 diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"), STR_LEN("float3 slasl_principled(float3 base_color, float metallic, float roughness, float3 normal, float3 view_dir, float3 light_dir, float3 light_color)\n{\n    float3 n = normalize(normal);\n    float3 v = normalize(view_dir);\n    float3 l = normalize(light_dir);\n    float3 h = normalize(l + v);\n    float ndv = max(dot(n, v), 0.0001);\n    float ndl = max(dot(n, l), 0.0);\n    float ndh = max(dot(n, h), 0.0);\n    float vdh = max(dot(v, h), 0.0);\n    float a = max(roughness * roughness, 0.0001);\n    float a2 = a * a;\n    float denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    float nd = a2 / (3.14159265 * denom * denom);\n    float3 f0 = mix(float3(0.04, 0.04, 0.04), base_color, metallic);\n    float3 f = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    float gv = ndv / (ndv * (1.0 - k) + k);\n    float gl = ndl / (ndl * (1.0 - k) + k);\n    float3 spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    float3 diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"));
+        return;
+    };
+    buf_push_lit(out, STR_PTR("vec3 slasl_principled(vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color)\n{\n    vec3 n = normalize(normal);\n    vec3 v = normalize(view_dir);\n    vec3 l = normalize(light_dir);\n    vec3 h = normalize(l + v);\n    float ndv = max(dot(n, v), 0.0001);\n    float ndl = max(dot(n, l), 0.0);\n    float ndh = max(dot(n, h), 0.0);\n    float vdh = max(dot(v, h), 0.0);\n    float a = max(roughness * roughness, 0.0001);\n    float a2 = a * a;\n    float denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    float nd = a2 / (3.14159265 * denom * denom);\n    vec3 f0 = mix(vec3(0.04, 0.04, 0.04), base_color, metallic);\n    vec3 f = f0 + (vec3(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    float gv = ndv / (ndv * (1.0 - k) + k);\n    float gl = ndl / (ndl * (1.0 - k) + k);\n    vec3 spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    vec3 diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"), STR_LEN("vec3 slasl_principled(vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color)\n{\n    vec3 n = normalize(normal);\n    vec3 v = normalize(view_dir);\n    vec3 l = normalize(light_dir);\n    vec3 h = normalize(l + v);\n    float ndv = max(dot(n, v), 0.0001);\n    float ndl = max(dot(n, l), 0.0);\n    float ndh = max(dot(n, h), 0.0);\n    float vdh = max(dot(v, h), 0.0);\n    float a = max(roughness * roughness, 0.0001);\n    float a2 = a * a;\n    float denom = ndh * ndh * (a2 - 1.0) + 1.0;\n    float nd = a2 / (3.14159265 * denom * denom);\n    vec3 f0 = mix(vec3(0.04, 0.04, 0.04), base_color, metallic);\n    vec3 f = f0 + (vec3(1.0, 1.0, 1.0) - f0) * pow(1.0 - vdh, 5.0);\n    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;\n    float gv = ndv / (ndv * (1.0 - k) + k);\n    float gl = ndl / (ndl * (1.0 - k) + k);\n    vec3 spec = nd * f * (gv * gl) / max(4.0 * ndv * ndl, 0.0001);\n    vec3 diffuse = base_color * (1.0 - metallic) / 3.14159265;\n    return (diffuse + spec) * light_color * ndl;\n}\n\n"));
+}
+
+fn push_agx_body(out: &Buf, dialect: i32) {
+    if dialect == 3 {
+        buf_push_lit(out, STR_PTR("fn slasl_agx(color: vec3<f32>) -> vec3<f32>\n{\n    let c = max(color, vec3<f32>(0.0001, 0.0001, 0.0001));\n    let x = clamp((log2(c) + 6.0) / 12.0, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));\n    let xp = pow(x, vec3<f32>(2.4, 2.4, 2.4));\n    let nxp = pow(vec3<f32>(1.0, 1.0, 1.0) - x, vec3<f32>(2.4, 2.4, 2.4));\n    let y = xp / (xp + nxp);\n    let lum = dot(y, vec3<f32>(0.2126, 0.7152, 0.0722));\n    let outc = mix(vec3<f32>(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));\n}\n\n"), STR_LEN("fn slasl_agx(color: vec3<f32>) -> vec3<f32>\n{\n    let c = max(color, vec3<f32>(0.0001, 0.0001, 0.0001));\n    let x = clamp((log2(c) + 6.0) / 12.0, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));\n    let xp = pow(x, vec3<f32>(2.4, 2.4, 2.4));\n    let nxp = pow(vec3<f32>(1.0, 1.0, 1.0) - x, vec3<f32>(2.4, 2.4, 2.4));\n    let y = xp / (xp + nxp);\n    let lum = dot(y, vec3<f32>(0.2126, 0.7152, 0.0722));\n    let outc = mix(vec3<f32>(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));\n}\n\n"));
+        return;
+    };
+    if dialect == 2 || dialect == 5 || dialect == 7 {
+        buf_push_lit(out, STR_PTR("float3 slasl_agx(float3 color)\n{\n    float3 c = max(color, float3(0.0001, 0.0001, 0.0001));\n    float3 x = clamp((log2(c) + 6.0) / 12.0, 0.0, 1.0);\n    float3 xp = pow(x, float3(2.4, 2.4, 2.4));\n    float3 nxp = pow(float3(1.0, 1.0, 1.0) - x, float3(2.4, 2.4, 2.4));\n    float3 y = xp / (xp + nxp);\n    float lum = dot(y, float3(0.2126, 0.7152, 0.0722));\n    float3 outc = lerp(float3(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, 0.0, 1.0);\n}\n\n"), STR_LEN("float3 slasl_agx(float3 color)\n{\n    float3 c = max(color, float3(0.0001, 0.0001, 0.0001));\n    float3 x = clamp((log2(c) + 6.0) / 12.0, 0.0, 1.0);\n    float3 xp = pow(x, float3(2.4, 2.4, 2.4));\n    float3 nxp = pow(float3(1.0, 1.0, 1.0) - x, float3(2.4, 2.4, 2.4));\n    float3 y = xp / (xp + nxp);\n    float lum = dot(y, float3(0.2126, 0.7152, 0.0722));\n    float3 outc = lerp(float3(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, 0.0, 1.0);\n}\n\n"));
+        return;
+    };
+    if dialect == 4 {
+        buf_push_lit(out, STR_PTR("float3 slasl_agx(float3 color)\n{\n    float3 c = max(color, float3(0.0001, 0.0001, 0.0001));\n    float3 x = clamp((log2(c) + 6.0) / 12.0, 0.0, 1.0);\n    float3 xp = pow(x, float3(2.4, 2.4, 2.4));\n    float3 nxp = pow(float3(1.0, 1.0, 1.0) - x, float3(2.4, 2.4, 2.4));\n    float3 y = xp / (xp + nxp);\n    float lum = dot(y, float3(0.2126, 0.7152, 0.0722));\n    float3 outc = mix(float3(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, 0.0, 1.0);\n}\n\n"), STR_LEN("float3 slasl_agx(float3 color)\n{\n    float3 c = max(color, float3(0.0001, 0.0001, 0.0001));\n    float3 x = clamp((log2(c) + 6.0) / 12.0, 0.0, 1.0);\n    float3 xp = pow(x, float3(2.4, 2.4, 2.4));\n    float3 nxp = pow(float3(1.0, 1.0, 1.0) - x, float3(2.4, 2.4, 2.4));\n    float3 y = xp / (xp + nxp);\n    float lum = dot(y, float3(0.2126, 0.7152, 0.0722));\n    float3 outc = mix(float3(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, 0.0, 1.0);\n}\n\n"));
+        return;
+    };
+    buf_push_lit(out, STR_PTR("vec3 slasl_agx(vec3 color)\n{\n    vec3 c = max(color, vec3(0.0001, 0.0001, 0.0001));\n    vec3 x = clamp((log2(c) + 6.0) / 12.0, 0.0, 1.0);\n    vec3 xp = pow(x, vec3(2.4, 2.4, 2.4));\n    vec3 nxp = pow(vec3(1.0, 1.0, 1.0) - x, vec3(2.4, 2.4, 2.4));\n    vec3 y = xp / (xp + nxp);\n    float lum = dot(y, vec3(0.2126, 0.7152, 0.0722));\n    vec3 outc = mix(vec3(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, 0.0, 1.0);\n}\n\n"), STR_LEN("vec3 slasl_agx(vec3 color)\n{\n    vec3 c = max(color, vec3(0.0001, 0.0001, 0.0001));\n    vec3 x = clamp((log2(c) + 6.0) / 12.0, 0.0, 1.0);\n    vec3 xp = pow(x, vec3(2.4, 2.4, 2.4));\n    vec3 nxp = pow(vec3(1.0, 1.0, 1.0) - x, vec3(2.4, 2.4, 2.4));\n    vec3 y = xp / (xp + nxp);\n    float lum = dot(y, vec3(0.2126, 0.7152, 0.0722));\n    vec3 outc = mix(vec3(lum, lum, lum), y, 1.0 - 0.4 * lum * lum);\n    return clamp(outc, 0.0, 1.0);\n}\n\n"));
+}
+
+fn push_probe_body(out: &Buf, dialect: i32, volume: bool) {
+    if dialect == 3 {
+        if volume {
+            buf_push_lit(out, STR_PTR("fn slasl_probe_volume(env: texture_2d<f32>, env_sampler: sampler, dir: vec3<f32>) -> vec4<f32>\n{\n    let d = normalize(dir);\n    let uv = vec2<f32>(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return textureSample(env, env_sampler, uv);\n}\n\n"), STR_LEN("fn slasl_probe_volume(env: texture_2d<f32>, env_sampler: sampler, dir: vec3<f32>) -> vec4<f32>\n{\n    let d = normalize(dir);\n    let uv = vec2<f32>(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return textureSample(env, env_sampler, uv);\n}\n\n"));
+        } else {
+            buf_push_lit(out, STR_PTR("fn slasl_probe_sphere(env: texture_2d<f32>, env_sampler: sampler, dir: vec3<f32>) -> vec4<f32>\n{\n    let d = normalize(dir);\n    let uv = vec2<f32>(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return textureSample(env, env_sampler, uv);\n}\n\n"), STR_LEN("fn slasl_probe_sphere(env: texture_2d<f32>, env_sampler: sampler, dir: vec3<f32>) -> vec4<f32>\n{\n    let d = normalize(dir);\n    let uv = vec2<f32>(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return textureSample(env, env_sampler, uv);\n}\n\n"));
+        };
+        return;
+    };
+    if dialect == 2 || dialect == 7 {
+        if volume {
+            buf_push_lit(out, STR_PTR("float4 slasl_probe_volume(Texture2D env, SamplerState env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.Sample(env_sampler, uv);\n}\n\n"), STR_LEN("float4 slasl_probe_volume(Texture2D env, SamplerState env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.Sample(env_sampler, uv);\n}\n\n"));
+        } else {
+            buf_push_lit(out, STR_PTR("float4 slasl_probe_sphere(Texture2D env, SamplerState env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.Sample(env_sampler, uv);\n}\n\n"), STR_LEN("float4 slasl_probe_sphere(Texture2D env, SamplerState env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.Sample(env_sampler, uv);\n}\n\n"));
+        };
+        return;
+    };
+    if dialect == 5 {
+        if volume {
+            buf_push_lit(out, STR_PTR("float4 slasl_probe_volume(Texture2D env, SamplerState samplerenv, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return SAMPLE_TEXTURE2D(env, samplerenv, uv);\n}\n\n"), STR_LEN("float4 slasl_probe_volume(Texture2D env, SamplerState samplerenv, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return SAMPLE_TEXTURE2D(env, samplerenv, uv);\n}\n\n"));
+        } else {
+            buf_push_lit(out, STR_PTR("float4 slasl_probe_sphere(Texture2D env, SamplerState samplerenv, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return SAMPLE_TEXTURE2D(env, samplerenv, uv);\n}\n\n"), STR_LEN("float4 slasl_probe_sphere(Texture2D env, SamplerState samplerenv, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return SAMPLE_TEXTURE2D(env, samplerenv, uv);\n}\n\n"));
+        };
+        return;
+    };
+    if dialect == 4 {
+        if volume {
+            buf_push_lit(out, STR_PTR("float4 slasl_probe_volume(texture2d<float> env, sampler env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.sample(env_sampler, uv);\n}\n\n"), STR_LEN("float4 slasl_probe_volume(texture2d<float> env, sampler env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.sample(env_sampler, uv);\n}\n\n"));
+        } else {
+            buf_push_lit(out, STR_PTR("float4 slasl_probe_sphere(texture2d<float> env, sampler env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.sample(env_sampler, uv);\n}\n\n"), STR_LEN("float4 slasl_probe_sphere(texture2d<float> env, sampler env_sampler, float3 dir)\n{\n    float3 d = normalize(dir);\n    float2 uv = float2(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return env.sample(env_sampler, uv);\n}\n\n"));
+        };
+        return;
+    };
+    if dialect == 1 {
+        if volume {
+            buf_push_lit(out, STR_PTR("vec4 slasl_probe_volume(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture2D(env, uv);\n}\n\n"), STR_LEN("vec4 slasl_probe_volume(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture2D(env, uv);\n}\n\n"));
+        } else {
+            buf_push_lit(out, STR_PTR("vec4 slasl_probe_sphere(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture2D(env, uv);\n}\n\n"), STR_LEN("vec4 slasl_probe_sphere(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture2D(env, uv);\n}\n\n"));
+        };
+        return;
+    };
+    if volume {
+        buf_push_lit(out, STR_PTR("vec4 slasl_probe_volume(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture(env, uv);\n}\n\n"), STR_LEN("vec4 slasl_probe_volume(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture(env, uv);\n}\n\n"));
+    } else {
+        buf_push_lit(out, STR_PTR("vec4 slasl_probe_sphere(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture(env, uv);\n}\n\n"), STR_LEN("vec4 slasl_probe_sphere(sampler2D env, vec3 dir)\n{\n    vec3 d = normalize(dir);\n    vec2 uv = vec2(atan(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);\n    return texture(env, uv);\n}\n\n"));
+    };
+}
+
+fn emit_helpers(c: &Ctx, out: &Buf, dialect: i32, do_vert: bool, do_frag: bool) {
+    let up: bool = false;
+    let ups: bool = false;
+    let upv: bool = false;
+    let uagx: bool = false;
+    if do_vert {
+        scan_stmts_constructs(c, c.v_woven_off, c.v_woven_len, &up, &ups, &upv, &uagx);
+        scan_stmts_constructs(c, c.lk_vert_off, c.lk_vert_len, &up, &ups, &upv, &uagx);
+    };
+    if do_frag {
+        scan_stmts_constructs(c, c.f_woven_off, c.f_woven_len, &up, &ups, &upv, &uagx);
+        scan_stmts_constructs(c, c.lk_frag_off, c.lk_frag_len, &up, &ups, &upv, &uagx);
+    };
+    if up { push_principled_body(out, dialect); };
+    if ups { push_probe_body(out, dialect, false); };
+    if upv { push_probe_body(out, dialect, true); };
+    if uagx { push_agx_body(out, dialect); };
 }
 
 fn emit_glsl(c: &Ctx, dialect: i32, stage: i32, out: &Buf) {
@@ -3622,6 +4012,7 @@ fn emit_glsl(c: &Ctx, dialect: i32, stage: i32, out: &Buf) {
             buf_push_lit(out, STR_PTR("out vec4 slasl_frag_color;\n"), STR_LEN("out vec4 slasl_frag_color;\n"));
         };
     };
+    emit_helpers(c, out, dialect, stage == 1, stage == 2);
     buf_push_lit(out, STR_PTR("\nvoid main()\n{\n"), STR_LEN("\nvoid main()\n{\n"));
     let li2: i32 = 0;
     while li2 < c.m_va_len {
@@ -3778,6 +4169,7 @@ fn emit_hlsl(c: &Ctx, out: &Buf) {
         vi = vi + 1;
     }
     buf_push_lit(out, STR_PTR("};\n"), STR_LEN("};\n"));
+    emit_helpers(c, out, 2, true, true);
     buf_push_lit(out, STR_PTR("\nVSOut VSMain(VSIn input)\n{\n    VSOut output;\n"), STR_LEN("\nVSOut VSMain(VSIn input)\n{\n    VSOut output;\n"));
     let li2: i32 = 0;
     while li2 < c.m_va_len {
@@ -4873,6 +5265,7 @@ fn emit_wgsl(c: &Ctx, out: &Buf) {
         vi2 = vi2 + 1;
     }
     buf_push_lit(out, STR_PTR("}\n\nstruct FragmentOut {\n  @location(0) frag_color: vec4<f32>,\n}\n\n"), STR_LEN("}\n\nstruct FragmentOut {\n  @location(0) frag_color: vec4<f32>,\n}\n\n"));
+    emit_helpers(c, out, 3, true, true);
     buf_push_lit(out, STR_PTR("@vertex\nfn vertex_main(input: VertexIn) -> VertexOut {\n    var output: VertexOut;\n"), STR_LEN("@vertex\nfn vertex_main(input: VertexIn) -> VertexOut {\n    var output: VertexOut;\n"));
     let di: i32 = 0;
     while di < c.m_va_len {
@@ -5384,6 +5777,7 @@ fn emit_msl(c: &Ctx, out: &Buf) {
     }
     buf_push_lit(out, STR_PTR("};\n\n"), STR_LEN("};\n\n"));
     // vertex entry
+    emit_helpers(c, out, 4, true, true);
     buf_push_lit(out, STR_PTR("vertex VertexOut vertex_main(VertexIn input [[stage_in]]"), STR_LEN("vertex VertexOut vertex_main(VertexIn input [[stage_in]]"));
     let bidx: i32 = 0;
     gi = 0;
@@ -5680,6 +6074,7 @@ fn emit_unity(c: &Ctx, out: &Buf) {
         vi2 = vi2 + 1;
     }
     buf_push_lit(out, STR_PTR("    };\n    ENDHLSL\n\n    SubShader\n    {\n        Tags { \"RenderType\" = \"Opaque\" \"RenderPipeline\" = \"UniversalPipeline\" }\n        Pass\n        {\n            HLSLPROGRAM\n            #pragma vertex vertex_main\n            #pragma fragment fragment_main\n            #pragma target 3.5\n\n"), STR_LEN("    };\n    ENDHLSL\n\n    SubShader\n    {\n        Tags { \"RenderType\" = \"Opaque\" \"RenderPipeline\" = \"UniversalPipeline\" }\n        Pass\n        {\n            HLSLPROGRAM\n            #pragma vertex vertex_main\n            #pragma fragment fragment_main\n            #pragma target 3.5\n\n"));
+    emit_helpers(c, out, 5, true, true);
     buf_push_lit(out, STR_PTR("            Varyings vertex_main(Attributes input)\n            {\n                Varyings output;\n"), STR_LEN("            Varyings vertex_main(Attributes input)\n            {\n                Varyings output;\n"));
     let di: i32 = 0;
     while di < c.m_va_len {
@@ -5809,6 +6204,7 @@ fn emit_blender(c: &Ctx, out: &Buf) {
     if ls.len() > 0 {
         buf_push_lit(out, STR_PTR("\n"), STR_LEN("\n"));
     };
+    emit_helpers(c, out, 6, true, true);
     buf_push_lit(out, STR_PTR("#ifdef GPU_VERTEX_SHADER\n"), STR_LEN("#ifdef GPU_VERTEX_SHADER\n"));
     let loc: i32 = 0;
     let ii: i32 = 0;
@@ -6030,6 +6426,7 @@ fn emit_unreal_ush(c: &Ctx, out: &Buf) {
 
 fn emit_unreal_usf(c: &Ctx, out: &Buf) {
     buf_push_lit(out, STR_PTR("/* merged.usf - generated by SLASL; do not edit. */\n#include \"/Plugin/SLASL/Private/Merged.ush\"\n\n"), STR_LEN("/* merged.usf - generated by SLASL; do not edit. */\n#include \"/Plugin/SLASL/Private/Merged.ush\"\n\n"));
+    emit_helpers(c, out, 7, true, true);
     buf_push_lit(out, STR_PTR("FMergedVertexOut MergedVS(FMergedVertexIn input)\n{\n    FMergedVertexOut output;\n"), STR_LEN("FMergedVertexOut MergedVS(FMergedVertexIn input)\n{\n    FMergedVertexOut output;\n"));
     let di: i32 = 0;
     while di < c.m_va_len {

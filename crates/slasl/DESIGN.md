@@ -180,6 +180,33 @@ shader Base {
 
 用户已定：shader 不是字符串。字符串形态（现行 three.js 路线）零编译期检查、合并只能文本拼贴；运行时 builder 把错误推迟到运行期且与 SLA 的编译期定位相悖。两者只可作逃生舱登记（TSyntax 式），不进主面——原型不做，生产形是否留逃生舱列分叉候议（默认不留）。
 
+### 5.4 内建函数与标准构造（2026-11-01 丰富批 B③④⑤ 落地）
+
+原型子集原只许 `sampler.get` 调用；本批起表达式位置开放两级调用面，
+仍无用户定义函数，签名在检查器里逐个钉死，未知名字照旧响亮拒绝。
+
+**数学内建**（同名直发各方言，仅 HLSL 家族 mix→lerp）：
+`dot`（vecN×vecN→float）、`cross`（vec3）、`normalize`、`length`、
+`reflect`、`pow`、`sqrt`、`log2`、`exp2`、`abs`、`floor`、`sin`、
+`cos`、`sign`（标量或向量、同型进同型出）、`clamp`（同型三元，
+另许标量三元）、`mix`（同型双元+标量或同型插值因子）、`max`/`min`
+（同型双元）。签名不合 → `ShaderDimensionMismatch` /
+`ShaderConstructError`，不做隐式广播。
+
+**标准构造**（发为每方言一份的 `slasl_*` 辅助函数，用到才发）：
+
+| 构造 | 签名 | 语义与声明偏差 |
+|---|---|---|
+| `principled` | (vec3 base_color, float metallic, float roughness, vec3 normal, vec3 view_dir, vec3 light_dir, vec3 light_color) → vec3 | Principled 型廓的直接光求值：Cook–Torrance GGX，F0 = mix(0.04, base_color, metallic)，漫反射 ×(1−metallic)。偏差：单直射光、无 IBL/阴影/次表面/光泽/涂层——型廓表与 sax3d BLENDER.md B3 同表 |
+| `probe_sphere` | (sampler2D env, vec3 dir) → vec4 | 球面探针：等距圆柱映射采样**预过滤辐射度**图（dir = 反射方向） |
+| `probe_volume` | (sampler2D irradiance, vec3 dir) → vec4 | 体积探针：同映射采样**辐照度**图（dir = 法线）；与 sphere 的差在资产内容契约（烘焙侧），不在采样式 |
+| `agx` | (vec3 color) → vec3 | AgX 观感变换的自研拟合：log2 编码（自选 EV 窗）→ 幂 S 曲线 → 亮度驱动高光去饱和；常数自选，**不含 Blender/OCIO 数据**，与真 AgX 的偏差为声明偏差 |
+
+探针构造的声明限制：无粗糙度 LOD（需带 LOD 的采样面，后续立项）；
+采样器在 HLSL/WGSL/MSL/Unity/Unreal 方言按既有 `.get` 的成对展开
+规则传入辅助函数。构造误用（参数个数/类型不合、探针首参非采样器）
+→ `ShaderConstructError` 具名拒绝。
+
 ---
 
 ## 6. 类型化 AST 与 SLASL 检查
@@ -218,6 +245,8 @@ shader Base {
 ### 7.4 逻辑布局（uniform 打包）
 
 Flatten 同构：globals 组与 params 组各自拍平为逻辑布局——每字段记 (offset, size) 的**逻辑槽**（以 vec4 字为单位的抽象布局 + 字段序），纹理/采样器记逻辑槽号。**AST 层永远只带逻辑槽**；物理绑定（GLSL layout(binding)、HLSL register、WGSL @group/@binding、Metal 索引分区、Blender 的 Metal 重排分区）由 target 层落定（Blender 档案实证：同一 info 逻辑槽在 GL/Vulkan/Metal 下物理排布不同，`mtl_shader_generate.hh`）。
+
+**Blender 对齐复核结论（2026-11-01，BLENDER_UBO_REVIEW.md）**：@global 块按名绑定与 Blender create-info 同构；但块成员经 DCE 裁剪（§7.3），同组在不同 shader 布局可不同——与 Eevee `*_shared` 全结构共享相反，属声明偏差。宿主纪律：按**单个 shader 的接口表**建 UBO（活字段、声明序、std140），禁止跨 shader 复用组布局。glsl-es100 无块、组拍平为散 uniform，跨组同名字段会重名——候选检查规则（ShaderDuplicateName）登记在复核文档，本节只记观察。
 
 ### 7.5 变体统一模型
 
