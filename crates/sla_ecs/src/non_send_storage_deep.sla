@@ -1,0 +1,265 @@
+// Deepened Bevy ECS NonSend storage.
+// Mirrors src/storage/non_send.rs:
+//   NonSendData insert/replace/remove/remove_and_drop/ticks/changed_by/thread guard
+//   NonSends sparse registry get_or_insert/get/clear/iter/present count
+// Shallow lib/non_send_storage.sla retained.
+// Fixed capacity: 4 NonSend entries.
+
+struct EcsNsDataDeep {
+    component_id: i32,
+    data: i64,
+    is_present: bool,
+    added_tick: i64,
+    changed_tick: i64,
+    changed_by: i64,
+    origin_thread: i32, // -1 unset
+    drop_count: i32,
+}
+
+fn ecs_ns_data_new(component_id: i32) -> EcsNsDataDeep {
+    return EcsNsDataDeep {
+        component_id: component_id, data: 0, is_present: false,
+        added_tick: 0, changed_tick: 0, changed_by: 0,
+        origin_thread: -1, drop_count: 0,
+    };
+}
+
+fn ecs_ns_data_component_id(d: EcsNsDataDeep) -> i32 { return d.component_id; }
+fn ecs_ns_data_is_present(d: EcsNsDataDeep) -> bool { return d.is_present; }
+fn ecs_ns_data_drop_count(d: EcsNsDataDeep) -> i32 { return d.drop_count; }
+fn ecs_ns_data_origin_thread(d: EcsNsDataDeep) -> i32 { return d.origin_thread; }
+
+fn ecs_ns_data_get_data(d: EcsNsDataDeep) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.data);
+}
+
+fn ecs_ns_data_get_added(d: EcsNsDataDeep) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.added_tick);
+}
+
+fn ecs_ns_data_get_changed(d: EcsNsDataDeep) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.changed_tick);
+}
+
+fn ecs_ns_data_get_changed_by(d: EcsNsDataDeep) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.changed_by);
+}
+
+// validate_access: current_thread must match origin when set and present
+fn ecs_ns_data_validate(d: EcsNsDataDeep, current_thread: i32) -> bool {
+    if d.is_present != true { return true; };
+    if d.origin_thread < 0 { return true; };
+    if d.origin_thread == current_thread { return true; };
+    return false;
+}
+
+// insert: first sets origin+added; replace keeps added, updates changed
+// returns (data, ok) where ok=false if thread validation failed
+fn ecs_ns_data_insert(d: EcsNsDataDeep, value: i64, tick: i64, caller: i64, current_thread: i32) -> (EcsNsDataDeep, bool) {
+    if d.is_present {
+        if ecs_ns_data_validate(d, current_thread) != true {
+            return (d, false);
+        };
+        let drops = d.drop_count + 1; // replace drops old
+        let out = EcsNsDataDeep {
+            component_id: d.component_id, data: value, is_present: true,
+            added_tick: d.added_tick, changed_tick: tick, changed_by: caller,
+            origin_thread: d.origin_thread, drop_count: drops,
+        };
+        return (out, true);
+    };
+    let out = EcsNsDataDeep {
+        component_id: d.component_id, data: value, is_present: true,
+        added_tick: tick, changed_tick: tick, changed_by: caller,
+        origin_thread: current_thread, drop_count: d.drop_count,
+    };
+    return (out, true);
+}
+
+fn ecs_ns_data_remove(d: EcsNsDataDeep, current_thread: i32) -> (EcsNsDataDeep, bool, i64, i64, i64, i64) {
+    // returns (data, ok_removed, value, added, changed, changed_by)
+    if d.is_present != true {
+        return (d, false, 0, 0, 0, 0);
+    };
+    if ecs_ns_data_validate(d, current_thread) != true {
+        return (d, false, 0, 0, 0, 0);
+    };
+    let val = d.data;
+    let a = d.added_tick;
+    let c = d.changed_tick;
+    let by = d.changed_by;
+    let out = EcsNsDataDeep {
+        component_id: d.component_id, data: 0, is_present: false,
+        added_tick: d.added_tick, changed_tick: d.changed_tick, changed_by: d.changed_by,
+        origin_thread: d.origin_thread, drop_count: d.drop_count,
+    };
+    return (out, true, val, a, c, by);
+}
+
+fn ecs_ns_data_remove_and_drop(d: EcsNsDataDeep, current_thread: i32) -> (EcsNsDataDeep, bool) {
+    if d.is_present != true {
+        return (d, true);
+    };
+    if ecs_ns_data_validate(d, current_thread) != true {
+        return (d, false);
+    };
+    let out = EcsNsDataDeep {
+        component_id: d.component_id, data: 0, is_present: false,
+        added_tick: d.added_tick, changed_tick: d.changed_tick, changed_by: d.changed_by,
+        origin_thread: d.origin_thread, drop_count: d.drop_count + 1,
+    };
+    return (out, true);
+}
+
+fn ecs_ns_data_set_changed(d: EcsNsDataDeep, tick: i64, changed_by: i64) -> EcsNsDataDeep {
+    return EcsNsDataDeep {
+        component_id: d.component_id, data: d.data, is_present: d.is_present,
+        added_tick: d.added_tick, changed_tick: tick, changed_by: changed_by,
+        origin_thread: d.origin_thread, drop_count: d.drop_count,
+    };
+}
+
+fn ecs_ns_data_check_ticks(d: EcsNsDataDeep, max_tick: i64) -> EcsNsDataDeep {
+    let a = d.added_tick;
+    let c = d.changed_tick;
+    if a > max_tick { a = max_tick; };
+    if c > max_tick { c = max_tick; };
+    return EcsNsDataDeep {
+        component_id: d.component_id, data: d.data, is_present: d.is_present,
+        added_tick: a, changed_tick: c, changed_by: d.changed_by,
+        origin_thread: d.origin_thread, drop_count: d.drop_count,
+    };
+}
+
+// === NonSends registry capacity 4 ===
+struct EcsNsDeep {
+    len: i32,
+    d0: EcsNsDataDeep, d1: EcsNsDataDeep, d2: EcsNsDataDeep, d3: EcsNsDataDeep,
+}
+
+fn ecs_ns_new() -> EcsNsDeep {
+    return EcsNsDeep {
+        len: 0,
+        d0: ecs_ns_data_new(-1),
+        d1: ecs_ns_data_new(-1),
+        d2: ecs_ns_data_new(-1),
+        d3: ecs_ns_data_new(-1),
+    };
+}
+
+fn ecs_ns_len(s: EcsNsDeep) -> i32 { return s.len; }
+fn ecs_ns_is_empty(s: EcsNsDeep) -> bool {
+    if s.len == 0 { return true; };
+    return false;
+}
+
+fn ecs_ns_get_index(s: EcsNsDeep, component_id: i32) -> i32 {
+    if s.len >= 1 { if s.d0.component_id == component_id { return 0; }; };
+    if s.len >= 2 { if s.d1.component_id == component_id { return 1; }; };
+    if s.len >= 3 { if s.d2.component_id == component_id { return 2; }; };
+    if s.len >= 4 { if s.d3.component_id == component_id { return 3; }; };
+    return -1;
+}
+
+fn ecs_ns_get_at(s: EcsNsDeep, idx: i32) -> EcsNsDataDeep {
+    if idx == 0 { return s.d0; };
+    if idx == 1 { return s.d1; };
+    if idx == 2 { return s.d2; };
+    if idx == 3 { return s.d3; };
+    return ecs_ns_data_new(-1);
+}
+
+fn ecs_ns_set_at(s: EcsNsDeep, idx: i32, d: EcsNsDataDeep) -> EcsNsDeep {
+    if idx == 0 {
+        return EcsNsDeep { len: s.len, d0: d, d1: s.d1, d2: s.d2, d3: s.d3 };
+    };
+    if idx == 1 {
+        return EcsNsDeep { len: s.len, d0: s.d0, d1: d, d2: s.d2, d3: s.d3 };
+    };
+    if idx == 2 {
+        return EcsNsDeep { len: s.len, d0: s.d0, d1: s.d1, d2: d, d3: s.d3 };
+    };
+    if idx == 3 {
+        return EcsNsDeep { len: s.len, d0: s.d0, d1: s.d1, d2: s.d2, d3: d };
+    };
+    return s;
+}
+
+fn ecs_ns_get_or_insert(s: EcsNsDeep, component_id: i32) -> (EcsNsDeep, i32) {
+    let idx = ecs_ns_get_index(s, component_id);
+    if idx >= 0 { return (s, idx); };
+    if s.len >= 4 { return (s, -1); };
+    let d = ecs_ns_data_new(component_id);
+    let n = s.len;
+    let s2 = ecs_ns_set_at(s, n, d);
+    s2 = EcsNsDeep { len: n + 1, d0: s2.d0, d1: s2.d1, d2: s2.d2, d3: s2.d3 };
+    return (s2, n);
+}
+
+fn ecs_ns_insert(s: EcsNsDeep, component_id: i32, value: i64, tick: i64, caller: i64, thread: i32) -> (EcsNsDeep, bool) {
+    let r = ecs_ns_get_or_insert(s, component_id);
+    let s2 = r.0;
+    let idx = r.1;
+    if idx < 0 { return (s2, false); };
+    let d = ecs_ns_get_at(s2, idx);
+    let ins = ecs_ns_data_insert(d, value, tick, caller, thread);
+    if ins.1 != true { return (s2, false); };
+    s2 = ecs_ns_set_at(s2, idx, ins.0);
+    return (s2, true);
+}
+
+fn ecs_ns_get(s: EcsNsDeep, component_id: i32) -> (bool, EcsNsDataDeep) {
+    let idx = ecs_ns_get_index(s, component_id);
+    if idx < 0 { return (false, ecs_ns_data_new(-1)); };
+    return (true, ecs_ns_get_at(s, idx));
+}
+
+fn ecs_ns_remove(s: EcsNsDeep, component_id: i32, thread: i32) -> (EcsNsDeep, bool) {
+    let idx = ecs_ns_get_index(s, component_id);
+    if idx < 0 { return (s, false); };
+    let d = ecs_ns_get_at(s, idx);
+    let rem = ecs_ns_data_remove(d, thread);
+    if rem.1 != true { return (s, false); };
+    let s2 = ecs_ns_set_at(s, idx, rem.0);
+    return (s2, true);
+}
+
+fn ecs_ns_remove_and_drop(s: EcsNsDeep, component_id: i32, thread: i32) -> (EcsNsDeep, bool) {
+    let idx = ecs_ns_get_index(s, component_id);
+    if idx < 0 { return (s, true); };
+    let d = ecs_ns_get_at(s, idx);
+    let rem = ecs_ns_data_remove_and_drop(d, thread);
+    if rem.1 != true { return (s, false); };
+    let s2 = ecs_ns_set_at(s, idx, rem.0);
+    return (s2, true);
+}
+
+fn ecs_ns_clear(s: EcsNsDeep) -> EcsNsDeep {
+    return ecs_ns_new();
+}
+
+fn ecs_ns_contains_present(s: EcsNsDeep, component_id: i32) -> bool {
+    let g = ecs_ns_get(s, component_id);
+    if g.0 != true { return false; };
+    return ecs_ns_data_is_present(g.1);
+}
+
+fn ecs_ns_count_present(s: EcsNsDeep) -> i32 {
+    let count = 0;
+    if s.len >= 1 { if s.d0.is_present { count = count + 1; }; };
+    if s.len >= 2 { if s.d1.is_present { count = count + 1; }; };
+    if s.len >= 3 { if s.d2.is_present { count = count + 1; }; };
+    if s.len >= 4 { if s.d3.is_present { count = count + 1; }; };
+    return count;
+}
+
+// iter at index: (ok, component_id)
+fn ecs_ns_iter_at(s: EcsNsDeep, index: i32) -> (bool, i32) {
+    if index < 0 || index >= s.len { return (false, -1); };
+    let d = ecs_ns_get_at(s, index);
+    return (true, d.component_id);
+}

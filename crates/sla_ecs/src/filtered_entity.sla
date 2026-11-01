@@ -1,0 +1,331 @@
+// Bevy ECS world::entity_access::filtered (src/world/entity_access/filtered.rs):
+// FilteredEntityRef + FilteredEntityMut + UnsafeFilteredEntityMut + TryFromFilteredError
+// Access-filtered entity views: only allowed components (by Access) can be read/written.
+
+const ECS_FILTERED_ERR_OK: i32 = 0;
+const ECS_FILTERED_ERR_MISSING_READ_ALL: i32 = 1;
+const ECS_FILTERED_ERR_MISSING_WRITE_ALL: i32 = 2;
+
+// TryFromFilteredError
+struct EcsTryFromFilteredError {
+    code: i32,
+}
+
+fn ecs_try_from_filtered_error_ok() -> EcsTryFromFilteredError {
+    return EcsTryFromFilteredError { code: ECS_FILTERED_ERR_OK };
+}
+fn ecs_try_from_filtered_error_missing_read_all() -> EcsTryFromFilteredError {
+    return EcsTryFromFilteredError { code: ECS_FILTERED_ERR_MISSING_READ_ALL };
+}
+fn ecs_try_from_filtered_error_missing_write_all() -> EcsTryFromFilteredError {
+    return EcsTryFromFilteredError { code: ECS_FILTERED_ERR_MISSING_WRITE_ALL };
+}
+fn ecs_try_from_filtered_error_is_ok(e: EcsTryFromFilteredError) -> bool { return e.code == ECS_FILTERED_ERR_OK; }
+fn ecs_try_from_filtered_error_code(e: EcsTryFromFilteredError) -> i32 { return e.code; }
+
+// Access: tracks which component ids have read/write access, plus read_all/write_all flags
+struct EcsAccess {
+    read_ids: Vec<i32>,
+    write_ids: Vec<i32>,
+    read_all: bool,
+    write_all: bool,
+}
+
+fn ecs_access_new() -> EcsAccess {
+    return EcsAccess { read_ids: Vec::new(), write_ids: Vec::new(), read_all: false, write_all: false };
+}
+
+fn ecs_access_add_read(a: EcsAccess, id: i32) -> EcsAccess {
+    a.read_ids.push(id);
+    return a;
+}
+
+fn ecs_access_add_write(a: EcsAccess, id: i32) -> EcsAccess {
+    a.write_ids.push(id);
+    return a;
+}
+
+fn ecs_access_set_read_all(a: EcsAccess) -> EcsAccess {
+    a.read_all = true;
+    return a;
+}
+
+fn ecs_access_set_write_all(a: EcsAccess) -> EcsAccess {
+    a.write_all = true;
+    return a;
+}
+
+fn ecs_access_has_read(a: EcsAccess, id: i32) -> bool {
+    if a.read_all { return true; };
+    let i: i64 = 0;
+    let n: i64 = len(a.read_ids) as i64;
+    while i < n {
+        if a.read_ids[i] == id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_access_has_write(a: EcsAccess, id: i32) -> bool {
+    if a.write_all { return true; };
+    let i: i64 = 0;
+    let n: i64 = len(a.write_ids) as i64;
+    while i < n {
+        if a.write_ids[i] == id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_access_has_read_all(a: EcsAccess) -> bool { return a.read_all; }
+fn ecs_access_has_write_all(a: EcsAccess) -> bool { return a.write_all; }
+
+// Clone access
+fn ecs_access_clone(a: EcsAccess) -> EcsAccess {
+    let result = EcsAccess { read_ids: Vec::new(), write_ids: Vec::new(), read_all: a.read_all, write_all: a.write_all };
+    let i: i64 = 0;
+    let n: i64 = len(a.read_ids) as i64;
+    while i < n {
+        result.read_ids.push(a.read_ids[i]);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let m: i64 = len(a.write_ids) as i64;
+    while j < m {
+        result.write_ids.push(a.write_ids[j]);
+        j = j + 1;
+    }
+    return result;
+}
+
+// === Entity storage (shared by Ref and Mut) ===
+// Components stored as parallel arrays of (component_id, value)
+
+struct EcsEntityComponents {
+    entity: i64,
+    component_ids: Vec<i32>,
+    values: Vec<i64>,
+    archetype_id: i64,
+    location_row: i64,
+    spawned_by: i64,
+    spawn_tick: i64,
+}
+
+fn ecs_entity_components_new(entity: i64) -> EcsEntityComponents {
+    return EcsEntityComponents { entity: entity, component_ids: Vec::new(), values: Vec::new(), archetype_id: 0, location_row: 0, spawned_by: 0, spawn_tick: 0 };
+}
+
+fn ecs_entity_components_insert(ec: EcsEntityComponents, component_id: i32, value: i64) -> EcsEntityComponents {
+    let i: i64 = 0;
+    let n: i64 = len(ec.component_ids) as i64;
+    while i < n {
+        if ec.component_ids[i] == component_id {
+            ec.values[i] = value;
+            return ec;
+        };
+        i = i + 1;
+    }
+    ec.component_ids.push(component_id);
+    ec.values.push(value);
+    return ec;
+}
+
+fn ecs_entity_components_get(ec: EcsEntityComponents, component_id: i32) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(ec.component_ids) as i64;
+    while i < n {
+        if ec.component_ids[i] == component_id { return (true, ec.values[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn ecs_entity_components_contains(ec: EcsEntityComponents, component_id: i32) -> bool {
+    let g = ecs_entity_components_get(ec, component_id);
+    return g.0;
+}
+
+fn ecs_entity_components_id(ec: EcsEntityComponents) -> i64 { return ec.entity; }
+fn ecs_entity_components_location(ec: EcsEntityComponents) -> (i64, i64) { return (ec.archetype_id, ec.location_row); }
+fn ecs_entity_components_archetype(ec: EcsEntityComponents) -> i64 { return ec.archetype_id; }
+fn ecs_entity_components_spawned_by(ec: EcsEntityComponents) -> i64 { return ec.spawned_by; }
+fn ecs_entity_components_spawn_tick(ec: EcsEntityComponents) -> i64 { return ec.spawn_tick; }
+fn ecs_entity_components_count(ec: EcsEntityComponents) -> i64 { return len(ec.component_ids) as i64; }
+
+// === FilteredEntityRef ===
+// Read-only filtered view. get/get_ref/get_by_id require has_read access.
+
+struct EcsFilteredEntityRef {
+    entity: EcsEntityComponents,
+    access: EcsAccess,
+}
+
+fn ecs_filtered_entity_ref_new(entity: EcsEntityComponents, access: EcsAccess) -> EcsFilteredEntityRef {
+    return EcsFilteredEntityRef { entity: entity, access: access };
+}
+
+fn ecs_filtered_entity_ref_id(f: EcsFilteredEntityRef) -> i64 { return ecs_entity_components_id(f.entity); }
+fn ecs_filtered_entity_ref_location(f: EcsFilteredEntityRef) -> (i64, i64) { return ecs_entity_components_location(f.entity); }
+fn ecs_filtered_entity_ref_archetype(f: EcsFilteredEntityRef) -> i64 { return ecs_entity_components_archetype(f.entity); }
+fn ecs_filtered_entity_ref_access(f: EcsFilteredEntityRef) -> EcsAccess { return f.access; }
+fn ecs_filtered_entity_ref_spawned_by(f: EcsFilteredEntityRef) -> i64 { return ecs_entity_components_spawned_by(f.entity); }
+fn ecs_filtered_entity_ref_spawn_tick(f: EcsFilteredEntityRef) -> i64 { return ecs_entity_components_spawn_tick(f.entity); }
+
+// contains: checks entity storage (not filtered by access)
+fn ecs_filtered_entity_ref_contains(f: EcsFilteredEntityRef, component_id: i32) -> bool {
+    return ecs_entity_components_contains(f.entity, component_id);
+}
+
+fn ecs_filtered_entity_ref_contains_id(f: EcsFilteredEntityRef, component_id: i32) -> bool {
+    return ecs_filtered_entity_ref_contains(f, component_id);
+}
+
+fn ecs_filtered_entity_ref_contains_type_id(f: EcsFilteredEntityRef, type_id: i32) -> bool {
+    return ecs_filtered_entity_ref_contains(f, type_id);
+}
+
+// get: returns (found, value) only if has_read AND component present
+fn ecs_filtered_entity_ref_get(f: EcsFilteredEntityRef, component_id: i32) -> (bool, i64) {
+    if ecs_access_has_read(f.access, component_id) != true { return (false, 0); };
+    return ecs_entity_components_get(f.entity, component_id);
+}
+
+fn ecs_filtered_entity_ref_get_ref(f: EcsFilteredEntityRef, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_ref_get(f, component_id);
+}
+
+fn ecs_filtered_entity_ref_get_by_id(f: EcsFilteredEntityRef, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_ref_get(f, component_id);
+}
+
+// get_change_ticks_by_id: requires read access
+fn ecs_filtered_entity_ref_get_change_ticks_by_id(f: EcsFilteredEntityRef, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_ref_get(f, component_id);
+}
+
+// try_into_all: returns (ok, error_code). ok only if has_read_all
+fn ecs_filtered_entity_ref_try_into_all(f: EcsFilteredEntityRef) -> (bool, i32) {
+    if ecs_access_has_read_all(f.access) != true { return (false, ECS_FILTERED_ERR_MISSING_READ_ALL); };
+    return (true, ECS_FILTERED_ERR_OK);
+}
+
+// === FilteredEntityMut ===
+// Mutable filtered view. get requires has_read, get_mut requires has_write.
+
+struct EcsFilteredEntityMut2 {
+    entity: EcsEntityComponents,
+    access: EcsAccess,
+}
+
+fn ecs_filtered_entity_mut2_new(entity: EcsEntityComponents, access: EcsAccess) -> EcsFilteredEntityMut2 {
+    return EcsFilteredEntityMut2 { entity: entity, access: access };
+}
+
+fn ecs_filtered_entity_mut2_id(f: EcsFilteredEntityMut2) -> i64 { return ecs_entity_components_id(f.entity); }
+fn ecs_filtered_entity_mut2_location(f: EcsFilteredEntityMut2) -> (i64, i64) { return ecs_entity_components_location(f.entity); }
+fn ecs_filtered_entity_mut2_archetype(f: EcsFilteredEntityMut2) -> i64 { return ecs_entity_components_archetype(f.entity); }
+fn ecs_filtered_entity_mut2_access(f: EcsFilteredEntityMut2) -> EcsAccess { return f.access; }
+fn ecs_filtered_entity_mut2_spawned_by(f: EcsFilteredEntityMut2) -> i64 { return ecs_entity_components_spawned_by(f.entity); }
+fn ecs_filtered_entity_mut2_spawn_tick(f: EcsFilteredEntityMut2) -> i64 { return ecs_entity_components_spawn_tick(f.entity); }
+
+fn ecs_filtered_entity_mut2_contains(f: EcsFilteredEntityMut2, component_id: i32) -> bool {
+    return ecs_entity_components_contains(f.entity, component_id);
+}
+
+fn ecs_filtered_entity_mut2_contains_id(f: EcsFilteredEntityMut2, component_id: i32) -> bool {
+    return ecs_filtered_entity_mut2_contains(f, component_id);
+}
+
+fn ecs_filtered_entity_mut2_contains_type_id(f: EcsFilteredEntityMut2, type_id: i32) -> bool {
+    return ecs_filtered_entity_mut2_contains(f, type_id);
+}
+
+// get: requires has_read
+fn ecs_filtered_entity_mut2_get(f: EcsFilteredEntityMut2, component_id: i32) -> (bool, i64) {
+    if ecs_access_has_read(f.access, component_id) != true { return (false, 0); };
+    return ecs_entity_components_get(f.entity, component_id);
+}
+
+fn ecs_filtered_entity_mut2_get_ref(f: EcsFilteredEntityMut2, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_mut2_get(f, component_id);
+}
+
+fn ecs_filtered_entity_mut2_get_by_id(f: EcsFilteredEntityMut2, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_mut2_get(f, component_id);
+}
+
+// get_mut: requires has_write
+fn ecs_filtered_entity_mut2_get_mut(f: EcsFilteredEntityMut2, component_id: i32) -> (bool, i64) {
+    if ecs_access_has_write(f.access, component_id) != true { return (false, 0); };
+    return ecs_entity_components_get(f.entity, component_id);
+}
+
+fn ecs_filtered_entity_mut2_get_mut_by_id(f: EcsFilteredEntityMut2, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_mut2_get_mut(f, component_id);
+}
+
+fn ecs_filtered_entity_mut2_get_change_ticks_by_id(f: EcsFilteredEntityMut2, component_id: i32) -> (bool, i64) {
+    return ecs_filtered_entity_mut2_get(f, component_id);
+}
+
+// reborrow: returns a copy
+fn ecs_filtered_entity_mut2_reborrow(f: EcsFilteredEntityMut2) -> EcsFilteredEntityMut2 { return f; }
+
+// into_readonly: convert to FilteredEntityRef
+fn ecs_filtered_entity_mut2_into_readonly(f: EcsFilteredEntityMut2) -> EcsFilteredEntityRef {
+    return EcsFilteredEntityRef { entity: f.entity, access: f.access };
+}
+
+// as_readonly: same as into_readonly but borrows
+fn ecs_filtered_entity_mut2_as_readonly(f: EcsFilteredEntityMut2) -> EcsFilteredEntityRef {
+    return ecs_filtered_entity_mut2_into_readonly(f);
+}
+
+// try_into_all: returns (ok, error_code). ok only if has_read_all AND has_write_all
+fn ecs_filtered_entity_mut2_try_into_all(f: EcsFilteredEntityMut2) -> (bool, i32) {
+    if ecs_access_has_read_all(f.access) != true { return (false, ECS_FILTERED_ERR_MISSING_READ_ALL); };
+    if ecs_access_has_write_all(f.access) != true { return (false, ECS_FILTERED_ERR_MISSING_WRITE_ALL); };
+    return (true, ECS_FILTERED_ERR_OK);
+}
+
+// === UnsafeFilteredEntityMut ===
+// A copyable variant that bypasses borrow checking (modeled as a simple copy)
+
+struct EcsUnsafeFilteredEntityMut {
+    entity: EcsEntityComponents,
+    access: EcsAccess,
+}
+
+fn ecs_unsafe_filtered_entity_mut_new_readonly(f: EcsFilteredEntityMut2) -> EcsUnsafeFilteredEntityMut {
+    return EcsUnsafeFilteredEntityMut { entity: f.entity, access: f.access };
+}
+
+fn ecs_unsafe_filtered_entity_mut_into_mut(u: EcsUnsafeFilteredEntityMut) -> EcsFilteredEntityMut2 {
+    return EcsFilteredEntityMut2 { entity: u.entity, access: u.access };
+}
+
+// === PartialEq / Eq / Ord / Hash (modeled via entity id comparison) ===
+
+fn ecs_filtered_entity_ref_eq(a: EcsFilteredEntityRef, b: EcsFilteredEntityRef) -> bool {
+    return ecs_filtered_entity_ref_id(a) == ecs_filtered_entity_ref_id(b);
+}
+
+fn ecs_filtered_entity_ref_cmp(a: EcsFilteredEntityRef, b: EcsFilteredEntityRef) -> i32 {
+    let aid = ecs_filtered_entity_ref_id(a);
+    let bid = ecs_filtered_entity_ref_id(b);
+    if aid < bid { return -1; };
+    if aid > bid { return 1; };
+    return 0;
+}
+
+fn ecs_filtered_entity_mut2_eq(a: EcsFilteredEntityMut2, b: EcsFilteredEntityMut2) -> bool {
+    return ecs_filtered_entity_mut2_id(a) == ecs_filtered_entity_mut2_id(b);
+}
+
+fn ecs_filtered_entity_mut2_cmp(a: EcsFilteredEntityMut2, b: EcsFilteredEntityMut2) -> i32 {
+    let aid = ecs_filtered_entity_mut2_id(a);
+    let bid = ecs_filtered_entity_mut2_id(b);
+    if aid < bid { return -1; };
+    if aid > bid { return 1; };
+    return 0;
+}

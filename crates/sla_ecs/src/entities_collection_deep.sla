@@ -1,0 +1,394 @@
+// Deepened Bevy ECS Entities collection (src/entity/mod.rs Entities) fixed cap-8.
+// Stand-in for shallow lib/entities_collection.sla (Vec-backed). Operations:
+//   new, tick/current_tick, alloc (returns EntitiesResult: index/generation),
+//   contains (by index+gen), contains_spawned, is_index_spawned,
+//   free (marks slot not spawned, bump despawn_tick, push to free queue),
+//   get_spawned, set_location (only if spawned), len, count_spawned, is_empty,
+//   any_spawned, get_spawn_tick, get_despawn_tick, resolve_from_index.
+// Each slot (EcsEntitiesSlotDeep) holds: gen, spawned, archetype_id, table_id,
+// table_row, spawn_tick, despawn_tick. Free queue is FIFO (despawn-then-alloc reuses
+// oldest first, generation bumped on re-spawn — matches shallow's free_indices[0]).
+
+const ECS_ENTITIES_CAP_DEEP: i32 = 8;
+
+struct EcsEntitiesSlotDeep {
+    gen: i32,
+    spawned: i32,
+    archetype_id: i32,
+    table_id: i32,
+    table_row: i32,
+    spawn_tick: i64,
+    despawn_tick: i64,
+}
+
+fn ecs_entities_slot_empty() -> EcsEntitiesSlotDeep {
+    return EcsEntitiesSlotDeep {
+        gen: 0,
+        spawned: 0,
+        archetype_id: 0,
+        table_id: 0,
+        table_row: 0,
+        spawn_tick: 0,
+        despawn_tick: 0,
+    };
+}
+
+struct EcsEntitiesSlotViewDeep {
+    gen: i32,
+    spawned: i32,
+    archetype_id: i32,
+    table_id: i32,
+    table_row: i32,
+    spawn_tick: i64,
+    despawn_tick: i64,
+}
+
+fn ecs_entities_slot_view(slot: EcsEntitiesSlotDeep) -> EcsEntitiesSlotViewDeep {
+    // Single consuming access returns plain scalars (all primitive copies).
+    return EcsEntitiesSlotViewDeep {
+        gen: slot.gen,
+        spawned: slot.spawned,
+        archetype_id: slot.archetype_id,
+        table_id: slot.table_id,
+        table_row: slot.table_row,
+        spawn_tick: slot.spawn_tick,
+        despawn_tick: slot.despawn_tick,
+    };
+}
+
+fn ecs_entities_slot_view_gen(v: EcsEntitiesSlotViewDeep) -> i32 { return v.gen; }
+fn ecs_entities_slot_view_spawned(v: EcsEntitiesSlotViewDeep) -> i32 { return v.spawned; }
+fn ecs_entities_slot_view_archetype_id(v: EcsEntitiesSlotViewDeep) -> i32 { return v.archetype_id; }
+fn ecs_entities_slot_view_table_id(v: EcsEntitiesSlotViewDeep) -> i32 { return v.table_id; }
+fn ecs_entities_slot_view_table_row(v: EcsEntitiesSlotViewDeep) -> i32 { return v.table_row; }
+fn ecs_entities_slot_view_spawn_tick(v: EcsEntitiesSlotViewDeep) -> i64 { return v.spawn_tick; }
+fn ecs_entities_slot_view_despawn_tick(v: EcsEntitiesSlotViewDeep) -> i64 { return v.despawn_tick; }
+
+fn ecs_entities_slot_spawned(slot: EcsEntitiesSlotDeep) -> i32 { return slot.spawned; }
+fn ecs_entities_slot_gen(slot: EcsEntitiesSlotDeep) -> i32 { return slot.gen; }
+fn ecs_entities_slot_archetype_id(slot: EcsEntitiesSlotDeep) -> i32 { return slot.archetype_id; }
+fn ecs_entities_slot_table_id(slot: EcsEntitiesSlotDeep) -> i32 { return slot.table_id; }
+fn ecs_entities_slot_table_row(slot: EcsEntitiesSlotDeep) -> i32 { return slot.table_row; }
+fn ecs_entities_slot_spawn_tick(slot: EcsEntitiesSlotDeep) -> i64 { return slot.spawn_tick; }
+fn ecs_entities_slot_despawn_tick(slot: EcsEntitiesSlotDeep) -> i64 { return slot.despawn_tick; }
+
+// Slot builder (rebuilds a slot from scalars; ≤24 args — only 7 fields).
+fn ecs_entities_slot_build(
+    gen: i32, spawned: i32, archetype_id: i32, table_id: i32, table_row: i32, spawn_tick: i64, despawn_tick: i64
+) -> EcsEntitiesSlotDeep {
+    return EcsEntitiesSlotDeep {
+        gen: gen,
+        spawned: spawned,
+        archetype_id: archetype_id,
+        table_id: table_id,
+        table_row: table_row,
+        spawn_tick: spawn_tick,
+        despawn_tick: despawn_tick,
+    };
+}
+
+struct EcsEntitiesResultDeep {
+    entities: EcsEntitiesDeep,
+    index: i32,
+    generation: i32,
+}
+
+fn ecs_entities_result_new(entities: EcsEntitiesDeep, index: i32, generation: i32) -> EcsEntitiesResultDeep {
+    return EcsEntitiesResultDeep { entities: entities, index: index, generation: generation };
+}
+
+fn ecs_entities_result_entities(r: EcsEntitiesResultDeep) -> EcsEntitiesDeep { return r.entities; }
+fn ecs_entities_result_index(r: EcsEntitiesResultDeep) -> i32 { return r.index; }
+fn ecs_entities_result_generation(r: EcsEntitiesResultDeep) -> i32 { return r.generation; }
+
+struct EcsEntitiesGetResultDeep {
+    valid: i32,
+    spawned: i32,
+    archetype_id: i32,
+    table_id: i32,
+    table_row: i32,
+}
+
+fn ecs_entities_get_result_empty() -> EcsEntitiesGetResultDeep {
+    return EcsEntitiesGetResultDeep { valid: 0, spawned: 0, archetype_id: 0, table_id: 0, table_row: 0 };
+}
+
+fn ecs_entities_get_result_build(valid: i32, spawned: i32, archetype_id: i32, table_id: i32, table_row: i32) -> EcsEntitiesGetResultDeep {
+    return EcsEntitiesGetResultDeep { valid: valid, spawned: spawned, archetype_id: archetype_id, table_id: table_id, table_row: table_row };
+}
+
+fn ecs_entities_get_result_valid(r: EcsEntitiesGetResultDeep) -> i32 { return r.valid; }
+fn ecs_entities_get_result_spawned(r: EcsEntitiesGetResultDeep) -> i32 { return r.spawned; }
+fn ecs_entities_get_result_archetype_id(r: EcsEntitiesGetResultDeep) -> i32 { return r.archetype_id; }
+fn ecs_entities_get_result_table_id(r: EcsEntitiesGetResultDeep) -> i32 { return r.table_id; }
+fn ecs_entities_get_result_table_row(r: EcsEntitiesGetResultDeep) -> i32 { return r.table_row; }
+
+struct EcsEntitiesTickResultDeep {
+    valid: i32,
+    tick: i64,
+}
+
+fn ecs_entities_tick_result_empty() -> EcsEntitiesTickResultDeep {
+    return EcsEntitiesTickResultDeep { valid: 0, tick: 0 };
+}
+
+fn ecs_entities_tick_result_build(valid: i32, tick: i64) -> EcsEntitiesTickResultDeep {
+    return EcsEntitiesTickResultDeep { valid: valid, tick: tick };
+}
+
+fn ecs_entities_tick_result_valid(r: EcsEntitiesTickResultDeep) -> i32 { return r.valid; }
+fn ecs_entities_tick_result_tick(r: EcsEntitiesTickResultDeep) -> i64 { return r.tick; }
+
+// === EcsEntitiesDeep: cap-8 slots + FIFO free-queue + counters ===
+
+struct EcsEntitiesDeep {
+    s0: EcsEntitiesSlotDeep, s1: EcsEntitiesSlotDeep, s2: EcsEntitiesSlotDeep, s3: EcsEntitiesSlotDeep,
+    s4: EcsEntitiesSlotDeep, s5: EcsEntitiesSlotDeep, s6: EcsEntitiesSlotDeep, s7: EcsEntitiesSlotDeep,
+    // free-queue (FIFO): index 0 = oldest despawned; index free_count-1 = newest.
+    f0: i32, f1: i32, f2: i32, f3: i32, f4: i32, f5: i32, f6: i32, f7: i32,
+    free_count: i32,
+    next_index: i32,
+    current_tick: i32,
+    spawned_count: i32,
+}
+
+fn ecs_entities_new() -> EcsEntitiesDeep {
+    let blank = ecs_entities_slot_empty();
+    let e = EcsEntitiesDeep {
+        s0: blank, s1: blank, s2: blank, s3: blank,
+        s4: blank, s5: blank, s6: blank, s7: blank,
+        f0: 0, f1: 0, f2: 0, f3: 0, f4: 0, f5: 0, f6: 0, f7: 0,
+        free_count: 0,
+        next_index: 0,
+        current_tick: 0,
+        spawned_count: 0,
+    };
+    return e;
+}
+
+fn ecs_entities_slot_at(e: EcsEntitiesDeep, idx: i32) -> EcsEntitiesSlotDeep {
+    if idx == 0 { return e.s0; };
+    if idx == 1 { return e.s1; };
+    if idx == 2 { return e.s2; };
+    if idx == 3 { return e.s3; };
+    if idx == 4 { return e.s4; };
+    if idx == 5 { return e.s5; };
+    if idx == 6 { return e.s6; };
+    if idx == 7 { return e.s7; };
+    return ecs_entities_slot_empty();
+}
+
+fn ecs_entities_set_slot(e: EcsEntitiesDeep, idx: i32, slot: EcsEntitiesSlotDeep) -> EcsEntitiesDeep {
+    // Capture scalar fields once (struct by value is consumed on first reassign).
+    let g = slot.gen;
+    let s = slot.spawned;
+    let a = slot.archetype_id;
+    let t = slot.table_id;
+    let r = slot.table_row;
+    let sp = slot.spawn_tick;
+    let dp = slot.despawn_tick;
+    if idx == 0 { e.s0 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 1 { e.s1 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 2 { e.s2 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 3 { e.s3 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 4 { e.s4 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 5 { e.s5 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 6 { e.s6 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    if idx == 7 { e.s7 = ecs_entities_slot_build(g, s, a, t, r, sp, dp); };
+    return e;
+}
+
+fn ecs_entities_free_at(e: EcsEntitiesDeep, qidx: i32) -> i32 {
+    if qidx == 0 { return e.f0; };
+    if qidx == 1 { return e.f1; };
+    if qidx == 2 { return e.f2; };
+    if qidx == 3 { return e.f3; };
+    if qidx == 4 { return e.f4; };
+    if qidx == 5 { return e.f5; };
+    if qidx == 6 { return e.f6; };
+    if qidx == 7 { return e.f7; };
+    return 0;
+}
+
+fn ecs_entities_set_free(e: EcsEntitiesDeep, qidx: i32, val: i32) -> EcsEntitiesDeep {
+    if qidx == 0 { e.f0 = val; };
+    if qidx == 1 { e.f1 = val; };
+    if qidx == 2 { e.f2 = val; };
+    if qidx == 3 { e.f3 = val; };
+    if qidx == 4 { e.f4 = val; };
+    if qidx == 5 { e.f5 = val; };
+    if qidx == 6 { e.f6 = val; };
+    if qidx == 7 { e.f7 = val; };
+    return e;
+}
+
+fn ecs_entities_free_count(e: EcsEntitiesDeep) -> i32 { return e.free_count; }
+fn ecs_entities_next_index(e: EcsEntitiesDeep) -> i32 { return e.next_index; }
+fn ecs_entities_current_tick(e: EcsEntitiesDeep) -> i64 { return e.current_tick as i64; }
+fn ecs_entities_count_spawned(e: EcsEntitiesDeep) -> i32 { return e.spawned_count; }
+fn ecs_entities_any_spawned(e: EcsEntitiesDeep) -> bool {
+    if e.spawned_count > 0 { return true; };
+    return false;
+}
+fn ecs_entities_len(e: EcsEntitiesDeep) -> i32 { return e.next_index; }
+fn ecs_entities_is_empty(e: EcsEntitiesDeep) -> bool { return e.next_index == 0; }
+
+fn ecs_entities_tick(e: EcsEntitiesDeep) -> EcsEntitiesDeep {
+    e.current_tick = e.current_tick + 1;
+    return e;
+}
+
+// Index validation: in range.
+fn ecs_entities_index_valid(e: EcsEntitiesDeep, idx: i32) -> bool {
+    if idx < 0 { return false; };
+    if idx >= ECS_ENTITIES_CAP_DEEP { return false; };
+    if idx >= e.next_index { return false; };
+    return true;
+}
+
+// FIFO free-queue push (newest at back).
+fn ecs_entities_push_free(e: EcsEntitiesDeep, idx: i32) -> EcsEntitiesDeep {
+    let slot = e.free_count;
+    e = ecs_entities_set_free(e, slot, idx);
+    e.free_count = e.free_count + 1;
+    return e;
+}
+
+// FIFO free-queue shift forward f[1..count] -> f[0..count-1].
+fn ecs_entities_shift_free(e: EcsEntitiesDeep, new_count: i32) -> EcsEntitiesDeep {
+    let i: i32 = 0;
+    while i < new_count {
+        let shifted = ecs_entities_free_at(e, i + 1);
+        e = ecs_entities_set_free(e, i, shifted);
+        i = i + 1;
+    }
+    return e;
+}
+
+// FIFO pop (oldest first).
+fn ecs_entities_pop_free(e: EcsEntitiesDeep) -> (EcsEntitiesDeep, i32) {
+    if e.free_count == 0 { return (e, -1); };
+    let idx = ecs_entities_free_at(e, 0);
+    let new_count = e.free_count - 1;
+    e = ecs_entities_shift_free(e, new_count);
+    e = ecs_entities_set_free(e, new_count, 0);
+    e.free_count = new_count;
+    return (e, idx);
+}
+
+fn ecs_entities_contains(e: EcsEntitiesDeep, idx: i32, gen: i32) -> bool {
+    if ecs_entities_index_valid(e, idx) != true { return false; };
+    let slot = ecs_entities_slot_at(e, idx);
+    return ecs_entities_slot_gen(slot) == gen;
+}
+
+fn ecs_entities_contains_spawned(e: EcsEntitiesDeep, idx: i32, gen: i32) -> bool {
+    if ecs_entities_contains(e, idx, gen) != true { return false; };
+    let slot = ecs_entities_slot_at(e, idx);
+    return ecs_entities_slot_spawned(slot) == 1;
+}
+
+fn ecs_entities_is_index_spawned(e: EcsEntitiesDeep, idx: i32) -> bool {
+    if ecs_entities_index_valid(e, idx) != true { return false; };
+    let slot = ecs_entities_slot_at(e, idx);
+    return ecs_entities_slot_spawned(slot) == 1;
+}
+
+// alloc: reuse a freed slot (gen bump) or allocate fresh.
+fn ecs_entities_alloc(e: EcsEntitiesDeep) -> EcsEntitiesResultDeep {
+    if e.free_count > 0 {
+        let pair = ecs_entities_pop_free(e);
+        let e1 = pair.0;
+        let idx = pair.1;
+        let old_slot = ecs_entities_slot_at(e1, idx);
+        let new_gen = ecs_entities_slot_gen(old_slot) + 1;
+        let new_slot = ecs_entities_slot_build(new_gen, 1, 0, 0, 0, e1.current_tick as i64, 0);
+        e1 = ecs_entities_set_slot(e1, idx, new_slot);
+        e1.spawned_count = e1.spawned_count + 1;
+        return ecs_entities_result_new(e1, idx, new_gen);
+    };
+    let idx = e.next_index;
+    if idx >= ECS_ENTITIES_CAP_DEEP { panic(136200); };
+    let new_slot = ecs_entities_slot_build(0, 1, 0, 0, 0, e.current_tick as i64, 0);
+    e = ecs_entities_set_slot(e, idx, new_slot);
+    e.next_index = e.next_index + 1;
+    e.spawned_count = e.spawned_count + 1;
+    return ecs_entities_result_new(e, idx, 0);
+}
+
+// free: despawn entity and push to free queue.
+fn ecs_entities_free(e: EcsEntitiesDeep, idx: i32, gen: i32) -> EcsEntitiesDeep {
+    if ecs_entities_contains_spawned(e, idx, gen) != true { return e; };
+    let slot = ecs_entities_slot_at(e, idx);
+    let view = ecs_entities_slot_view(slot);
+    let g = ecs_entities_slot_view_gen(view);
+    let spawn_tick = ecs_entities_slot_view_spawn_tick(view);
+    let new_slot = ecs_entities_slot_build(g, 0, 0, 0, 0, spawn_tick, e.current_tick as i64);
+    e = ecs_entities_set_slot(e, idx, new_slot);
+    e = ecs_entities_push_free(e, idx);
+    e.spawned_count = e.spawned_count - 1;
+    return e;
+}
+
+fn ecs_entities_set_location(e: EcsEntitiesDeep, idx: i32, gen: i32, archetype_id: i32, table_id: i32, table_row: i32) -> EcsEntitiesDeep {
+    if ecs_entities_contains_spawned(e, idx, gen) != true { return e; };
+    let slot = ecs_entities_slot_at(e, idx);
+    let view = ecs_entities_slot_view(slot);
+    let g = ecs_entities_slot_view_gen(view);
+    let spawned = ecs_entities_slot_view_spawned(view);
+    let spawn_tick = ecs_entities_slot_view_spawn_tick(view);
+    let despawn_tick = ecs_entities_slot_view_despawn_tick(view);
+    let new_slot = ecs_entities_slot_build(g, spawned, archetype_id, table_id, table_row, spawn_tick, despawn_tick);
+    e = ecs_entities_set_slot(e, idx, new_slot);
+    return e;
+}
+
+fn ecs_entities_get_spawned(e: EcsEntitiesDeep, idx: i32, gen: i32) -> EcsEntitiesGetResultDeep {
+    if ecs_entities_contains_spawned(e, idx, gen) != true { return ecs_entities_get_result_empty(); };
+    let slot = ecs_entities_slot_at(e, idx);
+    let view = ecs_entities_slot_view(slot);
+    let archetype_id = ecs_entities_slot_view_archetype_id(view);
+    let table_id = ecs_entities_slot_view_table_id(view);
+    let table_row = ecs_entities_slot_view_table_row(view);
+    return ecs_entities_get_result_build(1, 1, archetype_id, table_id, table_row);
+}
+
+fn ecs_entities_get(e: EcsEntitiesDeep, idx: i32, gen: i32) -> EcsEntitiesGetResultDeep {
+    if ecs_entities_contains(e, idx, gen) != true { return ecs_entities_get_result_empty(); };
+    let slot = ecs_entities_slot_at(e, idx);
+    let view = ecs_entities_slot_view(slot);
+    let spawned = ecs_entities_slot_view_spawned(view);
+    if spawned == 0 { return ecs_entities_get_result_build(1, 0, 0, 0, 0); };
+    let archetype_id = ecs_entities_slot_view_archetype_id(view);
+    let table_id = ecs_entities_slot_view_table_id(view);
+    let table_row = ecs_entities_slot_view_table_row(view);
+    return ecs_entities_get_result_build(1, 1, archetype_id, table_id, table_row);
+}
+
+fn ecs_entities_get_spawn_tick(e: EcsEntitiesDeep, idx: i32, gen: i32) -> EcsEntitiesTickResultDeep {
+    if ecs_entities_contains(e, idx, gen) != true { return ecs_entities_tick_result_empty(); };
+    let slot = ecs_entities_slot_at(e, idx);
+    return ecs_entities_tick_result_build(1, ecs_entities_slot_spawn_tick(slot));
+}
+
+fn ecs_entities_get_despawn_tick(e: EcsEntitiesDeep, idx: i32, gen: i32) -> EcsEntitiesTickResultDeep {
+    if ecs_entities_contains(e, idx, gen) != true { return ecs_entities_tick_result_empty(); };
+    let slot = ecs_entities_slot_at(e, idx);
+    let view = ecs_entities_slot_view(slot);
+    let spawned = ecs_entities_slot_view_spawned(view);
+    if spawned == 1 { return ecs_entities_tick_result_build(1, 0); };
+    let despawn_tick = ecs_entities_slot_view_despawn_tick(view);
+    return ecs_entities_tick_result_build(1, despawn_tick);
+}
+
+// resolve_from_index uses the current generation at idx (alive or despawned but not reused).
+fn ecs_entities_resolve_from_index(e: EcsEntitiesDeep, idx: i32) -> (i32, i32) {
+    if idx < 0 { return (-1, 0); };
+    if idx >= e.next_index { return (-1, 0); };
+    let slot = ecs_entities_slot_at(e, idx);
+    return (idx, ecs_entities_slot_gen(slot));
+}
+
+fn ecs_entities_clear(e: EcsEntitiesDeep) -> EcsEntitiesDeep {
+    return ecs_entities_new();
+}

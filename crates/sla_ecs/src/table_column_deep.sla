@@ -1,0 +1,265 @@
+// Deepened Bevy ECS storage::table::Column.
+// Mirrors src/storage/table/column.rs:
+//   with_capacity, initialize, replace, swap_remove, clear
+//   get_data / get_added_tick / get_changed_tick / get_changed_by / get_ticks
+//   check_change_ticks, realloc, drop_last_component, get_drop
+//   initialize_from (copy row from other column)
+// Fixed capacity: 8 rows. Shallow lib/table_column.sla retained.
+
+struct EcsColDeep {
+    component_id: i32,
+    component_size: i64,
+    capacity: i64,
+    has_drop: bool,
+    len: i32,
+    d0: i64, a0: i64, c0: i64, b0: i64,
+    d1: i64, a1: i64, c1: i64, b1: i64,
+    d2: i64, a2: i64, c2: i64, b2: i64,
+    d3: i64, a3: i64, c3: i64, b3: i64,
+    d4: i64, a4: i64, c4: i64, b4: i64,
+    d5: i64, a5: i64, c5: i64, b5: i64,
+    d6: i64, a6: i64, c6: i64, b6: i64,
+    d7: i64, a7: i64, c7: i64, b7: i64,
+}
+
+fn ecs_col_deep_with_capacity(component_id: i32, component_size: i64, capacity: i64, has_drop: bool) -> EcsColDeep {
+    return EcsColDeep {
+        component_id: component_id, component_size: component_size, capacity: capacity, has_drop: has_drop, len: 0,
+        d0: 0, a0: 0, c0: 0, b0: 0, d1: 0, a1: 0, c1: 0, b1: 0,
+        d2: 0, a2: 0, c2: 0, b2: 0, d3: 0, a3: 0, c3: 0, b3: 0,
+        d4: 0, a4: 0, c4: 0, b4: 0, d5: 0, a5: 0, c5: 0, b5: 0,
+        d6: 0, a6: 0, c6: 0, b6: 0, d7: 0, a7: 0, c7: 0, b7: 0,
+    };
+}
+
+fn ecs_col_deep_component_id(c: EcsColDeep) -> i32 { return c.component_id; }
+fn ecs_col_deep_component_size(c: EcsColDeep) -> i64 { return c.component_size; }
+fn ecs_col_deep_capacity(c: EcsColDeep) -> i64 { return c.capacity; }
+fn ecs_col_deep_has_drop(c: EcsColDeep) -> bool { return c.has_drop; }
+fn ecs_col_deep_len(c: EcsColDeep) -> i32 { return c.len; }
+fn ecs_col_deep_is_empty(c: EcsColDeep) -> bool {
+    if c.len == 0 { return true; };
+    return false;
+}
+fn ecs_col_deep_get_drop(c: EcsColDeep) -> bool { return c.has_drop; }
+
+fn ecs_col_deep_rebuild(
+    component_id: i32, component_size: i64, capacity: i64, has_drop: bool, len: i32,
+    d0: i64, a0: i64, c0: i64, b0: i64, d1: i64, a1: i64, c1: i64, b1: i64,
+    d2: i64, a2: i64, c2: i64, b2: i64, d3: i64, a3: i64, c3: i64, b3: i64,
+    d4: i64, a4: i64, c4: i64, b4: i64, d5: i64, a5: i64, c5: i64, b5: i64,
+    d6: i64, a6: i64, c6: i64, b6: i64, d7: i64, a7: i64, c7: i64, b7: i64
+) -> EcsColDeep {
+    return EcsColDeep {
+        component_id: component_id, component_size: component_size, capacity: capacity, has_drop: has_drop, len: len,
+        d0: d0, a0: a0, c0: c0, b0: b0, d1: d1, a1: a1, c1: c1, b1: b1,
+        d2: d2, a2: a2, c2: c2, b2: b2, d3: d3, a3: a3, c3: c3, b3: b3,
+        d4: d4, a4: a4, c4: c4, b4: b4, d5: d5, a5: a5, c5: c5, b5: b5,
+        d6: d6, a6: a6, c6: c6, b6: b6, d7: d7, a7: a7, c7: c7, b7: b7,
+    };
+}
+
+fn ecs_col_deep_from(c: EcsColDeep) -> EcsColDeep {
+    return ecs_col_deep_rebuild(
+        c.component_id, c.component_size, c.capacity, c.has_drop, c.len,
+        c.d0, c.a0, c.c0, c.b0, c.d1, c.a1, c.c1, c.b1,
+        c.d2, c.a2, c.c2, c.b2, c.d3, c.a3, c.c3, c.b3,
+        c.d4, c.a4, c.c4, c.b4, c.d5, c.a5, c.c5, c.b5,
+        c.d6, c.a6, c.c6, c.b6, c.d7, c.a7, c.c7, c.b7
+    );
+}
+
+struct EcsColCell {
+    found: bool,
+    data: i64,
+    added: i64,
+    changed: i64,
+    changed_by: i64,
+}
+
+fn ecs_col_cell_found(r: EcsColCell) -> bool { return r.found; }
+fn ecs_col_cell_data(r: EcsColCell) -> i64 { return r.data; }
+fn ecs_col_cell_added(r: EcsColCell) -> i64 { return r.added; }
+fn ecs_col_cell_changed(r: EcsColCell) -> i64 { return r.changed; }
+fn ecs_col_cell_changed_by(r: EcsColCell) -> i64 { return r.changed_by; }
+
+fn ecs_col_deep_get_cell(c: EcsColDeep, row: i32) -> EcsColCell {
+    if row < 0 {
+        return EcsColCell { found: false, data: 0, added: 0, changed: 0, changed_by: 0 };
+    };
+    if row >= c.len {
+        return EcsColCell { found: false, data: 0, added: 0, changed: 0, changed_by: 0 };
+    };
+    if row == 0 { return EcsColCell { found: true, data: c.d0, added: c.a0, changed: c.c0, changed_by: c.b0 }; };
+    if row == 1 { return EcsColCell { found: true, data: c.d1, added: c.a1, changed: c.c1, changed_by: c.b1 }; };
+    if row == 2 { return EcsColCell { found: true, data: c.d2, added: c.a2, changed: c.c2, changed_by: c.b2 }; };
+    if row == 3 { return EcsColCell { found: true, data: c.d3, added: c.a3, changed: c.c3, changed_by: c.b3 }; };
+    if row == 4 { return EcsColCell { found: true, data: c.d4, added: c.a4, changed: c.c4, changed_by: c.b4 }; };
+    if row == 5 { return EcsColCell { found: true, data: c.d5, added: c.a5, changed: c.c5, changed_by: c.b5 }; };
+    if row == 6 { return EcsColCell { found: true, data: c.d6, added: c.a6, changed: c.c6, changed_by: c.b6 }; };
+    if row == 7 { return EcsColCell { found: true, data: c.d7, added: c.a7, changed: c.c7, changed_by: c.b7 }; };
+    return EcsColCell { found: false, data: 0, added: 0, changed: 0, changed_by: 0 };
+}
+
+fn ecs_col_deep_get_data(c: EcsColDeep, row: i32) -> EcsColCell { return ecs_col_deep_get_cell(c, row); }
+fn ecs_col_deep_get_added_tick(c: EcsColDeep, row: i32) -> EcsColCell { return ecs_col_deep_get_cell(c, row); }
+fn ecs_col_deep_get_changed_tick(c: EcsColDeep, row: i32) -> EcsColCell { return ecs_col_deep_get_cell(c, row); }
+fn ecs_col_deep_get_changed_by(c: EcsColDeep, row: i32) -> EcsColCell { return ecs_col_deep_get_cell(c, row); }
+fn ecs_col_deep_get_ticks(c: EcsColDeep, row: i32) -> EcsColCell { return ecs_col_deep_get_cell(c, row); }
+
+fn ecs_col_deep_set_row(c: EcsColDeep, row: i32, data: i64, added: i64, changed: i64, changed_by: i64) -> EcsColDeep {
+    let d0 = c.d0; let a0 = c.a0; let ch0 = c.c0; let b0 = c.b0;
+    let d1 = c.d1; let a1 = c.a1; let ch1 = c.c1; let b1 = c.b1;
+    let d2 = c.d2; let a2 = c.a2; let ch2 = c.c2; let b2 = c.b2;
+    let d3 = c.d3; let a3 = c.a3; let ch3 = c.c3; let b3 = c.b3;
+    let d4 = c.d4; let a4 = c.a4; let ch4 = c.c4; let b4 = c.b4;
+    let d5 = c.d5; let a5 = c.a5; let ch5 = c.c5; let b5 = c.b5;
+    let d6 = c.d6; let a6 = c.a6; let ch6 = c.c6; let b6 = c.b6;
+    let d7 = c.d7; let a7 = c.a7; let ch7 = c.c7; let b7 = c.b7;
+    if row == 0 { d0 = data; a0 = added; ch0 = changed; b0 = changed_by; };
+    if row == 1 { d1 = data; a1 = added; ch1 = changed; b1 = changed_by; };
+    if row == 2 { d2 = data; a2 = added; ch2 = changed; b2 = changed_by; };
+    if row == 3 { d3 = data; a3 = added; ch3 = changed; b3 = changed_by; };
+    if row == 4 { d4 = data; a4 = added; ch4 = changed; b4 = changed_by; };
+    if row == 5 { d5 = data; a5 = added; ch5 = changed; b5 = changed_by; };
+    if row == 6 { d6 = data; a6 = added; ch6 = changed; b6 = changed_by; };
+    if row == 7 { d7 = data; a7 = added; ch7 = changed; b7 = changed_by; };
+    return ecs_col_deep_rebuild(
+        c.component_id, c.component_size, c.capacity, c.has_drop, c.len,
+        d0, a0, ch0, b0, d1, a1, ch1, b1, d2, a2, ch2, b2, d3, a3, ch3, b3,
+        d4, a4, ch4, b4, d5, a5, ch5, b5, d6, a6, ch6, b6, d7, a7, ch7, b7
+    );
+}
+
+// initialize at end (row == len) or at existing uninit row equal to len only in this model
+fn ecs_col_deep_initialize(c: EcsColDeep, row: i32, data: i64, tick: i64, caller: i64) -> EcsColDeep {
+    if row != c.len { return c; };
+    if c.len >= 8 { return c; };
+    let c2 = ecs_col_deep_rebuild(
+        c.component_id, c.component_size, c.capacity, c.has_drop, c.len + 1,
+        c.d0, c.a0, c.c0, c.b0, c.d1, c.a1, c.c1, c.b1,
+        c.d2, c.a2, c.c2, c.b2, c.d3, c.a3, c.c3, c.b3,
+        c.d4, c.a4, c.c4, c.b4, c.d5, c.a5, c.c5, c.b5,
+        c.d6, c.a6, c.c6, c.b6, c.d7, c.a7, c.c7, c.b7
+    );
+    return ecs_col_deep_set_row(c2, row, data, tick, tick, caller);
+}
+
+// replace existing initialized row: drop old, set data + changed tick/caller; keep added
+fn ecs_col_deep_replace(c: EcsColDeep, row: i32, data: i64, change_tick: i64, caller: i64) -> EcsColDeep {
+    if row < 0 { return c; };
+    if row >= c.len { return c; };
+    let cell = ecs_col_deep_get_cell(c, row);
+    return ecs_col_deep_set_row(c, row, data, ecs_col_cell_added(cell), change_tick, caller);
+}
+
+// swap_remove: move last into row, decrement len
+fn ecs_col_deep_swap_remove(c: EcsColDeep, row: i32) -> EcsColDeep {
+    if row < 0 { return c; };
+    if row >= c.len { return c; };
+    let last = c.len - 1;
+    if row != last {
+        let cell = ecs_col_deep_get_cell(c, last);
+        c = ecs_col_deep_set_row(c, row, ecs_col_cell_data(cell), ecs_col_cell_added(cell), ecs_col_cell_changed(cell), ecs_col_cell_changed_by(cell));
+    };
+    // clear last and shrink
+    c = ecs_col_deep_set_row(c, last, 0, 0, 0, 0);
+    return ecs_col_deep_rebuild(
+        c.component_id, c.component_size, c.capacity, c.has_drop, last,
+        c.d0, c.a0, c.c0, c.b0, c.d1, c.a1, c.c1, c.b1,
+        c.d2, c.a2, c.c2, c.b2, c.d3, c.a3, c.c3, c.b3,
+        c.d4, c.a4, c.c4, c.b4, c.d5, c.a5, c.c5, c.b5,
+        c.d6, c.a6, c.c6, c.b6, c.d7, c.a7, c.c7, c.b7
+    );
+}
+
+fn ecs_col_deep_clear(c: EcsColDeep) -> EcsColDeep {
+    return ecs_col_deep_with_capacity(c.component_id, c.component_size, c.capacity, c.has_drop);
+}
+
+fn ecs_col_deep_drop_last(c: EcsColDeep) -> EcsColDeep {
+    if c.len <= 0 { return c; };
+    return ecs_col_deep_swap_remove(c, c.len - 1);
+}
+
+// check_change_ticks: clamp added/changed to max_tick if greater
+fn ecs_col_deep_clamp_tick(t: i64, max_tick: i64) -> i64 {
+    if t > max_tick { return max_tick; };
+    return t;
+}
+
+fn ecs_col_deep_check_change_ticks(c: EcsColDeep, max_tick: i64) -> EcsColDeep {
+    let n = c.len;
+    let d0 = c.d0; let a0 = ecs_col_deep_clamp_tick(c.a0, max_tick); let ch0 = ecs_col_deep_clamp_tick(c.c0, max_tick); let b0 = c.b0;
+    let d1 = c.d1; let a1 = ecs_col_deep_clamp_tick(c.a1, max_tick); let ch1 = ecs_col_deep_clamp_tick(c.c1, max_tick); let b1 = c.b1;
+    let d2 = c.d2; let a2 = ecs_col_deep_clamp_tick(c.a2, max_tick); let ch2 = ecs_col_deep_clamp_tick(c.c2, max_tick); let b2 = c.b2;
+    let d3 = c.d3; let a3 = ecs_col_deep_clamp_tick(c.a3, max_tick); let ch3 = ecs_col_deep_clamp_tick(c.c3, max_tick); let b3 = c.b3;
+    let d4 = c.d4; let a4 = ecs_col_deep_clamp_tick(c.a4, max_tick); let ch4 = ecs_col_deep_clamp_tick(c.c4, max_tick); let b4 = c.b4;
+    let d5 = c.d5; let a5 = ecs_col_deep_clamp_tick(c.a5, max_tick); let ch5 = ecs_col_deep_clamp_tick(c.c5, max_tick); let b5 = c.b5;
+    let d6 = c.d6; let a6 = ecs_col_deep_clamp_tick(c.a6, max_tick); let ch6 = ecs_col_deep_clamp_tick(c.c6, max_tick); let b6 = c.b6;
+    let d7 = c.d7; let a7 = ecs_col_deep_clamp_tick(c.a7, max_tick); let ch7 = ecs_col_deep_clamp_tick(c.c7, max_tick); let b7 = c.b7;
+    // only clamp rows that exist; zero rows remain zero
+    if n < 1 { a0 = 0; ch0 = 0; };
+    if n < 2 { a1 = 0; ch1 = 0; };
+    if n < 3 { a2 = 0; ch2 = 0; };
+    if n < 4 { a3 = 0; ch3 = 0; };
+    if n < 5 { a4 = 0; ch4 = 0; };
+    if n < 6 { a5 = 0; ch5 = 0; };
+    if n < 7 { a6 = 0; ch6 = 0; };
+    if n < 8 { a7 = 0; ch7 = 0; };
+    return ecs_col_deep_rebuild(
+        c.component_id, c.component_size, c.capacity, c.has_drop, c.len,
+        d0, a0, ch0, b0, d1, a1, ch1, b1, d2, a2, ch2, b2, d3, a3, ch3, b3,
+        d4, a4, ch4, b4, d5, a5, ch5, b5, d6, a6, ch6, b6, d7, a7, ch7, b7
+    );
+}
+
+fn ecs_col_deep_realloc(c: EcsColDeep, new_capacity: i64) -> EcsColDeep {
+    let cap = c.capacity;
+    if new_capacity > cap { cap = new_capacity; };
+    return ecs_col_deep_rebuild(
+        c.component_id, c.component_size, cap, c.has_drop, c.len,
+        c.d0, c.a0, c.c0, c.b0, c.d1, c.a1, c.c1, c.b1,
+        c.d2, c.a2, c.c2, c.b2, c.d3, c.a3, c.c3, c.b3,
+        c.d4, c.a4, c.c4, c.b4, c.d5, c.a5, c.c5, c.b5,
+        c.d6, c.a6, c.c6, c.b6, c.d7, c.a7, c.c7, c.b7
+    );
+}
+
+// initialize_from: copy source row into dest at dest.len
+fn ecs_col_deep_initialize_from(dest: EcsColDeep, src: EcsColDeep, src_row: i32) -> EcsColDeep {
+    let cell = ecs_col_deep_get_cell(src, src_row);
+    if ecs_col_cell_found(cell) != true { return dest; };
+    return ecs_col_deep_initialize(
+        dest, dest.len, ecs_col_cell_data(cell), ecs_col_cell_added(cell), ecs_col_cell_changed_by(cell)
+    );
+}
+
+fn ecs_col_deep_count_matching(c: EcsColDeep, value: i64) -> i32 {
+    let count = 0;
+    if c.len >= 1 {
+        if c.d0 == value { count = count + 1; };
+    };
+    if c.len >= 2 {
+        if c.d1 == value { count = count + 1; };
+    };
+    if c.len >= 3 {
+        if c.d2 == value { count = count + 1; };
+    };
+    if c.len >= 4 {
+        if c.d3 == value { count = count + 1; };
+    };
+    if c.len >= 5 {
+        if c.d4 == value { count = count + 1; };
+    };
+    if c.len >= 6 {
+        if c.d5 == value { count = count + 1; };
+    };
+    if c.len >= 7 {
+        if c.d6 == value { count = count + 1; };
+    };
+    if c.len >= 8 {
+        if c.d7 == value { count = count + 1; };
+    };
+    return count;
+}

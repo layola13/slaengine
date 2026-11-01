@@ -1,0 +1,429 @@
+// Deepened Bevy ECS DynamicComponentFetch surface.
+// Mirrors src/world/entity_access/component_fetch.rs:
+//   DynamicComponentFetch::{fetch_ref, fetch_mut, fetch_mut_assume_mutable}
+//   Implementations: single ComponentId; array/slice (aliased-mut O(N^2)); unique set
+//   EntityComponentError::{MissingComponent, AliasedMutability}
+// Fixed entity component capacity: 4 slots. Request list capacity: 4.
+// Shallow lib/entity_component_fetch.sla retained.
+
+const ECS_ECF_OK: i32 = 0;
+const ECS_ECF_MISSING: i32 = 1;
+const ECS_ECF_ALIASED: i32 = 2;
+
+// Entity component storage
+struct EcsEcfEntityDeep {
+    entity: i64,
+    c0: i32, v0: i64,
+    c1: i32, v1: i64,
+    c2: i32, v2: i64,
+    c3: i32, v3: i64,
+    len: i32,
+}
+
+fn ecs_ecf_entity_new(entity: i64) -> EcsEcfEntityDeep {
+    return EcsEcfEntityDeep {
+        entity: entity,
+        c0: -1, v0: 0, c1: -1, v1: 0, c2: -1, v2: 0, c3: -1, v3: 0, len: 0,
+    };
+}
+
+fn ecs_ecf_entity_id(e: EcsEcfEntityDeep) -> i64 { return e.entity; }
+fn ecs_ecf_entity_len(e: EcsEcfEntityDeep) -> i32 { return e.len; }
+
+fn ecs_ecf_entity_rebuild(
+    entity: i64,
+    c0: i32, v0: i64, c1: i32, v1: i64, c2: i32, v2: i64, c3: i32, v3: i64, len: i32
+) -> EcsEcfEntityDeep {
+    return EcsEcfEntityDeep {
+        entity: entity, c0: c0, v0: v0, c1: c1, v1: v1, c2: c2, v2: v2, c3: c3, v3: v3, len: len,
+    };
+}
+
+fn ecs_ecf_entity_insert(e: EcsEcfEntityDeep, cid: i32, value: i64) -> EcsEcfEntityDeep {
+    if e.len >= 1 {
+        if e.c0 == cid {
+            return ecs_ecf_entity_rebuild(e.entity, e.c0, value, e.c1, e.v1, e.c2, e.v2, e.c3, e.v3, e.len);
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid {
+            return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, e.c1, value, e.c2, e.v2, e.c3, e.v3, e.len);
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid {
+            return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, value, e.c3, e.v3, e.len);
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid {
+            return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, e.v2, e.c3, value, e.len);
+        };
+    };
+    if e.len == 0 {
+        return ecs_ecf_entity_rebuild(e.entity, cid, value, e.c1, e.v1, e.c2, e.v2, e.c3, e.v3, 1);
+    };
+    if e.len == 1 {
+        return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, cid, value, e.c2, e.v2, e.c3, e.v3, 2);
+    };
+    if e.len == 2 {
+        return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, cid, value, e.c3, e.v3, 3);
+    };
+    if e.len == 3 {
+        return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, e.v2, cid, value, 4);
+    };
+    return ecs_ecf_entity_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, e.v2, e.c3, e.v3, e.len);
+}
+
+fn ecs_ecf_entity_has(e: EcsEcfEntityDeep, cid: i32) -> bool {
+    if e.len >= 1 {
+        if e.c0 == cid { return true; };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return true; };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return true; };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return true; };
+    };
+    return false;
+}
+
+fn ecs_ecf_entity_value(e: EcsEcfEntityDeep, cid: i32) -> i64 {
+    if e.len >= 1 {
+        if e.c0 == cid { return e.v0; };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return e.v1; };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return e.v2; };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return e.v3; };
+    };
+    return 0;
+}
+
+// Single-id fetch result
+struct EcsEcfOneResult {
+    ok: bool,
+    err: i32,
+    component_id: i32,
+    value: i64,
+    is_mut: bool,
+    assume_mutable: bool,
+}
+
+fn ecs_ecf_one_ok(r: EcsEcfOneResult) -> bool { return r.ok; }
+fn ecs_ecf_one_err(r: EcsEcfOneResult) -> i32 { return r.err; }
+fn ecs_ecf_one_cid(r: EcsEcfOneResult) -> i32 { return r.component_id; }
+fn ecs_ecf_one_value(r: EcsEcfOneResult) -> i64 { return r.value; }
+fn ecs_ecf_one_is_mut(r: EcsEcfOneResult) -> bool { return r.is_mut; }
+fn ecs_ecf_one_assume_mutable(r: EcsEcfOneResult) -> bool { return r.assume_mutable; }
+
+fn ecs_ecf_fetch_ref_one(e: EcsEcfEntityDeep, cid: i32) -> EcsEcfOneResult {
+    if ecs_ecf_entity_has(e, cid) != true {
+        return EcsEcfOneResult {
+            ok: false, err: ECS_ECF_MISSING, component_id: cid, value: 0,
+            is_mut: false, assume_mutable: false,
+        };
+    };
+    return EcsEcfOneResult {
+        ok: true, err: ECS_ECF_OK, component_id: cid, value: ecs_ecf_entity_value(e, cid),
+        is_mut: false, assume_mutable: false,
+    };
+}
+
+fn ecs_ecf_fetch_mut_one(e: EcsEcfEntityDeep, cid: i32) -> EcsEcfOneResult {
+    if ecs_ecf_entity_has(e, cid) != true {
+        return EcsEcfOneResult {
+            ok: false, err: ECS_ECF_MISSING, component_id: cid, value: 0,
+            is_mut: true, assume_mutable: false,
+        };
+    };
+    return EcsEcfOneResult {
+        ok: true, err: ECS_ECF_OK, component_id: cid, value: ecs_ecf_entity_value(e, cid),
+        is_mut: true, assume_mutable: false,
+    };
+}
+
+fn ecs_ecf_fetch_mut_assume_mutable_one(e: EcsEcfEntityDeep, cid: i32) -> EcsEcfOneResult {
+    if ecs_ecf_entity_has(e, cid) != true {
+        return EcsEcfOneResult {
+            ok: false, err: ECS_ECF_MISSING, component_id: cid, value: 0,
+            is_mut: true, assume_mutable: true,
+        };
+    };
+    return EcsEcfOneResult {
+        ok: true, err: ECS_ECF_OK, component_id: cid, value: ecs_ecf_entity_value(e, cid),
+        is_mut: true, assume_mutable: true,
+    };
+}
+
+// Multi-id request list (array/slice up to 4)
+struct EcsEcfIds {
+    i0: i32, i1: i32, i2: i32, i3: i32,
+    n: i32,
+    // unique_set marker: HashSet path skips alias check
+    unique_set: bool,
+}
+
+fn ecs_ecf_ids_new() -> EcsEcfIds {
+    return EcsEcfIds { i0: -1, i1: -1, i2: -1, i3: -1, n: 0, unique_set: false };
+}
+
+fn ecs_ecf_ids_unique_new() -> EcsEcfIds {
+    return EcsEcfIds { i0: -1, i1: -1, i2: -1, i3: -1, n: 0, unique_set: true };
+}
+
+fn ecs_ecf_ids_len(ids: EcsEcfIds) -> i32 { return ids.n; }
+fn ecs_ecf_ids_is_unique_set(ids: EcsEcfIds) -> bool { return ids.unique_set; }
+
+fn ecs_ecf_ids_rebuild(i0: i32, i1: i32, i2: i32, i3: i32, n: i32, unique_set: bool) -> EcsEcfIds {
+    return EcsEcfIds { i0: i0, i1: i1, i2: i2, i3: i3, n: n, unique_set: unique_set };
+}
+
+fn ecs_ecf_ids_push(ids: EcsEcfIds, cid: i32) -> EcsEcfIds {
+    // unique set: ignore duplicates on insert
+    if ids.unique_set {
+        if ids.n >= 1 {
+            if ids.i0 == cid { return ids; };
+        };
+        if ids.n >= 2 {
+            if ids.i1 == cid { return ids; };
+        };
+        if ids.n >= 3 {
+            if ids.i2 == cid { return ids; };
+        };
+        if ids.n >= 4 {
+            if ids.i3 == cid { return ids; };
+        };
+    };
+    if ids.n == 0 {
+        return ecs_ecf_ids_rebuild(cid, ids.i1, ids.i2, ids.i3, 1, ids.unique_set);
+    };
+    if ids.n == 1 {
+        return ecs_ecf_ids_rebuild(ids.i0, cid, ids.i2, ids.i3, 2, ids.unique_set);
+    };
+    if ids.n == 2 {
+        return ecs_ecf_ids_rebuild(ids.i0, ids.i1, cid, ids.i3, 3, ids.unique_set);
+    };
+    if ids.n == 3 {
+        return ecs_ecf_ids_rebuild(ids.i0, ids.i1, ids.i2, cid, 4, ids.unique_set);
+    };
+    return ids;
+}
+
+fn ecs_ecf_ids_at(ids: EcsEcfIds, idx: i32) -> i32 {
+    if idx == 0 { return ids.i0; };
+    if idx == 1 { return ids.i1; };
+    if idx == 2 { return ids.i2; };
+    if idx == 3 { return ids.i3; };
+    return -1;
+}
+
+// O(N^2) alias check for array/slice mut fetch
+fn ecs_ecf_ids_has_alias(ids: EcsEcfIds) -> i32 {
+    // returns aliased component id, or -1 if none
+    if ids.n >= 2 {
+        if ids.i0 == ids.i1 { return ids.i0; };
+    };
+    if ids.n >= 3 {
+        if ids.i0 == ids.i2 { return ids.i0; };
+        if ids.i1 == ids.i2 { return ids.i1; };
+    };
+    if ids.n >= 4 {
+        if ids.i0 == ids.i3 { return ids.i0; };
+        if ids.i1 == ids.i3 { return ids.i1; };
+        if ids.i2 == ids.i3 { return ids.i2; };
+    };
+    return -1;
+}
+
+// Multi fetch result
+struct EcsEcfMultiResult {
+    ok: bool,
+    err: i32,
+    err_component_id: i32,
+    count: i32,
+    c0: i32, v0: i64,
+    c1: i32, v1: i64,
+    c2: i32, v2: i64,
+    c3: i32, v3: i64,
+    is_mut: bool,
+    assume_mutable: bool,
+}
+
+fn ecs_ecf_multi_ok(r: EcsEcfMultiResult) -> bool { return r.ok; }
+fn ecs_ecf_multi_err(r: EcsEcfMultiResult) -> i32 { return r.err; }
+fn ecs_ecf_multi_err_cid(r: EcsEcfMultiResult) -> i32 { return r.err_component_id; }
+fn ecs_ecf_multi_count(r: EcsEcfMultiResult) -> i32 { return r.count; }
+fn ecs_ecf_multi_is_mut(r: EcsEcfMultiResult) -> bool { return r.is_mut; }
+fn ecs_ecf_multi_assume_mutable(r: EcsEcfMultiResult) -> bool { return r.assume_mutable; }
+
+fn ecs_ecf_multi_cid_at(r: EcsEcfMultiResult, idx: i32) -> i32 {
+    if idx == 0 { return r.c0; };
+    if idx == 1 { return r.c1; };
+    if idx == 2 { return r.c2; };
+    if idx == 3 { return r.c3; };
+    return -1;
+}
+
+fn ecs_ecf_multi_value_at(r: EcsEcfMultiResult, idx: i32) -> i64 {
+    if idx == 0 { return r.v0; };
+    if idx == 1 { return r.v1; };
+    if idx == 2 { return r.v2; };
+    if idx == 3 { return r.v3; };
+    return 0;
+}
+
+fn ecs_ecf_multi_fail(err: i32, cid: i32, is_mut: bool, assume_mutable: bool) -> EcsEcfMultiResult {
+    return EcsEcfMultiResult {
+        ok: false, err: err, err_component_id: cid, count: 0,
+        c0: -1, v0: 0, c1: -1, v1: 0, c2: -1, v2: 0, c3: -1, v3: 0,
+        is_mut: is_mut, assume_mutable: assume_mutable,
+    };
+}
+
+fn ecs_ecf_fetch_ref_many(e: EcsEcfEntityDeep, ids: EcsEcfIds) -> EcsEcfMultiResult {
+    // read path: duplicates allowed
+    let c0: i32 = -1; let v0: i64 = 0;
+    let c1: i32 = -1; let v1: i64 = 0;
+    let c2: i32 = -1; let v2: i64 = 0;
+    let c3: i32 = -1; let v3: i64 = 0;
+    if ids.n >= 1 {
+        c0 = ids.i0;
+        if ecs_ecf_entity_has(e, c0) != true {
+            return ecs_ecf_multi_fail(ECS_ECF_MISSING, c0, false, false);
+        };
+        v0 = ecs_ecf_entity_value(e, c0);
+    };
+    if ids.n >= 2 {
+        c1 = ids.i1;
+        if ecs_ecf_entity_has(e, c1) != true {
+            return ecs_ecf_multi_fail(ECS_ECF_MISSING, c1, false, false);
+        };
+        v1 = ecs_ecf_entity_value(e, c1);
+    };
+    if ids.n >= 3 {
+        c2 = ids.i2;
+        if ecs_ecf_entity_has(e, c2) != true {
+            return ecs_ecf_multi_fail(ECS_ECF_MISSING, c2, false, false);
+        };
+        v2 = ecs_ecf_entity_value(e, c2);
+    };
+    if ids.n >= 4 {
+        c3 = ids.i3;
+        if ecs_ecf_entity_has(e, c3) != true {
+            return ecs_ecf_multi_fail(ECS_ECF_MISSING, c3, false, false);
+        };
+        v3 = ecs_ecf_entity_value(e, c3);
+    };
+    return EcsEcfMultiResult {
+        ok: true, err: ECS_ECF_OK, err_component_id: 0, count: ids.n,
+        c0: c0, v0: v0, c1: c1, v1: v1, c2: c2, v2: v2, c3: c3, v3: v3,
+        is_mut: false, assume_mutable: false,
+    };
+}
+
+fn ecs_ecf_fetch_mut_many(e: EcsEcfEntityDeep, ids: EcsEcfIds) -> EcsEcfMultiResult {
+    // array/slice: alias check unless unique_set
+    if ids.unique_set != true {
+        let alias = ecs_ecf_ids_has_alias(ids);
+        if alias >= 0 {
+            return ecs_ecf_multi_fail(ECS_ECF_ALIASED, alias, true, false);
+        };
+    };
+    let r = ecs_ecf_fetch_ref_many(e, ids);
+    if r.ok != true {
+        return ecs_ecf_multi_fail(r.err, r.err_component_id, true, false);
+    };
+    return EcsEcfMultiResult {
+        ok: true, err: ECS_ECF_OK, err_component_id: 0, count: r.count,
+        c0: r.c0, v0: r.v0, c1: r.c1, v1: r.v1, c2: r.c2, v2: r.v2, c3: r.c3, v3: r.v3,
+        is_mut: true, assume_mutable: false,
+    };
+}
+
+fn ecs_ecf_fetch_mut_assume_mutable_many(e: EcsEcfEntityDeep, ids: EcsEcfIds) -> EcsEcfMultiResult {
+    if ids.unique_set != true {
+        let alias = ecs_ecf_ids_has_alias(ids);
+        if alias >= 0 {
+            return ecs_ecf_multi_fail(ECS_ECF_ALIASED, alias, true, true);
+        };
+    };
+    let r = ecs_ecf_fetch_ref_many(e, ids);
+    if r.ok != true {
+        return ecs_ecf_multi_fail(r.err, r.err_component_id, true, true);
+    };
+    return EcsEcfMultiResult {
+        ok: true, err: ECS_ECF_OK, err_component_id: 0, count: r.count,
+        c0: r.c0, v0: r.v0, c1: r.c1, v1: r.v1, c2: r.c2, v2: r.v2, c3: r.c3, v3: r.v3,
+        is_mut: true, assume_mutable: true,
+    };
+}
+
+// apply set after mut fetch
+struct EcsEcfSetResult {
+    entity: EcsEcfEntityDeep,
+    ok: bool,
+}
+
+fn ecs_ecf_set_entity(r: EcsEcfSetResult) -> EcsEcfEntityDeep { return r.entity; }
+fn ecs_ecf_set_ok(r: EcsEcfSetResult) -> bool { return r.ok; }
+
+fn ecs_ecf_apply_set(e: EcsEcfEntityDeep, cid: i32, value: i64) -> EcsEcfSetResult {
+    if ecs_ecf_entity_has(e, cid) != true {
+        return EcsEcfSetResult { entity: e, ok: false };
+    };
+    return EcsEcfSetResult { entity: ecs_ecf_entity_insert(e, cid, value), ok: true };
+}
+
+// value lookup helpers for multi result map-style get by cid
+fn ecs_ecf_multi_get_by_cid(r: EcsEcfMultiResult, cid: i32) -> EcsEcfOneResult {
+    if r.ok != true {
+        return EcsEcfOneResult {
+            ok: false, err: r.err, component_id: r.err_component_id, value: 0,
+            is_mut: r.is_mut, assume_mutable: r.assume_mutable,
+        };
+    };
+    if r.count >= 1 {
+        if r.c0 == cid {
+            return EcsEcfOneResult {
+                ok: true, err: ECS_ECF_OK, component_id: cid, value: r.v0,
+                is_mut: r.is_mut, assume_mutable: r.assume_mutable,
+            };
+        };
+    };
+    if r.count >= 2 {
+        if r.c1 == cid {
+            return EcsEcfOneResult {
+                ok: true, err: ECS_ECF_OK, component_id: cid, value: r.v1,
+                is_mut: r.is_mut, assume_mutable: r.assume_mutable,
+            };
+        };
+    };
+    if r.count >= 3 {
+        if r.c2 == cid {
+            return EcsEcfOneResult {
+                ok: true, err: ECS_ECF_OK, component_id: cid, value: r.v2,
+                is_mut: r.is_mut, assume_mutable: r.assume_mutable,
+            };
+        };
+    };
+    if r.count >= 4 {
+        if r.c3 == cid {
+            return EcsEcfOneResult {
+                ok: true, err: ECS_ECF_OK, component_id: cid, value: r.v3,
+                is_mut: r.is_mut, assume_mutable: r.assume_mutable,
+            };
+        };
+    };
+    return EcsEcfOneResult {
+        ok: false, err: ECS_ECF_MISSING, component_id: cid, value: 0,
+        is_mut: r.is_mut, assume_mutable: r.assume_mutable,
+    };
+}

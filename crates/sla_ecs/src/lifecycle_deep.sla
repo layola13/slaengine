@@ -1,0 +1,701 @@
+// Deepened Bevy ECS lifecycle surface.
+// Mirrors src/lifecycle.rs:
+//   ComponentHook + HookContext { entity, component_id, caller, relationship_hook_mode }
+//   ComponentHooks on_add/on_insert/on_discard/on_remove/on_despawn (+ try_*)
+//   Fixed EventKeys ADD/INSERT/DISCARD/REMOVE/DESPAWN (component constants 0..4)
+//   Lifecycle events Add/Insert/Discard/Remove/Despawn
+//   RemovedComponentEntity + RemovedComponentMessages write/get/update
+//   RemovedComponents SystemParam: read/read_with_id/len/is_empty/clear
+//   Hook evaluation order: Add before Insert; Discard before Remove before Despawn
+// Shallow lib/lifecycle_hooks.sla + lib/entity_lifecycle.sla retained.
+
+// === Fixed lifecycle EventKey / ComponentId constants (component/constants.rs) ===
+const ECS_LC_ADD: i32 = 0;
+const ECS_LC_INSERT: i32 = 1;
+const ECS_LC_DISCARD: i32 = 2;
+const ECS_LC_REMOVE: i32 = 3;
+const ECS_LC_DESPAWN: i32 = 4;
+
+fn ecs_lc_event_key_add() -> i32 { return ECS_LC_ADD; }
+fn ecs_lc_event_key_insert() -> i32 { return ECS_LC_INSERT; }
+fn ecs_lc_event_key_discard() -> i32 { return ECS_LC_DISCARD; }
+fn ecs_lc_event_key_remove() -> i32 { return ECS_LC_REMOVE; }
+fn ecs_lc_event_key_despawn() -> i32 { return ECS_LC_DESPAWN; }
+
+fn ecs_lc_event_key_name_id(key: i32) -> i64 {
+    if key == ECS_LC_ADD { return 900001; };
+    if key == ECS_LC_INSERT { return 900002; };
+    if key == ECS_LC_DISCARD { return 900003; };
+    if key == ECS_LC_REMOVE { return 900004; };
+    if key == ECS_LC_DESPAWN { return 900005; };
+    return 0;
+}
+
+fn ecs_lc_is_lifecycle_event_key(key: i32) -> bool {
+    return key >= ECS_LC_ADD && key <= ECS_LC_DESPAWN;
+}
+
+// === RelationshipHookMode (from relationship, used by HookContext) ===
+const ECS_LC_RHM_RUN: i32 = 0;
+const ECS_LC_RHM_SKIP: i32 = 1;
+const ECS_LC_RHM_RUN_IF_NOT_LINKED: i32 = 2;
+
+fn ecs_lc_rhm_run() -> i32 { return ECS_LC_RHM_RUN; }
+fn ecs_lc_rhm_skip() -> i32 { return ECS_LC_RHM_SKIP; }
+fn ecs_lc_rhm_run_if_not_linked() -> i32 { return ECS_LC_RHM_RUN_IF_NOT_LINKED; }
+
+fn ecs_lc_rhm_should_run_hooks(mode: i32) -> bool {
+    return mode == ECS_LC_RHM_RUN;
+}
+
+fn ecs_lc_rhm_should_skip(mode: i32) -> bool {
+    return mode == ECS_LC_RHM_SKIP || mode == ECS_LC_RHM_RUN_IF_NOT_LINKED;
+}
+
+// === HookContext ===
+// Bevy: entity, component_id, caller: MaybeLocation, relationship_hook_mode
+struct EcsLcHookContextDeep {
+    entity: i64,
+    component_id: i32,
+    caller: i64,
+    has_caller: bool,
+    relationship_hook_mode: i32,
+}
+
+fn ecs_lc_hook_ctx_new(entity: i64, component_id: i32, caller: i64, has_caller: bool, rhm: i32) -> EcsLcHookContextDeep {
+    return EcsLcHookContextDeep {
+        entity: entity,
+        component_id: component_id,
+        caller: caller,
+        has_caller: has_caller,
+        relationship_hook_mode: rhm,
+    };
+}
+
+fn ecs_lc_hook_ctx_default(entity: i64, component_id: i32) -> EcsLcHookContextDeep {
+    return ecs_lc_hook_ctx_new(entity, component_id, 0, false, ECS_LC_RHM_RUN);
+}
+
+fn ecs_lc_hook_ctx_entity(c: EcsLcHookContextDeep) -> i64 { return c.entity; }
+fn ecs_lc_hook_ctx_component_id(c: EcsLcHookContextDeep) -> i32 { return c.component_id; }
+fn ecs_lc_hook_ctx_caller(c: EcsLcHookContextDeep) -> i64 { return c.caller; }
+fn ecs_lc_hook_ctx_has_caller(c: EcsLcHookContextDeep) -> bool { return c.has_caller; }
+fn ecs_lc_hook_ctx_rhm(c: EcsLcHookContextDeep) -> i32 { return c.relationship_hook_mode; }
+
+// === ComponentHooks (hook ids; 0 = unset) ===
+struct EcsLcComponentHooksDeep {
+    on_add: i32,
+    on_insert: i32,
+    on_discard: i32,
+    on_remove: i32,
+    on_despawn: i32,
+}
+
+fn ecs_lc_hooks_new() -> EcsLcComponentHooksDeep {
+    return EcsLcComponentHooksDeep {
+        on_add: 0,
+        on_insert: 0,
+        on_discard: 0,
+        on_remove: 0,
+        on_despawn: 0,
+    };
+}
+
+fn ecs_lc_hooks_on_add(h: EcsLcComponentHooksDeep, hook_id: i32) -> EcsLcComponentHooksDeep {
+    h.on_add = hook_id;
+    return h;
+}
+fn ecs_lc_hooks_on_insert(h: EcsLcComponentHooksDeep, hook_id: i32) -> EcsLcComponentHooksDeep {
+    h.on_insert = hook_id;
+    return h;
+}
+fn ecs_lc_hooks_on_discard(h: EcsLcComponentHooksDeep, hook_id: i32) -> EcsLcComponentHooksDeep {
+    h.on_discard = hook_id;
+    return h;
+}
+fn ecs_lc_hooks_on_remove(h: EcsLcComponentHooksDeep, hook_id: i32) -> EcsLcComponentHooksDeep {
+    h.on_remove = hook_id;
+    return h;
+}
+fn ecs_lc_hooks_on_despawn(h: EcsLcComponentHooksDeep, hook_id: i32) -> EcsLcComponentHooksDeep {
+    h.on_despawn = hook_id;
+    return h;
+}
+
+fn ecs_lc_hooks_try_on_add(h: EcsLcComponentHooksDeep, hook_id: i32) -> (bool, EcsLcComponentHooksDeep) {
+    if h.on_add != 0 { return (false, h); };
+    h.on_add = hook_id;
+    return (true, h);
+}
+fn ecs_lc_hooks_try_on_insert(h: EcsLcComponentHooksDeep, hook_id: i32) -> (bool, EcsLcComponentHooksDeep) {
+    if h.on_insert != 0 { return (false, h); };
+    h.on_insert = hook_id;
+    return (true, h);
+}
+fn ecs_lc_hooks_try_on_discard(h: EcsLcComponentHooksDeep, hook_id: i32) -> (bool, EcsLcComponentHooksDeep) {
+    if h.on_discard != 0 { return (false, h); };
+    h.on_discard = hook_id;
+    return (true, h);
+}
+fn ecs_lc_hooks_try_on_remove(h: EcsLcComponentHooksDeep, hook_id: i32) -> (bool, EcsLcComponentHooksDeep) {
+    if h.on_remove != 0 { return (false, h); };
+    h.on_remove = hook_id;
+    return (true, h);
+}
+fn ecs_lc_hooks_try_on_despawn(h: EcsLcComponentHooksDeep, hook_id: i32) -> (bool, EcsLcComponentHooksDeep) {
+    if h.on_despawn != 0 { return (false, h); };
+    h.on_despawn = hook_id;
+    return (true, h);
+}
+
+fn ecs_lc_hooks_get_add(h: EcsLcComponentHooksDeep) -> i32 { return h.on_add; }
+fn ecs_lc_hooks_get_insert(h: EcsLcComponentHooksDeep) -> i32 { return h.on_insert; }
+fn ecs_lc_hooks_get_discard(h: EcsLcComponentHooksDeep) -> i32 { return h.on_discard; }
+fn ecs_lc_hooks_get_remove(h: EcsLcComponentHooksDeep) -> i32 { return h.on_remove; }
+fn ecs_lc_hooks_get_despawn(h: EcsLcComponentHooksDeep) -> i32 { return h.on_despawn; }
+
+fn ecs_lc_hooks_count(h: EcsLcComponentHooksDeep) -> i32 {
+    let n: i32 = 0;
+    if h.on_add != 0 { n = n + 1; };
+    if h.on_insert != 0 { n = n + 1; };
+    if h.on_discard != 0 { n = n + 1; };
+    if h.on_remove != 0 { n = n + 1; };
+    if h.on_despawn != 0 { n = n + 1; };
+    return n;
+}
+
+// === Lifecycle event kinds + entity payload ===
+const ECS_LC_KIND_ADD: i32 = 0;
+const ECS_LC_KIND_INSERT: i32 = 1;
+const ECS_LC_KIND_DISCARD: i32 = 2;
+const ECS_LC_KIND_REMOVE: i32 = 3;
+const ECS_LC_KIND_DESPAWN: i32 = 4;
+
+struct EcsLcEventDeep {
+    kind: i32,
+    entity: i64,
+    component_id: i32, // which component the lifecycle event is about
+}
+
+fn ecs_lc_event_add(entity: i64, component_id: i32) -> EcsLcEventDeep {
+    return EcsLcEventDeep { kind: ECS_LC_KIND_ADD, entity: entity, component_id: component_id };
+}
+fn ecs_lc_event_insert(entity: i64, component_id: i32) -> EcsLcEventDeep {
+    return EcsLcEventDeep { kind: ECS_LC_KIND_INSERT, entity: entity, component_id: component_id };
+}
+fn ecs_lc_event_discard(entity: i64, component_id: i32) -> EcsLcEventDeep {
+    return EcsLcEventDeep { kind: ECS_LC_KIND_DISCARD, entity: entity, component_id: component_id };
+}
+fn ecs_lc_event_remove(entity: i64, component_id: i32) -> EcsLcEventDeep {
+    return EcsLcEventDeep { kind: ECS_LC_KIND_REMOVE, entity: entity, component_id: component_id };
+}
+fn ecs_lc_event_despawn(entity: i64, component_id: i32) -> EcsLcEventDeep {
+    return EcsLcEventDeep { kind: ECS_LC_KIND_DESPAWN, entity: entity, component_id: component_id };
+}
+
+fn ecs_lc_event_kind(e: EcsLcEventDeep) -> i32 { return e.kind; }
+fn ecs_lc_event_entity(e: EcsLcEventDeep) -> i64 { return e.entity; }
+fn ecs_lc_event_component_id(e: EcsLcEventDeep) -> i32 { return e.component_id; }
+fn ecs_lc_event_event_key(e: EcsLcEventDeep) -> i32 { return e.kind; }
+
+fn ecs_lc_event_eq(a: EcsLcEventDeep, b: EcsLcEventDeep) -> bool {
+    return a.kind == b.kind && a.entity == b.entity && a.component_id == b.component_id;
+}
+
+// Hook eval order ranks (lower runs first within category)
+// Add path: Add(0) then Insert(1)
+// Remove path: Discard(2) then Remove(3) then Despawn(4)
+fn ecs_lc_event_order_rank(kind: i32) -> i32 {
+    return kind;
+}
+
+fn ecs_lc_add_path_before(a: i32, b: i32) -> bool {
+    // true if a should run before b on insert-into-new path
+    return a < b && a >= ECS_LC_KIND_ADD && b <= ECS_LC_KIND_INSERT;
+}
+
+fn ecs_lc_remove_path_before(a: i32, b: i32) -> bool {
+    return a < b && a >= ECS_LC_KIND_DISCARD && b <= ECS_LC_KIND_DESPAWN;
+}
+
+// Path sequence as struct (avoids multi-i32 tuple field quirks)
+struct EcsLcPathDeep {
+    len: i32,
+    k0: i32,
+    k1: i32,
+    k2: i32,
+}
+
+fn ecs_lc_path_len(p: EcsLcPathDeep) -> i32 { return p.len; }
+fn ecs_lc_path_k0(p: EcsLcPathDeep) -> i32 { return p.k0; }
+fn ecs_lc_path_k1(p: EcsLcPathDeep) -> i32 { return p.k1; }
+fn ecs_lc_path_k2(p: EcsLcPathDeep) -> i32 { return p.k2; }
+
+// Emit insert path: if already_present -> only Insert; else Add then Insert
+fn ecs_lc_emit_insert_path(already_present: bool) -> EcsLcPathDeep {
+    if already_present {
+        return EcsLcPathDeep { len: 1, k0: ECS_LC_KIND_INSERT, k1: -1, k2: -1 };
+    };
+    return EcsLcPathDeep { len: 2, k0: ECS_LC_KIND_ADD, k1: ECS_LC_KIND_INSERT, k2: -1 };
+}
+
+// Emit remove path: Discard, then Remove (not replaced). Despawn is entity-level.
+fn ecs_lc_emit_remove_path() -> EcsLcPathDeep {
+    return EcsLcPathDeep { len: 2, k0: ECS_LC_KIND_DISCARD, k1: ECS_LC_KIND_REMOVE, k2: -1 };
+}
+
+// Emit replace path: Discard then Insert (component replaced in place)
+fn ecs_lc_emit_replace_path() -> EcsLcPathDeep {
+    return EcsLcPathDeep { len: 2, k0: ECS_LC_KIND_DISCARD, k1: ECS_LC_KIND_INSERT, k2: -1 };
+}
+
+// Emit despawn for one component: Discard, Remove, Despawn
+fn ecs_lc_emit_despawn_component_path() -> EcsLcPathDeep {
+    return EcsLcPathDeep { len: 3, k0: ECS_LC_KIND_DISCARD, k1: ECS_LC_KIND_REMOVE, k2: ECS_LC_KIND_DESPAWN };
+}
+
+// Snapshot hook ids so multi-kind dispatch does not UseAfterMove the hooks struct.
+struct EcsLcHookIdsDeep {
+    on_add: i32,
+    on_insert: i32,
+    on_discard: i32,
+    on_remove: i32,
+    on_despawn: i32,
+}
+
+fn ecs_lc_hooks_ids(h: EcsLcComponentHooksDeep) -> EcsLcHookIdsDeep {
+    return EcsLcHookIdsDeep {
+        on_add: h.on_add,
+        on_insert: h.on_insert,
+        on_discard: h.on_discard,
+        on_remove: h.on_remove,
+        on_despawn: h.on_despawn,
+    };
+}
+
+// === Invoke hooks for an event against ComponentHooks; returns hook id or 0 ===
+fn ecs_lc_hooks_for_kind(h: EcsLcComponentHooksDeep, kind: i32) -> i32 {
+    let ids = ecs_lc_hooks_ids(h);
+    return ecs_lc_hook_ids_for_kind(ids, kind);
+}
+
+fn ecs_lc_hook_ids_for_kind(ids: EcsLcHookIdsDeep, kind: i32) -> i32 {
+    if kind == ECS_LC_KIND_ADD { return ids.on_add; };
+    if kind == ECS_LC_KIND_INSERT { return ids.on_insert; };
+    if kind == ECS_LC_KIND_DISCARD { return ids.on_discard; };
+    if kind == ECS_LC_KIND_REMOVE { return ids.on_remove; };
+    if kind == ECS_LC_KIND_DESPAWN { return ids.on_despawn; };
+    return 0;
+}
+
+// Run a path sequence; record which hooks fired in order
+struct EcsLcHookRunResultDeep {
+    fired_count: i32,
+    first_hook: i32,
+    second_hook: i32,
+    third_hook: i32,
+    skipped_rhm: bool,
+}
+
+fn ecs_lc_hook_run_push(res: EcsLcHookRunResultDeep, hook_id: i32) -> EcsLcHookRunResultDeep {
+    if hook_id == 0 { return res; };
+    if res.fired_count == 0 {
+        res.first_hook = hook_id;
+        res.fired_count = 1;
+        return res;
+    };
+    if res.fired_count == 1 {
+        res.second_hook = hook_id;
+        res.fired_count = 2;
+        return res;
+    };
+    if res.fired_count == 2 {
+        res.third_hook = hook_id;
+        res.fired_count = 3;
+        return res;
+    };
+    return res;
+}
+
+// Flatten hook ids to five i32 args — no multi-struct tuple clones.
+fn ecs_lc_resolve_hook_ids(add: i32, insert: i32, discard: i32, remove: i32, despawn: i32, kind: i32) -> i32 {
+    if kind == ECS_LC_KIND_ADD { return add; };
+    if kind == ECS_LC_KIND_INSERT { return insert; };
+    if kind == ECS_LC_KIND_DISCARD { return discard; };
+    if kind == ECS_LC_KIND_REMOVE { return remove; };
+    if kind == ECS_LC_KIND_DESPAWN { return despawn; };
+    return 0;
+}
+
+fn ecs_lc_run_hooks_path(
+    h: EcsLcComponentHooksDeep,
+    path: EcsLcPathDeep,
+    rhm: i32
+) -> EcsLcHookRunResultDeep {
+    let res = EcsLcHookRunResultDeep {
+        fired_count: 0,
+        first_hook: 0,
+        second_hook: 0,
+        third_hook: 0,
+        skipped_rhm: false,
+    };
+    if ecs_lc_rhm_should_skip(rhm) {
+        res.skipped_rhm = true;
+        return res;
+    };
+    // Capture scalar hook ids before any path field access moves path.
+    let add = h.on_add;
+    let insert = h.on_insert;
+    let discard = h.on_discard;
+    let remove = h.on_remove;
+    let despawn = h.on_despawn;
+    let n = path.len;
+    let k0 = path.k0;
+    let k1 = path.k1;
+    let k2 = path.k2;
+    let id0 = ecs_lc_resolve_hook_ids(add, insert, discard, remove, despawn, k0);
+    let id1 = ecs_lc_resolve_hook_ids(add, insert, discard, remove, despawn, k1);
+    let id2 = ecs_lc_resolve_hook_ids(add, insert, discard, remove, despawn, k2);
+    if n >= 1 {
+        if id0 != 0 {
+            res.first_hook = id0;
+            res.fired_count = 1;
+        };
+    };
+    if n >= 2 {
+        if id1 != 0 {
+            if res.fired_count == 0 {
+                res.first_hook = id1;
+                res.fired_count = 1;
+            } else {
+                res.second_hook = id1;
+                res.fired_count = res.fired_count + 1;
+            };
+        };
+    };
+    if n >= 3 {
+        if id2 != 0 {
+            if res.fired_count == 0 {
+                res.first_hook = id2;
+                res.fired_count = 1;
+            } else {
+                if res.fired_count == 1 {
+                    res.second_hook = id2;
+                    res.fired_count = 2;
+                } else {
+                    res.third_hook = id2;
+                    res.fired_count = res.fired_count + 1;
+                };
+            };
+        };
+    };
+    return res;
+}
+
+// Backward-compatible free-form sequence runner
+fn ecs_lc_run_hooks_sequence(
+    h: EcsLcComponentHooksDeep,
+    kind0: i32,
+    kind1: i32,
+    kind2: i32,
+    seq_len: i32,
+    rhm: i32
+) -> EcsLcHookRunResultDeep {
+    let path = EcsLcPathDeep { len: seq_len, k0: kind0, k1: kind1, k2: kind2 };
+    return ecs_lc_run_hooks_path(h, path, rhm);
+}
+
+fn ecs_lc_hook_run_fired_count(r: EcsLcHookRunResultDeep) -> i32 { return r.fired_count; }
+fn ecs_lc_hook_run_first(r: EcsLcHookRunResultDeep) -> i32 { return r.first_hook; }
+fn ecs_lc_hook_run_second(r: EcsLcHookRunResultDeep) -> i32 { return r.second_hook; }
+fn ecs_lc_hook_run_third(r: EcsLcHookRunResultDeep) -> i32 { return r.third_hook; }
+fn ecs_lc_hook_run_skipped(r: EcsLcHookRunResultDeep) -> bool { return r.skipped_rhm; }
+
+// === RemovedComponentEntity wrapper ===
+struct EcsLcRemovedComponentEntityDeep {
+    entity: i64,
+}
+
+fn ecs_lc_rce_new(entity: i64) -> EcsLcRemovedComponentEntityDeep {
+    return EcsLcRemovedComponentEntityDeep { entity: entity };
+}
+fn ecs_lc_rce_entity(e: EcsLcRemovedComponentEntityDeep) -> i64 { return e.entity; }
+
+// === RemovedComponentMessages (fixed 4 component slots, capacity 8 entities each) ===
+// Models SparseSet<ComponentId, Messages<RemovedComponentEntity>> with a simple map.
+struct EcsLcRemovedMessagesDeep {
+    // slot i: component_id, message_count, entities e0..e7
+    s0_cid: i32, s0_len: i32,
+    s0_e0: i64, s0_e1: i64, s0_e2: i64, s0_e3: i64,
+    s0_e4: i64, s0_e5: i64, s0_e6: i64, s0_e7: i64,
+    s1_cid: i32, s1_len: i32,
+    s1_e0: i64, s1_e1: i64, s1_e2: i64, s1_e3: i64,
+    s1_e4: i64, s1_e5: i64, s1_e6: i64, s1_e7: i64,
+    s2_cid: i32, s2_len: i32,
+    s2_e0: i64, s2_e1: i64, s2_e2: i64, s2_e3: i64,
+    s2_e4: i64, s2_e5: i64, s2_e6: i64, s2_e7: i64,
+    s3_cid: i32, s3_len: i32,
+    s3_e0: i64, s3_e1: i64, s3_e2: i64, s3_e3: i64,
+    s3_e4: i64, s3_e5: i64, s3_e6: i64, s3_e7: i64,
+    used_slots: i32,
+    update_count: i64,
+}
+
+fn ecs_lc_rm_new() -> EcsLcRemovedMessagesDeep {
+    return EcsLcRemovedMessagesDeep {
+        s0_cid: -1, s0_len: 0,
+        s0_e0: 0, s0_e1: 0, s0_e2: 0, s0_e3: 0,
+        s0_e4: 0, s0_e5: 0, s0_e6: 0, s0_e7: 0,
+        s1_cid: -1, s1_len: 0,
+        s1_e0: 0, s1_e1: 0, s1_e2: 0, s1_e3: 0,
+        s1_e4: 0, s1_e5: 0, s1_e6: 0, s1_e7: 0,
+        s2_cid: -1, s2_len: 0,
+        s2_e0: 0, s2_e1: 0, s2_e2: 0, s2_e3: 0,
+        s2_e4: 0, s2_e5: 0, s2_e6: 0, s2_e7: 0,
+        s3_cid: -1, s3_len: 0,
+        s3_e0: 0, s3_e1: 0, s3_e2: 0, s3_e3: 0,
+        s3_e4: 0, s3_e5: 0, s3_e6: 0, s3_e7: 0,
+        used_slots: 0,
+        update_count: 0,
+    };
+}
+
+fn ecs_lc_rm_find_slot(m: EcsLcRemovedMessagesDeep, component_id: i32) -> i32 {
+    if m.s0_cid == component_id { return 0; };
+    if m.s1_cid == component_id { return 1; };
+    if m.s2_cid == component_id { return 2; };
+    if m.s3_cid == component_id { return 3; };
+    return -1;
+}
+
+fn ecs_lc_rm_alloc_slot(m: EcsLcRemovedMessagesDeep, component_id: i32) -> (EcsLcRemovedMessagesDeep, i32) {
+    let existing = ecs_lc_rm_find_slot(m, component_id);
+    if existing >= 0 { return (m, existing); };
+    if m.s0_cid < 0 {
+        m.s0_cid = component_id;
+        m.used_slots = m.used_slots + 1;
+        return (m, 0);
+    };
+    if m.s1_cid < 0 {
+        m.s1_cid = component_id;
+        m.used_slots = m.used_slots + 1;
+        return (m, 1);
+    };
+    if m.s2_cid < 0 {
+        m.s2_cid = component_id;
+        m.used_slots = m.used_slots + 1;
+        return (m, 2);
+    };
+    if m.s3_cid < 0 {
+        m.s3_cid = component_id;
+        m.used_slots = m.used_slots + 1;
+        return (m, 3);
+    };
+    return (m, -1);
+}
+
+fn ecs_lc_rm_slot_len(m: EcsLcRemovedMessagesDeep, slot: i32) -> i32 {
+    if slot == 0 { return m.s0_len; };
+    if slot == 1 { return m.s1_len; };
+    if slot == 2 { return m.s2_len; };
+    if slot == 3 { return m.s3_len; };
+    return 0;
+}
+
+fn ecs_lc_rm_slot_get(m: EcsLcRemovedMessagesDeep, slot: i32, idx: i32) -> i64 {
+    if slot == 0 {
+        if idx == 0 { return m.s0_e0; };
+        if idx == 1 { return m.s0_e1; };
+        if idx == 2 { return m.s0_e2; };
+        if idx == 3 { return m.s0_e3; };
+        if idx == 4 { return m.s0_e4; };
+        if idx == 5 { return m.s0_e5; };
+        if idx == 6 { return m.s0_e6; };
+        if idx == 7 { return m.s0_e7; };
+        return 0;
+    };
+    if slot == 1 {
+        if idx == 0 { return m.s1_e0; };
+        if idx == 1 { return m.s1_e1; };
+        if idx == 2 { return m.s1_e2; };
+        if idx == 3 { return m.s1_e3; };
+        if idx == 4 { return m.s1_e4; };
+        if idx == 5 { return m.s1_e5; };
+        if idx == 6 { return m.s1_e6; };
+        if idx == 7 { return m.s1_e7; };
+        return 0;
+    };
+    if slot == 2 {
+        if idx == 0 { return m.s2_e0; };
+        if idx == 1 { return m.s2_e1; };
+        if idx == 2 { return m.s2_e2; };
+        if idx == 3 { return m.s2_e3; };
+        if idx == 4 { return m.s2_e4; };
+        if idx == 5 { return m.s2_e5; };
+        if idx == 6 { return m.s2_e6; };
+        if idx == 7 { return m.s2_e7; };
+        return 0;
+    };
+    if slot == 3 {
+        if idx == 0 { return m.s3_e0; };
+        if idx == 1 { return m.s3_e1; };
+        if idx == 2 { return m.s3_e2; };
+        if idx == 3 { return m.s3_e3; };
+        if idx == 4 { return m.s3_e4; };
+        if idx == 5 { return m.s3_e5; };
+        if idx == 6 { return m.s3_e6; };
+        if idx == 7 { return m.s3_e7; };
+        return 0;
+    };
+    return 0;
+}
+
+fn ecs_lc_rm_slot_push(m: EcsLcRemovedMessagesDeep, slot: i32, entity: i64) -> EcsLcRemovedMessagesDeep {
+    let n = ecs_lc_rm_slot_len(m, slot);
+    if n >= 8 { return m; };
+    if slot == 0 {
+        if n == 0 { m.s0_e0 = entity; };
+        if n == 1 { m.s0_e1 = entity; };
+        if n == 2 { m.s0_e2 = entity; };
+        if n == 3 { m.s0_e3 = entity; };
+        if n == 4 { m.s0_e4 = entity; };
+        if n == 5 { m.s0_e5 = entity; };
+        if n == 6 { m.s0_e6 = entity; };
+        if n == 7 { m.s0_e7 = entity; };
+        m.s0_len = n + 1;
+        return m;
+    };
+    if slot == 1 {
+        if n == 0 { m.s1_e0 = entity; };
+        if n == 1 { m.s1_e1 = entity; };
+        if n == 2 { m.s1_e2 = entity; };
+        if n == 3 { m.s1_e3 = entity; };
+        if n == 4 { m.s1_e4 = entity; };
+        if n == 5 { m.s1_e5 = entity; };
+        if n == 6 { m.s1_e6 = entity; };
+        if n == 7 { m.s1_e7 = entity; };
+        m.s1_len = n + 1;
+        return m;
+    };
+    if slot == 2 {
+        if n == 0 { m.s2_e0 = entity; };
+        if n == 1 { m.s2_e1 = entity; };
+        if n == 2 { m.s2_e2 = entity; };
+        if n == 3 { m.s2_e3 = entity; };
+        if n == 4 { m.s2_e4 = entity; };
+        if n == 5 { m.s2_e5 = entity; };
+        if n == 6 { m.s2_e6 = entity; };
+        if n == 7 { m.s2_e7 = entity; };
+        m.s2_len = n + 1;
+        return m;
+    };
+    if slot == 3 {
+        if n == 0 { m.s3_e0 = entity; };
+        if n == 1 { m.s3_e1 = entity; };
+        if n == 2 { m.s3_e2 = entity; };
+        if n == 3 { m.s3_e3 = entity; };
+        if n == 4 { m.s3_e4 = entity; };
+        if n == 5 { m.s3_e5 = entity; };
+        if n == 6 { m.s3_e6 = entity; };
+        if n == 7 { m.s3_e7 = entity; };
+        m.s3_len = n + 1;
+        return m;
+    };
+    return m;
+}
+
+fn ecs_lc_rm_write(m: EcsLcRemovedMessagesDeep, component_id: i32, entity: i64) -> EcsLcRemovedMessagesDeep {
+    let pair = ecs_lc_rm_alloc_slot(m, component_id);
+    m = pair.0;
+    let slot = pair.1;
+    if slot < 0 { return m; };
+    m = ecs_lc_rm_slot_push(m, slot, entity);
+    return m;
+}
+
+fn ecs_lc_rm_has(m: EcsLcRemovedMessagesDeep, component_id: i32) -> bool {
+    return ecs_lc_rm_find_slot(m, component_id) >= 0;
+}
+
+fn ecs_lc_rm_len(m: EcsLcRemovedMessagesDeep, component_id: i32) -> i32 {
+    let slot = ecs_lc_rm_find_slot(m, component_id);
+    if slot < 0 { return 0; };
+    return ecs_lc_rm_slot_len(m, slot);
+}
+
+fn ecs_lc_rm_get(m: EcsLcRemovedMessagesDeep, component_id: i32, idx: i32) -> i64 {
+    let slot = ecs_lc_rm_find_slot(m, component_id);
+    if slot < 0 { return 0; };
+    return ecs_lc_rm_slot_get(m, slot, idx);
+}
+
+fn ecs_lc_rm_used_slots(m: EcsLcRemovedMessagesDeep) -> i32 { return m.used_slots; }
+
+// update(): Bevy swaps/clears message buffers; model as clear all lengths + bump update_count
+fn ecs_lc_rm_update(m: EcsLcRemovedMessagesDeep) -> EcsLcRemovedMessagesDeep {
+    m.s0_len = 0;
+    m.s1_len = 0;
+    m.s2_len = 0;
+    m.s3_len = 0;
+    m.update_count = m.update_count + 1;
+    return m;
+}
+
+fn ecs_lc_rm_update_count(m: EcsLcRemovedMessagesDeep) -> i64 { return m.update_count; }
+
+// === RemovedComponents SystemParam model ===
+// Local cursor over one component_id's messages in RemovedComponentMessages.
+struct EcsLcRemovedComponentsDeep {
+    component_id: i32,
+    cursor: i32,
+}
+
+fn ecs_lc_rc_new(component_id: i32) -> EcsLcRemovedComponentsDeep {
+    return EcsLcRemovedComponentsDeep { component_id: component_id, cursor: 0 };
+}
+
+fn ecs_lc_rc_component_id(r: EcsLcRemovedComponentsDeep) -> i32 { return r.component_id; }
+fn ecs_lc_rc_cursor(r: EcsLcRemovedComponentsDeep) -> i32 { return r.cursor; }
+
+fn ecs_lc_rc_len(r: EcsLcRemovedComponentsDeep, m: EcsLcRemovedMessagesDeep) -> i32 {
+    let total = ecs_lc_rm_len(m, r.component_id);
+    if r.cursor >= total { return 0; };
+    return total - r.cursor;
+}
+
+fn ecs_lc_rc_is_empty(r: EcsLcRemovedComponentsDeep, m: EcsLcRemovedMessagesDeep) -> bool {
+    return ecs_lc_rc_len(r, m) == 0;
+}
+
+// read one: (had, entity, updated_reader)
+fn ecs_lc_rc_read(r: EcsLcRemovedComponentsDeep, m: EcsLcRemovedMessagesDeep) -> (bool, i64, EcsLcRemovedComponentsDeep) {
+    let total = ecs_lc_rm_len(m, r.component_id);
+    if r.cursor >= total {
+        return (false, 0, r);
+    };
+    let e = ecs_lc_rm_get(m, r.component_id, r.cursor);
+    r.cursor = r.cursor + 1;
+    return (true, e, r);
+}
+
+// read_with_id: (had, component_id, entity, updated_reader)
+fn ecs_lc_rc_read_with_id(r: EcsLcRemovedComponentsDeep, m: EcsLcRemovedMessagesDeep) -> (bool, i32, i64, EcsLcRemovedComponentsDeep) {
+    let total = ecs_lc_rm_len(m, r.component_id);
+    if r.cursor >= total {
+        return (false, 0, 0, r);
+    };
+    let e = ecs_lc_rm_get(m, r.component_id, r.cursor);
+    r.cursor = r.cursor + 1;
+    return (true, r.component_id, e, r);
+}
+
+fn ecs_lc_rc_clear(r: EcsLcRemovedComponentsDeep, m: EcsLcRemovedMessagesDeep) -> EcsLcRemovedComponentsDeep {
+    // Bevy clear advances cursor to end of current messages
+    r.cursor = ecs_lc_rm_len(m, r.component_id);
+    return r;
+}
+
+fn ecs_lc_rc_reset_cursor(r: EcsLcRemovedComponentsDeep) -> EcsLcRemovedComponentsDeep {
+    r.cursor = 0;
+    return r;
+}

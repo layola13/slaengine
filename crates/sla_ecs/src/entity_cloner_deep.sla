@@ -1,0 +1,304 @@
+// Deepened Bevy ECS EntityCloner surface.
+// Mirrors src/entity/clone_entities.rs:
+//   OptOut/OptIn filters, InsertMode
+//   EntityClonerBuilder allow/deny/move/linked/insert_mode/finish
+//   EntityCloner should_clone / clone_entity / spawn_clone
+//   per-component clone behavior overrides
+// Shallow lib/entity_cloner.sla retained.
+// Fixed capacity: 4 allowed, 4 denied, 4 overrides, 8 source components.
+
+// filter: 0=OptOut, 1=OptIn
+fn ecs_ec_filter_opt_out() -> i32 { return 0; }
+fn ecs_ec_filter_opt_in() -> i32 { return 1; }
+
+// InsertMode: 0=Replace/Default, 1=KeepExisting
+fn ecs_ec_insert_replace() -> i32 { return 0; }
+fn ecs_ec_insert_keep() -> i32 { return 1; }
+
+struct EcsEcBuilder {
+    filter_mode: i32,
+    move_components: bool,
+    linked_cloning: bool,
+    insert_mode: i32,
+    allow_len: i32,
+    a0: i32, a1: i32, a2: i32, a3: i32,
+    deny_len: i32,
+    d0: i32, d1: i32, d2: i32, d3: i32,
+    // override clone behavior kinds per component id
+    o_len: i32,
+    o_id0: i32, o_beh0: i32,
+    o_id1: i32, o_beh1: i32,
+    o_id2: i32, o_beh2: i32,
+    o_id3: i32, o_beh3: i32,
+    default_clone_fn: i32, // 0 ignore, 1 clone
+    add_observers: bool,
+}
+
+fn ecs_ec_builder_opt_out() -> EcsEcBuilder {
+    return EcsEcBuilder {
+        filter_mode: 0, move_components: false, linked_cloning: false, insert_mode: 0,
+        allow_len: 0, a0: -1, a1: -1, a2: -1, a3: -1,
+        deny_len: 0, d0: -1, d1: -1, d2: -1, d3: -1,
+        o_len: 0, o_id0: -1, o_beh0: 0, o_id1: -1, o_beh1: 0, o_id2: -1, o_beh2: 0, o_id3: -1, o_beh3: 0,
+        default_clone_fn: 1, add_observers: false,
+    };
+}
+
+fn ecs_ec_builder_opt_in() -> EcsEcBuilder {
+    let b = ecs_ec_builder_opt_out();
+    return EcsEcBuilder {
+        filter_mode: 1, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: 0, a0: -1, a1: -1, a2: -1, a3: -1,
+        deny_len: 0, d0: -1, d1: -1, d2: -1, d3: -1,
+        o_len: 0, o_id0: -1, o_beh0: 0, o_id1: -1, o_beh1: 0, o_id2: -1, o_beh2: 0, o_id3: -1, o_beh3: 0,
+        default_clone_fn: 1, add_observers: false,
+    };
+}
+
+fn ecs_ec_builder_move(b: EcsEcBuilder, enable: bool) -> EcsEcBuilder {
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: enable, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_builder_linked(b: EcsEcBuilder, linked: bool) -> EcsEcBuilder {
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: linked, insert_mode: b.insert_mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_builder_insert_mode(b: EcsEcBuilder, mode: i32) -> EcsEcBuilder {
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_builder_default_fn(b: EcsEcBuilder, fn_id: i32) -> EcsEcBuilder {
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: fn_id, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_builder_add_observers(b: EcsEcBuilder, add: bool) -> EcsEcBuilder {
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: add,
+    };
+}
+
+fn ecs_ec_list_has(n: i32, v0: i32, v1: i32, v2: i32, v3: i32, cid: i32) -> bool {
+    if n >= 1 { if v0 == cid { return true; }; };
+    if n >= 2 { if v1 == cid { return true; }; };
+    if n >= 3 { if v2 == cid { return true; }; };
+    if n >= 4 { if v3 == cid { return true; }; };
+    return false;
+}
+
+fn ecs_ec_builder_allow(b: EcsEcBuilder, cid: i32) -> EcsEcBuilder {
+    if ecs_ec_list_has(b.allow_len, b.a0, b.a1, b.a2, b.a3, cid) { return b; };
+    if b.allow_len >= 4 { return b; };
+    let n = b.allow_len;
+    let a0 = b.a0; let a1 = b.a1; let a2 = b.a2; let a3 = b.a3;
+    if n == 0 { a0 = cid; };
+    if n == 1 { a1 = cid; };
+    if n == 2 { a2 = cid; };
+    if n == 3 { a3 = cid; };
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: n + 1, a0: a0, a1: a1, a2: a2, a3: a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_builder_deny(b: EcsEcBuilder, cid: i32) -> EcsEcBuilder {
+    if ecs_ec_list_has(b.deny_len, b.d0, b.d1, b.d2, b.d3, cid) { return b; };
+    if b.deny_len >= 4 { return b; };
+    let n = b.deny_len;
+    let d0 = b.d0; let d1 = b.d1; let d2 = b.d2; let d3 = b.d3;
+    if n == 0 { d0 = cid; };
+    if n == 1 { d1 = cid; };
+    if n == 2 { d2 = cid; };
+    if n == 3 { d3 = cid; };
+    return EcsEcBuilder {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: n + 1, d0: d0, d1: d1, d2: d2, d3: d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_builder_override(b: EcsEcBuilder, cid: i32, beh: i32) -> EcsEcBuilder {
+    // update if exists
+    if b.o_len >= 1 {
+        if b.o_id0 == cid {
+            return EcsEcBuilder {
+                filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+                allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+                deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+                o_len: b.o_len, o_id0: cid, o_beh0: beh, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+                default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+            };
+        };
+    };
+    if b.o_len >= 4 { return b; };
+    let n = b.o_len;
+    if n == 0 {
+        return EcsEcBuilder {
+            filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+            allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+            deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+            o_len: 1, o_id0: cid, o_beh0: beh, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+            default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+        };
+    };
+    if n == 1 {
+        return EcsEcBuilder {
+            filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+            allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+            deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+            o_len: 2, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: cid, o_beh1: beh, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+            default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+        };
+    };
+    return b;
+}
+
+fn ecs_ec_builder_allow_len(b: EcsEcBuilder) -> i32 { return b.allow_len; }
+fn ecs_ec_builder_deny_len(b: EcsEcBuilder) -> i32 { return b.deny_len; }
+fn ecs_ec_builder_is_opt_in(b: EcsEcBuilder) -> bool {
+    if b.filter_mode == 1 { return true; };
+    return false;
+}
+
+// Built cloner
+struct EcsEcCloner {
+    filter_mode: i32,
+    move_components: bool,
+    linked_cloning: bool,
+    insert_mode: i32,
+    allow_len: i32,
+    a0: i32, a1: i32, a2: i32, a3: i32,
+    deny_len: i32,
+    d0: i32, d1: i32, d2: i32, d3: i32,
+    o_len: i32,
+    o_id0: i32, o_beh0: i32,
+    o_id1: i32, o_beh1: i32,
+    o_id2: i32, o_beh2: i32,
+    o_id3: i32, o_beh3: i32,
+    default_clone_fn: i32,
+    add_observers: bool,
+}
+
+fn ecs_ec_finish(b: EcsEcBuilder) -> EcsEcCloner {
+    return EcsEcCloner {
+        filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode,
+        allow_len: b.allow_len, a0: b.a0, a1: b.a1, a2: b.a2, a3: b.a3,
+        deny_len: b.deny_len, d0: b.d0, d1: b.d1, d2: b.d2, d3: b.d3,
+        o_len: b.o_len, o_id0: b.o_id0, o_beh0: b.o_beh0, o_id1: b.o_id1, o_beh1: b.o_beh1, o_id2: b.o_id2, o_beh2: b.o_beh2, o_id3: b.o_id3, o_beh3: b.o_beh3,
+        default_clone_fn: b.default_clone_fn, add_observers: b.add_observers,
+    };
+}
+
+fn ecs_ec_linked(c: EcsEcCloner) -> bool { return c.linked_cloning; }
+fn ecs_ec_moving(c: EcsEcCloner) -> bool { return c.move_components; }
+fn ecs_ec_insert_mode(c: EcsEcCloner) -> i32 { return c.insert_mode; }
+fn ecs_ec_add_observers(c: EcsEcCloner) -> bool { return c.add_observers; }
+
+fn ecs_ec_override_of(c: EcsEcCloner, cid: i32) -> (bool, i32) {
+    if c.o_len >= 1 { if c.o_id0 == cid { return (true, c.o_beh0); }; };
+    if c.o_len >= 2 { if c.o_id1 == cid { return (true, c.o_beh1); }; };
+    if c.o_len >= 3 { if c.o_id2 == cid { return (true, c.o_beh2); }; };
+    if c.o_len >= 4 { if c.o_id3 == cid { return (true, c.o_beh3); }; };
+    return (false, 0);
+}
+
+// should_clone for filter
+fn ecs_ec_should_clone(c: EcsEcCloner, cid: i32) -> bool {
+    let denied = ecs_ec_list_has(c.deny_len, c.d0, c.d1, c.d2, c.d3, cid);
+    if denied { return false; };
+    if c.filter_mode == ecs_ec_filter_opt_in() {
+        return ecs_ec_list_has(c.allow_len, c.a0, c.a1, c.a2, c.a3, cid);
+    };
+    // opt-out: clone unless denied (already checked)
+    return true;
+}
+
+// clone_behavior for component: override or default; 0=ignore means skip even if filter allows
+fn ecs_ec_clone_behavior_of(c: EcsEcCloner, cid: i32) -> i32 {
+    let o = ecs_ec_override_of(c, cid);
+    if o.0 == true { return o.1; };
+    return c.default_clone_fn;
+}
+
+// clone_entity: count components that will be written
+// source components provided as c0.. up to 4
+fn ecs_ec_clone_entity_count(c: EcsEcCloner, n: i32, c0: i32, c1: i32, c2: i32, c3: i32) -> i32 {
+    let count = 0;
+    if n >= 1 {
+        if ecs_ec_should_clone(c, c0) {
+            if ecs_ec_clone_behavior_of(c, c0) != 0 {
+                count = count + 1;
+            };
+        };
+    };
+    if n >= 2 {
+        if ecs_ec_should_clone(c, c1) {
+            if ecs_ec_clone_behavior_of(c, c1) != 0 {
+                count = count + 1;
+            };
+        };
+    };
+    if n >= 3 {
+        if ecs_ec_should_clone(c, c2) {
+            if ecs_ec_clone_behavior_of(c, c2) != 0 {
+                count = count + 1;
+            };
+        };
+    };
+    if n >= 4 {
+        if ecs_ec_should_clone(c, c3) {
+            if ecs_ec_clone_behavior_of(c, c3) != 0 {
+                count = count + 1;
+            };
+        };
+    };
+    return count;
+}
+
+// spawn_clone: returns (new_entity, cloned_count)
+fn ecs_ec_spawn_clone(c: EcsEcCloner, next_entity: i64, n: i32, c0: i32, c1: i32, c2: i32, c3: i32) -> (i64, i32) {
+    let count = ecs_ec_clone_entity_count(c, n, c0, c1, c2, c3);
+    return (next_entity, count);
+}
+
+// would_write under insert mode: if keep and target_has, skip
+fn ecs_ec_would_write(c: EcsEcCloner, cid: i32, target_has: bool) -> bool {
+    if ecs_ec_should_clone(c, cid) != true { return false; };
+    if ecs_ec_clone_behavior_of(c, cid) == 0 { return false; };
+    if c.insert_mode == ecs_ec_insert_keep() {
+        if target_has { return false; };
+    };
+    return true;
+}

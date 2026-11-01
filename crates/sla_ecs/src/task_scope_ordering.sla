@@ -1,0 +1,270 @@
+// Bevy TaskPool::scope result ordering model over explicit i32 tasks.
+//
+// Bevy documents two important ordering rules for scoped tasks: results from
+// tasks spawned directly by the scope closure are deterministic in spawn order,
+// while results from tasks that themselves spawn more scoped tasks must be
+// treated as non-deterministic by callers. This file models that observable
+// contract plus the cancellation/rejection edges around scope drop, without
+// implementing Rust Future/Waker or work-stealing internals.
+@import "sa_std/vec.sa"
+
+const ECS_SCOPE_ORDER_DIRECT: i64 = 0;
+const ECS_SCOPE_ORDER_NESTED_PARENT: i64 = 1;
+const ECS_SCOPE_ORDER_NESTED_CHILD: i64 = 2;
+
+const ECS_SCOPE_ORDER_PENDING: i64 = 0;
+const ECS_SCOPE_ORDER_OK: i64 = 1;
+const ECS_SCOPE_ORDER_PANIC: i64 = 2;
+const ECS_SCOPE_ORDER_CANCELED: i64 = 3;
+
+struct EcsScopeOrderingPlanI32 {
+    values: Vec<i32>,
+    lanes: Vec<i64>,
+    origins: Vec<i64>,
+    parent_slots: Vec<i64>,
+    states: Vec<i64>,
+    scope_closed: bool,
+    escaped_spawn_rejected_count: i64,
+}
+
+struct EcsScopeOrderingResultI32 {
+    plan: EcsScopeOrderingPlanI32,
+    result_values: Vec<i32>,
+    result_lanes: Vec<i64>,
+    result_origins: Vec<i64>,
+    result_parent_slots: Vec<i64>,
+    completed_count: i64,
+    panic_count: i64,
+    canceled_count: i64,
+    nested_spawn_count: i64,
+    stable_order: bool,
+    nondeterministic_order: bool,
+    direct_order_preserved: bool,
+    escaped_spawn_rejected_count: i64,
+    all_drained: bool,
+}
+
+fn ecs_scope_ordering_plan_i32_new() -> EcsScopeOrderingPlanI32 {
+    let values: Vec<i32> = Vec::new();
+    let lanes: Vec<i64> = Vec::new();
+    let origins: Vec<i64> = Vec::new();
+    let parent_slots: Vec<i64> = Vec::new();
+    let states: Vec<i64> = Vec::new();
+    return EcsScopeOrderingPlanI32 { values: values, lanes: lanes, origins: origins, parent_slots: parent_slots, states: states, scope_closed: false, escaped_spawn_rejected_count: 0 };
+}
+
+fn ecs_scope_ordering_plan_len_i32(plan: EcsScopeOrderingPlanI32) -> i64 {
+    return len(plan.values) as i64;
+}
+
+fn ecs_scope_ordering_push_i32(plan: EcsScopeOrderingPlanI32, value: i32, lane: i64, origin: i64, parent_slot: i64, state: i64) -> EcsScopeOrderingPlanI32 {
+    if plan.scope_closed {
+        plan.escaped_spawn_rejected_count = plan.escaped_spawn_rejected_count + 1;
+        return plan;
+    };
+    plan.values.push(value);
+    plan.lanes.push(lane);
+    plan.origins.push(origin);
+    plan.parent_slots.push(parent_slot);
+    plan.states.push(state);
+    return plan;
+}
+
+fn ecs_scope_ordering_spawn_direct_i32(plan: EcsScopeOrderingPlanI32, value: i32) -> EcsScopeOrderingPlanI32 {
+    return ecs_scope_ordering_push_i32(plan, value, 0, ECS_SCOPE_ORDER_DIRECT, -1, ECS_SCOPE_ORDER_OK);
+}
+
+fn ecs_scope_ordering_spawn_direct_on_lane_i32(plan: EcsScopeOrderingPlanI32, value: i32, lane: i64) -> EcsScopeOrderingPlanI32 {
+    return ecs_scope_ordering_push_i32(plan, value, lane, ECS_SCOPE_ORDER_DIRECT, -1, ECS_SCOPE_ORDER_OK);
+}
+
+fn ecs_scope_ordering_spawn_pending_direct_i32(plan: EcsScopeOrderingPlanI32, value: i32, lane: i64) -> EcsScopeOrderingPlanI32 {
+    return ecs_scope_ordering_push_i32(plan, value, lane, ECS_SCOPE_ORDER_DIRECT, -1, ECS_SCOPE_ORDER_PENDING);
+}
+
+fn ecs_scope_ordering_spawn_panic_direct_i32(plan: EcsScopeOrderingPlanI32, payload_id: i32, lane: i64) -> EcsScopeOrderingPlanI32 {
+    return ecs_scope_ordering_push_i32(plan, payload_id, lane, ECS_SCOPE_ORDER_DIRECT, -1, ECS_SCOPE_ORDER_PANIC);
+}
+
+fn ecs_scope_ordering_spawn_nested_pair_i32(plan: EcsScopeOrderingPlanI32, parent_value: i32, child_value: i32, lane: i64) -> EcsScopeOrderingPlanI32 {
+    let parent_slot = ecs_scope_ordering_plan_len_i32(plan);
+    plan = ecs_scope_ordering_push_i32(plan, parent_value, lane, ECS_SCOPE_ORDER_NESTED_PARENT, -1, ECS_SCOPE_ORDER_OK);
+    plan = ecs_scope_ordering_push_i32(plan, child_value, lane, ECS_SCOPE_ORDER_NESTED_CHILD, parent_slot, ECS_SCOPE_ORDER_OK);
+    return plan;
+}
+
+fn ecs_scope_ordering_spawn_nested_child_i32(plan: EcsScopeOrderingPlanI32, parent_slot: i64, child_value: i32, lane: i64) -> EcsScopeOrderingPlanI32 {
+    if parent_slot < 0 { return plan; };
+    if parent_slot >= ecs_scope_ordering_plan_len_i32(plan) { return plan; };
+    return ecs_scope_ordering_push_i32(plan, child_value, lane, ECS_SCOPE_ORDER_NESTED_CHILD, parent_slot, ECS_SCOPE_ORDER_OK);
+}
+
+fn ecs_scope_ordering_close_i32(plan: EcsScopeOrderingPlanI32) -> EcsScopeOrderingPlanI32 {
+    plan.scope_closed = true;
+    return plan;
+}
+
+fn ecs_scope_ordering_spawn_after_close_i32(plan: EcsScopeOrderingPlanI32, value: i32) -> EcsScopeOrderingPlanI32 {
+    return ecs_scope_ordering_push_i32(plan, value, 0, ECS_SCOPE_ORDER_DIRECT, -1, ECS_SCOPE_ORDER_OK);
+}
+
+fn ecs_scope_ordering_contains_result_i32(result: EcsScopeOrderingResultI32, value: i32) -> bool {
+    let i: i64 = 0;
+    let n = len(result.result_values) as i64;
+    while i < n {
+        if result.result_values[i] == value { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_scope_ordering_pending_count_i32(plan: EcsScopeOrderingPlanI32) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n = ecs_scope_ordering_plan_len_i32(plan);
+    while i < n {
+        if plan.states[i] == ECS_SCOPE_ORDER_PENDING { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_scope_ordering_nested_count_i32(plan: EcsScopeOrderingPlanI32) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n = ecs_scope_ordering_plan_len_i32(plan);
+    while i < n {
+        if plan.origins[i] == ECS_SCOPE_ORDER_NESTED_CHILD { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_scope_ordering_drain_i32(plan: EcsScopeOrderingPlanI32) -> EcsScopeOrderingResultI32 {
+    let result_values: Vec<i32> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let result_origins: Vec<i64> = Vec::new();
+    let result_parent_slots: Vec<i64> = Vec::new();
+    let completed_count: i64 = 0;
+    let panic_count: i64 = 0;
+    let canceled_count: i64 = 0;
+    let nested_spawn_count = ecs_scope_ordering_nested_count_i32(plan);
+    let pending_count = ecs_scope_ordering_pending_count_i32(plan);
+    let i: i64 = 0;
+    let n = ecs_scope_ordering_plan_len_i32(plan);
+    while i < n {
+        let state = plan.states[i];
+        if state == ECS_SCOPE_ORDER_OK {
+            result_values.push(plan.values[i]);
+            result_lanes.push(plan.lanes[i]);
+            result_origins.push(plan.origins[i]);
+            result_parent_slots.push(plan.parent_slots[i]);
+            completed_count = completed_count + 1;
+        };
+        if state == ECS_SCOPE_ORDER_PENDING {
+            canceled_count = canceled_count + 1;
+        };
+        if state == ECS_SCOPE_ORDER_CANCELED {
+            canceled_count = canceled_count + 1;
+        };
+        if state == ECS_SCOPE_ORDER_PANIC {
+            panic_count = panic_count + 1;
+            canceled_count = canceled_count + n - i - 1;
+            let stable = nested_spawn_count == 0 && panic_count == 0 && pending_count == 0;
+            return EcsScopeOrderingResultI32 { plan: plan, result_values: result_values, result_lanes: result_lanes, result_origins: result_origins, result_parent_slots: result_parent_slots, completed_count: completed_count, panic_count: panic_count, canceled_count: canceled_count, nested_spawn_count: nested_spawn_count, stable_order: stable, nondeterministic_order: nested_spawn_count > 0, direct_order_preserved: nested_spawn_count == 0, escaped_spawn_rejected_count: plan.escaped_spawn_rejected_count, all_drained: false };
+        };
+        i = i + 1;
+    }
+    let stable_order = nested_spawn_count == 0 && pending_count == 0;
+    return EcsScopeOrderingResultI32 { plan: plan, result_values: result_values, result_lanes: result_lanes, result_origins: result_origins, result_parent_slots: result_parent_slots, completed_count: completed_count, panic_count: panic_count, canceled_count: canceled_count, nested_spawn_count: nested_spawn_count, stable_order: stable_order, nondeterministic_order: nested_spawn_count > 0, direct_order_preserved: nested_spawn_count == 0, escaped_spawn_rejected_count: plan.escaped_spawn_rejected_count, all_drained: pending_count == 0 };
+}
+
+fn ecs_scope_ordering_drop_i32(plan: EcsScopeOrderingPlanI32) -> EcsScopeOrderingResultI32 {
+    let result_values: Vec<i32> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let result_origins: Vec<i64> = Vec::new();
+    let result_parent_slots: Vec<i64> = Vec::new();
+    let n = ecs_scope_ordering_plan_len_i32(plan);
+    let nested_spawn_count = ecs_scope_ordering_nested_count_i32(plan);
+    return EcsScopeOrderingResultI32 { plan: plan, result_values: result_values, result_lanes: result_lanes, result_origins: result_origins, result_parent_slots: result_parent_slots, completed_count: 0, panic_count: 0, canceled_count: n, nested_spawn_count: nested_spawn_count, stable_order: false, nondeterministic_order: nested_spawn_count > 0, direct_order_preserved: false, escaped_spawn_rejected_count: plan.escaped_spawn_rejected_count, all_drained: false };
+}
+
+@test "scope ordering direct spawn preserves insertion order"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_direct_i32(p0, 0);
+    let p2 = ecs_scope_ordering_spawn_direct_i32(p1, 1);
+    let result = ecs_scope_ordering_drain_i32(p2);
+    if result.stable_order != true { panic(32310); };
+    if result.nondeterministic_order { panic(32311); };
+    if result.completed_count != 2 { panic(32312); };
+    if result.result_values[0] != 0 { panic(32313); };
+    if result.result_values[1] != 1 { panic(32314); };
+}
+
+@test "scope ordering direct spawns on explicit lanes remain stable"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_direct_on_lane_i32(p0, 10, 0);
+    let p2 = ecs_scope_ordering_spawn_direct_on_lane_i32(p1, 20, 1);
+    let p3 = ecs_scope_ordering_spawn_direct_on_lane_i32(p2, 30, 2);
+    let result = ecs_scope_ordering_drain_i32(p3);
+    if result.stable_order != true { panic(32320); };
+    if result.result_lanes[0] != 0 { panic(32321); };
+    if result.result_lanes[1] != 1 { panic(32322); };
+    if result.result_lanes[2] != 2 { panic(32323); };
+    if result.direct_order_preserved != true { panic(32324); };
+}
+
+@test "scope ordering nested spawn marks result order non deterministic"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_nested_pair_i32(p0, 0, 1, 0);
+    let result = ecs_scope_ordering_drain_i32(p1);
+    if result.stable_order { panic(32330); };
+    if result.nondeterministic_order != true { panic(32331); };
+    if result.nested_spawn_count != 1 { panic(32332); };
+    if ecs_scope_ordering_contains_result_i32(result, 0) != true { panic(32333); };
+    if ecs_scope_ordering_contains_result_i32(result, 1) != true { panic(32334); };
+}
+
+@test "scope ordering records nested child parent slot"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_nested_pair_i32(p0, 7, 8, 1);
+    let p2 = ecs_scope_ordering_spawn_nested_child_i32(p1, 0, 9, 1);
+    let result = ecs_scope_ordering_drain_i32(p2);
+    if result.nested_spawn_count != 2 { panic(32340); };
+    if result.result_origins[1] != ECS_SCOPE_ORDER_NESTED_CHILD { panic(32341); };
+    if result.result_parent_slots[1] != 0 { panic(32342); };
+    if result.result_parent_slots[2] != 0 { panic(32343); };
+}
+
+@test "scope ordering panic cancels following tasks"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_direct_i32(p0, 1);
+    let p2 = ecs_scope_ordering_spawn_panic_direct_i32(p1, 99, 0);
+    let p3 = ecs_scope_ordering_spawn_direct_i32(p2, 3);
+    let result = ecs_scope_ordering_drain_i32(p3);
+    if result.panic_count != 1 { panic(32350); };
+    if result.canceled_count != 1 { panic(32351); };
+    if result.completed_count != 1 { panic(32352); };
+    if result.all_drained { panic(32353); };
+}
+
+@test "scope ordering pending tasks are canceled on explicit drop"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_pending_direct_i32(p0, 4, 0);
+    let p2 = ecs_scope_ordering_spawn_pending_direct_i32(p1, 5, 1);
+    let result = ecs_scope_ordering_drop_i32(p2);
+    if result.canceled_count != 2 { panic(32360); };
+    if result.completed_count != 0 { panic(32361); };
+    if result.stable_order { panic(32362); };
+}
+
+@test "scope ordering rejects escaped spawn after close"() {
+    let p0 = ecs_scope_ordering_plan_i32_new();
+    let p1 = ecs_scope_ordering_spawn_direct_i32(p0, 1);
+    let p2 = ecs_scope_ordering_close_i32(p1);
+    let p3 = ecs_scope_ordering_spawn_after_close_i32(p2, 2);
+    let result = ecs_scope_ordering_drain_i32(p3);
+    if result.escaped_spawn_rejected_count != 1 { panic(32370); };
+    if result.completed_count != 1 { panic(32371); };
+    if ecs_scope_ordering_plan_len_i32(result.plan) != 1 { panic(32372); };
+}

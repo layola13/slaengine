@@ -1,0 +1,294 @@
+// Deepened Bevy ECS BundleInfo extras + Bundles registry.
+// Mirrors src/bundle/info.rs:
+//   BundleId index
+//   BundleInfo explicit/required/contributed split
+//   Bundles register/get/get_id/is_empty/len
+// Fixed capacity: 4 bundles, 4 contributed slots each, 4 type mappings.
+// Shallow lib/bundle_info_extras.sla retained.
+
+const ECS_BIE_ERR_OK: i32 = 0;
+const ECS_BIE_ERR_MISSING: i32 = 1;
+const ECS_BIE_ERR_FULL: i32 = 2;
+
+struct EcsBieInfoDeep {
+    bundle_id: i32,
+    // contributed = explicit then required
+    c0: i32, c1: i32, c2: i32, c3: i32,
+    total: i32,
+    explicit_count: i32,
+}
+
+fn ecs_bie_info_empty() -> EcsBieInfoDeep {
+    return EcsBieInfoDeep {
+        bundle_id: -1, c0: -1, c1: -1, c2: -1, c3: -1, total: 0, explicit_count: 0,
+    };
+}
+
+fn ecs_bie_info_id(i: EcsBieInfoDeep) -> i32 { return i.bundle_id; }
+fn ecs_bie_info_total(i: EcsBieInfoDeep) -> i32 { return i.total; }
+fn ecs_bie_info_explicit_count(i: EcsBieInfoDeep) -> i32 { return i.explicit_count; }
+fn ecs_bie_info_required_count(i: EcsBieInfoDeep) -> i32 { return i.total - i.explicit_count; }
+
+fn ecs_bie_info_rebuild(
+    bundle_id: i32, c0: i32, c1: i32, c2: i32, c3: i32, total: i32, explicit_count: i32
+) -> EcsBieInfoDeep {
+    return EcsBieInfoDeep {
+        bundle_id: bundle_id, c0: c0, c1: c1, c2: c2, c3: c3, total: total, explicit_count: explicit_count,
+    };
+}
+
+fn ecs_bie_info_new(bundle_id: i32, e0: i32, e1: i32, e_count: i32, r0: i32, r1: i32, r_count: i32) -> EcsBieInfoDeep {
+    // pack up to 4 contributed
+    if e_count <= 0 {
+        if r_count <= 0 {
+            return ecs_bie_info_rebuild(bundle_id, -1, -1, -1, -1, 0, 0);
+        };
+        if r_count == 1 {
+            return ecs_bie_info_rebuild(bundle_id, r0, -1, -1, -1, 1, 0);
+        };
+        return ecs_bie_info_rebuild(bundle_id, r0, r1, -1, -1, 2, 0);
+    };
+    if e_count == 1 {
+        if r_count <= 0 {
+            return ecs_bie_info_rebuild(bundle_id, e0, -1, -1, -1, 1, 1);
+        };
+        if r_count == 1 {
+            return ecs_bie_info_rebuild(bundle_id, e0, r0, -1, -1, 2, 1);
+        };
+        return ecs_bie_info_rebuild(bundle_id, e0, r0, r1, -1, 3, 1);
+    };
+    // e_count >= 2
+    if r_count <= 0 {
+        return ecs_bie_info_rebuild(bundle_id, e0, e1, -1, -1, 2, 2);
+    };
+    if r_count == 1 {
+        return ecs_bie_info_rebuild(bundle_id, e0, e1, r0, -1, 3, 2);
+    };
+    return ecs_bie_info_rebuild(bundle_id, e0, e1, r0, r1, 4, 2);
+}
+
+fn ecs_bie_info_at(i: EcsBieInfoDeep, idx: i32) -> i32 {
+    if idx == 0 {
+        if i.total >= 1 { return i.c0; };
+    };
+    if idx == 1 {
+        if i.total >= 2 { return i.c1; };
+    };
+    if idx == 2 {
+        if i.total >= 3 { return i.c2; };
+    };
+    if idx == 3 {
+        if i.total >= 4 { return i.c3; };
+    };
+    return -1;
+}
+
+fn ecs_bie_info_explicit_at(i: EcsBieInfoDeep, idx: i32) -> i32 {
+    if idx < 0 { return -1; };
+    if idx >= i.explicit_count { return -1; };
+    return ecs_bie_info_at(i, idx);
+}
+
+fn ecs_bie_info_required_at(i: EcsBieInfoDeep, idx: i32) -> i32 {
+    if idx < 0 { return -1; };
+    let abs = i.explicit_count + idx;
+    if abs >= i.total { return -1; };
+    return ecs_bie_info_at(i, abs);
+}
+
+fn ecs_bie_info_contains(i: EcsBieInfoDeep, cid: i32) -> bool {
+    if i.total >= 1 {
+        if i.c0 == cid { return true; };
+    };
+    if i.total >= 2 {
+        if i.c1 == cid { return true; };
+    };
+    if i.total >= 3 {
+        if i.c2 == cid { return true; };
+    };
+    if i.total >= 4 {
+        if i.c3 == cid { return true; };
+    };
+    return false;
+}
+
+// Bundles registry
+struct EcsBieDeep {
+    b0: EcsBieInfoDeep, b1: EcsBieInfoDeep, b2: EcsBieInfoDeep, b3: EcsBieInfoDeep,
+    len: i32,
+    // type_id -> bundle_id mappings
+    t0: i32, tb0: i32,
+    t1: i32, tb1: i32,
+    t2: i32, tb2: i32,
+    t3: i32, tb3: i32,
+    tlen: i32,
+}
+
+fn ecs_bie_deep_new() -> EcsBieDeep {
+    return EcsBieDeep {
+        b0: ecs_bie_info_empty(), b1: ecs_bie_info_empty(), b2: ecs_bie_info_empty(), b3: ecs_bie_info_empty(),
+        len: 0,
+        t0: -1, tb0: -1, t1: -1, tb1: -1, t2: -1, tb2: -1, t3: -1, tb3: -1, tlen: 0,
+    };
+}
+
+fn ecs_bie_deep_len(b: EcsBieDeep) -> i32 { return b.len; }
+fn ecs_bie_deep_is_empty(b: EcsBieDeep) -> bool { return b.len == 0; }
+fn ecs_bie_deep_tlen(b: EcsBieDeep) -> i32 { return b.tlen; }
+
+fn ecs_bie_deep_rebuild(
+    b0: EcsBieInfoDeep, b1: EcsBieInfoDeep, b2: EcsBieInfoDeep, b3: EcsBieInfoDeep, len: i32,
+    t0: i32, tb0: i32, t1: i32, tb1: i32, t2: i32, tb2: i32, t3: i32, tb3: i32, tlen: i32
+) -> EcsBieDeep {
+    return EcsBieDeep {
+        b0: b0, b1: b1, b2: b2, b3: b3, len: len,
+        t0: t0, tb0: tb0, t1: t1, tb1: tb1, t2: t2, tb2: tb2, t3: t3, tb3: tb3, tlen: tlen,
+    };
+}
+
+fn ecs_bie_deep_get_slot(b: EcsBieDeep, idx: i32) -> EcsBieInfoDeep {
+    if idx == 0 { return b.b0; };
+    if idx == 1 { return b.b1; };
+    if idx == 2 { return b.b2; };
+    if idx == 3 { return b.b3; };
+    return ecs_bie_info_empty();
+}
+
+struct EcsBieGetDeep {
+    ok: bool,
+    err: i32,
+    index: i32,
+    info: EcsBieInfoDeep,
+    world: EcsBieDeep,
+    bundle_id: i32,
+}
+
+fn ecs_bie_get_ok(g: EcsBieGetDeep) -> bool { return g.ok; }
+fn ecs_bie_get_err(g: EcsBieGetDeep) -> i32 { return g.err; }
+fn ecs_bie_get_index(g: EcsBieGetDeep) -> i32 { return g.index; }
+fn ecs_bie_get_info(g: EcsBieGetDeep) -> EcsBieInfoDeep { return g.info; }
+fn ecs_bie_get_world(g: EcsBieGetDeep) -> EcsBieDeep { return g.world; }
+fn ecs_bie_get_bundle_id(g: EcsBieGetDeep) -> i32 { return g.bundle_id; }
+
+fn ecs_bie_get_fail(b: EcsBieDeep, err: i32) -> EcsBieGetDeep {
+    return EcsBieGetDeep { ok: false, err: err, index: -1, info: ecs_bie_info_empty(), world: b, bundle_id: -1 };
+}
+
+fn ecs_bie_get_ok_val(b: EcsBieDeep, index: i32, info: EcsBieInfoDeep, bundle_id: i32) -> EcsBieGetDeep {
+    return EcsBieGetDeep { ok: true, err: ECS_BIE_ERR_OK, index: index, info: info, world: b, bundle_id: bundle_id };
+}
+
+fn ecs_bie_deep_find(b: EcsBieDeep, bundle_id: i32) -> i32 {
+    if b.len >= 1 {
+        if b.b0.bundle_id == bundle_id { return 0; };
+    };
+    if b.len >= 2 {
+        if b.b1.bundle_id == bundle_id { return 1; };
+    };
+    if b.len >= 3 {
+        if b.b2.bundle_id == bundle_id { return 2; };
+    };
+    if b.len >= 4 {
+        if b.b3.bundle_id == bundle_id { return 3; };
+    };
+    return -1;
+}
+
+fn ecs_bie_deep_get(b: EcsBieDeep, bundle_id: i32) -> EcsBieGetDeep {
+    let idx = ecs_bie_deep_find(b, bundle_id);
+    if idx < 0 { return ecs_bie_get_fail(b, ECS_BIE_ERR_MISSING); };
+    return ecs_bie_get_ok_val(b, idx, ecs_bie_deep_get_slot(b, idx), bundle_id);
+}
+
+fn ecs_bie_deep_register(b: EcsBieDeep, info: EcsBieInfoDeep) -> EcsBieGetDeep {
+    let existing = ecs_bie_deep_find(b, info.bundle_id);
+    if existing >= 0 {
+        // replace
+        if existing == 0 {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(info, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 0, info, info.bundle_id);
+        };
+        if existing == 1 {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, info, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 1, info, info.bundle_id);
+        };
+        if existing == 2 {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, info, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 2, info, info.bundle_id);
+        };
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, info, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 3, info, info.bundle_id);
+    };
+    if b.len == 0 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(info, b.b1, b.b2, b.b3, 1, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 0, info, info.bundle_id);
+    };
+    if b.len == 1 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, info, b.b2, b.b3, 2, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 1, info, info.bundle_id);
+    };
+    if b.len == 2 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, info, b.b3, 3, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 2, info, info.bundle_id);
+    };
+    if b.len == 3 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, info, 4, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 3, info, info.bundle_id);
+    };
+    return ecs_bie_get_fail(b, ECS_BIE_ERR_FULL);
+}
+
+fn ecs_bie_deep_register_type(b: EcsBieDeep, type_id: i32, bundle_id: i32) -> EcsBieGetDeep {
+    // update existing type
+    if b.tlen >= 1 {
+        if b.t0 == type_id {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, bundle_id, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 0, ecs_bie_info_empty(), bundle_id);
+        };
+    };
+    if b.tlen >= 2 {
+        if b.t1 == type_id {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, bundle_id, b.t2, b.tb2, b.t3, b.tb3, b.tlen), 1, ecs_bie_info_empty(), bundle_id);
+        };
+    };
+    if b.tlen >= 3 {
+        if b.t2 == type_id {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, bundle_id, b.t3, b.tb3, b.tlen), 2, ecs_bie_info_empty(), bundle_id);
+        };
+    };
+    if b.tlen >= 4 {
+        if b.t3 == type_id {
+            return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, b.t3, bundle_id, b.tlen), 3, ecs_bie_info_empty(), bundle_id);
+        };
+    };
+    if b.tlen == 0 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, type_id, bundle_id, b.t1, b.tb1, b.t2, b.tb2, b.t3, b.tb3, 1), 0, ecs_bie_info_empty(), bundle_id);
+    };
+    if b.tlen == 1 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, type_id, bundle_id, b.t2, b.tb2, b.t3, b.tb3, 2), 1, ecs_bie_info_empty(), bundle_id);
+    };
+    if b.tlen == 2 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, type_id, bundle_id, b.t3, b.tb3, 3), 2, ecs_bie_info_empty(), bundle_id);
+    };
+    if b.tlen == 3 {
+        return ecs_bie_get_ok_val(ecs_bie_deep_rebuild(b.b0, b.b1, b.b2, b.b3, b.len, b.t0, b.tb0, b.t1, b.tb1, b.t2, b.tb2, type_id, bundle_id, 4), 3, ecs_bie_info_empty(), bundle_id);
+    };
+    return ecs_bie_get_fail(b, ECS_BIE_ERR_FULL);
+}
+
+fn ecs_bie_deep_get_id(b: EcsBieDeep, type_id: i32) -> EcsBieGetDeep {
+    if b.tlen >= 1 {
+        if b.t0 == type_id {
+            return ecs_bie_get_ok_val(b, 0, ecs_bie_info_empty(), b.tb0);
+        };
+    };
+    if b.tlen >= 2 {
+        if b.t1 == type_id {
+            return ecs_bie_get_ok_val(b, 1, ecs_bie_info_empty(), b.tb1);
+        };
+    };
+    if b.tlen >= 3 {
+        if b.t2 == type_id {
+            return ecs_bie_get_ok_val(b, 2, ecs_bie_info_empty(), b.tb2);
+        };
+    };
+    if b.tlen >= 4 {
+        if b.t3 == type_id {
+            return ecs_bie_get_ok_val(b, 3, ecs_bie_info_empty(), b.tb3);
+        };
+    };
+    return ecs_bie_get_fail(b, ECS_BIE_ERR_MISSING);
+}
+
+fn ecs_bie_id_index(bundle_id: i32) -> i32 { return bundle_id; }

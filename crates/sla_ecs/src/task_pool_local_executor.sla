@@ -1,0 +1,173 @@
+// Bevy TaskPool::spawn_local / with_local_executor facade model.
+//
+// In Bevy's multithreaded TaskPool, `spawn_local` queues work on the
+// thread-local LocalExecutor and does not complete it immediately. The caller
+// explicitly drives that queue through `with_local_executor`. This differs from
+// the single-threaded fallback, where spawn_local drains immediately.
+@import "task_executor.sla"
+
+struct EcsTaskPoolLocalExecutorI32 {
+    global_executor: EcsTaskExecutorI32,
+    local_executor: EcsTaskExecutorI32,
+    spawn_count: i64,
+    local_spawn_count: i64,
+    global_tick_count: i64,
+    local_tick_count: i64,
+    with_local_executor_count: i64,
+}
+
+struct EcsTaskPoolLocalSpawnResultI32 {
+    pool: EcsTaskPoolLocalExecutorI32,
+    handle: EcsTaskHandleI32,
+    spawned: bool,
+    overflow: bool,
+}
+
+struct EcsTaskPoolLocalTickResultI32 {
+    pool: EcsTaskPoolLocalExecutorI32,
+    ticked: bool,
+    task_id: i64,
+}
+
+struct EcsTaskPoolLocalRunResultI32 {
+    pool: EcsTaskPoolLocalExecutorI32,
+    ticked_count: i64,
+}
+
+fn ecs_task_pool_local_executor_i32_new(global_capacity: i64, local_capacity: i64) -> EcsTaskPoolLocalExecutorI32 {
+    return EcsTaskPoolLocalExecutorI32 { global_executor: ecs_task_executor_i32_new(global_capacity), local_executor: ecs_local_task_executor_i32_new(local_capacity), spawn_count: 0, local_spawn_count: 0, global_tick_count: 0, local_tick_count: 0, with_local_executor_count: 0 };
+}
+
+fn ecs_task_pool_local_spawn_result_i32(pool: EcsTaskPoolLocalExecutorI32, handle: EcsTaskHandleI32, spawned: bool, overflow: bool) -> EcsTaskPoolLocalSpawnResultI32 {
+    return EcsTaskPoolLocalSpawnResultI32 { pool: pool, handle: handle, spawned: spawned, overflow: overflow };
+}
+
+fn ecs_task_pool_local_tick_result_i32(pool: EcsTaskPoolLocalExecutorI32, ticked: bool, task_id: i64) -> EcsTaskPoolLocalTickResultI32 {
+    return EcsTaskPoolLocalTickResultI32 { pool: pool, ticked: ticked, task_id: task_id };
+}
+
+fn ecs_task_pool_local_executor_spawn_i32(pool: EcsTaskPoolLocalExecutorI32, value: i32) -> EcsTaskPoolLocalSpawnResultI32 {
+    let spawn = ecs_task_executor_spawn_i32(pool.global_executor, value);
+    pool.global_executor = spawn.executor;
+    if spawn.spawned {
+        pool.spawn_count = pool.spawn_count + 1;
+    };
+    return ecs_task_pool_local_spawn_result_i32(pool, spawn.handle, spawn.spawned, spawn.overflow);
+}
+
+fn ecs_task_pool_local_executor_spawn_local_i32(pool: EcsTaskPoolLocalExecutorI32, value: i32) -> EcsTaskPoolLocalSpawnResultI32 {
+    let spawn = ecs_task_executor_spawn_local_i32(pool.local_executor, value);
+    pool.local_executor = spawn.executor;
+    if spawn.spawned {
+        pool.local_spawn_count = pool.local_spawn_count + 1;
+    };
+    return ecs_task_pool_local_spawn_result_i32(pool, spawn.handle, spawn.spawned, spawn.overflow);
+}
+
+fn ecs_task_pool_local_executor_tick_global_one_i32(pool: EcsTaskPoolLocalExecutorI32) -> EcsTaskPoolLocalTickResultI32 {
+    let tick = ecs_task_executor_try_tick_i32(pool.global_executor);
+    pool.global_executor = tick.executor;
+    if tick.ticked { pool.global_tick_count = pool.global_tick_count + 1; };
+    return ecs_task_pool_local_tick_result_i32(pool, tick.ticked, tick.task_id);
+}
+
+fn ecs_task_pool_local_executor_with_local_try_tick_i32(pool: EcsTaskPoolLocalExecutorI32) -> EcsTaskPoolLocalTickResultI32 {
+    pool.with_local_executor_count = pool.with_local_executor_count + 1;
+    let tick = ecs_task_executor_try_tick_i32(pool.local_executor);
+    pool.local_executor = tick.executor;
+    if tick.ticked { pool.local_tick_count = pool.local_tick_count + 1; };
+    return ecs_task_pool_local_tick_result_i32(pool, tick.ticked, tick.task_id);
+}
+
+fn ecs_task_pool_local_executor_with_local_run_until_idle_i32(pool: EcsTaskPoolLocalExecutorI32) -> EcsTaskPoolLocalRunResultI32 {
+    pool.with_local_executor_count = pool.with_local_executor_count + 1;
+    let run = ecs_task_executor_run_until_idle_i32(pool.local_executor);
+    pool.local_executor = run.executor;
+    pool.local_tick_count = pool.local_tick_count + run.ticked_count;
+    return EcsTaskPoolLocalRunResultI32 { pool: pool, ticked_count: run.ticked_count };
+}
+
+fn ecs_task_pool_local_executor_pending_local_count_i32(pool: EcsTaskPoolLocalExecutorI32) -> i64 {
+    return ecs_task_executor_pending_count_i32(pool.local_executor);
+}
+
+fn ecs_task_pool_local_executor_pending_global_count_i32(pool: EcsTaskPoolLocalExecutorI32) -> i64 {
+    return ecs_task_executor_pending_count_i32(pool.global_executor);
+}
+
+@test "task pool spawn local queues until with local executor tick"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 4);
+    let spawn = ecs_task_pool_local_executor_spawn_local_i32(pool, 10);
+    if spawn.spawned != true { panic(32410); };
+    if ecs_task_registry_is_finished_i32(spawn.pool.local_executor.registry, spawn.handle) { panic(32411); };
+    if ecs_task_pool_local_executor_pending_local_count_i32(spawn.pool) != 1 { panic(32412); };
+    let tick = ecs_task_pool_local_executor_with_local_try_tick_i32(spawn.pool);
+    if tick.ticked != true { panic(32413); };
+    if ecs_task_registry_is_finished_i32(tick.pool.local_executor.registry, spawn.handle) != true { panic(32414); };
+    if tick.pool.local_tick_count != 1 { panic(32415); };
+}
+
+@test "task pool with local executor ticks one queued local task"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 4);
+    let s1 = ecs_task_pool_local_executor_spawn_local_i32(pool, 1);
+    let s2 = ecs_task_pool_local_executor_spawn_local_i32(s1.pool, 2);
+    let tick = ecs_task_pool_local_executor_with_local_try_tick_i32(s2.pool);
+    if tick.ticked != true { panic(32420); };
+    if tick.task_id != s1.handle.task_id { panic(32421); };
+    if ecs_task_registry_is_finished_i32(tick.pool.local_executor.registry, s1.handle) != true { panic(32422); };
+    if ecs_task_registry_is_finished_i32(tick.pool.local_executor.registry, s2.handle) { panic(32423); };
+    if ecs_task_pool_local_executor_pending_local_count_i32(tick.pool) != 1 { panic(32424); };
+}
+
+@test "task pool with local executor run until idle drains locals"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 4);
+    let s1 = ecs_task_pool_local_executor_spawn_local_i32(pool, 1);
+    let s2 = ecs_task_pool_local_executor_spawn_local_i32(s1.pool, 2);
+    let s3 = ecs_task_pool_local_executor_spawn_local_i32(s2.pool, 3);
+    let run = ecs_task_pool_local_executor_with_local_run_until_idle_i32(s3.pool);
+    if run.ticked_count != 3 { panic(32430); };
+    if ecs_task_pool_local_executor_pending_local_count_i32(run.pool) != 0 { panic(32431); };
+    if run.pool.local_tick_count != 3 { panic(32432); };
+    if run.pool.with_local_executor_count != 1 { panic(32433); };
+}
+
+@test "task pool local and global executors are independent"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 4);
+    let global = ecs_task_pool_local_executor_spawn_i32(pool, 11);
+    let local = ecs_task_pool_local_executor_spawn_local_i32(global.pool, 22);
+    let local_tick = ecs_task_pool_local_executor_with_local_try_tick_i32(local.pool);
+    if ecs_task_registry_is_finished_i32(local_tick.pool.local_executor.registry, local.handle) != true { panic(32440); };
+    if ecs_task_registry_is_finished_i32(local_tick.pool.global_executor.registry, global.handle) { panic(32441); };
+    if ecs_task_pool_local_executor_pending_global_count_i32(local_tick.pool) != 1 { panic(32442); };
+    let global_tick = ecs_task_pool_local_executor_tick_global_one_i32(local_tick.pool);
+    if ecs_task_registry_is_finished_i32(global_tick.pool.global_executor.registry, global.handle) != true { panic(32443); };
+}
+
+@test "task pool spawn local records local capacity overflow"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 1);
+    let s1 = ecs_task_pool_local_executor_spawn_local_i32(pool, 1);
+    let s2 = ecs_task_pool_local_executor_spawn_local_i32(s1.pool, 2);
+    if s2.spawned { panic(32450); };
+    if s2.overflow != true { panic(32451); };
+    if s2.pool.local_spawn_count != 1 { panic(32452); };
+    if s2.pool.local_executor.overflow_count != 1 { panic(32453); };
+}
+
+@test "task pool with local executor idle still records callback"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 4);
+    let tick = ecs_task_pool_local_executor_with_local_try_tick_i32(pool);
+    if tick.ticked { panic(32460); };
+    if tick.pool.with_local_executor_count != 1 { panic(32461); };
+    if tick.pool.local_tick_count != 0 { panic(32462); };
+}
+
+@test "task pool global spawn requires global executor tick"() {
+    let pool = ecs_task_pool_local_executor_i32_new(4, 4);
+    let spawn = ecs_task_pool_local_executor_spawn_i32(pool, 77);
+    if spawn.spawned != true { panic(32470); };
+    if ecs_task_registry_is_finished_i32(spawn.pool.global_executor.registry, spawn.handle) { panic(32471); };
+    let tick = ecs_task_pool_local_executor_tick_global_one_i32(spawn.pool);
+    if tick.ticked != true { panic(32472); };
+    if ecs_task_registry_is_finished_i32(tick.pool.global_executor.registry, spawn.handle) != true { panic(32473); };
+    if tick.pool.global_tick_count != 1 { panic(32474); };
+}

@@ -1,0 +1,354 @@
+// Deepened Bevy ECS schedule::schedule::Schedules surface.
+// Mirrors src/schedule/schedule.rs Schedules (lines 46-284).
+// Shallow lib/schedules.sla covers basic insert/remove/get; this file models the
+// temporarily_removed / empty_labels contracts, ignored_scheduling_ambiguities,
+// entry-based mutation APIs, and multi-schedule configuration helpers.
+
+// === Per-schedule stub stored inside Schedules ===
+// Enough state to exercise Schedules methods without pulling full Schedule graph.
+struct EcsSchedDeepEntry {
+    label: i64,
+    schedule_id: i64,
+    // system ids added via add_systems
+    system_ids: Vec<i64>,
+    // set ids configured via configure_sets
+    set_ids: Vec<i64>,
+    // ambiguous pairs flattened (a,b,a,b,...)
+    ignore_ambiguity_pairs: Vec<i64>,
+    // build settings snapshot applied via configure_schedules / set_build_settings
+    build_settings_tag: i64,
+    // change-tick check counter (how many times check_change_ticks ran)
+    change_tick_checks: i64,
+    graph_changed: bool,
+}
+
+fn ecs_sched_deep_entry_new(label: i64, schedule_id: i64) -> EcsSchedDeepEntry {
+    return EcsSchedDeepEntry {
+        label: label,
+        schedule_id: schedule_id,
+        system_ids: Vec::new(),
+        set_ids: Vec::new(),
+        ignore_ambiguity_pairs: Vec::new(),
+        build_settings_tag: 0,
+        change_tick_checks: 0,
+        graph_changed: true,
+    };
+}
+
+fn ecs_sched_deep_entry_label(e: EcsSchedDeepEntry) -> i64 { return e.label; }
+fn ecs_sched_deep_entry_id(e: EcsSchedDeepEntry) -> i64 { return e.schedule_id; }
+fn ecs_sched_deep_entry_system_count(e: EcsSchedDeepEntry) -> i64 { return len(e.system_ids) as i64; }
+fn ecs_sched_deep_entry_set_count(e: EcsSchedDeepEntry) -> i64 { return len(e.set_ids) as i64; }
+fn ecs_sched_deep_entry_ignore_pair_count(e: EcsSchedDeepEntry) -> i64 { return (len(e.ignore_ambiguity_pairs) as i64) / 2; }
+fn ecs_sched_deep_entry_build_settings_tag(e: EcsSchedDeepEntry) -> i64 { return e.build_settings_tag; }
+fn ecs_sched_deep_entry_change_tick_checks(e: EcsSchedDeepEntry) -> i64 { return e.change_tick_checks; }
+
+// === Schedules deep container ===
+struct EcsSchedulesDeep {
+    // parallel map: labels[i] -> entries[i]
+    labels: Vec<i64>,
+    entries: Vec<EcsSchedDeepEntry>,
+    // ignored ComponentId / Resource ComponentId ambiguities
+    ignored_ambiguities: Vec<i64>,
+    temporarily_removed: Vec<i64>,
+    empty_labels: Vec<i64>,
+    // monotonic id allocator for entry() created schedules
+    next_schedule_id: i64,
+}
+
+fn ecs_schedules_deep_new() -> EcsSchedulesDeep {
+    return EcsSchedulesDeep {
+        labels: Vec::new(),
+        entries: Vec::new(),
+        ignored_ambiguities: Vec::new(),
+        temporarily_removed: Vec::new(),
+        empty_labels: Vec::new(),
+        next_schedule_id: 1,
+    };
+}
+
+fn ecs_schedules_deep_len(s: EcsSchedulesDeep) -> i64 { return len(s.labels) as i64; }
+fn ecs_schedules_deep_is_empty(s: EcsSchedulesDeep) -> bool { return len(s.labels) == 0; }
+
+fn ecs_schedules_deep_find(s: EcsSchedulesDeep, label: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(s.labels) as i64;
+    while i < n {
+        if s.labels[i] == label { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_schedules_deep_contains(s: EcsSchedulesDeep, label: i64) -> bool {
+    return ecs_schedules_deep_find(s, label) >= 0;
+}
+
+fn ecs_vec_contains_i64(v: Vec<i64>, x: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_vec_remove_i64(v: Vec<i64>, x: i64) -> (Vec<i64>, bool) {
+    let out: Vec<i64> = Vec::new();
+    let found = false;
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] == x {
+            found = true;
+        } else {
+            out.push(v[i]);
+        };
+        i = i + 1;
+    }
+    return (out, found);
+}
+
+fn ecs_vec_push_unique_i64(v: Vec<i64>, x: i64) -> Vec<i64> {
+    if ecs_vec_contains_i64(v, x) { return v; };
+    v.push(x);
+    return v;
+}
+
+// insert(schedule): clears temporarily_removed for label; replaces if present.
+// Returns (schedules, replaced, old_schedule_id). old_schedule_id=-1 if none.
+fn ecs_schedules_deep_insert(s: EcsSchedulesDeep, label: i64, schedule_id: i64) -> (EcsSchedulesDeep, bool, i64) {
+    let tr = ecs_vec_remove_i64(s.temporarily_removed, label);
+    s.temporarily_removed = tr.0;
+    let idx = ecs_schedules_deep_find(s, label);
+    if idx >= 0 {
+        let old = s.entries[idx].schedule_id;
+        s.entries[idx].schedule_id = schedule_id;
+        s.entries[idx].label = label;
+        return (s, true, old);
+    };
+    s.labels.push(label);
+    s.entries.push(ecs_sched_deep_entry_new(label, schedule_id));
+    return (s, false, -1);
+}
+
+// reinsert: same as insert for map semantics; also clears temporarily_removed.
+// Bevy comments "error if above false" meaning label should have been temporarily removed;
+// we report was_temporarily_removed flag for callers.
+fn ecs_schedules_deep_reinsert(s: EcsSchedulesDeep, label: i64, schedule_id: i64) -> (EcsSchedulesDeep, bool, bool) {
+    // (schedules, was_temporarily_removed, replaced)
+    let was_temp = ecs_vec_contains_i64(s.temporarily_removed, label);
+    let r = ecs_schedules_deep_insert(s, label, schedule_id);
+    return (r.0, was_temp, r.1);
+}
+
+// remove: permanent remove, does not touch temporarily_removed/empty_labels
+fn ecs_schedules_deep_remove(s: EcsSchedulesDeep, label: i64) -> (EcsSchedulesDeep, bool, i64) {
+    let idx = ecs_schedules_deep_find(s, label);
+    if idx < 0 { return (s, false, -1); };
+    let old_id = s.entries[idx].schedule_id;
+    let new_labels: Vec<i64> = Vec::new();
+    let new_entries: Vec<EcsSchedDeepEntry> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(s.labels) as i64;
+    while i < n {
+        if i != idx {
+            new_labels.push(s.labels[i]);
+            new_entries.push(s.entries[i]);
+        };
+        i = i + 1;
+    }
+    s.labels = new_labels;
+    s.entries = new_entries;
+    return (s, true, old_id);
+}
+
+// remove_temporarily:
+//   if present: remove from inner, insert temporarily_removed, remove from empty_labels
+//   if absent: insert empty_labels
+fn ecs_schedules_deep_remove_temporarily(s: EcsSchedulesDeep, label: i64) -> (EcsSchedulesDeep, bool, i64) {
+    let r = ecs_schedules_deep_remove(s, label);
+    s = r.0;
+    if r.1 {
+        s.temporarily_removed = ecs_vec_push_unique_i64(s.temporarily_removed, label);
+        let el = ecs_vec_remove_i64(s.empty_labels, label);
+        s.empty_labels = el.0;
+        return (s, true, r.2);
+    };
+    s.empty_labels = ecs_vec_push_unique_i64(s.empty_labels, label);
+    return (s, false, -1);
+}
+
+// remove_entry: like remove, returns (found, label, schedule_id)
+fn ecs_schedules_deep_remove_entry(s: EcsSchedulesDeep, label: i64) -> (EcsSchedulesDeep, bool, i64, i64) {
+    let r = ecs_schedules_deep_remove(s, label);
+    if r.1 { return (r.0, true, label, r.2); };
+    return (r.0, false, label, -1);
+}
+
+fn ecs_schedules_deep_get(s: EcsSchedulesDeep, label: i64) -> (bool, EcsSchedDeepEntry) {
+    let idx = ecs_schedules_deep_find(s, label);
+    if idx < 0 {
+        return (false, ecs_sched_deep_entry_new(-1, -1));
+    };
+    return (true, s.entries[idx]);
+}
+
+// entry: get or create Schedule::new(label)
+fn ecs_schedules_deep_entry(s: EcsSchedulesDeep, label: i64) -> (EcsSchedulesDeep, i64) {
+    let idx = ecs_schedules_deep_find(s, label);
+    if idx >= 0 { return (s, idx); };
+    let id = s.next_schedule_id;
+    s.next_schedule_id = s.next_schedule_id + 1;
+    let r = ecs_schedules_deep_insert(s, label, id);
+    s = r.0;
+    let idx2 = ecs_schedules_deep_find(s, label);
+    return (s, idx2);
+}
+
+fn ecs_schedules_deep_temporarily_removed(s: EcsSchedulesDeep) -> Vec<i64> {
+    return s.temporarily_removed;
+}
+
+fn ecs_schedules_deep_empty_labels(s: EcsSchedulesDeep) -> Vec<i64> {
+    return s.empty_labels;
+}
+
+fn ecs_schedules_deep_temporarily_removed_count(s: EcsSchedulesDeep) -> i64 {
+    return len(s.temporarily_removed) as i64;
+}
+
+fn ecs_schedules_deep_empty_labels_count(s: EcsSchedulesDeep) -> i64 {
+    return len(s.empty_labels) as i64;
+}
+
+fn ecs_schedules_deep_is_temporarily_removed(s: EcsSchedulesDeep, label: i64) -> bool {
+    return ecs_vec_contains_i64(s.temporarily_removed, label);
+}
+
+fn ecs_schedules_deep_is_empty_label(s: EcsSchedulesDeep, label: i64) -> bool {
+    return ecs_vec_contains_i64(s.empty_labels, label);
+}
+
+// configure_schedules: apply build settings tag to all present schedules
+fn ecs_schedules_deep_configure_schedules(s: EcsSchedulesDeep, build_settings_tag: i64) -> EcsSchedulesDeep {
+    let i: i64 = 0;
+    let n: i64 = len(s.entries) as i64;
+    while i < n {
+        s.entries[i].build_settings_tag = build_settings_tag;
+        i = i + 1;
+    }
+    return s;
+}
+
+// allow_ambiguous_component / allow_ambiguous_resource: insert ComponentId
+fn ecs_schedules_deep_allow_ambiguous_component(s: EcsSchedulesDeep, component_id: i64) -> EcsSchedulesDeep {
+    s.ignored_ambiguities = ecs_vec_push_unique_i64(s.ignored_ambiguities, component_id);
+    return s;
+}
+
+fn ecs_schedules_deep_allow_ambiguous_resource(s: EcsSchedulesDeep, component_id: i64) -> EcsSchedulesDeep {
+    // Bevy registers resource as a component id; same set
+    s.ignored_ambiguities = ecs_vec_push_unique_i64(s.ignored_ambiguities, component_id);
+    return s;
+}
+
+fn ecs_schedules_deep_ignored_ambiguities_count(s: EcsSchedulesDeep) -> i64 {
+    return len(s.ignored_ambiguities) as i64;
+}
+
+fn ecs_schedules_deep_ignored_ambiguities(s: EcsSchedulesDeep) -> Vec<i64> {
+    return s.ignored_ambiguities;
+}
+
+fn ecs_schedules_deep_contains_ignored_ambiguity(s: EcsSchedulesDeep, id: i64) -> bool {
+    return ecs_vec_contains_i64(s.ignored_ambiguities, id);
+}
+
+// print_ignored_ambiguities proxy: returns count of lines that would be printed
+fn ecs_schedules_deep_print_ignored_ambiguities_count(s: EcsSchedulesDeep) -> i64 {
+    return len(s.ignored_ambiguities) as i64;
+}
+
+// add_systems: entry(schedule).add_systems(...)
+fn ecs_schedules_deep_add_systems(s: EcsSchedulesDeep, label: i64, system_id: i64) -> EcsSchedulesDeep {
+    let r = ecs_schedules_deep_entry(s, label);
+    s = r.0;
+    let idx = r.1;
+    s.entries[idx].system_ids.push(system_id);
+    s.entries[idx].graph_changed = true;
+    return s;
+}
+
+// configure_sets: entry(schedule).configure_sets(...)
+fn ecs_schedules_deep_configure_sets(s: EcsSchedulesDeep, label: i64, set_id: i64) -> EcsSchedulesDeep {
+    let r = ecs_schedules_deep_entry(s, label);
+    s = r.0;
+    let idx = r.1;
+    s.entries[idx].set_ids.push(set_id);
+    s.entries[idx].graph_changed = true;
+    return s;
+}
+
+// ignore_ambiguity: entry(schedule).ignore_ambiguity(a,b)
+fn ecs_schedules_deep_ignore_ambiguity(s: EcsSchedulesDeep, label: i64, a: i64, b: i64) -> EcsSchedulesDeep {
+    let r = ecs_schedules_deep_entry(s, label);
+    s = r.0;
+    let idx = r.1;
+    s.entries[idx].ignore_ambiguity_pairs.push(a);
+    s.entries[idx].ignore_ambiguity_pairs.push(b);
+    return s;
+}
+
+// remove_systems_in_set: get_mut required; error if schedule not found
+// Returns (ok, removed_count, schedules). ok=false => ScheduleNotFound
+fn ecs_schedules_deep_remove_systems_in_set(s: EcsSchedulesDeep, label: i64, set_id: i64) -> (bool, i64, EcsSchedulesDeep) {
+    let idx = ecs_schedules_deep_find(s, label);
+    if idx < 0 { return (false, 0, s); };
+    // Model: systems "in set" are those whose system_id == set_id for simplicity of the
+    // Schedules facade (full membership lives in ScheduleGraph). Count+filter matches.
+    let kept: Vec<i64> = Vec::new();
+    let removed: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(s.entries[idx].system_ids) as i64;
+    while i < n {
+        if s.entries[idx].system_ids[i] == set_id {
+            removed = removed + 1;
+        } else {
+            kept.push(s.entries[idx].system_ids[i]);
+        };
+        i = i + 1;
+    }
+    s.entries[idx].system_ids = kept;
+    if removed > 0 { s.entries[idx].graph_changed = true; };
+    return (true, removed, s);
+}
+
+// check_change_ticks: iterate all schedules
+fn ecs_schedules_deep_check_change_ticks(s: EcsSchedulesDeep) -> EcsSchedulesDeep {
+    let i: i64 = 0;
+    let n: i64 = len(s.entries) as i64;
+    while i < n {
+        s.entries[i].change_tick_checks = s.entries[i].change_tick_checks + 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+// iter labels (undefined order; we preserve insertion order)
+fn ecs_schedules_deep_iter_labels(s: EcsSchedulesDeep) -> Vec<i64> {
+    return s.labels;
+}
+
+fn ecs_schedules_deep_entry_at(s: EcsSchedulesDeep, index: i64) -> (bool, EcsSchedDeepEntry) {
+    if index < 0 || index >= (len(s.entries) as i64) {
+        return (false, ecs_sched_deep_entry_new(-1, -1));
+    };
+    return (true, s.entries[index]);
+}
+
+// ScheduleError::ScheduleNotFound proxy for remove_systems_in_set failure
+const ECS_SCHEDULE_ERR_NOT_FOUND: i32 = 1;
+
+fn ecs_schedule_error_not_found() -> i32 { return ECS_SCHEDULE_ERR_NOT_FOUND; }

@@ -1,0 +1,1312 @@
+// Deepened Bevy ECS deferred command queue for the generic relationship runtime.
+// (shallow lib/commands_relationship.sla deep; src/system/commands/relationship.rs.)
+//
+// Mirrors the shallow RelationshipCommands queue but replaces the Vec<RelationshipCommand> +
+// Vec<RelationshipCommandEntityList> pool + boxed entity lists + RelationshipWorld generics
+// with fixed-cap-8 kind-discriminated command storage + a cap-8 x cap-4 entity-list pool +
+// a cap-2 relationship-kind registry x cap-8 sources-target adjacency. No Vec, no recursion,
+// no generic types. command kinds mirror the shallow const set (1..9).
+//
+// Kinds (mirror shallow `RELATIONSHIP_COMMAND_*`):
+//   SET_RELATED=1, ADD_RELATED=2, INSERT_RELATED=3, REMOVE_RELATED=4,
+//   DETACH_ALL_RELATED=5, REPLACE_RELATED=6, REPLACE_RELATED_WITH_DIFFERENCE=7,
+//   DESPAWN=8, DESPAWN_RELATED=9.
+// SET_RELATED carries a single source (slot field) + an index. ADD/INSERT/REMOVE/REPLACE
+// reference one entity-list (related_index). REPLACE_DIFF references three (unrelate/related/
+// newly). DETACH_ALL_RELATED / DESPAWN_RELATED / DESPAWN carry no list-side payload.
+//
+// Critical SLA constraints observed (see progress.md / tasks.md cookbook):
+//  - field-assign on struct-by-value params is SLA-legal on SA (Batch 374); set_slot uses the
+//    flat `if idx == N { q.kN = ...; return q; };` cascade-of-return form. Per Batch 378, SA
+//    SWALLOWS `buf = some_fn(buf, x)` inside `if cond { ... }` and `while` bodies, so apply
+//    is a flat let-ladder over the 8 queue slots and accumulators use flat b1..bN ladders.
+//  - apply RESETS the returned queue count to 0 (Batch 380 finding) so chained applies only
+//    run newly-queued commands (matches shallow `relationship_commands_apply` returning a
+//    fresh empty RelationshipCommands).
+//  - Tuple-return callsites replaced with wrapper structs (Batch 373 avoidance rule):
+//    EcsRelCmdApplyDeep { world, state } for apply; EcsRelCmdReserveDeep / EcsRelCmdSpawnRelDeep
+//    for reserve_entity / spawn_related; EcsRelCmdStoreListDeep for store_entity_list — each
+//    with scalar split accessors. No tuple-return destructuring in tests.
+
+const ECS_RELCMD_CAP_DEEP: i32 = 8;
+const ECS_RELCMD_LIST_CAP_DEEP: i32 = 4;
+const ECS_RELCMD_KIND_CAP_DEEP: i32 = 2;
+
+const ECS_RELCMD_SET_RELATED: i32 = 1;
+const ECS_RELCMD_ADD_RELATED: i32 = 2;
+const ECS_RELCMD_INSERT_RELATED: i32 = 3;
+const ECS_RELCMD_REMOVE_RELATED: i32 = 4;
+const ECS_RELCMD_DETACH_ALL_RELATED: i32 = 5;
+const ECS_RELCMD_REPLACE_RELATED: i32 = 6;
+const ECS_RELCMD_REPLACE_DIFF: i32 = 7;
+const ECS_RELCMD_DESPAWN: i32 = 8;
+const ECS_RELCMD_DESPAWN_RELATED: i32 = 9;
+
+const ECS_RELCMD_INDEX_MAX: i64 = 2147483647;
+
+// ── Command queue (cap-8) ───────────────────────────────────────────────────
+struct EcsRelCmdsDeep {
+    k0: i32, k1: i32, k2: i32, k3: i32, k4: i32, k5: i32, k6: i32, k7: i32,
+    kid0: i32, kid1: i32, kid2: i32, kid3: i32, kid4: i32, kid5: i32, kid6: i32, kid7: i32,
+    t0: i64, t1: i64, t2: i64, t3: i64, t4: i64, t5: i64, t6: i64, t7: i64,
+    s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64,
+    i0: i64, i1: i64, i2: i64, i3: i64, i4: i64, i5: i64, i6: i64, i7: i64,
+    r0: i32, r1: i32, r2: i32, r3: i32, r4: i32, r5: i32, r6: i32, r7: i32,
+    u0: i32, u1: i32, u2: i32, u3: i32, u4: i32, u5: i32, u6: i32, u7: i32,
+    n0: i32, n1: i32, n2: i32, n3: i32, n4: i32, n5: i32, n6: i32, n7: i32,
+    count: i32,
+}
+
+fn ecs_rel_cmds_deep_new() -> EcsRelCmdsDeep {
+    let c = EcsRelCmdsDeep {
+        k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0,
+        kid0: 0, kid1: 0, kid2: 0, kid3: 0, kid4: 0, kid5: 0, kid6: 0, kid7: 0,
+        t0: -1, t1: -1, t2: -1, t3: -1, t4: -1, t5: -1, t6: -1, t7: -1,
+        s0: -1, s1: -1, s2: -1, s3: -1, s4: -1, s5: -1, s6: -1, s7: -1,
+        i0: 0, i1: 0, i2: 0, i3: 0, i4: 0, i5: 0, i6: 0, i7: 0,
+        r0: -1, r1: -1, r2: -1, r3: -1, r4: -1, r5: -1, r6: -1, r7: -1,
+        u0: -1, u1: -1, u2: -1, u3: -1, u4: -1, u5: -1, u6: -1, u7: -1,
+        n0: -1, n1: -1, n2: -1, n3: -1, n4: -1, n5: -1, n6: -1, n7: -1,
+        count: 0,
+    };
+    return c;
+}
+
+fn ecs_rel_cmds_deep_len(c: EcsRelCmdsDeep) -> i32 { return c.count; }
+
+fn ecs_rel_cmds_deep_kind_at(c: EcsRelCmdsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.k0; };
+    if idx == 1 { return c.k1; };
+    if idx == 2 { return c.k2; };
+    if idx == 3 { return c.k3; };
+    if idx == 4 { return c.k4; };
+    if idx == 5 { return c.k5; };
+    if idx == 6 { return c.k6; };
+    return c.k7;
+}
+
+fn ecs_rel_cmds_deep_kind_id_at(c: EcsRelCmdsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.kid0; };
+    if idx == 1 { return c.kid1; };
+    if idx == 2 { return c.kid2; };
+    if idx == 3 { return c.kid3; };
+    if idx == 4 { return c.kid4; };
+    if idx == 5 { return c.kid5; };
+    if idx == 6 { return c.kid6; };
+    return c.kid7;
+}
+
+fn ecs_rel_cmds_deep_target_at(c: EcsRelCmdsDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.t0; };
+    if idx == 1 { return c.t1; };
+    if idx == 2 { return c.t2; };
+    if idx == 3 { return c.t3; };
+    if idx == 4 { return c.t4; };
+    if idx == 5 { return c.t5; };
+    if idx == 6 { return c.t6; };
+    return c.t7;
+}
+
+fn ecs_rel_cmds_deep_source_at(c: EcsRelCmdsDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.s0; };
+    if idx == 1 { return c.s1; };
+    if idx == 2 { return c.s2; };
+    if idx == 3 { return c.s3; };
+    if idx == 4 { return c.s4; };
+    if idx == 5 { return c.s5; };
+    if idx == 6 { return c.s6; };
+    return c.s7;
+}
+
+fn ecs_rel_cmds_deep_index_at(c: EcsRelCmdsDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.i0; };
+    if idx == 1 { return c.i1; };
+    if idx == 2 { return c.i2; };
+    if idx == 3 { return c.i3; };
+    if idx == 4 { return c.i4; };
+    if idx == 5 { return c.i5; };
+    if idx == 6 { return c.i6; };
+    return c.i7;
+}
+
+fn ecs_rel_cmds_deep_related_index_at(c: EcsRelCmdsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.r0; };
+    if idx == 1 { return c.r1; };
+    if idx == 2 { return c.r2; };
+    if idx == 3 { return c.r3; };
+    if idx == 4 { return c.r4; };
+    if idx == 5 { return c.r5; };
+    if idx == 6 { return c.r6; };
+    return c.r7;
+}
+
+fn ecs_rel_cmds_deep_unrelate_index_at(c: EcsRelCmdsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.u0; };
+    if idx == 1 { return c.u1; };
+    if idx == 2 { return c.u2; };
+    if idx == 3 { return c.u3; };
+    if idx == 4 { return c.u4; };
+    if idx == 5 { return c.u5; };
+    if idx == 6 { return c.u6; };
+    return c.u7;
+}
+
+fn ecs_rel_cmds_deep_newly_index_at(c: EcsRelCmdsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.n0; };
+    if idx == 1 { return c.n1; };
+    if idx == 2 { return c.n2; };
+    if idx == 3 { return c.n3; };
+    if idx == 4 { return c.n4; };
+    if idx == 5 { return c.n5; };
+    if idx == 6 { return c.n6; };
+    return c.n7;
+}
+
+// ── Entity-list pool (cap-8 lists × cap-4 entities) ──────────────────────────
+struct EcsRelCmdListPoolDeep {
+    e0_0: i64, e0_1: i64, e0_2: i64, e0_3: i64,
+    e1_0: i64, e1_1: i64, e1_2: i64, e1_3: i64,
+    e2_0: i64, e2_1: i64, e2_2: i64, e2_3: i64,
+    e3_0: i64, e3_1: i64, e3_2: i64, e3_3: i64,
+    e4_0: i64, e4_1: i64, e4_2: i64, e4_3: i64,
+    e5_0: i64, e5_1: i64, e5_2: i64, e5_3: i64,
+    e6_0: i64, e6_1: i64, e6_2: i64, e6_3: i64,
+    e7_0: i64, e7_1: i64, e7_2: i64, e7_3: i64,
+    n0: i32, n1: i32, n2: i32, n3: i32, n4: i32, n5: i32, n6: i32, n7: i32,
+    pool_count: i32,
+}
+
+fn ecs_rel_cmd_list_pool_deep_new() -> EcsRelCmdListPoolDeep {
+    let p = EcsRelCmdListPoolDeep {
+        e0_0: 0, e0_1: 0, e0_2: 0, e0_3: 0,
+        e1_0: 0, e1_1: 0, e1_2: 0, e1_3: 0,
+        e2_0: 0, e2_1: 0, e2_2: 0, e2_3: 0,
+        e3_0: 0, e3_1: 0, e3_2: 0, e3_3: 0,
+        e4_0: 0, e4_1: 0, e4_2: 0, e4_3: 0,
+        e5_0: 0, e5_1: 0, e5_2: 0, e5_3: 0,
+        e6_0: 0, e6_1: 0, e6_2: 0, e6_3: 0,
+        e7_0: 0, e7_1: 0, e7_2: 0, e7_3: 0,
+        n0: 0, n1: 0, n2: 0, n3: 0, n4: 0, n5: 0, n6: 0, n7: 0,
+        pool_count: 0,
+    };
+    return p;
+}
+
+fn _ecs_rel_cmd_list_pool_push_slot(p: EcsRelCmdListPoolDeep, list_idx: i32, e: i64) -> EcsRelCmdListPoolDeep {
+    if list_idx == 0 {
+        if p.n0 == 0 { p.e0_0 = e; p.n0 = 1; return p; };
+        if p.n0 == 1 { p.e0_1 = e; p.n0 = 2; return p; };
+        if p.n0 == 2 { p.e0_2 = e; p.n0 = 3; return p; };
+        if p.n0 == 3 { p.e0_3 = e; p.n0 = 4; return p; };
+        return p;
+    };
+    if list_idx == 1 {
+        if p.n1 == 0 { p.e1_0 = e; p.n1 = 1; return p; };
+        if p.n1 == 1 { p.e1_1 = e; p.n1 = 2; return p; };
+        if p.n1 == 2 { p.e1_2 = e; p.n1 = 3; return p; };
+        if p.n1 == 3 { p.e1_3 = e; p.n1 = 4; return p; };
+        return p;
+    };
+    if list_idx == 2 {
+        if p.n2 == 0 { p.e2_0 = e; p.n2 = 1; return p; };
+        if p.n2 == 1 { p.e2_1 = e; p.n2 = 2; return p; };
+        if p.n2 == 2 { p.e2_2 = e; p.n2 = 3; return p; };
+        if p.n2 == 3 { p.e2_3 = e; p.n2 = 4; return p; };
+        return p;
+    };
+    if list_idx == 3 {
+        if p.n3 == 0 { p.e3_0 = e; p.n3 = 1; return p; };
+        if p.n3 == 1 { p.e3_1 = e; p.n3 = 2; return p; };
+        if p.n3 == 2 { p.e3_2 = e; p.n3 = 3; return p; };
+        if p.n3 == 3 { p.e3_3 = e; p.n3 = 4; return p; };
+        return p;
+    };
+    if list_idx == 4 {
+        if p.n4 == 0 { p.e4_0 = e; p.n4 = 1; return p; };
+        if p.n4 == 1 { p.e4_1 = e; p.n4 = 2; return p; };
+        if p.n4 == 2 { p.e4_2 = e; p.n4 = 3; return p; };
+        if p.n4 == 3 { p.e4_3 = e; p.n4 = 4; return p; };
+        return p;
+    };
+    if list_idx == 5 {
+        if p.n5 == 0 { p.e5_0 = e; p.n5 = 1; return p; };
+        if p.n5 == 1 { p.e5_1 = e; p.n5 = 2; return p; };
+        if p.n5 == 2 { p.e5_2 = e; p.n5 = 3; return p; };
+        if p.n5 == 3 { p.e5_3 = e; p.n5 = 4; return p; };
+        return p;
+    };
+    if list_idx == 6 {
+        if p.n6 == 0 { p.e6_0 = e; p.n6 = 1; return p; };
+        if p.n6 == 1 { p.e6_1 = e; p.n6 = 2; return p; };
+        if p.n6 == 2 { p.e6_2 = e; p.n6 = 3; return p; };
+        if p.n6 == 3 { p.e6_3 = e; p.n6 = 4; return p; };
+        return p;
+    };
+    if p.n7 == 0 { p.e7_0 = e; p.n7 = 1; return p; };
+    if p.n7 == 1 { p.e7_1 = e; p.n7 = 2; return p; };
+    if p.n7 == 2 { p.e7_2 = e; p.n7 = 3; return p; };
+    if p.n7 == 3 { p.e7_3 = e; p.n7 = 4; return p; };
+    return p;
+}
+
+fn _ecs_rel_cmd_list_pool_len(p: EcsRelCmdListPoolDeep, list_idx: i32) -> i32 {
+    if list_idx == 0 { return p.n0; };
+    if list_idx == 1 { return p.n1; };
+    if list_idx == 2 { return p.n2; };
+    if list_idx == 3 { return p.n3; };
+    if list_idx == 4 { return p.n4; };
+    if list_idx == 5 { return p.n5; };
+    if list_idx == 6 { return p.n6; };
+    return p.n7;
+}
+
+fn _ecs_rel_cmd_list_pool_at(p: EcsRelCmdListPoolDeep, list_idx: i32, k: i32) -> i64 {
+    if list_idx == 0 {
+        if k == 0 { return p.e0_0; };
+        if k == 1 { return p.e0_1; };
+        if k == 2 { return p.e0_2; };
+        return p.e0_3;
+    };
+    if list_idx == 1 {
+        if k == 0 { return p.e1_0; };
+        if k == 1 { return p.e1_1; };
+        if k == 2 { return p.e1_2; };
+        return p.e1_3;
+    };
+    if list_idx == 2 {
+        if k == 0 { return p.e2_0; };
+        if k == 1 { return p.e2_1; };
+        if k == 2 { return p.e2_2; };
+        return p.e2_3;
+    };
+    if list_idx == 3 {
+        if k == 0 { return p.e3_0; };
+        if k == 1 { return p.e3_1; };
+        if k == 2 { return p.e3_2; };
+        return p.e3_3;
+    };
+    if list_idx == 4 {
+        if k == 0 { return p.e4_0; };
+        if k == 1 { return p.e4_1; };
+        if k == 2 { return p.e4_2; };
+        return p.e4_3;
+    };
+    if list_idx == 5 {
+        if k == 0 { return p.e5_0; };
+        if k == 1 { return p.e5_1; };
+        if k == 2 { return p.e5_2; };
+        return p.e5_3;
+    };
+    if list_idx == 6 {
+        if k == 0 { return p.e6_0; };
+        if k == 1 { return p.e6_1; };
+        if k == 2 { return p.e6_2; };
+        return p.e6_3;
+    };
+    if k == 0 { return p.e7_0; };
+    if k == 1 { return p.e7_1; };
+    if k == 2 { return p.e7_2; };
+    return p.e7_3;
+}
+
+// ── Combined command state (queue + list pool) ───────────────────────────────
+struct EcsRelCmdStateDeep {
+    queue: EcsRelCmdsDeep,
+    pool: EcsRelCmdListPoolDeep,
+}
+
+fn ecs_rel_cmd_state_deep_new() -> EcsRelCmdStateDeep {
+    let s = EcsRelCmdStateDeep {
+        queue: ecs_rel_cmds_deep_new(),
+        pool: ecs_rel_cmd_list_pool_deep_new(),
+    };
+    return s;
+}
+
+fn ecs_rel_cmd_state_deep_len(s: EcsRelCmdStateDeep) -> i32 { return ecs_rel_cmds_deep_len(s.queue); }
+fn ecs_rel_cmd_state_deep_list_len(s: EcsRelCmdStateDeep, list_idx: i32) -> i32 { return _ecs_rel_cmd_list_pool_len(s.pool, list_idx); }
+fn ecs_rel_cmd_state_deep_list_at(s: EcsRelCmdStateDeep, list_idx: i32, k: i32) -> i64 { return _ecs_rel_cmd_list_pool_at(s.pool, list_idx, k); }
+fn ecs_rel_cmd_state_deep_kind_at(s: EcsRelCmdStateDeep, idx: i32) -> i32 { return ecs_rel_cmds_deep_kind_at(s.queue, idx); }
+fn ecs_rel_cmd_state_deep_kind_id_at(s: EcsRelCmdStateDeep, idx: i32) -> i32 { return ecs_rel_cmds_deep_kind_id_at(s.queue, idx); }
+fn ecs_rel_cmd_state_deep_target_at(s: EcsRelCmdStateDeep, idx: i32) -> i64 { return ecs_rel_cmds_deep_target_at(s.queue, idx); }
+fn ecs_rel_cmd_state_deep_source_at(s: EcsRelCmdStateDeep, idx: i32) -> i64 { return ecs_rel_cmds_deep_source_at(s.queue, idx); }
+fn ecs_rel_cmd_state_deep_related_index_at(s: EcsRelCmdStateDeep, idx: i32) -> i32 { return ecs_rel_cmds_deep_related_index_at(s.queue, idx); }
+
+// set_slot on the queue (field-assign cascade-of-return; Batch 374/366/377 form).
+fn _ecs_rel_cmds_deep_set_slot(q: EcsRelCmdsDeep, idx: i32, k: i32, kid: i32, t: i64, s: i64, ins: i64, r: i32, u: i32, n: i32) -> EcsRelCmdsDeep {
+    if idx == 0 { q.k0 = k; q.kid0 = kid; q.t0 = t; q.s0 = s; q.i0 = ins; q.r0 = r; q.u0 = u; q.n0 = n; return q; };
+    if idx == 1 { q.k1 = k; q.kid1 = kid; q.t1 = t; q.s1 = s; q.i1 = ins; q.r1 = r; q.u1 = u; q.n1 = n; return q; };
+    if idx == 2 { q.k2 = k; q.kid2 = kid; q.t2 = t; q.s2 = s; q.i2 = ins; q.r2 = r; q.u2 = u; q.n2 = n; return q; };
+    if idx == 3 { q.k3 = k; q.kid3 = kid; q.t3 = t; q.s3 = s; q.i3 = ins; q.r3 = r; q.u3 = u; q.n3 = n; return q; };
+    if idx == 4 { q.k4 = k; q.kid4 = kid; q.t4 = t; q.s4 = s; q.i4 = ins; q.r4 = r; q.u4 = u; q.n4 = n; return q; };
+    if idx == 5 { q.k5 = k; q.kid5 = kid; q.t5 = t; q.s5 = s; q.i5 = ins; q.r5 = r; q.u5 = u; q.n5 = n; return q; };
+    if idx == 6 { q.k6 = k; q.kid6 = kid; q.t6 = t; q.s6 = s; q.i6 = ins; q.r6 = r; q.u6 = u; q.n6 = n; return q; };
+    q.k7 = k; q.kid7 = kid; q.t7 = t; q.s7 = s; q.i7 = ins; q.r7 = r; q.u7 = u; q.n7 = n;
+    return q;
+}
+
+// ── store_entity_list wrapper (avoids tuple destructure; Batch 373 rule) ────
+struct EcsRelCmdStoreListDeep {
+    state: EcsRelCmdStateDeep,
+    index: i32,
+}
+fn ecs_rel_cmd_store_list_state(r: EcsRelCmdStoreListDeep) -> EcsRelCmdStateDeep { return r.state; }
+fn ecs_rel_cmd_store_list_index(r: EcsRelCmdStoreListDeep) -> i32 { return r.index; }
+
+// Store a single-entity list and return the list index in the pool.
+fn _ecs_rel_cmds_deep_store_one(s: EcsRelCmdStateDeep, e: i64) -> EcsRelCmdStoreListDeep {
+    let slot = s.pool.pool_count;
+    if s.pool.pool_count < ECS_RELCMD_CAP_DEEP { s.pool.pool_count = s.pool.pool_count + 1; };
+    let p = _ecs_rel_cmd_list_pool_push_slot(s.pool, slot, e);
+    s.pool = p;
+    let r = EcsRelCmdStoreListDeep { state: s, index: slot };
+    return r;
+}
+
+// ── Public command setters ──────────────────────────────────────────────────
+// Each mirrors a shallow `relationship_commands_*` push. Cap-8 reject is silent (state unchanged).
+
+fn ecs_rel_cmds_deep_set_related(s: EcsRelCmdStateDeep, kind_id: i32, source: i64, target: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let q = _ecs_rel_cmds_deep_set_slot(s.queue, s.queue.count, ECS_RELCMD_SET_RELATED, kind_id, target, source, ECS_RELCMD_INDEX_MAX, -1, -1, -1);
+    q.count = q.count + 1;
+    s.queue = q;
+    return s;
+}
+
+fn ecs_rel_cmds_deep_add_related(s: EcsRelCmdStateDeep, kind_id: i32, target: i64, child: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let stored = _ecs_rel_cmds_deep_store_one(s, child);
+    let s2 = ecs_rel_cmd_store_list_state(stored);
+    let ridx = ecs_rel_cmd_store_list_index(stored);
+    let q = _ecs_rel_cmds_deep_set_slot(s2.queue, s2.queue.count, ECS_RELCMD_ADD_RELATED, kind_id, target, -1, ECS_RELCMD_INDEX_MAX, ridx, -1, -1);
+    q.count = q.count + 1;
+    s2.queue = q;
+    return s2;
+}
+
+fn ecs_rel_cmds_deep_insert_related(s: EcsRelCmdStateDeep, kind_id: i32, target: i64, index: i64, child: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let stored = _ecs_rel_cmds_deep_store_one(s, child);
+    let s2 = ecs_rel_cmd_store_list_state(stored);
+    let ridx = ecs_rel_cmd_store_list_index(stored);
+    let q = _ecs_rel_cmds_deep_set_slot(s2.queue, s2.queue.count, ECS_RELCMD_INSERT_RELATED, kind_id, target, -1, index, ridx, -1, -1);
+    q.count = q.count + 1;
+    s2.queue = q;
+    return s2;
+}
+
+fn ecs_rel_cmds_deep_remove_related(s: EcsRelCmdStateDeep, kind_id: i32, target: i64, child: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let stored = _ecs_rel_cmds_deep_store_one(s, child);
+    let s2 = ecs_rel_cmd_store_list_state(stored);
+    let ridx = ecs_rel_cmd_store_list_index(stored);
+    let q = _ecs_rel_cmds_deep_set_slot(s2.queue, s2.queue.count, ECS_RELCMD_REMOVE_RELATED, kind_id, target, -1, 0, ridx, -1, -1);
+    q.count = q.count + 1;
+    s2.queue = q;
+    return s2;
+}
+
+fn ecs_rel_cmds_deep_detach_all_related(s: EcsRelCmdStateDeep, kind_id: i32, target: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let q = _ecs_rel_cmds_deep_set_slot(s.queue, s.queue.count, ECS_RELCMD_DETACH_ALL_RELATED, kind_id, target, -1, 0, -1, -1, -1);
+    q.count = q.count + 1;
+    s.queue = q;
+    return s;
+}
+
+fn ecs_rel_cmds_deep_replace_related(s: EcsRelCmdStateDeep, kind_id: i32, target: i64, child: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let stored = _ecs_rel_cmds_deep_store_one(s, child);
+    let s2 = ecs_rel_cmd_store_list_state(stored);
+    let ridx = ecs_rel_cmd_store_list_index(stored);
+    let q = _ecs_rel_cmds_deep_set_slot(s2.queue, s2.queue.count, ECS_RELCMD_REPLACE_RELATED, kind_id, target, -1, 0, ridx, -1, -1);
+    q.count = q.count + 1;
+    s2.queue = q;
+    return s2;
+}
+
+// Build a three-list store (unrelate / relate / newly) using sequential store_one calls.
+fn ecs_rel_cmds_deep_replace_diff(s: EcsRelCmdStateDeep, kind_id: i32, target: i64, unrelate: i64, relate: i64, newly: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let st1 = _ecs_rel_cmds_deep_store_one(s, unrelate);
+    let s1 = ecs_rel_cmd_store_list_state(st1);
+    let uidx = ecs_rel_cmd_store_list_index(st1);
+    let st2 = _ecs_rel_cmds_deep_store_one(s1, relate);
+    let s2 = ecs_rel_cmd_store_list_state(st2);
+    let ridx = ecs_rel_cmd_store_list_index(st2);
+    let st3 = _ecs_rel_cmds_deep_store_one(s2, newly);
+    let s3 = ecs_rel_cmd_store_list_state(st3);
+    let nidx = ecs_rel_cmd_store_list_index(st3);
+    let q = _ecs_rel_cmds_deep_set_slot(s3.queue, s3.queue.count, ECS_RELCMD_REPLACE_DIFF, kind_id, target, -1, 0, ridx, uidx, nidx);
+    q.count = q.count + 1;
+    s3.queue = q;
+    return s3;
+}
+
+fn ecs_rel_cmds_deep_despawn(s: EcsRelCmdStateDeep, entity: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let q = _ecs_rel_cmds_deep_set_slot(s.queue, s.queue.count, ECS_RELCMD_DESPAWN, 0, entity, -1, 0, -1, -1, -1);
+    q.count = q.count + 1;
+    s.queue = q;
+    return s;
+}
+
+fn ecs_rel_cmds_deep_despawn_related(s: EcsRelCmdStateDeep, kind_id: i32, target: i64) -> EcsRelCmdStateDeep {
+    if s.queue.count >= ECS_RELCMD_CAP_DEEP { return s; };
+    let q = _ecs_rel_cmds_deep_set_slot(s.queue, s.queue.count, ECS_RELCMD_DESPAWN_RELATED, kind_id, target, -1, 0, -1, -1, -1);
+    q.count = q.count + 1;
+    s.queue = q;
+    return s;
+}
+
+// clear — reset queue count to 0 (Batch 380 cleared-helper form).
+fn ecs_rel_cmds_deep_clear(s: EcsRelCmdStateDeep) -> EcsRelCmdStateDeep {
+    s.queue.count = 0;
+    return s;
+}
+
+// ── Relationship world (cap-2 kinds × cap-8 source→target adjacency) ───────
+// Each kind slot holds up to 8 (src→tgt) directed pairs + a linked_despawn flag +
+// per-kind entity-alive-aware despawn. Entities are plain i64 ids. The shallow
+// `relationship_world_register_many/register_one` registers a kind with (link_despawn,
+// one_to_one) flags; we model the kind_id 0/1 registry inline here with cap-2 kinds.
+struct EcsRelCmdWorldDeep {
+    // kind 0
+    kind0_id: i32, kind0_link: i32, kind0_one: i32, kind0_reg: i32,
+    k0src0: i64, k0src1: i64, k0src2: i64, k0src3: i64, k0src4: i64, k0src5: i64, k0src6: i64, k0src7: i64,
+    k0tgt0: i64, k0tgt1: i64, k0tgt2: i64, k0tgt3: i64, k0tgt4: i64, k0tgt5: i64, k0tgt6: i64, k0tgt7: i64,
+    k0cnt: i32,
+    // kind 1
+    kind1_id: i32, kind1_link: i32, kind1_one: i32, kind1_reg: i32,
+    k1src0: i64, k1src1: i64, k1src2: i64, k1src3: i64, k1src4: i64, k1src5: i64, k1src6: i64, k1src7: i64,
+    k1tgt0: i64, k1tgt1: i64, k1tgt2: i64, k1tgt3: i64, k1tgt4: i64, k1tgt5: i64, k1tgt6: i64, k1tgt7: i64,
+    k1cnt: i32,
+    next_entity: i64,
+    alive0: i32, alive1: i32, alive2: i32, alive3: i32, alive4: i32, alive5: i32, alive6: i32, alive7: i32, alive8: i32,
+}
+
+fn ecs_rel_cmd_world_deep_new() -> EcsRelCmdWorldDeep {
+    let w = EcsRelCmdWorldDeep {
+        kind0_id: 0, kind0_link: 0, kind0_one: 0, kind0_reg: 0,
+        k0src0: -1, k0src1: -1, k0src2: -1, k0src3: -1, k0src4: -1, k0src5: -1, k0src6: -1, k0src7: -1,
+        k0tgt0: -1, k0tgt1: -1, k0tgt2: -1, k0tgt3: -1, k0tgt4: -1, k0tgt5: -1, k0tgt6: -1, k0tgt7: -1,
+        k0cnt: 0,
+        kind1_id: 1, kind1_link: 0, kind1_one: 0, kind1_reg: 0,
+        k1src0: -1, k1src1: -1, k1src2: -1, k1src3: -1, k1src4: -1, k1src5: -1, k1src6: -1, k1src7: -1,
+        k1tgt0: -1, k1tgt1: -1, k1tgt2: -1, k1tgt3: -1, k1tgt4: -1, k1tgt5: -1, k1tgt6: -1, k1tgt7: -1,
+        k1cnt: 0,
+        next_entity: 1,
+        alive0: 0, alive1: 0, alive2: 0, alive3: 0, alive4: 0, alive5: 0, alive6: 0, alive7: 0, alive8: 0,
+    };
+    return w;
+}
+
+fn _ecs_rel_cmd_world_deep_set_alive(w: EcsRelCmdWorldDeep, e: i64, v: i32) -> EcsRelCmdWorldDeep {
+    if e == 1 { w.alive0 = v; return w; };
+    if e == 2 { w.alive1 = v; return w; };
+    if e == 3 { w.alive2 = v; return w; };
+    if e == 4 { w.alive3 = v; return w; };
+    if e == 5 { w.alive4 = v; return w; };
+    if e == 6 { w.alive5 = v; return w; };
+    if e == 7 { w.alive6 = v; return w; };
+    if e == 8 { w.alive7 = v; return w; };
+    if e == 9 { w.alive8 = v; return w; };
+    return w;
+}
+
+fn ecs_rel_cmd_world_deep_is_alive(w: EcsRelCmdWorldDeep, e: i64) -> bool {
+    if e == 1 { return w.alive0 == 1; };
+    if e == 2 { return w.alive1 == 1; };
+    if e == 3 { return w.alive2 == 1; };
+    if e == 4 { return w.alive3 == 1; };
+    if e == 5 { return w.alive4 == 1; };
+    if e == 6 { return w.alive5 == 1; };
+    if e == 7 { return w.alive6 == 1; };
+    if e == 8 { return w.alive7 == 1; };
+    if e == 9 { return w.alive8 == 1; };
+    return false;
+}
+
+// Register a relationship kind by id (cap-2). link_despawn and one_to_one are flags.
+fn ecs_rel_cmd_world_deep_register(w: EcsRelCmdWorldDeep, kind_id: i32, link_despawn: i32, one_to_one: i32) -> EcsRelCmdWorldDeep {
+    if kind_id == 0 {
+        if w.kind0_reg == 0 { w.kind0_reg = 1; w.kind0_link = link_despawn; w.kind0_one = one_to_one; };
+        return w;
+    };
+    if w.kind1_reg == 0 { w.kind1_reg = 1; w.kind1_link = link_despawn; w.kind1_one = one_to_one; };
+    return w;
+}
+
+fn ecs_rel_cmd_world_deep_spawn(w: EcsRelCmdWorldDeep) -> (EcsRelCmdWorldDeep, i64) {
+    let e = w.next_entity;
+    w.next_entity = w.next_entity + 1;
+    w = _ecs_rel_cmd_world_deep_set_alive(w, e, 1);
+    return (w, e);
+}
+
+// Resolve a kind_id to a slot index 0/1 (or -1 if not registered).
+fn _ecs_rel_cmd_world_deep_kind_slot(w: EcsRelCmdWorldDeep, kind_id: i32) -> i32 {
+    if kind_id == 0 {
+        if w.kind0_reg == 1 { return 0; };
+        return -1;
+    };
+    if w.kind1_reg == 1 { return 1; };
+    return -1;
+}
+
+// ── Per-slot pair accessors/mutators ─────────────────────────────────────────
+fn _ecs_rel_cmd_world_deep_cnt_slot(w: EcsRelCmdWorldDeep, slot: i32) -> i32 {
+    if slot == 0 { return w.k0cnt; };
+    return w.k1cnt;
+}
+
+fn _ecs_rel_cmd_world_deep_src_at(w: EcsRelCmdWorldDeep, slot: i32, k: i32) -> i64 {
+    if slot == 0 {
+        if k == 0 { return w.k0src0; };
+        if k == 1 { return w.k0src1; };
+        if k == 2 { return w.k0src2; };
+        if k == 3 { return w.k0src3; };
+        if k == 4 { return w.k0src4; };
+        if k == 5 { return w.k0src5; };
+        if k == 6 { return w.k0src6; };
+        return w.k0src7;
+    };
+    if k == 0 { return w.k1src0; };
+    if k == 1 { return w.k1src1; };
+    if k == 2 { return w.k1src2; };
+    if k == 3 { return w.k1src3; };
+    if k == 4 { return w.k1src4; };
+    if k == 5 { return w.k1src5; };
+    if k == 6 { return w.k1src6; };
+    return w.k1src7;
+}
+
+fn _ecs_rel_cmd_world_deep_tgt_at(w: EcsRelCmdWorldDeep, slot: i32, k: i32) -> i64 {
+    if slot == 0 {
+        if k == 0 { return w.k0tgt0; };
+        if k == 1 { return w.k0tgt1; };
+        if k == 2 { return w.k0tgt2; };
+        if k == 3 { return w.k0tgt3; };
+        if k == 4 { return w.k0tgt4; };
+        if k == 5 { return w.k0tgt5; };
+        if k == 6 { return w.k0tgt6; };
+        return w.k0tgt7;
+    };
+    if k == 0 { return w.k1tgt0; };
+    if k == 1 { return w.k1tgt1; };
+    if k == 2 { return w.k1tgt2; };
+    if k == 3 { return w.k1tgt3; };
+    if k == 4 { return w.k1tgt4; };
+    if k == 5 { return w.k1tgt5; };
+    if k == 6 { return w.k1tgt6; };
+    return w.k1tgt7;
+}
+
+fn _ecs_rel_cmd_world_deep_src_index(w: EcsRelCmdWorldDeep, slot: i32, source: i64) -> i32 {
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    if cnt <= 0 { return -1; };
+    if _ecs_rel_cmd_world_deep_src_at(w, slot, 0) == source { return 0; };
+    if cnt > 1 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 1) == source { return 1; }; };
+    if cnt > 2 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 2) == source { return 2; }; };
+    if cnt > 3 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 3) == source { return 3; }; };
+    if cnt > 4 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 4) == source { return 4; }; };
+    if cnt > 5 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 5) == source { return 5; }; };
+    if cnt > 6 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 6) == source { return 6; }; };
+    if cnt > 7 { if _ecs_rel_cmd_world_deep_src_at(w, slot, 7) == source { return 7; }; };
+    return -1;
+}
+
+// one_to_one kind: a source holds exactly one target. set_related upserts in place if source exists.
+// many kind: multiple (src, tgt) pairs may share a source; set appends only if not already present.
+fn _ecs_rel_cmd_world_deep_set_src_tgt_slot(w: EcsRelCmdWorldDeep, slot: i32, k: i32, src: i64, tgt: i64) -> EcsRelCmdWorldDeep {
+    if slot == 0 {
+        if k == 0 { w.k0src0 = src; w.k0tgt0 = tgt; return w; };
+        if k == 1 { w.k0src1 = src; w.k0tgt1 = tgt; return w; };
+        if k == 2 { w.k0src2 = src; w.k0tgt2 = tgt; return w; };
+        if k == 3 { w.k0src3 = src; w.k0tgt3 = tgt; return w; };
+        if k == 4 { w.k0src4 = src; w.k0tgt4 = tgt; return w; };
+        if k == 5 { w.k0src5 = src; w.k0tgt5 = tgt; return w; };
+        if k == 6 { w.k0src6 = src; w.k0tgt6 = tgt; return w; };
+        w.k0src7 = src; w.k0tgt7 = tgt; return w;
+    };
+    if k == 0 { w.k1src0 = src; w.k1tgt0 = tgt; return w; };
+    if k == 1 { w.k1src1 = src; w.k1tgt1 = tgt; return w; };
+    if k == 2 { w.k1src2 = src; w.k1tgt2 = tgt; return w; };
+    if k == 3 { w.k1src3 = src; w.k1tgt3 = tgt; return w; };
+    if k == 4 { w.k1src4 = src; w.k1tgt4 = tgt; return w; };
+    if k == 5 { w.k1src5 = src; w.k1tgt5 = tgt; return w; };
+    if k == 6 { w.k1src6 = src; w.k1tgt6 = tgt; return w; };
+    w.k1src7 = src; w.k1tgt7 = tgt;
+    return w;
+}
+
+// set_related: ensure source→target. one_to_one kinds upsert (replace existing target if any);
+// many kinds append a distinct (src, tgt) if absent. cap-8 reject silent.
+// set_related: ensure (source, target) is present in the slot. one_to_one kinds (target_mode
+// == ONE) first remove every OTHER source currently pointing at `target` (mirror shallow
+// relationship_world_set_related_at's `RELATIONSHIP_TARGET_ONE` sweep) then upsert. Many
+// kinds ensure the exact pair is present and replace the source's prior target if it moves.
+fn _ecs_rel_cmd_world_deep_set_related(w0: EcsRelCmdWorldDeep, slot: i32, src: i64, tgt: i64) -> EcsRelCmdWorldDeep {
+    if slot < 0 { return w0; };
+    let one = _ecs_rel_cmd_world_deep_is_one(w0, slot);
+    let idx = _ecs_rel_cmd_world_deep_src_index(w0, slot, src);
+    if one == 1 {
+        // Remove every OTHER source currently pointing at `tgt` (keep `src` if it already points there).
+        let w1 = _ecs_rel_cmd_dwdr_remove_others_for_target(w0, slot, tgt, src, idx);
+        let idx2 = _ecs_rel_cmd_world_deep_src_index(w1, slot, src);
+        if idx2 >= 0 {
+            let cur = _ecs_rel_cmd_world_deep_tgt_at(w1, slot, idx2);
+            if cur == tgt { return w1; };
+            return _ecs_rel_cmd_world_deep_set_src_tgt_slot(w1, slot, idx2, src, tgt);
+        };
+        let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w1, slot);
+        if cnt >= ECS_RELCMD_CAP_DEEP { return w1; };
+        let w2 = _ecs_rel_cmd_world_deep_set_src_tgt_slot(w1, slot, cnt, src, tgt);
+        return _ecs_rel_cmd_world_deep_set_cnt_slot(w2, slot, cnt + 1);
+    };
+    // many: ensure the exact (src, tgt) pair is present; otherwise append.
+    if idx >= 0 {
+        let cur = _ecs_rel_cmd_world_deep_tgt_at(w0, slot, idx);
+        if cur == tgt { return w0; };
+        return _ecs_rel_cmd_world_deep_set_src_tgt_slot(w0, slot, idx, src, tgt);
+    };
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w0, slot);
+    if cnt >= ECS_RELCMD_CAP_DEEP { return w0; };
+    let w2 = _ecs_rel_cmd_world_deep_set_src_tgt_slot(w0, slot, cnt, src, tgt);
+    return _ecs_rel_cmd_world_deep_set_cnt_slot(w2, slot, cnt + 1);
+}
+
+fn _ecs_rel_cmd_dwdr_remove_others_for_target(w: EcsRelCmdWorldDeep, slot: i32, tgt: i64, keep_src: i64, keep_idx: i32) -> EcsRelCmdWorldDeep {
+    let w1 = _ecs_rel_cmd_dwdr_remove_other_match(w, slot, tgt, keep_src, keep_idx);
+    let w2 = _ecs_rel_cmd_dwdr_remove_other_match(w1, slot, tgt, keep_src, keep_idx);
+    let w3 = _ecs_rel_cmd_dwdr_remove_other_match(w2, slot, tgt, keep_src, keep_idx);
+    let w4 = _ecs_rel_cmd_dwdr_remove_other_match(w3, slot, tgt, keep_src, keep_idx);
+    let w5 = _ecs_rel_cmd_dwdr_remove_other_match(w4, slot, tgt, keep_src, keep_idx);
+    let w6 = _ecs_rel_cmd_dwdr_remove_other_match(w5, slot, tgt, keep_src, keep_idx);
+    let w7 = _ecs_rel_cmd_dwdr_remove_other_match(w6, slot, tgt, keep_src, keep_idx);
+    let w8 = _ecs_rel_cmd_dwdr_remove_other_match(w7, slot, tgt, keep_src, keep_idx);
+    return w8;
+}
+
+fn _ecs_rel_cmd_dwdr_remove_other_match(w: EcsRelCmdWorldDeep, slot: i32, tgt: i64, keep_src: i64, keep_idx: i32) -> EcsRelCmdWorldDeep {
+    if _ecs_rel_cmd_world_deep_cnt_slot(w, slot) <= 0 { return w; };
+    let found = _ecs_rel_cmd_world_deep_find_other_target_idx(w, slot, tgt, keep_src);
+    if found < 0 { return w; };
+    return _ecs_rel_cmd_world_deep_remove_pair(w, slot, found);
+}
+
+fn _ecs_rel_cmd_world_deep_find_other_target_idx(w: EcsRelCmdWorldDeep, slot: i32, tgt: i64, keep_src: i64) -> i32 {
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    if cnt <= 0 { return -1; };
+    if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 0) == tgt {
+        if _ecs_rel_cmd_world_deep_src_at(w, slot, 0) != keep_src { return 0; };
+    };
+    if cnt > 1 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 1) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 1) != keep_src { return 1; };
+        };
+    };
+    if cnt > 2 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 2) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 2) != keep_src { return 2; };
+        };
+    };
+    if cnt > 3 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 3) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 3) != keep_src { return 3; };
+        };
+    };
+    if cnt > 4 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 4) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 4) != keep_src { return 4; };
+        };
+    };
+    if cnt > 5 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 5) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 5) != keep_src { return 5; };
+        };
+    };
+    if cnt > 6 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 6) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 6) != keep_src { return 6; };
+        };
+    };
+    if cnt > 7 {
+        if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 7) == tgt {
+            if _ecs_rel_cmd_world_deep_src_at(w, slot, 7) != keep_src { return 7; };
+        };
+    };
+    return -1;
+}
+
+fn _ecs_rel_cmd_world_deep_is_one(w: EcsRelCmdWorldDeep, slot: i32) -> i32 {
+    if slot == 0 { return w.kind0_one; };
+    return w.kind1_one;
+}
+
+fn _ecs_rel_cmd_world_deep_set_cnt_slot(w: EcsRelCmdWorldDeep, slot: i32, v: i32) -> EcsRelCmdWorldDeep {
+    if slot == 0 { w.k0cnt = v; return w; };
+    w.k1cnt = v;
+    return w;
+}
+
+fn _ecs_rel_cmd_world_deep_clear_slot(w: EcsRelCmdWorldDeep, slot: i32) -> EcsRelCmdWorldDeep {
+    if slot == 0 {
+        w.k0cnt = 0;
+        w.k0src0 = -1; w.k0src1 = -1; w.k0src2 = -1; w.k0src3 = -1; w.k0src4 = -1; w.k0src5 = -1; w.k0src6 = -1; w.k0src7 = -1;
+        w.k0tgt0 = -1; w.k0tgt1 = -1; w.k0tgt2 = -1; w.k0tgt3 = -1; w.k0tgt4 = -1; w.k0tgt5 = -1; w.k0tgt6 = -1; w.k0tgt7 = -1;
+        return w;
+    };
+    w.k1cnt = 0;
+    w.k1src0 = -1; w.k1src1 = -1; w.k1src2 = -1; w.k1src3 = -1; w.k1src4 = -1; w.k1src5 = -1; w.k1src6 = -1; w.k1src7 = -1;
+    w.k1tgt0 = -1; w.k1tgt1 = -1; w.k1tgt2 = -1; w.k1tgt3 = -1; w.k1tgt4 = -1; w.k1tgt5 = -1; w.k1tgt6 = -1; w.k1tgt7 = -1;
+    return w;
+}
+
+// Remove the pair at slot.k — shift the remaining pairs down preserving order.
+fn _ecs_rel_cmd_world_deep_remove_pair(w: EcsRelCmdWorldDeep, slot: i32, k: i32) -> EcsRelCmdWorldDeep {
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    if k < 0 { return w; };
+    if k >= cnt { return w; };
+    if slot == 0 {
+        if k == 0 { if cnt > 1 { w.k0src0 = w.k0src1; w.k0tgt0 = w.k0tgt1; }; if cnt > 2 { w.k0src1 = w.k0src2; w.k0tgt1 = w.k0tgt2; }; if cnt > 3 { w.k0src2 = w.k0src3; w.k0tgt2 = w.k0tgt3; }; if cnt > 4 { w.k0src3 = w.k0src4; w.k0tgt3 = w.k0tgt4; }; if cnt > 5 { w.k0src4 = w.k0src5; w.k0tgt4 = w.k0tgt5; }; if cnt > 6 { w.k0src5 = w.k0src6; w.k0tgt5 = w.k0tgt6; }; if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        if k == 1 { if cnt > 2 { w.k0src1 = w.k0src2; w.k0tgt1 = w.k0tgt2; }; if cnt > 3 { w.k0src2 = w.k0src3; w.k0tgt2 = w.k0tgt3; }; if cnt > 4 { w.k0src3 = w.k0src4; w.k0tgt3 = w.k0tgt4; }; if cnt > 5 { w.k0src4 = w.k0src5; w.k0tgt4 = w.k0tgt5; }; if cnt > 6 { w.k0src5 = w.k0src6; w.k0tgt5 = w.k0tgt6; }; if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        if k == 2 { if cnt > 3 { w.k0src2 = w.k0src3; w.k0tgt2 = w.k0tgt3; }; if cnt > 4 { w.k0src3 = w.k0src4; w.k0tgt3 = w.k0tgt4; }; if cnt > 5 { w.k0src4 = w.k0src5; w.k0tgt4 = w.k0tgt5; }; if cnt > 6 { w.k0src5 = w.k0src6; w.k0tgt5 = w.k0tgt6; }; if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        if k == 3 { if cnt > 4 { w.k0src3 = w.k0src4; w.k0tgt3 = w.k0tgt4; }; if cnt > 5 { w.k0src4 = w.k0src5; w.k0tgt4 = w.k0tgt5; }; if cnt > 6 { w.k0src5 = w.k0src6; w.k0tgt5 = w.k0tgt6; }; if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        if k == 4 { if cnt > 5 { w.k0src4 = w.k0src5; w.k0tgt4 = w.k0tgt5; }; if cnt > 6 { w.k0src5 = w.k0src6; w.k0tgt5 = w.k0tgt6; }; if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        if k == 5 { if cnt > 6 { w.k0src5 = w.k0src6; w.k0tgt5 = w.k0tgt6; }; if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        if k == 6 { if cnt > 7 { w.k0src6 = w.k0src7; w.k0tgt6 = w.k0tgt7; }; };
+        return _ecs_rel_cmd_world_deep_set_cnt_slot(w, 0, cnt - 1);
+    };
+    if k == 0 { if cnt > 1 { w.k1src0 = w.k1src1; w.k1tgt0 = w.k1tgt1; }; if cnt > 2 { w.k1src1 = w.k1src2; w.k1tgt1 = w.k1tgt2; }; if cnt > 3 { w.k1src2 = w.k1src3; w.k1tgt2 = w.k1tgt3; }; if cnt > 4 { w.k1src3 = w.k1src4; w.k1tgt3 = w.k1tgt4; }; if cnt > 5 { w.k1src4 = w.k1src5; w.k1tgt4 = w.k1tgt5; }; if cnt > 6 { w.k1src5 = w.k1src6; w.k1tgt5 = w.k1tgt6; }; if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    if k == 1 { if cnt > 2 { w.k1src1 = w.k1src2; w.k1tgt1 = w.k1tgt2; }; if cnt > 3 { w.k1src2 = w.k1src3; w.k1tgt2 = w.k1tgt3; }; if cnt > 4 { w.k1src3 = w.k1src4; w.k1tgt3 = w.k1tgt4; }; if cnt > 5 { w.k1src4 = w.k1src5; w.k1tgt4 = w.k1tgt5; }; if cnt > 6 { w.k1src5 = w.k1src6; w.k1tgt5 = w.k1tgt6; }; if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    if k == 2 { if cnt > 3 { w.k1src2 = w.k1src3; w.k1tgt2 = w.k1tgt3; }; if cnt > 4 { w.k1src3 = w.k1src4; w.k1tgt3 = w.k1tgt4; }; if cnt > 5 { w.k1src4 = w.k1src5; w.k1tgt4 = w.k1tgt5; }; if cnt > 6 { w.k1src5 = w.k1src6; w.k1tgt5 = w.k1tgt6; }; if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    if k == 3 { if cnt > 4 { w.k1src3 = w.k1src4; w.k1tgt3 = w.k1tgt4; }; if cnt > 5 { w.k1src4 = w.k1src5; w.k1tgt4 = w.k1tgt5; }; if cnt > 6 { w.k1src5 = w.k1src6; w.k1tgt5 = w.k1tgt6; }; if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    if k == 4 { if cnt > 5 { w.k1src4 = w.k1src5; w.k1tgt4 = w.k1tgt5; }; if cnt > 6 { w.k1src5 = w.k1src6; w.k1tgt5 = w.k1tgt6; }; if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    if k == 5 { if cnt > 6 { w.k1src5 = w.k1src6; w.k1tgt5 = w.k1tgt6; }; if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    if k == 6 { if cnt > 7 { w.k1src6 = w.k1src7; w.k1tgt6 = w.k1tgt7; }; };
+    return _ecs_rel_cmd_world_deep_set_cnt_slot(w, 1, cnt - 1);
+}
+
+// ── Public query accessors on the world ──────────────────────────────────────
+fn ecs_rel_cmd_world_deep_has_related(w: EcsRelCmdWorldDeep, kind_id: i32, source: i64) -> bool {
+    let slot = _ecs_rel_cmd_world_deep_kind_slot(w, kind_id);
+    if slot < 0 { return false; };
+    let idx = _ecs_rel_cmd_world_deep_src_index(w, slot, source);
+    return idx >= 0;
+}
+
+fn ecs_rel_cmd_world_deep_related(w: EcsRelCmdWorldDeep, kind_id: i32, source: i64) -> i64 {
+    let slot = _ecs_rel_cmd_world_deep_kind_slot(w, kind_id);
+    if slot < 0 { return -1; };
+    let idx = _ecs_rel_cmd_world_deep_src_index(w, slot, source);
+    if idx < 0 { return -1; };
+    return _ecs_rel_cmd_world_deep_tgt_at(w, slot, idx);
+}
+
+// Count sources pointing at target — recursive read-only scan (SA permits simple recursion;
+// verified recfact probe: no UseAfterMove risk for pure i32 returns on read-only world).
+fn ecs_rel_cmd_world_deep_source_count(w: EcsRelCmdWorldDeep, kind_id: i32, target: i64) -> i32 {
+    let slot = _ecs_rel_cmd_world_deep_kind_slot(w, kind_id);
+    if slot < 0 { return 0; };
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    return _ecs_rel_cmd_count_sources_for_target(w, slot, cnt, target, 0);
+}
+
+fn _ecs_rel_cmd_count_sources_for_target(w: EcsRelCmdWorldDeep, slot: i32, cnt: i32, target: i64, k: i32) -> i32 {
+    if k >= cnt { return 0; };
+    let rest = _ecs_rel_cmd_count_sources_for_target(w, slot, cnt, target, k + 1);
+    if _ecs_rel_cmd_world_deep_tgt_at(w, slot, k) == target { return rest + 1; };
+    return rest;
+}
+
+// Find the source at position `pos` among sources pointing at target — recursive read-only scan.
+fn ecs_rel_cmd_world_deep_source_at(w: EcsRelCmdWorldDeep, kind_id: i32, target: i64, pos: i32) -> i64 {
+    let slot = _ecs_rel_cmd_world_deep_kind_slot(w, kind_id);
+    if slot < 0 { return -1; };
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    let idx = _ecs_rel_cmd_scan_target_for_pos(w, slot, cnt, target, pos, 0);
+    if idx < 0 { return -1; };
+    return _ecs_rel_cmd_world_deep_src_at(w, slot, idx);
+}
+
+fn _ecs_rel_cmd_scan_target_for_pos(w: EcsRelCmdWorldDeep, slot: i32, cnt: i32, target: i64, pos: i32, k: i32) -> i32 {
+    if k >= cnt { return -1; };
+    if _ecs_rel_cmd_world_deep_tgt_at(w, slot, k) == target {
+        if pos == 0 { return k; };
+        return _ecs_rel_cmd_scan_target_for_pos(w, slot, cnt, target, pos - 1, k + 1);
+    };
+    return _ecs_rel_cmd_scan_target_for_pos(w, slot, cnt, target, pos, k + 1);
+}
+
+// ── High-level world ops ────────────────────────────────────────────────────
+fn _ecs_rel_cmd_world_deep_remove_related(w: EcsRelCmdWorldDeep, slot: i32, source: i64) -> EcsRelCmdWorldDeep {
+    if slot < 0 { return w; };
+    let idx = _ecs_rel_cmd_world_deep_src_index(w, slot, source);
+    if idx < 0 { return w; };
+    return _ecs_rel_cmd_world_deep_remove_pair(w, slot, idx);
+}
+
+// detach_all_related(target): remove every pair whose target matches. Flat let-ladder over
+// 8 slots — each pass removes the first remaining match in place; caps at 8 removals total.
+fn _ecs_rel_cmd_world_deep_detach_all_related(w: EcsRelCmdWorldDeep, slot: i32, target: i64) -> EcsRelCmdWorldDeep {
+    if slot < 0 { return w; };
+    let w1 = _ecs_rel_cmd_world_deep_detach_one_match(w, slot, target);
+    let w2 = _ecs_rel_cmd_world_deep_detach_one_match(w1, slot, target);
+    let w3 = _ecs_rel_cmd_world_deep_detach_one_match(w2, slot, target);
+    let w4 = _ecs_rel_cmd_world_deep_detach_one_match(w3, slot, target);
+    let w5 = _ecs_rel_cmd_world_deep_detach_one_match(w4, slot, target);
+    let w6 = _ecs_rel_cmd_world_deep_detach_one_match(w5, slot, target);
+    let w7 = _ecs_rel_cmd_world_deep_detach_one_match(w6, slot, target);
+    let w8 = _ecs_rel_cmd_world_deep_detach_one_match(w7, slot, target);
+    return w8;
+}
+
+fn _ecs_rel_cmd_world_deep_detach_one_match(w: EcsRelCmdWorldDeep, slot: i32, target: i64) -> EcsRelCmdWorldDeep {
+    let first = _ecs_rel_cmd_world_deep_first_tgt_idx(w, slot, target);
+    if first < 0 { return w; };
+    return _ecs_rel_cmd_world_deep_remove_pair(w, slot, first);
+}
+
+fn _ecs_rel_cmd_world_deep_first_tgt_idx(w: EcsRelCmdWorldDeep, slot: i32, target: i64) -> i32 {
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    if cnt <= 0 { return -1; };
+    if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 0) == target { return 0; };
+    if cnt > 1 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 1) == target { return 1; }; };
+    if cnt > 2 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 2) == target { return 2; }; };
+    if cnt > 3 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 3) == target { return 3; }; };
+    if cnt > 4 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 4) == target { return 4; }; };
+    if cnt > 5 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 5) == target { return 5; }; };
+    if cnt > 6 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 6) == target { return 6; }; };
+    if cnt > 7 { if _ecs_rel_cmd_world_deep_tgt_at(w, slot, 7) == target { return 7; }; };
+    return -1;
+}
+
+// ── replace_related / replace_related_with_difference / despawn ─────────────
+fn _ecs_rel_cmd_world_deep_replace_related(w0: EcsRelCmdWorldDeep, slot: i32, target: i64, pool: EcsRelCmdListPoolDeep, ridx: i32) -> EcsRelCmdWorldDeep {
+    let w1 = _ecs_rel_cmd_world_deep_clear_slot(w0, slot);
+    let n = _ecs_rel_cmd_list_pool_len(pool, ridx);
+    if n <= 0 { return w1; };
+    let e0 = _ecs_rel_cmd_list_pool_at(pool, ridx, 0);
+    let w2 = _ecs_rel_cmd_world_deep_set_related(w1, slot, e0, target);
+    if n > 1 {
+        let e1 = _ecs_rel_cmd_list_pool_at(pool, ridx, 1);
+        let w3 = _ecs_rel_cmd_world_deep_set_related(w2, slot, e1, target);
+        if n > 2 {
+            let e2 = _ecs_rel_cmd_list_pool_at(pool, ridx, 2);
+            let w4 = _ecs_rel_cmd_world_deep_set_related(w3, slot, e2, target);
+            if n > 3 {
+                let e3 = _ecs_rel_cmd_list_pool_at(pool, ridx, 3);
+                let w5 = _ecs_rel_cmd_world_deep_set_related(w4, slot, e3, target);
+                return w5;
+            };
+            return w4;
+        };
+        return w3;
+    };
+    return w2;
+}
+
+// replace_related_with_difference: remove unrelate entities, then ensure relate entities point at target.
+fn _ecs_rel_cmd_world_deep_replace_diff(w0: EcsRelCmdWorldDeep, slot: i32, target: i64, pool: EcsRelCmdListPoolDeep, uidx: i32, ridx: i32) -> EcsRelCmdWorldDeep {
+    let w1 = _ecs_rel_cmd_diff_unrelate(w0, slot, pool, uidx);
+    let w2 = _ecs_rel_cmd_diff_relate(w1, slot, target, pool, ridx);
+    return w2;
+}
+
+fn _ecs_rel_cmd_diff_unrelate(w: EcsRelCmdWorldDeep, slot: i32, pool: EcsRelCmdListPoolDeep, uidx: i32) -> EcsRelCmdWorldDeep {
+    let n = _ecs_rel_cmd_list_pool_len(pool, uidx);
+    if n <= 0 { return w; };
+    let e0 = _ecs_rel_cmd_list_pool_at(pool, uidx, 0);
+    let w1 = _ecs_rel_cmd_world_deep_remove_related(w, slot, e0);
+    if n > 1 {
+        let e1 = _ecs_rel_cmd_list_pool_at(pool, uidx, 1);
+        let w2 = _ecs_rel_cmd_world_deep_remove_related(w1, slot, e1);
+        if n > 2 {
+            let e2 = _ecs_rel_cmd_list_pool_at(pool, uidx, 2);
+            let w3 = _ecs_rel_cmd_world_deep_remove_related(w2, slot, e2);
+            if n > 3 {
+                let e3 = _ecs_rel_cmd_list_pool_at(pool, uidx, 3);
+                let w4 = _ecs_rel_cmd_world_deep_remove_related(w3, slot, e3);
+                return w4;
+            };
+            return w3;
+        };
+        return w2;
+    };
+    return w1;
+}
+
+fn _ecs_rel_cmd_diff_relate(w: EcsRelCmdWorldDeep, slot: i32, target: i64, pool: EcsRelCmdListPoolDeep, ridx: i32) -> EcsRelCmdWorldDeep {
+    let n = _ecs_rel_cmd_list_pool_len(pool, ridx);
+    if n <= 0 { return w; };
+    let e0 = _ecs_rel_cmd_list_pool_at(pool, ridx, 0);
+    let w1 = _ecs_rel_cmd_world_deep_set_related(w, slot, e0, target);
+    if n > 1 {
+        let e1 = _ecs_rel_cmd_list_pool_at(pool, ridx, 1);
+        let w2 = _ecs_rel_cmd_world_deep_set_related(w1, slot, e1, target);
+        if n > 2 {
+            let e2 = _ecs_rel_cmd_list_pool_at(pool, ridx, 2);
+            let w3 = _ecs_rel_cmd_world_deep_set_related(w2, slot, e2, target);
+            if n > 3 {
+                let e3 = _ecs_rel_cmd_list_pool_at(pool, ridx, 3);
+                let w4 = _ecs_rel_cmd_world_deep_set_related(w3, slot, e3, target);
+                return w4;
+            };
+            return w3;
+        };
+        return w2;
+    };
+    return w1;
+}
+
+fn _ecs_rel_cmd_world_deep_despawn(w: EcsRelCmdWorldDeep, e: i64) -> EcsRelCmdWorldDeep {
+    return _ecs_rel_cmd_world_deep_set_alive(w, e, 0);
+}
+
+// despawn_related: mark every source pointing at target not-alive IF the kind links despawns;
+// shallow link_despawn=true marks the targets recursively — here we mark sources not-alive.
+fn _ecs_rel_cmd_world_deep_despawn_related(w0: EcsRelCmdWorldDeep, slot: i32, target: i64) -> EcsRelCmdWorldDeep {
+    if slot < 0 { return w0; };
+    let link = _ecs_rel_cmd_world_deep_is_link(w0, slot);
+    if link != 1 { return w0; };
+    let w1 = _ecs_rel_cmd_world_deep_despawn(w0, target);
+    let w2 = _ecs_rel_cmd_despawn_sources_of(w1, slot, target);
+    return w2;
+}
+
+fn _ecs_rel_cmd_world_deep_is_link(w: EcsRelCmdWorldDeep, slot: i32) -> i32 {
+    if slot == 0 { return w.kind0_link; };
+    return w.kind1_link;
+}
+
+fn _ecs_rel_cmd_despawn_sources_of(w: EcsRelCmdWorldDeep, slot: i32, target: i64) -> EcsRelCmdWorldDeep {
+    // Mark each source pointing at target not-alive; flat let-ladder over pairs.
+    let cnt = _ecs_rel_cmd_world_deep_cnt_slot(w, slot);
+    let w0 = _ecs_rel_cmd_kill_src_if(w, slot, 0, cnt, target);
+    let w1 = _ecs_rel_cmd_kill_src_if(w0, slot, 1, cnt, target);
+    let w2 = _ecs_rel_cmd_kill_src_if(w1, slot, 2, cnt, target);
+    let w3 = _ecs_rel_cmd_kill_src_if(w2, slot, 3, cnt, target);
+    let w4 = _ecs_rel_cmd_kill_src_if(w3, slot, 4, cnt, target);
+    let w5 = _ecs_rel_cmd_kill_src_if(w4, slot, 5, cnt, target);
+    let w6 = _ecs_rel_cmd_kill_src_if(w5, slot, 6, cnt, target);
+    let w7 = _ecs_rel_cmd_kill_src_if(w6, slot, 7, cnt, target);
+    return w7;
+}
+
+fn _ecs_rel_cmd_kill_src_if(w: EcsRelCmdWorldDeep, slot: i32, k: i32, cnt: i32, target: i64) -> EcsRelCmdWorldDeep {
+    if k >= cnt { return w; };
+    if _ecs_rel_cmd_world_deep_tgt_at(w, slot, k) == target {
+        let src = _ecs_rel_cmd_world_deep_src_at(w, slot, k);
+        return _ecs_rel_cmd_world_deep_set_alive(w, src, 0);
+    };
+    return w;
+}
+
+// ── Apply walker (flat let-ladder over the 8 queue slots — Batch 378 rule) ───
+struct EcsRelCmdApplyDeep {
+    world: EcsRelCmdWorldDeep,
+    state: EcsRelCmdStateDeep,
+}
+
+fn ecs_rel_cmd_apply_world(r: EcsRelCmdApplyDeep) -> EcsRelCmdWorldDeep { return r.world; }
+fn ecs_rel_cmd_apply_state(r: EcsRelCmdApplyDeep) -> EcsRelCmdStateDeep { return r.state; }
+fn ecs_rel_cmd_apply_commands(r: EcsRelCmdApplyDeep) -> EcsRelCmdsDeep { return r.state.queue; }
+
+fn _ecs_rel_cmd_state_cleared(s: EcsRelCmdStateDeep) -> EcsRelCmdStateDeep {
+    // Batch 380 finding: reset the queue count so chained applies only run newly-queued commands.
+    s.queue.count = 0;
+    return s;
+}
+
+fn _ecs_rel_cmd_world_deep_apply_cmd(wt: EcsRelCmdWorldDeep, s: EcsRelCmdStateDeep, qi: i32) -> EcsRelCmdWorldDeep {
+    let pool = s.pool;
+    let q = s.queue;
+    let kind = ecs_rel_cmds_deep_kind_at(q, qi);
+    let kid = ecs_rel_cmds_deep_kind_id_at(q, qi);
+    let slot = _ecs_rel_cmd_world_deep_kind_slot(wt, kid);
+    if kind == ECS_RELCMD_SET_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        let source = ecs_rel_cmds_deep_source_at(q, qi);
+        if slot < 0 { return wt; };
+        let ins = ecs_rel_cmds_deep_index_at(q, qi);
+        if ins == ECS_RELCMD_INDEX_MAX {
+            return _ecs_rel_cmd_world_deep_set_related(wt, slot, source, target);
+        };
+        // set_at: only valid for one_to_one kinds where index < cnt; mirror by replacing the
+        // target of the pair at position `ins` if ins < cnt.
+        if ins < 0 { return _ecs_rel_cmd_world_deep_set_related(wt, slot, source, target); };
+        let cnt = _ecs_rel_cmd_world_deep_cnt_slot(wt, slot);
+        if ins < cnt {
+            let cur_src = _ecs_rel_cmd_world_deep_src_at(wt, slot, ins);
+            if cur_src == source {
+                return _ecs_rel_cmd_world_deep_set_src_tgt_slot(wt, slot, ins, source, target);
+            };
+        };
+        return _ecs_rel_cmd_world_deep_set_related(wt, slot, source, target);
+    };
+    if kind == ECS_RELCMD_ADD_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        let ridx = ecs_rel_cmds_deep_related_index_at(q, qi);
+        let n = _ecs_rel_cmd_list_pool_len(pool, ridx);
+        if slot < 0 { return wt; };
+        let e0 = _ecs_rel_cmd_list_pool_at(pool, ridx, 0);
+        let w1 = _ecs_rel_cmd_world_deep_set_related(wt, slot, e0, target);
+        if n > 1 {
+            let e1 = _ecs_rel_cmd_list_pool_at(pool, ridx, 1);
+            let w2 = _ecs_rel_cmd_world_deep_set_related(w1, slot, e1, target);
+            if n > 2 {
+                let e2 = _ecs_rel_cmd_list_pool_at(pool, ridx, 2);
+                let w3 = _ecs_rel_cmd_world_deep_set_related(w2, slot, e2, target);
+                if n > 3 {
+                    let e3 = _ecs_rel_cmd_list_pool_at(pool, ridx, 3);
+                    let w4 = _ecs_rel_cmd_world_deep_set_related(w3, slot, e3, target);
+                    return w4;
+                };
+                return w3;
+            };
+            return w2;
+        };
+        return w1;
+    };
+    if kind == ECS_RELCMD_INSERT_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        let ridx = ecs_rel_cmds_deep_related_index_at(q, qi);
+        let n = _ecs_rel_cmd_list_pool_len(pool, ridx);
+        if slot < 0 { return wt; };
+        // INSERT in the shallow inserts each source at index + i; for the deep model with append-
+        // style set_related we treat insert like add (cap-N storage has no per-element ordering by
+        // index; we ensure the entities are related to the target).
+        let e0 = _ecs_rel_cmd_list_pool_at(pool, ridx, 0);
+        let w1 = _ecs_rel_cmd_world_deep_set_related(wt, slot, e0, target);
+        if n > 1 {
+            let e1 = _ecs_rel_cmd_list_pool_at(pool, ridx, 1);
+            let w2 = _ecs_rel_cmd_world_deep_set_related(w1, slot, e1, target);
+            if n > 2 {
+                let e2 = _ecs_rel_cmd_list_pool_at(pool, ridx, 2);
+                let w3 = _ecs_rel_cmd_world_deep_set_related(w2, slot, e2, target);
+                if n > 3 {
+                    let e3 = _ecs_rel_cmd_list_pool_at(pool, ridx, 3);
+                    let w4 = _ecs_rel_cmd_world_deep_set_related(w3, slot, e3, target);
+                    return w4;
+                };
+                return w3;
+            };
+            return w2;
+        };
+        return w1;
+    };
+    if kind == ECS_RELCMD_REMOVE_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        let ridx = ecs_rel_cmds_deep_related_index_at(q, qi);
+        return _ecs_rel_diff_remove_with_target(wt, slot, pool, ridx, target);
+    };
+    if kind == ECS_RELCMD_DETACH_ALL_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        return _ecs_rel_cmd_world_deep_detach_all_related(wt, slot, target);
+    };
+    if kind == ECS_RELCMD_REPLACE_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        let ridx = ecs_rel_cmds_deep_related_index_at(q, qi);
+        return _ecs_rel_cmd_world_deep_replace_related(wt, slot, target, pool, ridx);
+    };
+    if kind == ECS_RELCMD_REPLACE_DIFF {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        let uidx = ecs_rel_cmds_deep_unrelate_index_at(q, qi);
+        let ridx = ecs_rel_cmds_deep_related_index_at(q, qi);
+        return _ecs_rel_cmd_world_deep_replace_diff(wt, slot, target, pool, uidx, ridx);
+    };
+    if kind == ECS_RELCMD_DESPAWN {
+        let entity = ecs_rel_cmds_deep_target_at(q, qi);
+        return _ecs_rel_cmd_world_deep_despawn(wt, entity);
+    };
+    if kind == ECS_RELCMD_DESPAWN_RELATED {
+        let target = ecs_rel_cmds_deep_target_at(q, qi);
+        return _ecs_rel_cmd_world_deep_despawn_related(wt, slot, target);
+    };
+    return wt;
+}
+
+// REMOVE_RELATED: only remove the source if its current target equals `command.target`
+// (mirror shallow remove_related guarding on the current target being the given one).
+fn _ecs_rel_diff_remove_with_target(wt: EcsRelCmdWorldDeep, slot: i32, pool: EcsRelCmdListPoolDeep, ridx: i32, target: i64) -> EcsRelCmdWorldDeep {
+    let n = _ecs_rel_cmd_list_pool_len(pool, ridx);
+    if n <= 0 { return wt; };
+    let e0 = _ecs_rel_cmd_list_pool_at(pool, ridx, 0);
+    let w1 = _ecs_rel_diff_remove_one_with_target(wt, slot, e0, target);
+    if n > 1 {
+        let e1 = _ecs_rel_cmd_list_pool_at(pool, ridx, 1);
+        let w2 = _ecs_rel_diff_remove_one_with_target(w1, slot, e1, target);
+        if n > 2 {
+            let e2 = _ecs_rel_cmd_list_pool_at(pool, ridx, 2);
+            let w3 = _ecs_rel_diff_remove_one_with_target(w2, slot, e2, target);
+            if n > 3 {
+                let e3 = _ecs_rel_cmd_list_pool_at(pool, ridx, 3);
+                let w4 = _ecs_rel_diff_remove_one_with_target(w3, slot, e3, target);
+                return w4;
+            };
+            return w3;
+        };
+        return w2;
+    };
+    return w1;
+}
+
+fn _ecs_rel_diff_remove_one_with_target(wt: EcsRelCmdWorldDeep, slot: i32, source: i64, target: i64) -> EcsRelCmdWorldDeep {
+    if slot < 0 { return wt; };
+    let idx = _ecs_rel_cmd_world_deep_src_index(wt, slot, source);
+    if idx < 0 { return wt; };
+    let cur = _ecs_rel_cmd_world_deep_tgt_at(wt, slot, idx);
+    if cur != target { return wt; };
+    return _ecs_rel_cmd_world_deep_remove_pair(wt, slot, idx);
+}
+
+fn ecs_rel_cmds_deep_apply(world: EcsRelCmdWorldDeep, s: EcsRelCmdStateDeep) -> EcsRelCmdApplyDeep {
+    let qcnt = ecs_rel_cmds_deep_len(s.queue);
+    if qcnt <= 0 {
+        let r = EcsRelCmdApplyDeep { world: world, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w0 = _ecs_rel_cmd_world_deep_apply_cmd(world, s, 0);
+    if qcnt == 1 {
+        let r = EcsRelCmdApplyDeep { world: w0, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w1 = _ecs_rel_cmd_world_deep_apply_cmd(w0, s, 1);
+    if qcnt == 2 {
+        let r = EcsRelCmdApplyDeep { world: w1, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w2 = _ecs_rel_cmd_world_deep_apply_cmd(w1, s, 2);
+    if qcnt == 3 {
+        let r = EcsRelCmdApplyDeep { world: w2, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w3 = _ecs_rel_cmd_world_deep_apply_cmd(w2, s, 3);
+    if qcnt == 4 {
+        let r = EcsRelCmdApplyDeep { world: w3, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w4 = _ecs_rel_cmd_world_deep_apply_cmd(w3, s, 4);
+    if qcnt == 5 {
+        let r = EcsRelCmdApplyDeep { world: w4, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w5 = _ecs_rel_cmd_world_deep_apply_cmd(w4, s, 5);
+    if qcnt == 6 {
+        let r = EcsRelCmdApplyDeep { world: w5, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w6 = _ecs_rel_cmd_world_deep_apply_cmd(w5, s, 6);
+    if qcnt == 7 {
+        let r = EcsRelCmdApplyDeep { world: w6, state: _ecs_rel_cmd_state_cleared(s) };
+        return r;
+    };
+    let w7 = _ecs_rel_cmd_world_deep_apply_cmd(w6, s, 7);
+    let r = EcsRelCmdApplyDeep { world: w7, state: _ecs_rel_cmd_state_cleared(s) };
+    return r;
+}
+
+// ── reserve_entity and spawn_related wrappers (Batch 373 rule) ──────────────
+struct EcsRelCmdReserveDeep {
+    world: EcsRelCmdWorldDeep,
+    state: EcsRelCmdStateDeep,
+    entity: i64,
+}
+
+fn ecs_rel_cmd_reserve_world(r: EcsRelCmdReserveDeep) -> EcsRelCmdWorldDeep { return r.world; }
+fn ecs_rel_cmd_reserve_state(r: EcsRelCmdReserveDeep) -> EcsRelCmdStateDeep { return r.state; }
+fn ecs_rel_cmd_reserve_entity(r: EcsRelCmdReserveDeep) -> i64 { return r.entity; }
+
+fn ecs_rel_cmds_deep_reserve_entity(world: EcsRelCmdWorldDeep, s: EcsRelCmdStateDeep) -> EcsRelCmdReserveDeep {
+    let pair = ecs_rel_cmd_world_deep_spawn(world);
+    let w = pair.0;
+    let e = pair.1;
+    let r = EcsRelCmdReserveDeep { world: w, state: s, entity: e };
+    return r;
+}
+
+struct EcsRelCmdSpawnRelDeep {
+    world: EcsRelCmdWorldDeep,
+    state: EcsRelCmdStateDeep,
+    entity: i64,
+}
+
+fn ecs_rel_cmd_spawn_rel_world(r: EcsRelCmdSpawnRelDeep) -> EcsRelCmdWorldDeep { return r.world; }
+fn ecs_rel_cmd_spawn_rel_state(r: EcsRelCmdSpawnRelDeep) -> EcsRelCmdStateDeep { return r.state; }
+fn ecs_rel_cmd_spawn_rel_entity(r: EcsRelCmdSpawnRelDeep) -> i64 { return r.entity; }
+
+// spawn_related: spawn a fresh entity in the world and queue SET_RELATED(source=entity, target).
+fn ecs_rel_cmds_deep_spawn_related(world: EcsRelCmdWorldDeep, s: EcsRelCmdStateDeep, kind_id: i32, target: i64) -> EcsRelCmdSpawnRelDeep {
+    let pair = ecs_rel_cmd_world_deep_spawn(world);
+    let w = pair.0;
+    let e = pair.1;
+    let s2 = ecs_rel_cmds_deep_set_related(s, kind_id, e, target);
+    let r = EcsRelCmdSpawnRelDeep { world: w, state: s2, entity: e };
+    return r;
+}
+
+// ── RelatedSpawnerCommands builder (mirrors shallow RelationshipRelatedSpawnerCommands) ──
+struct EcsRelSpawnerDeep {
+    state: EcsRelCmdStateDeep,
+    kind_id: i32,
+    target: i64,
+}
+
+fn ecs_rel_spawner_deep_new(s: EcsRelCmdStateDeep, kind_id: i32, target: i64) -> EcsRelSpawnerDeep {
+    let sp = EcsRelSpawnerDeep { state: s, kind_id: kind_id, target: target };
+    return sp;
+}
+
+fn ecs_rel_spawner_deep_len(sp: EcsRelSpawnerDeep) -> i32 { return ecs_rel_cmds_deep_len(sp.state.queue); }
+
+// Result of spawner.spawn — carries the updated world + spawner + the spawned entity.
+struct EcsRelSpawnerSpawnDeep {
+    world: EcsRelCmdWorldDeep,
+    spawner: EcsRelSpawnerDeep,
+    entity: i64,
+}
+fn ecs_rel_spawner_spawn_world(r: EcsRelSpawnerSpawnDeep) -> EcsRelCmdWorldDeep { return r.world; }
+fn ecs_rel_spawner_spawn_spawner(r: EcsRelSpawnerSpawnDeep) -> EcsRelSpawnerDeep { return r.spawner; }
+fn ecs_rel_spawner_spawn_entity(r: EcsRelSpawnerSpawnDeep) -> i64 { return r.entity; }
+
+// spawn a fresh entity and queue SET_RELATED(source=entity, target=sp.target) onto sp.state.
+fn ecs_rel_spawner_deep_spawn(world: EcsRelCmdWorldDeep, sp: EcsRelSpawnerDeep) -> EcsRelSpawnerSpawnDeep {
+    let pair = ecs_rel_cmd_world_deep_spawn(world);
+    let w = pair.0;
+    let e = pair.1;
+    let s2 = ecs_rel_cmds_deep_set_related(sp.state, sp.kind_id, e, sp.target);
+    sp.state = s2;
+    let r = EcsRelSpawnerSpawnDeep { world: w, spawner: sp, entity: e };
+    return r;
+}
+
+fn ecs_rel_spawner_deep_add_existing(sp: EcsRelSpawnerDeep, source: i64) -> EcsRelSpawnerDeep {
+    let s2 = ecs_rel_cmds_deep_set_related(sp.state, sp.kind_id, source, sp.target);
+    sp.state = s2;
+    return sp;
+}
+
+fn ecs_rel_spawner_deep_finish(sp: EcsRelSpawnerDeep) -> EcsRelCmdStateDeep {
+    return sp.state;
+}
+
+// spawn_linked helper used by relationship_world_spawn_related direct ops (mirror shallow).
+struct EcsRelSpawnLinkedDeep {
+    world: EcsRelCmdWorldDeep,
+    entity: i64,
+}
+fn ecs_rel_spawn_linked_world(r: EcsRelSpawnLinkedDeep) -> EcsRelCmdWorldDeep { return r.world; }
+fn ecs_rel_spawn_linked_entity(r: EcsRelSpawnLinkedDeep) -> i64 { return r.entity; }
+
+// Direct (non-deferred) spawn_related: spawn entity, then set_related immediately on the world.
+fn ecs_rel_cmd_world_deep_spawn_related(world: EcsRelCmdWorldDeep, kind_id: i32, target: i64) -> EcsRelSpawnLinkedDeep {
+    let pair = ecs_rel_cmd_world_deep_spawn(world);
+    let w = pair.0;
+    let e = pair.1;
+    let slot = _ecs_rel_cmd_world_deep_kind_slot(w, kind_id);
+    let w1 = _ecs_rel_cmd_world_deep_set_related(w, slot, e, target);
+    let r = EcsRelSpawnLinkedDeep { world: w1, entity: e };
+    return r;
+}

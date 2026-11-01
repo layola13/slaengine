@@ -1,0 +1,410 @@
+// Deepened Bevy ECS entity_disabling surface.
+// Mirrors src/entity_disabling.rs: Disabled marker, DefaultQueryFilters
+// (empty/from_world bootstrap, register_disabling_component idempotent,
+// disabling_ids, modify_access, is_dense), multi-disabling query semantics
+// (entity visible only if query mentions all disabling components present).
+// Shallow lib/entity_disabling_filters.sla retained.
+
+// Component id bit helpers (ids 0..62)
+fn ecs_ed_deep_bit(id: i64) -> i64 {
+    if id < 0 || id > 62 { return 0; };
+    let b: i64 = 1;
+    let i: i64 = 0;
+    while i < id {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ecs_ed_deep_has_bit(mask: i64, id: i64) -> bool {
+    let b = ecs_ed_deep_bit(id);
+    if b == 0 { return false; };
+    return (mask / b) % 2 == 1;
+}
+
+fn ecs_ed_deep_set_bit(mask: i64, id: i64) -> i64 {
+    if ecs_ed_deep_has_bit(mask, id) { return mask; };
+    return mask + ecs_ed_deep_bit(id);
+}
+
+fn ecs_ed_deep_clear_bit(mask: i64, id: i64) -> i64 {
+    if ecs_ed_deep_has_bit(mask, id) != true { return mask; };
+    return mask - ecs_ed_deep_bit(id);
+}
+
+// Storage type for is_dense checks
+const ECS_ED_STORAGE_TABLE: i32 = 0;
+const ECS_ED_STORAGE_SPARSE: i32 = 1;
+
+// === Disabled marker (bootstrap component id conventionally 0) ===
+const ECS_ED_DISABLED_ID: i64 = 0;
+
+struct EcsDisabledDeep {
+    component_id: i64,
+}
+
+fn ecs_ed_deep_disabled_new() -> EcsDisabledDeep {
+    return EcsDisabledDeep { component_id: ECS_ED_DISABLED_ID };
+}
+
+fn ecs_ed_deep_disabled_component_id(d: EcsDisabledDeep) -> i64 {
+    return d.component_id;
+}
+
+// === Minimal FilteredAccess for modify_access tests ===
+// models: read/write/archetypal "contains" + with/without filter sets
+struct EcsEdFilteredAccessDeep {
+    // component ids the query "contains" (read/write/archetypal mention)
+    contains_mask: i64,
+    with_mask: i64,
+    without_mask: i64,
+}
+
+fn ecs_ed_fa_new() -> EcsEdFilteredAccessDeep {
+    return EcsEdFilteredAccessDeep { contains_mask: 0, with_mask: 0, without_mask: 0 };
+}
+
+fn ecs_ed_fa_add_read(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    fa.contains_mask = ecs_ed_deep_set_bit(fa.contains_mask, id);
+    return fa;
+}
+
+fn ecs_ed_fa_add_write(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    fa.contains_mask = ecs_ed_deep_set_bit(fa.contains_mask, id);
+    return fa;
+}
+
+fn ecs_ed_fa_add_archetypal(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    // Has/Allow-style archetypal mention also counts as contains
+    fa.contains_mask = ecs_ed_deep_set_bit(fa.contains_mask, id);
+    return fa;
+}
+
+fn ecs_ed_fa_and_with(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    fa.with_mask = ecs_ed_deep_set_bit(fa.with_mask, id);
+    fa.contains_mask = ecs_ed_deep_set_bit(fa.contains_mask, id);
+    return fa;
+}
+
+fn ecs_ed_fa_and_without(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    fa.without_mask = ecs_ed_deep_set_bit(fa.without_mask, id);
+    return fa;
+}
+
+fn ecs_ed_fa_contains(fa: EcsEdFilteredAccessDeep, id: i64) -> bool {
+    return ecs_ed_deep_has_bit(fa.contains_mask, id);
+}
+
+fn ecs_ed_fa_has_with(fa: EcsEdFilteredAccessDeep, id: i64) -> bool {
+    return ecs_ed_deep_has_bit(fa.with_mask, id);
+}
+
+fn ecs_ed_fa_has_without(fa: EcsEdFilteredAccessDeep, id: i64) -> bool {
+    return ecs_ed_deep_has_bit(fa.without_mask, id);
+}
+
+fn ecs_ed_fa_with_count(fa: EcsEdFilteredAccessDeep) -> i32 {
+    let n: i32 = 0;
+    let i: i64 = 0;
+    while i < 63 {
+        if ecs_ed_deep_has_bit(fa.with_mask, i) { n = n + 1; };
+        i = i + 1;
+    }
+    return n;
+}
+
+fn ecs_ed_fa_without_count(fa: EcsEdFilteredAccessDeep) -> i32 {
+    let n: i32 = 0;
+    let i: i64 = 0;
+    while i < 63 {
+        if ecs_ed_deep_has_bit(fa.without_mask, i) { n = n + 1; };
+        i = i + 1;
+    }
+    return n;
+}
+
+// === DefaultQueryFilters ===
+// fixed 8 slots for disabling component ids; -1 empty
+struct EcsDefaultQueryFiltersDeep {
+    d0: i64, d1: i64, d2: i64, d3: i64,
+    d4: i64, d5: i64, d6: i64, d7: i64,
+    len: i32,
+    // storage type registry for is_dense: bit set => SparseSet, clear => Table
+    sparse_mask: i64,
+    // entity component masks for query simulation (8 entities)
+    e0: i64, e1: i64, e2: i64, e3: i64,
+    e4: i64, e5: i64, e6: i64, e7: i64,
+    occupied: i64, // bit i => entity i exists
+}
+
+fn ecs_ed_dqf_empty() -> EcsDefaultQueryFiltersDeep {
+    return EcsDefaultQueryFiltersDeep {
+        d0: -1, d1: -1, d2: -1, d3: -1,
+        d4: -1, d5: -1, d6: -1, d7: -1,
+        len: 0,
+        sparse_mask: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0,
+        e4: 0, e5: 0, e6: 0, e7: 0,
+        occupied: 0,
+    };
+}
+
+// FromWorld bootstrap: registers Disabled (id 0)
+fn ecs_ed_dqf_from_world() -> EcsDefaultQueryFiltersDeep {
+    let f = ecs_ed_dqf_empty();
+    f = ecs_ed_dqf_register_disabling_component(f, ECS_ED_DISABLED_ID);
+    return f;
+}
+
+fn ecs_ed_dqf_len(f: EcsDefaultQueryFiltersDeep) -> i32 { return f.len; }
+
+fn ecs_ed_dqf_get_slot(f: EcsDefaultQueryFiltersDeep, i: i32) -> i64 {
+    if i == 0 { return f.d0; };
+    if i == 1 { return f.d1; };
+    if i == 2 { return f.d2; };
+    if i == 3 { return f.d3; };
+    if i == 4 { return f.d4; };
+    if i == 5 { return f.d5; };
+    if i == 6 { return f.d6; };
+    if i == 7 { return f.d7; };
+    return -1;
+}
+
+fn ecs_ed_dqf_set_slot(f: EcsDefaultQueryFiltersDeep, i: i32, id: i64) -> EcsDefaultQueryFiltersDeep {
+    if i == 0 { f.d0 = id; };
+    if i == 1 { f.d1 = id; };
+    if i == 2 { f.d2 = id; };
+    if i == 3 { f.d3 = id; };
+    if i == 4 { f.d4 = id; };
+    if i == 5 { f.d5 = id; };
+    if i == 6 { f.d6 = id; };
+    if i == 7 { f.d7 = id; };
+    return f;
+}
+
+fn ecs_ed_dqf_contains_id(f: EcsDefaultQueryFiltersDeep, component_id: i64) -> bool {
+    let i: i32 = 0;
+    while i < f.len {
+        if ecs_ed_dqf_get_slot(f, i) == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// register_disabling_component: idempotent
+fn ecs_ed_dqf_register_disabling_component(
+    f: EcsDefaultQueryFiltersDeep,
+    component_id: i64
+) -> EcsDefaultQueryFiltersDeep {
+    if ecs_ed_dqf_contains_id(f, component_id) { return f; };
+    if f.len >= 8 { return f; };
+    f = ecs_ed_dqf_set_slot(f, f.len, component_id);
+    f.len = f.len + 1;
+    return f;
+}
+
+// World::register_disabling_component facade
+fn ecs_ed_world_register_disabling(
+    f: EcsDefaultQueryFiltersDeep,
+    component_id: i64
+) -> EcsDefaultQueryFiltersDeep {
+    return ecs_ed_dqf_register_disabling_component(f, component_id);
+}
+
+fn ecs_ed_dqf_disabling_ids_count(f: EcsDefaultQueryFiltersDeep) -> i32 {
+    return f.len;
+}
+
+fn ecs_ed_dqf_disabling_id_at(f: EcsDefaultQueryFiltersDeep, i: i32) -> i64 {
+    return ecs_ed_dqf_get_slot(f, i);
+}
+
+fn ecs_ed_dqf_is_disabling(f: EcsDefaultQueryFiltersDeep, component_id: i64) -> bool {
+    return ecs_ed_dqf_contains_id(f, component_id);
+}
+
+// modify_access: for each disabling id not already contained, and_without(id)
+fn ecs_ed_dqf_modify_access(
+    f: EcsDefaultQueryFiltersDeep,
+    fa: EcsEdFilteredAccessDeep
+) -> EcsEdFilteredAccessDeep {
+    let i: i32 = 0;
+    while i < f.len {
+        let id = ecs_ed_dqf_get_slot(f, i);
+        if ecs_ed_fa_contains(fa, id) != true {
+            fa = ecs_ed_fa_and_without(fa, id);
+        };
+        i = i + 1;
+    }
+    return fa;
+}
+
+// storage registry for is_dense
+fn ecs_ed_dqf_set_storage(
+    f: EcsDefaultQueryFiltersDeep,
+    component_id: i64,
+    storage: i32
+) -> EcsDefaultQueryFiltersDeep {
+    if storage == ECS_ED_STORAGE_SPARSE {
+        f.sparse_mask = ecs_ed_deep_set_bit(f.sparse_mask, component_id);
+    };
+    if storage == ECS_ED_STORAGE_TABLE {
+        f.sparse_mask = ecs_ed_deep_clear_bit(f.sparse_mask, component_id);
+    };
+    return f;
+}
+
+fn ecs_ed_dqf_storage_of(f: EcsDefaultQueryFiltersDeep, component_id: i64) -> i32 {
+    if ecs_ed_deep_has_bit(f.sparse_mask, component_id) {
+        return ECS_ED_STORAGE_SPARSE;
+    };
+    return ECS_ED_STORAGE_TABLE;
+}
+
+// is_dense: all disabling components use Table storage
+fn ecs_ed_dqf_is_dense(f: EcsDefaultQueryFiltersDeep) -> bool {
+    let i: i32 = 0;
+    while i < f.len {
+        let id = ecs_ed_dqf_get_slot(f, i);
+        if ecs_ed_dqf_storage_of(f, id) != ECS_ED_STORAGE_TABLE {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// === Entity spawn helpers for multi-disabling query simulation ===
+fn ecs_ed_dqf_spawn(f: EcsDefaultQueryFiltersDeep, entity: i64, components_mask: i64) -> EcsDefaultQueryFiltersDeep {
+    if entity < 0 || entity > 7 { return f; };
+    f.occupied = ecs_ed_deep_set_bit(f.occupied, entity);
+    if entity == 0 { f.e0 = components_mask; };
+    if entity == 1 { f.e1 = components_mask; };
+    if entity == 2 { f.e2 = components_mask; };
+    if entity == 3 { f.e3 = components_mask; };
+    if entity == 4 { f.e4 = components_mask; };
+    if entity == 5 { f.e5 = components_mask; };
+    if entity == 6 { f.e6 = components_mask; };
+    if entity == 7 { f.e7 = components_mask; };
+    return f;
+}
+
+fn ecs_ed_dqf_entity_mask(f: EcsDefaultQueryFiltersDeep, entity: i64) -> i64 {
+    if entity == 0 { return f.e0; };
+    if entity == 1 { return f.e1; };
+    if entity == 2 { return f.e2; };
+    if entity == 3 { return f.e3; };
+    if entity == 4 { return f.e4; };
+    if entity == 5 { return f.e5; };
+    if entity == 6 { return f.e6; };
+    if entity == 7 { return f.e7; };
+    return 0;
+}
+
+fn ecs_ed_dqf_entity_occupied(f: EcsDefaultQueryFiltersDeep, entity: i64) -> bool {
+    return ecs_ed_deep_has_bit(f.occupied, entity);
+}
+
+// Query mention mask: component ids the query explicitly mentions (With/Has/data).
+// required_with_mask: components the query requires present (With filters).
+// Entity is included if:
+// 1) it has every required_with component, and
+// 2) for every disabling component D present on the entity, D is also mentioned
+//    (Bevy default filters only apply When the query does not mention D).
+fn ecs_ed_dqf_entity_matches_query(
+    f: EcsDefaultQueryFiltersDeep,
+    entity: i64,
+    query_mention_mask: i64
+) -> bool {
+    return ecs_ed_dqf_entity_matches_query_ex(f, entity, query_mention_mask, 0);
+}
+
+fn ecs_ed_dqf_entity_matches_query_ex(
+    f: EcsDefaultQueryFiltersDeep,
+    entity: i64,
+    query_mention_mask: i64,
+    required_with_mask: i64
+) -> bool {
+    if ecs_ed_dqf_entity_occupied(f, entity) != true { return false; };
+    let em = ecs_ed_dqf_entity_mask(f, entity);
+    // required With filters
+    let i: i64 = 0;
+    while i < 63 {
+        if ecs_ed_deep_has_bit(required_with_mask, i) {
+            if ecs_ed_deep_has_bit(em, i) != true { return false; };
+        };
+        i = i + 1;
+    }
+    // default disabling filters
+    let j: i32 = 0;
+    while j < f.len {
+        let did = ecs_ed_dqf_get_slot(f, j);
+        if ecs_ed_deep_has_bit(em, did) {
+            if ecs_ed_deep_has_bit(query_mention_mask, did) != true {
+                return false;
+            };
+        };
+        j = j + 1;
+    }
+    return true;
+}
+
+// count entities matching a query mention mask (no required With)
+fn ecs_ed_dqf_query_count(f: EcsDefaultQueryFiltersDeep, query_mention_mask: i64) -> i32 {
+    return ecs_ed_dqf_query_count_ex(f, query_mention_mask, 0);
+}
+
+fn ecs_ed_dqf_query_count_ex(
+    f: EcsDefaultQueryFiltersDeep,
+    query_mention_mask: i64,
+    required_with_mask: i64
+) -> i32 {
+    let n: i32 = 0;
+    let e: i64 = 0;
+    while e < 8 {
+        if ecs_ed_dqf_entity_matches_query_ex(f, e, query_mention_mask, required_with_mask) {
+            n = n + 1;
+        };
+        e = e + 1;
+    }
+    return n;
+}
+
+// resource_scope escape hatch: temporarily empty filters
+fn ecs_ed_dqf_resource_scope_empty(
+    f: EcsDefaultQueryFiltersDeep
+) -> (EcsDefaultQueryFiltersDeep, EcsDefaultQueryFiltersDeep) {
+    // returns (scoped empty filters, original) — caller restores original
+    return (ecs_ed_dqf_empty(), f);
+}
+
+// Allow filter: mention disabling id so modify_access will not add Without
+fn ecs_ed_fa_allow(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    // Allow is a QueryFilter that mentions the component without requiring it
+    return ecs_ed_fa_add_archetypal(fa, id);
+}
+
+// Has data: also mentions component
+fn ecs_ed_fa_has_data(fa: EcsEdFilteredAccessDeep, id: i64) -> EcsEdFilteredAccessDeep {
+    return ecs_ed_fa_add_archetypal(fa, id);
+}
+
+// overwrite filters (escape hatch)
+fn ecs_ed_dqf_overwrite(f: EcsDefaultQueryFiltersDeep, next: EcsDefaultQueryFiltersDeep) -> EcsDefaultQueryFiltersDeep {
+    // keep entity state from f when overwriting only disabling list? Bevy replaces resource entirely.
+    next.e0 = f.e0; next.e1 = f.e1; next.e2 = f.e2; next.e3 = f.e3;
+    next.e4 = f.e4; next.e5 = f.e5; next.e6 = f.e6; next.e7 = f.e7;
+    next.occupied = f.occupied;
+    next.sparse_mask = f.sparse_mask;
+    return next;
+}
+
+// helper: build component mask from up to 3 ids (-1 to skip)
+fn ecs_ed_deep_mask3(a: i64, b: i64, c: i64) -> i64 {
+    let m: i64 = 0;
+    if a >= 0 { m = ecs_ed_deep_set_bit(m, a); };
+    if b >= 0 { m = ecs_ed_deep_set_bit(m, b); };
+    if c >= 0 { m = ecs_ed_deep_set_bit(m, c); };
+    return m;
+}

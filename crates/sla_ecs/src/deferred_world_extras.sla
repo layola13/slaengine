@@ -1,0 +1,254 @@
+// Bevy ECS DeferredWorld extras — the DeferredWorld pub surface not in lib/deferred_world.sla.
+// Mirrors src/world/deferred_world.rs (gaps not in lib/deferred_world.sla).
+// Uncovered Bevy pub fns: get_mut<T> / get_entity_mut<F> / query / non_send_resource_mut /
+// get_resource_mut_by_id / get_non_send_mut_by_id. DeferredWorld also exposes get_mut / query as
+// panic-vs-error variants of the get_* family — we model the entity-fetch + query-handle paths.
+
+// A tiny deferred-world model: per-entity component column store + resource-by-id store + the
+// deferred query handle book.
+struct EcsDeferredWorldExtras {
+    change_tick: i32,
+    world_id: i32,
+    entity_indices: Vec<i32>,
+    component_ids_per: Vec<Vec<i32>>,
+    values_per: Vec<Vec<i32>>,
+    non_send_resource_ids: Vec<i32>,
+    non_send_resource_values: Vec<i32>,
+    non_send_resource_thread_ids: Vec<i32>,
+    next_query_handle: i32,
+    call_thread_id: i32,
+}
+
+fn ecs_dwx_new(world_id: i32, call_thread_id: i32) -> EcsDeferredWorldExtras {
+    let d = EcsDeferredWorldExtras { change_tick: 0, world_id: world_id, entity_indices: Vec::new(), component_ids_per: Vec::new(), values_per: Vec::new(), non_send_resource_ids: Vec::new(), non_send_resource_values: Vec::new(), non_send_resource_thread_ids: Vec::new(), next_query_handle: 1, call_thread_id: call_thread_id };
+    return d;
+}
+
+fn ecs_dwx_spawn(d: EcsDeferredWorldExtras, value: i32) -> EcsDeferredWorldExtras {
+    let idx: i32 = len(d.entity_indices) as i32;
+    d.entity_indices.push(idx);
+    let comps = Vec::new();
+    let vals = Vec::new();
+    vals.push(value);
+    comps.push(1);
+    d.component_ids_per.push(comps);
+    d.values_per.push(vals);
+    return d;
+}
+
+// EntityMutableFetchError: 0 = NotSpawned, 1 = AliasedMutability
+fn ecs_dwx_fetch_err_not_spawned() -> i32 {
+    return 0;
+}
+
+fn ecs_dwx_fetch_err_aliased_mutability() -> i32 {
+    return 1;
+}
+
+// get_entity_mut result: struct with ok + err_code + entity_idx + mutable_value.
+struct GetEntityMutResult {
+    ok: i32,
+    err_code: i32,
+    entity_idx: i32,
+    value: i32,
+}
+
+fn ecs_dwx_gem_ok(r: GetEntityMutResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_dwx_gem_err_code(r: GetEntityMutResult) -> i32 {
+    return r.err_code;
+}
+
+fn ecs_dwx_gem_entity_idx(r: GetEntityMutResult) -> i32 {
+    return r.entity_idx;
+}
+
+fn ecs_dwx_gem_value(r: GetEntityMutResult) -> i32 {
+    return r.value;
+}
+
+// get_entity_mut(entity): looks up the entity; returns EntityMutableFetchError::NotSpawned if absent.
+fn ecs_dwx_get_entity_mut(d: EcsDeferredWorldExtras, entity: i32) -> GetEntityMutResult {
+    let n: i32 = len(d.entity_indices) as i32;
+    if entity < 0 || entity >= n {
+        let r = GetEntityMutResult { ok: 0, err_code: ecs_dwx_fetch_err_not_spawned(), entity_idx: -1, value: 0 };
+        return r;
+    };
+    let r = GetEntityMutResult { ok: 1, err_code: -1, entity_idx: entity, value: d.values_per[entity][0] };
+    return r;
+}
+
+// get_mut result: Option<Mut<T>> shaped — value at the component_id slot for the entity, or None.
+struct GetMutResult {
+    ok: i32,
+    value: i32,
+}
+
+fn ecs_dwx_gm_ok(r: GetMutResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_dwx_gm_value(r: GetMutResult) -> i32 {
+    return r.value;
+}
+
+fn ecs_dwx_get_mut(d: EcsDeferredWorldExtras, entity: i32, component_id: i32) -> GetMutResult {
+    let gem = ecs_dwx_get_entity_mut(d, entity);
+    if ecs_dwx_gem_ok(gem) != 1 {
+        let r = GetMutResult { ok: 0, value: 0 };
+        return r;
+    };
+    // find the component_id slot inside the entity column
+    let cols_c = d.component_ids_per[entity];
+    let cols_v = d.values_per[entity];
+    let m: i32 = len(cols_c) as i32;
+    let i: i32 = 0;
+    while i < m { if cols_c[i] == component_id { let r = GetMutResult { ok: 1, value: cols_v[i] }; return r; }; i = i + 1; }
+    let r = GetMutResult { ok: 0, value: 0 };
+    return r;
+}
+
+// query result: returns a Query handle id against the model (query handle is just a number here).
+struct QueryResult {
+    handle: i32,
+    world_id: i32,
+}
+
+fn ecs_dwx_query_handle(r: QueryResult) -> i32 {
+    return r.handle;
+}
+
+fn ecs_dwx_query_world_id(r: QueryResult) -> i32 {
+    return r.world_id;
+}
+
+// query(state): returns a Query tied to this deferred world. We allocate a fresh handle id.
+fn ecs_dwx_query(d: EcsDeferredWorldExtras) -> QueryResult {
+    let h = d.next_query_handle;
+    d.next_query_handle = d.next_query_handle + 1;
+    let r = QueryResult { handle: h, world_id: d.world_id };
+    return r;
+}
+
+// get_resource_mut_by_id result: Option<MutUntyped> over resource-by-id store.
+struct GetResourceMutByIdResult {
+    ok: i32,
+    value: i32,
+}
+
+fn ecs_dwx_grmb_ok(r: GetResourceMutByIdResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_dwx_grmb_value(r: GetResourceMutByIdResult) -> i32 {
+    return r.value;
+}
+
+// resource store (separate from non-send), keyed by component_id.
+struct EcsDwxResources {
+    ids: Vec<i32>,
+    values: Vec<i32>,
+}
+
+fn ecs_dwx_resources_new() -> EcsDwxResources {
+    let r = EcsDwxResources { ids: Vec::new(), values: Vec::new() };
+    return r;
+}
+
+fn ecs_dwx_resources_insert(rs: EcsDwxResources, component_id: i32, value: i32) -> EcsDwxResources {
+    let n: i32 = len(rs.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if rs.ids[i] == component_id { rs.values[i] = value; return rs; }; i = i + 1; }
+    rs.ids.push(component_id);
+    rs.values.push(value);
+    return rs;
+}
+
+fn ecs_dwx_get_resource_mut_by_id(rs: EcsDwxResources, component_id: i32) -> GetResourceMutByIdResult {
+    let n: i32 = len(rs.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if rs.ids[i] == component_id { let r = GetResourceMutByIdResult { ok: 1, value: rs.values[i] }; return r; }; i = i + 1; }
+    let r = GetResourceMutByIdResult { ok: 0, value: 0 };
+    return r;
+}
+
+// insert a non-send resource onto the deferred world (panic-equiv path: thread-check)
+fn ecs_dwx_insert_non_send(d: EcsDeferredWorldExtras, component_id: i32, value: i32, thread_id: i32) -> EcsDeferredWorldExtras {
+    let n: i32 = len(d.non_send_resource_ids) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if d.non_send_resource_ids[i] == component_id {
+            d.non_send_resource_values[i] = value;
+            d.non_send_resource_thread_ids[i] = thread_id;
+            return d;
+        };
+        i = i + 1;
+    }
+    d.non_send_resource_ids.push(component_id);
+    d.non_send_resource_values.push(value);
+    d.non_send_resource_thread_ids.push(thread_id);
+    return d;
+}
+
+// get_non_send_mut_by_id result: includes the thread-id check.
+struct GetNonSendMutByIdResult {
+    ok: i32,
+    value: i32,
+    thread_ok: i32,
+}
+
+fn ecs_dwx_gnsmb_ok(r: GetNonSendMutByIdResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_dwx_gnsmb_value(r: GetNonSendMutByIdResult) -> i32 {
+    return r.value;
+}
+
+fn ecs_dwx_gnsmb_thread_ok(r: GetNonSendMutByIdResult) -> bool {
+    return r.thread_ok == 1;
+}
+
+fn ecs_dwx_get_non_send_mut_by_id(d: EcsDeferredWorldExtras, component_id: i32) -> GetNonSendMutByIdResult {
+    let n: i32 = len(d.non_send_resource_ids) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if d.non_send_resource_ids[i] == component_id {
+            let thread_ok: i32 = 0;
+            if d.non_send_resource_thread_ids[i] == d.call_thread_id { thread_ok = 1; };
+            let r = GetNonSendMutByIdResult { ok: 1, value: d.non_send_resource_values[i], thread_ok: thread_ok };
+            return r;
+        };
+        i = i + 1;
+    }
+    let r = GetNonSendMutByIdResult { ok: 0, value: 0, thread_ok: 0 };
+    return r;
+}
+
+// non_send_resource_mut: combines the resource creation + lookup; panic if absent (panic sentinel returned as ok=0).
+fn ecs_dwx_non_send_resource_mut(d: EcsDeferredWorldExtras, component_id: i32) -> GetNonSendMutByIdResult {
+    let n: i32 = len(d.non_send_resource_ids) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if d.non_send_resource_ids[i] == component_id {
+            let thread_ok: i32 = 0;
+            if d.non_send_resource_thread_ids[i] == d.call_thread_id { thread_ok = 1; };
+            let r = GetNonSendMutByIdResult { ok: 1, value: d.non_send_resource_values[i], thread_ok: thread_ok };
+            return r;
+        };
+        i = i + 1;
+    }
+    let r = GetNonSendMutByIdResult { ok: 0, value: 0, thread_ok: 0 };
+    return r;
+}
+
+// change_tick accessor (for completeness with the File already partially covered)
+fn ecs_dwx_change_tick(d: EcsDeferredWorldExtras) -> i32 {
+    return d.change_tick;
+}
+
+fn ecs_dwx_world_id(d: EcsDeferredWorldExtras) -> i32 {
+    return d.world_id;
+}

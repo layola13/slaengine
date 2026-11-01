@@ -1,0 +1,273 @@
+// Deepened Bevy ECS FilteredAccessSet surface.
+// Mirrors src/query/access.rs FilteredAccessSet:
+//   combined access, filtered list, add/extend, resource read/write,
+//   read_all/write_all, clear, is_compatible, get_conflicts_single.
+// Shallow lib/query_filtered_set.sla retained.
+// Fixed capacity: 4 filtered entries; each entry tracks one read + one write id + with/without.
+
+struct EcsFasEntryDeep {
+    read_id: i32,   // -1 none, -2 read_all
+    write_id: i32,  // -1 none, -2 write_all
+    with_id: i32,   // -1 none
+    without_id: i32,// -1 none
+}
+
+fn ecs_fas_entry_empty() -> EcsFasEntryDeep {
+    return EcsFasEntryDeep { read_id: -1, write_id: -1, with_id: -1, without_id: -1 };
+}
+
+struct EcsFasDeep {
+    len: i32,
+    e0: EcsFasEntryDeep, e1: EcsFasEntryDeep, e2: EcsFasEntryDeep, e3: EcsFasEntryDeep,
+    // combined access summary
+    combined_read_all: bool,
+    combined_write_all: bool,
+    combined_read0: i32, combined_read1: i32, combined_read_len: i32,
+    combined_write0: i32, combined_write1: i32, combined_write_len: i32,
+}
+
+fn ecs_fas_deep_new() -> EcsFasDeep {
+    let empty = ecs_fas_entry_empty();
+    return EcsFasDeep {
+        len: 0, e0: empty, e1: empty, e2: empty, e3: empty,
+        combined_read_all: false, combined_write_all: false,
+        combined_read0: -1, combined_read1: -1, combined_read_len: 0,
+        combined_write0: -1, combined_write1: -1, combined_write_len: 0,
+    };
+}
+
+fn ecs_fas_deep_len(s: EcsFasDeep) -> i32 { return s.len; }
+fn ecs_fas_deep_combined_read_all(s: EcsFasDeep) -> bool { return s.combined_read_all; }
+fn ecs_fas_deep_combined_write_all(s: EcsFasDeep) -> bool { return s.combined_write_all; }
+fn ecs_fas_deep_combined_read_len(s: EcsFasDeep) -> i32 { return s.combined_read_len; }
+fn ecs_fas_deep_combined_write_len(s: EcsFasDeep) -> i32 { return s.combined_write_len; }
+
+fn ecs_fas_deep_add_combined_read(s: EcsFasDeep, id: i32) -> EcsFasDeep {
+    if id == -2 {
+        return EcsFasDeep {
+            len: s.len, e0: s.e0, e1: s.e1, e2: s.e2, e3: s.e3,
+            combined_read_all: true, combined_write_all: s.combined_write_all,
+            combined_read0: s.combined_read0, combined_read1: s.combined_read1, combined_read_len: s.combined_read_len,
+            combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+        };
+    };
+    if s.combined_read_len >= 1 { if s.combined_read0 == id { return s; }; };
+    if s.combined_read_len >= 2 { if s.combined_read1 == id { return s; }; };
+    if s.combined_read_len == 0 {
+        return EcsFasDeep {
+            len: s.len, e0: s.e0, e1: s.e1, e2: s.e2, e3: s.e3,
+            combined_read_all: s.combined_read_all, combined_write_all: s.combined_write_all,
+            combined_read0: id, combined_read1: s.combined_read1, combined_read_len: 1,
+            combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+        };
+    };
+    if s.combined_read_len == 1 {
+        return EcsFasDeep {
+            len: s.len, e0: s.e0, e1: s.e1, e2: s.e2, e3: s.e3,
+            combined_read_all: s.combined_read_all, combined_write_all: s.combined_write_all,
+            combined_read0: s.combined_read0, combined_read1: id, combined_read_len: 2,
+            combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+        };
+    };
+    return s;
+}
+
+fn ecs_fas_deep_add_combined_write(s: EcsFasDeep, id: i32) -> EcsFasDeep {
+    // write implies read
+    let base = ecs_fas_deep_add_combined_read(s, id);
+    if id == -2 {
+        return EcsFasDeep {
+            len: base.len, e0: base.e0, e1: base.e1, e2: base.e2, e3: base.e3,
+            combined_read_all: base.combined_read_all, combined_write_all: true,
+            combined_read0: base.combined_read0, combined_read1: base.combined_read1, combined_read_len: base.combined_read_len,
+            combined_write0: base.combined_write0, combined_write1: base.combined_write1, combined_write_len: base.combined_write_len,
+        };
+    };
+    if base.combined_write_len >= 1 { if base.combined_write0 == id { return base; }; };
+    if base.combined_write_len >= 2 { if base.combined_write1 == id { return base; }; };
+    if base.combined_write_len == 0 {
+        return EcsFasDeep {
+            len: base.len, e0: base.e0, e1: base.e1, e2: base.e2, e3: base.e3,
+            combined_read_all: base.combined_read_all, combined_write_all: base.combined_write_all,
+            combined_read0: base.combined_read0, combined_read1: base.combined_read1, combined_read_len: base.combined_read_len,
+            combined_write0: id, combined_write1: base.combined_write1, combined_write_len: 1,
+        };
+    };
+    if base.combined_write_len == 1 {
+        return EcsFasDeep {
+            len: base.len, e0: base.e0, e1: base.e1, e2: base.e2, e3: base.e3,
+            combined_read_all: base.combined_read_all, combined_write_all: base.combined_write_all,
+            combined_read0: base.combined_read0, combined_read1: base.combined_read1, combined_read_len: base.combined_read_len,
+            combined_write0: base.combined_write0, combined_write1: id, combined_write_len: 2,
+        };
+    };
+    return base;
+}
+
+fn ecs_fas_deep_push_entry(s: EcsFasDeep, e: EcsFasEntryDeep) -> EcsFasDeep {
+    if s.len >= 4 { return s; };
+    if s.len == 0 {
+        return EcsFasDeep {
+            len: 1, e0: e, e1: s.e1, e2: s.e2, e3: s.e3,
+            combined_read_all: s.combined_read_all, combined_write_all: s.combined_write_all,
+            combined_read0: s.combined_read0, combined_read1: s.combined_read1, combined_read_len: s.combined_read_len,
+            combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+        };
+    };
+    if s.len == 1 {
+        return EcsFasDeep {
+            len: 2, e0: s.e0, e1: e, e2: s.e2, e3: s.e3,
+            combined_read_all: s.combined_read_all, combined_write_all: s.combined_write_all,
+            combined_read0: s.combined_read0, combined_read1: s.combined_read1, combined_read_len: s.combined_read_len,
+            combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+        };
+    };
+    if s.len == 2 {
+        return EcsFasDeep {
+            len: 3, e0: s.e0, e1: s.e1, e2: e, e3: s.e3,
+            combined_read_all: s.combined_read_all, combined_write_all: s.combined_write_all,
+            combined_read0: s.combined_read0, combined_read1: s.combined_read1, combined_read_len: s.combined_read_len,
+            combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+        };
+    };
+    return EcsFasDeep {
+        len: 4, e0: s.e0, e1: s.e1, e2: s.e2, e3: e,
+        combined_read_all: s.combined_read_all, combined_write_all: s.combined_write_all,
+        combined_read0: s.combined_read0, combined_read1: s.combined_read1, combined_read_len: s.combined_read_len,
+        combined_write0: s.combined_write0, combined_write1: s.combined_write1, combined_write_len: s.combined_write_len,
+    };
+}
+
+fn ecs_fas_deep_add_resource_read(s: EcsFasDeep, id: i32) -> EcsFasDeep {
+    let e = EcsFasEntryDeep { read_id: id, write_id: -1, with_id: -1, without_id: -1 };
+    let s2 = ecs_fas_deep_push_entry(s, e);
+    return ecs_fas_deep_add_combined_read(s2, id);
+}
+fn ecs_fas_deep_add_resource_write(s: EcsFasDeep, id: i32) -> EcsFasDeep {
+    let e = EcsFasEntryDeep { read_id: id, write_id: id, with_id: -1, without_id: -1 };
+    let s2 = ecs_fas_deep_push_entry(s, e);
+    return ecs_fas_deep_add_combined_write(s2, id);
+}
+fn ecs_fas_deep_read_all(s: EcsFasDeep) -> EcsFasDeep {
+    let e = EcsFasEntryDeep { read_id: -2, write_id: -1, with_id: -1, without_id: -1 };
+    let s2 = ecs_fas_deep_push_entry(s, e);
+    return ecs_fas_deep_add_combined_read(s2, -2);
+}
+fn ecs_fas_deep_write_all(s: EcsFasDeep) -> EcsFasDeep {
+    let e = EcsFasEntryDeep { read_id: -2, write_id: -2, with_id: -1, without_id: -1 };
+    let s2 = ecs_fas_deep_push_entry(s, e);
+    return ecs_fas_deep_add_combined_write(s2, -2);
+}
+
+fn ecs_fas_deep_add_filtered(s: EcsFasDeep, read_id: i32, write_id: i32, with_id: i32, without_id: i32) -> EcsFasDeep {
+    let e = EcsFasEntryDeep { read_id: read_id, write_id: write_id, with_id: with_id, without_id: without_id };
+    let s2 = ecs_fas_deep_push_entry(s, e);
+    if write_id != -1 {
+        return ecs_fas_deep_add_combined_write(s2, write_id);
+    };
+    if read_id != -1 {
+        return ecs_fas_deep_add_combined_read(s2, read_id);
+    };
+    return s2;
+}
+
+fn ecs_fas_deep_clear() -> EcsFasDeep {
+    return ecs_fas_deep_new();
+}
+
+// combined write conflicts with other combined read/write
+fn ecs_fas_deep_combined_compatible(a: EcsFasDeep, b: EcsFasDeep) -> bool {
+    if a.combined_write_all {
+        if b.combined_read_all { return false; };
+        if b.combined_read_len > 0 { return false; };
+        if b.combined_write_len > 0 { return false; };
+    };
+    if b.combined_write_all {
+        if a.combined_read_all { return false; };
+        if a.combined_read_len > 0 { return false; };
+        if a.combined_write_len > 0 { return false; };
+    };
+    if a.combined_write_len >= 1 {
+        if b.combined_read_all { return false; };
+        if b.combined_read_len >= 1 { if b.combined_read0 == a.combined_write0 { return false; }; };
+        if b.combined_read_len >= 2 { if b.combined_read1 == a.combined_write0 { return false; }; };
+        if b.combined_write_len >= 1 { if b.combined_write0 == a.combined_write0 { return false; }; };
+        if b.combined_write_len >= 2 { if b.combined_write1 == a.combined_write0 { return false; }; };
+    };
+    if a.combined_write_len >= 2 {
+        if b.combined_read_len >= 1 { if b.combined_read0 == a.combined_write1 { return false; }; };
+        if b.combined_read_len >= 2 { if b.combined_read1 == a.combined_write1 { return false; }; };
+    };
+    if b.combined_write_len >= 1 {
+        if a.combined_read_all { return false; };
+        if a.combined_read_len >= 1 { if a.combined_read0 == b.combined_write0 { return false; }; };
+        if a.combined_read_len >= 2 { if a.combined_read1 == b.combined_write0 { return false; }; };
+    };
+    return true;
+}
+
+// filter disjoint: a.with == b.without or reverse
+fn ecs_fas_entry_disjoint(a: EcsFasEntryDeep, b: EcsFasEntryDeep) -> bool {
+    if a.with_id != -1 {
+        if a.with_id == b.without_id { return true; };
+    };
+    if b.with_id != -1 {
+        if b.with_id == a.without_id { return true; };
+    };
+    return false;
+}
+
+fn ecs_fas_deep_is_compatible(a: EcsFasDeep, b: EcsFasDeep) -> bool {
+    // if every pair of entries is either access-ok via combined or some entry pair is disjoint, simplify:
+    // Bevy: set compatible if combined access compatible OR filters make all conflicting pairs disjoint.
+    // Deep model: if combined compatible => true; else if any a-entry is disjoint from all b-entries that conflict => allow when first a has with and first b without match.
+    if ecs_fas_deep_combined_compatible(a, b) { return true; };
+    // check first entries only for disjoint rescue
+    if a.len >= 1 {
+        if b.len >= 1 {
+            if ecs_fas_entry_disjoint(a.e0, b.e0) { return true; };
+        };
+    };
+    return false;
+}
+
+struct EcsFasConflictDeep {
+    has: bool,
+    component_id: i32,
+}
+fn ecs_fas_conflict_has(c: EcsFasConflictDeep) -> bool { return c.has; }
+fn ecs_fas_conflict_id(c: EcsFasConflictDeep) -> i32 { return c.component_id; }
+
+fn ecs_fas_deep_get_conflicts(a: EcsFasDeep, b: EcsFasDeep) -> EcsFasConflictDeep {
+    if ecs_fas_deep_is_compatible(a, b) {
+        return EcsFasConflictDeep { has: false, component_id: -1 };
+    };
+    if a.combined_write_len >= 1 {
+        return EcsFasConflictDeep { has: true, component_id: a.combined_write0 };
+    };
+    if b.combined_write_len >= 1 {
+        return EcsFasConflictDeep { has: true, component_id: b.combined_write0 };
+    };
+    return EcsFasConflictDeep { has: true, component_id: -2 };
+}
+
+// extend: append entries and merge combined
+fn ecs_fas_deep_extend(s: EcsFasDeep, other: EcsFasDeep) -> EcsFasDeep {
+    let olen = other.len;
+    let oe0 = other.e0; let oe1 = other.e1; let oe2 = other.e2; let oe3 = other.e3;
+    let o_ra = other.combined_read_all; let o_wa = other.combined_write_all;
+    let or0 = other.combined_read0; let or1 = other.combined_read1; let orl = other.combined_read_len;
+    let ow0 = other.combined_write0; let ow1 = other.combined_write1; let owl = other.combined_write_len;
+    let out = s;
+    if olen >= 1 { out = ecs_fas_deep_push_entry(out, oe0); };
+    if olen >= 2 { out = ecs_fas_deep_push_entry(out, oe1); };
+    if olen >= 3 { out = ecs_fas_deep_push_entry(out, oe2); };
+    if olen >= 4 { out = ecs_fas_deep_push_entry(out, oe3); };
+    if o_ra { out = ecs_fas_deep_add_combined_read(out, -2); };
+    if o_wa { out = ecs_fas_deep_add_combined_write(out, -2); };
+    if orl >= 1 { out = ecs_fas_deep_add_combined_read(out, or0); };
+    if orl >= 2 { out = ecs_fas_deep_add_combined_read(out, or1); };
+    if owl >= 1 { out = ecs_fas_deep_add_combined_write(out, ow0); };
+    if owl >= 2 { out = ecs_fas_deep_add_combined_write(out, ow1); };
+    return out;
+}

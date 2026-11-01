@@ -1,0 +1,179 @@
+// Deepened Bevy ECS query fetch surface.
+// Mirrors src/query/fetch.rs core kinds:
+//   Entity / Read / Ref / Write / Option / Has / AnyOf / Nested
+//   QueryItem + ROQueryItem, read-only classification, present flags.
+// Shallow lib/query_fetch.sla retained.
+// Fixed capacity: 4 AnyOf slots, 4 nested results.
+
+const ECS_QFD_ENTITY: i32 = 0;
+const ECS_QFD_READ: i32 = 1;
+const ECS_QFD_REF: i32 = 2;
+const ECS_QFD_WRITE: i32 = 3;
+const ECS_QFD_OPTION: i32 = 4;
+const ECS_QFD_HAS: i32 = 5;
+const ECS_QFD_ANY_OF: i32 = 6;
+const ECS_QFD_NESTED: i32 = 7;
+
+struct EcsQfDeep {
+    kind: i32,
+    component_id: i32,
+    value: i64,
+    present: bool,
+}
+
+fn ecs_qfd_entity(entity: i64) -> EcsQfDeep {
+    return EcsQfDeep { kind: ECS_QFD_ENTITY, component_id: 0, value: entity, present: true };
+}
+fn ecs_qfd_read(cid: i32, value: i64) -> EcsQfDeep {
+    return EcsQfDeep { kind: ECS_QFD_READ, component_id: cid, value: value, present: true };
+}
+fn ecs_qfd_ref(cid: i32, value: i64) -> EcsQfDeep {
+    return EcsQfDeep { kind: ECS_QFD_REF, component_id: cid, value: value, present: true };
+}
+fn ecs_qfd_write(cid: i32, value: i64) -> EcsQfDeep {
+    return EcsQfDeep { kind: ECS_QFD_WRITE, component_id: cid, value: value, present: true };
+}
+fn ecs_qfd_option(cid: i32, present: bool, value: i64) -> EcsQfDeep {
+    if present != true {
+        return EcsQfDeep { kind: ECS_QFD_OPTION, component_id: cid, value: 0, present: false };
+    };
+    return EcsQfDeep { kind: ECS_QFD_OPTION, component_id: cid, value: value, present: true };
+}
+fn ecs_qfd_has(cid: i32, present: bool) -> EcsQfDeep {
+    return EcsQfDeep { kind: ECS_QFD_HAS, component_id: cid, value: 0, present: present };
+}
+
+fn ecs_qfd_kind(f: EcsQfDeep) -> i32 { return f.kind; }
+fn ecs_qfd_component_id(f: EcsQfDeep) -> i32 { return f.component_id; }
+fn ecs_qfd_value(f: EcsQfDeep) -> i64 { return f.value; }
+fn ecs_qfd_present(f: EcsQfDeep) -> bool { return f.present; }
+
+fn ecs_qfd_is_read_only(f: EcsQfDeep) -> bool {
+    if f.kind == ECS_QFD_WRITE { return false; };
+    if f.kind == ECS_QFD_ANY_OF { return true; };
+    if f.kind == ECS_QFD_NESTED { return true; };
+    if f.kind == ECS_QFD_OPTION { return true; };
+    if f.kind == ECS_QFD_HAS { return true; };
+    if f.kind == ECS_QFD_READ { return true; };
+    if f.kind == ECS_QFD_REF { return true; };
+    if f.kind == ECS_QFD_ENTITY { return true; };
+    return true;
+}
+fn ecs_qfd_is_write(f: EcsQfDeep) -> bool {
+    if f.kind == ECS_QFD_WRITE { return true; };
+    return false;
+}
+
+// write mutation returns updated fetch
+fn ecs_qfd_write_set(f: EcsQfDeep, value: i64) -> EcsQfDeep {
+    if f.kind != ECS_QFD_WRITE {
+        return f;
+    };
+    return EcsQfDeep { kind: f.kind, component_id: f.component_id, value: value, present: true };
+}
+
+// AnyOf fixed 4
+struct EcsQfAnyOfDeep {
+    len: i32,
+    c0: i32, p0: bool,
+    c1: i32, p1: bool,
+    c2: i32, p2: bool,
+    c3: i32, p3: bool,
+}
+
+fn ecs_qfd_any_of_new() -> EcsQfAnyOfDeep {
+    return EcsQfAnyOfDeep {
+        len: 0, c0: -1, p0: false, c1: -1, p1: false, c2: -1, p2: false, c3: -1, p3: false,
+    };
+}
+fn ecs_qfd_any_of_len(a: EcsQfAnyOfDeep) -> i32 { return a.len; }
+fn ecs_qfd_any_of_add(a: EcsQfAnyOfDeep, cid: i32, present: bool) -> EcsQfAnyOfDeep {
+    if a.len >= 4 { return a; };
+    if a.len == 0 {
+        return EcsQfAnyOfDeep { len: 1, c0: cid, p0: present, c1: a.c1, p1: a.p1, c2: a.c2, p2: a.p2, c3: a.c3, p3: a.p3 };
+    };
+    if a.len == 1 {
+        return EcsQfAnyOfDeep { len: 2, c0: a.c0, p0: a.p0, c1: cid, p1: present, c2: a.c2, p2: a.p2, c3: a.c3, p3: a.p3 };
+    };
+    if a.len == 2 {
+        return EcsQfAnyOfDeep { len: 3, c0: a.c0, p0: a.p0, c1: a.c1, p1: a.p1, c2: cid, p2: present, c3: a.c3, p3: a.p3 };
+    };
+    return EcsQfAnyOfDeep { len: 4, c0: a.c0, p0: a.p0, c1: a.c1, p1: a.p1, c2: a.c2, p2: a.p2, c3: cid, p3: present };
+}
+fn ecs_qfd_any_of_any_present(a: EcsQfAnyOfDeep) -> bool {
+    if a.len >= 1 { if a.p0 { return true; }; };
+    if a.len >= 2 { if a.p1 { return true; }; };
+    if a.len >= 3 { if a.p2 { return true; }; };
+    if a.len >= 4 { if a.p3 { return true; }; };
+    return false;
+}
+fn ecs_qfd_any_of_has_id(a: EcsQfAnyOfDeep, cid: i32) -> bool {
+    if a.len >= 1 { if a.c0 == cid { return true; }; };
+    if a.len >= 2 { if a.c1 == cid { return true; }; };
+    if a.len >= 3 { if a.c2 == cid { return true; }; };
+    if a.len >= 4 { if a.c3 == cid { return true; }; };
+    return false;
+}
+
+// Nested query results
+struct EcsQfNestedDeep {
+    inner_data_id: i32,
+    filter_id: i32,
+    len: i32,
+    r0: i64, r1: i64, r2: i64, r3: i64,
+}
+fn ecs_qfd_nested_new(inner_data_id: i32, filter_id: i32) -> EcsQfNestedDeep {
+    return EcsQfNestedDeep { inner_data_id: inner_data_id, filter_id: filter_id, len: 0, r0: 0, r1: 0, r2: 0, r3: 0 };
+}
+fn ecs_qfd_nested_len(n: EcsQfNestedDeep) -> i32 { return n.len; }
+fn ecs_qfd_nested_inner(n: EcsQfNestedDeep) -> i32 { return n.inner_data_id; }
+fn ecs_qfd_nested_filter(n: EcsQfNestedDeep) -> i32 { return n.filter_id; }
+fn ecs_qfd_nested_push(n: EcsQfNestedDeep, value: i64) -> EcsQfNestedDeep {
+    if n.len >= 4 { return n; };
+    if n.len == 0 {
+        return EcsQfNestedDeep { inner_data_id: n.inner_data_id, filter_id: n.filter_id, len: 1, r0: value, r1: n.r1, r2: n.r2, r3: n.r3 };
+    };
+    if n.len == 1 {
+        return EcsQfNestedDeep { inner_data_id: n.inner_data_id, filter_id: n.filter_id, len: 2, r0: n.r0, r1: value, r2: n.r2, r3: n.r3 };
+    };
+    if n.len == 2 {
+        return EcsQfNestedDeep { inner_data_id: n.inner_data_id, filter_id: n.filter_id, len: 3, r0: n.r0, r1: n.r1, r2: value, r3: n.r3 };
+    };
+    return EcsQfNestedDeep { inner_data_id: n.inner_data_id, filter_id: n.filter_id, len: 4, r0: n.r0, r1: n.r1, r2: n.r2, r3: value };
+}
+fn ecs_qfd_nested_at(n: EcsQfNestedDeep, idx: i32) -> i64 {
+    if idx == 0 { return n.r0; };
+    if idx == 1 { return n.r1; };
+    if idx == 2 { return n.r2; };
+    if idx == 3 { return n.r3; };
+    return 0;
+}
+
+// QueryItem / ROQueryItem
+struct EcsQfItemDeep {
+    fetch: EcsQfDeep,
+    read_only: bool,
+}
+fn ecs_qfd_item_new(fetch: EcsQfDeep) -> EcsQfItemDeep {
+    let ro = ecs_qfd_is_read_only(fetch);
+    return EcsQfItemDeep { fetch: fetch, read_only: ro };
+}
+fn ecs_qfd_ro_item(fetch: EcsQfDeep) -> EcsQfItemDeep {
+    return EcsQfItemDeep { fetch: fetch, read_only: true };
+}
+fn ecs_qfd_item_value(item: EcsQfItemDeep) -> i64 { return item.fetch.value; }
+fn ecs_qfd_item_is_read_only(item: EcsQfItemDeep) -> bool { return item.read_only; }
+fn ecs_qfd_item_kind(item: EcsQfItemDeep) -> i32 { return item.fetch.kind; }
+
+// Spawn details (fetch-adjacent metadata used by some query items)
+struct EcsQfSpawnDeep {
+    entity: i64,
+    spawn_tick: i32,
+    spawned_by: i64,
+}
+fn ecs_qfd_spawn_new(entity: i64, spawn_tick: i32, spawned_by: i64) -> EcsQfSpawnDeep {
+    return EcsQfSpawnDeep { entity: entity, spawn_tick: spawn_tick, spawned_by: spawned_by };
+}
+fn ecs_qfd_spawn_entity(s: EcsQfSpawnDeep) -> i64 { return s.entity; }
+fn ecs_qfd_spawn_tick(s: EcsQfSpawnDeep) -> i32 { return s.spawn_tick; }
+fn ecs_qfd_spawn_by(s: EcsQfSpawnDeep) -> i64 { return s.spawned_by; }

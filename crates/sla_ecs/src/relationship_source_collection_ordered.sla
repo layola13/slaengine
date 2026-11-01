@@ -1,0 +1,214 @@
+// Bevy ECS OrderedRelationshipSourceCollection — ordered source collection ops missing from
+// lib/relationship_source_collection.sla.
+//
+// Mirrors src/relationship/relationship_source_collection.rs OrderedRelationshipSourceCollection trait:
+//   insert(index, entity)              — insert at index; clamp-to-end if out of bounds
+//   remove_at(index)                  — remove entity at index; Option model via entity_id or -1 sentinel
+//   insert_stable(index, entity)      — insert at index; never reorders others (same as insert here)
+//   remove_at_stable(index, entity)   — remove at index but no reordering (same as remove_at)
+//   sort()                              — sort the existing entities ascending
+//   insert_sorted(entity)              — insert keeping ascending order
+//   place_most_recent(index)            — place the tail entity at the given index (oob -> end)
+//   place(entity, index)               — relocate entity to index; no-op when not present
+//   push_front(entity)                 — insert(0, entity)
+//
+// Also extends RelationshipSourceCollection with_capacity / reserve / shrink_to_fit (no-ops in linear model)
+// source_to_remove_before_add (returns -1 sentinel for one-to-many; returns single entity for one-to-one unions)
+// extend_from_iter (push all ids to existing).
+//
+// Model: EcsRscOrdered (entities Vec<i64>) — builder-style mutators, all return the mutated model.
+// Drop-Entity result struct carries (was_found, entity) for remove_at-style ops.
+
+// === Result struct for remove_at (single-field accessors) ===
+struct RscRemoveAt {
+    found: i32,
+    removed_entity: i64,
+}
+
+fn ecs_rsc_ra_found(r: RscRemoveAt) -> i32 {
+    return r.found;
+}
+
+fn ecs_rsc_ra_entity(r: RscRemoveAt) -> i64 {
+    return r.removed_entity;
+}
+
+// === Model ===
+struct EcsRscOrdered {
+    entities: Vec<i64>,
+}
+
+fn ecs_rsc_ordered_new() -> EcsRscOrdered {
+    let c = EcsRscOrdered { entities: Vec::new() };
+    return c;
+}
+
+fn ecs_rsc_ordered_with_capacity(_capacity: i32) -> EcsRscOrdered {
+    let c = EcsRscOrdered { entities: Vec::new() };
+    return c;
+}
+
+fn ecs_rsc_ordered_reserve(c: EcsRscOrdered, _additional: i32) -> EcsRscOrdered {
+    // Vecs are uncapped in our model — no-op.
+    return c;
+}
+
+fn ecs_rsc_ordered_shrink_to_fit(c: EcsRscOrdered) -> EcsRscOrdered {
+    return c;
+}
+
+fn ecs_rsc_ordered_len(c: EcsRscOrdered) -> i32 {
+    return len(c.entities) as i32;
+}
+
+fn ecs_rsc_ordered_is_empty(c: EcsRscOrdered) -> bool {
+    return len(c.entities) as i32 == 0;
+}
+
+fn ecs_rsc_ordered_at(c: EcsRscOrdered, idx: i32) -> i64 {
+    let n: i32 = len(c.entities) as i32;
+    if idx < 0 || idx >= n { return -1; };
+    return c.entities[idx];
+}
+
+// insert(index, entity): insert at clamped index; if OOB becomes end-append.
+fn ecs_rsc_ordered_insert(c: EcsRscOrdered, index: i32, entity: i64) -> EcsRscOrdered {
+    let n: i32 = len(c.entities) as i32;
+    let place_idx: i32 = index;
+    if place_idx > n { place_idx = n; };
+    if place_idx < 0 { place_idx = 0; };
+    if place_idx >= n {
+        c.entities.push(entity);
+        return c;
+    };
+    let rebuilt = Vec::new();
+    let i: i32 = 0;
+    while i < place_idx { rebuilt.push(c.entities[i]); i = i + 1; }
+    rebuilt.push(entity);
+    let j: i32 = place_idx;
+    while j < n { rebuilt.push(c.entities[j]); j = j + 1; }
+    c.entities = rebuilt;
+    return c;
+}
+
+// push_front: insert(0, entity).
+fn ecs_rsc_ordered_push_front(c: EcsRscOrdered, entity: i64) -> EcsRscOrdered {
+    return ecs_rsc_ordered_insert(c, 0, entity);
+}
+
+// remove_at(index): drop entity at index. Returns RscRemoveAt{found, removed_entity}.
+fn ecs_rsc_ordered_remove_at(c: EcsRscOrdered, index: i32) -> (EcsRscOrdered, RscRemoveAt) {
+    let n: i32 = len(c.entities) as i32;
+    if index < 0 || index >= n {
+        let none = RscRemoveAt { found: 0, removed_entity: -1 };
+        return (c, none);
+    };
+    let removed_entity = c.entities[index];
+    let rebuilt = Vec::new();
+    let i: i32 = 0;
+    while i < n - 1 {
+        let src: i32 = i;
+        if i >= index { src = i + 1; };
+        rebuilt.push(c.entities[src]);
+        i = i + 1;
+    }
+    c.entities = rebuilt;
+    let some = RscRemoveAt { found: 1, removed_entity: removed_entity };
+    return (c, some);
+}
+
+// remove_at_stable: identical to remove_at in our linear model (we never swap-tail-remove).
+fn ecs_rsc_ordered_remove_at_stable(c: EcsRscOrdered, index: i32) -> (EcsRscOrdered, RscRemoveAt) {
+    return ecs_rsc_ordered_remove_at(c, index);
+}
+
+// insert_stable: identical to insert — our model never reorders trailing slots.
+fn ecs_rsc_ordered_insert_stable(c: EcsRscOrdered, index: i32, entity: i64) -> EcsRscOrdered {
+    return ecs_rsc_ordered_insert(c, index, entity);
+}
+
+// internal: is entity already in c.entities
+fn _ecs_rsc_ordered_contains(c: EcsRscOrdered, entity: i64) -> bool {
+    let n: i32 = len(c.entities) as i32;
+    let i: i32 = 0;
+    while i < n { if c.entities[i] == entity { return true; }; i = i + 1; }
+    return false;
+}
+
+// extend_from_iter(entities): push every id onto the existing list (mirrors Bevy extend_from_iter).
+fn ecs_rsc_ordered_extend_from_iter(c: EcsRscOrdered, entities: Vec<i64>) -> EcsRscOrdered {
+    let n: i32 = len(entities) as i32;
+    let i: i32 = 0;
+    while i < n { c.entities.push(entities[i]); i = i + 1; }
+    return c;
+}
+
+// source_to_remove_before_add: returns -1 for one-to-many (default trait impl).
+// For one-to-one collections, callers can use last(). We expose a typed accessor here.
+fn ecs_rsc_ordered_source_to_remove_before_add(c: EcsRscOrdered) -> i64 {
+    // Bevy's RelationshipSourceCollection default is None (sentinel -1) for one-to-many.
+    let _ = c;
+    return -1;
+}
+
+// place_most_recent(index): relocate the tail entity to `index` (oob -> end). Bevy moves the most-recently-added into the slot.
+fn ecs_rsc_ordered_place_most_recent(c: EcsRscOrdered, index: i32) -> EcsRscOrdered {
+    let n: i32 = len(c.entities) as i32;
+    if n == 0 { return c; };
+    let tail: i64 = c.entities[n - 1];
+    // remove tail, insert at clamped index
+    let (after_remove, _) = ecs_rsc_ordered_remove_at(c, n - 1);
+    let res = ecs_rsc_ordered_insert(after_remove, index, tail);
+    return res;
+}
+
+// place(entity, index): relocate `entity` from its existing slot to `index`. No-op if entity not present.
+fn ecs_rsc_ordered_place(c: EcsRscOrdered, entity: i64, index: i32) -> EcsRscOrdered {
+    if !_ecs_rsc_ordered_contains(c, entity) { return c; };
+    // find index
+    let n: i32 = len(c.entities) as i32;
+    let existing_idx: i32 = -1;
+    let cur: i32 = 0;
+    while cur < n {
+        if c.entities[cur] == entity { existing_idx = cur; };
+        cur = cur + 1;
+    }
+    // remove-from-existing-then-insert-at-target
+    let (after_remove, _) = ecs_rsc_ordered_remove_at(c, existing_idx);
+    let res = ecs_rsc_ordered_insert(after_remove, index, entity);
+    return res;
+}
+
+// sort(): bubble-sort ascending (sla has no built-in Vec sort).
+fn ecs_rsc_ordered_sort(c: EcsRscOrdered) -> EcsRscOrdered {
+    let n: i32 = len(c.entities) as i32;
+    let i: i32 = 0;
+    while i < n - 1 {
+        let min_idx: i32 = i;
+        let j: i32 = i + 1;
+        while j < n {
+            if c.entities[j] < c.entities[min_idx] { min_idx = j; };
+            j = j + 1;
+        }
+        if min_idx != i {
+            let tmp: i64 = c.entities[i];
+            c.entities[i] = c.entities[min_idx];
+            c.entities[min_idx] = tmp;
+        };
+        i = i + 1;
+    }
+    return c;
+}
+
+// insert_sorted(entity): insert at the proper slot to maintain ascending order.
+fn ecs_rsc_ordered_insert_sorted(c: EcsRscOrdered, entity: i64) -> EcsRscOrdered {
+    let n: i32 = len(c.entities) as i32;
+    let place_idx: i32 = n;
+    let i: i32 = 0;
+    while i < n {
+        if c.entities[i] >= entity { place_idx = i; };
+        if place_idx != n { let _ = c.entities[i]; };
+        i = i + 1;
+    }
+    return ecs_rsc_ordered_insert(c, place_idx, entity);
+}

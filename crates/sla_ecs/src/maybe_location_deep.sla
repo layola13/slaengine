@@ -1,0 +1,234 @@
+// Deepened Bevy ECS MaybeLocation surface.
+// Mirrors src/change_detection/maybe_location.rs:
+//   MaybeLocation<T> — feature-gated Option-like (track_location on/off)
+//   new / new_with / map / zip / unwrap_or_default / into_option
+//   MaybeLocation<Option<T>>::transpose / new_with_flattened
+//   MaybeLocation<&T>::copied
+//   as_ref / as_mut (modeled via has_value flag + id payload)
+// Shallow lib/change_detection.sla MaybeLocation + lib/caller_location.sla retained.
+// SLA models both feature modes explicitly via track_enabled flag.
+
+// === Feature mode ===
+const ECS_ML_TRACK_OFF: i32 = 0;
+const ECS_ML_TRACK_ON: i32 = 1;
+
+fn ecs_ml_track_off() -> i32 { return ECS_ML_TRACK_OFF; }
+fn ecs_ml_track_on() -> i32 { return ECS_ML_TRACK_ON; }
+
+// Location payload as i64 id (file/line packed externally via caller_location)
+struct EcsMlDeep {
+    track: i32,      // TRACK_ON / TRACK_OFF
+    has_value: bool, // when track ON: always true for plain T; for Option<T> may be false
+    value: i64,
+    is_option_layer: bool, // true when modeling MaybeLocation<Option<T>>
+}
+
+fn ecs_ml_new_on(value: i64) -> EcsMlDeep {
+    return EcsMlDeep {
+        track: ECS_ML_TRACK_ON,
+        has_value: true,
+        value: value,
+        is_option_layer: false,
+    };
+}
+
+fn ecs_ml_new_off() -> EcsMlDeep {
+    // track disabled: ZST — into_option always None
+    return EcsMlDeep {
+        track: ECS_ML_TRACK_OFF,
+        has_value: false,
+        value: 0,
+        is_option_layer: false,
+    };
+}
+
+// new_with: evaluate producer only when track ON
+fn ecs_ml_new_with_on(value: i64) -> EcsMlDeep {
+    return ecs_ml_new_on(value);
+}
+
+fn ecs_ml_new_with_off() -> EcsMlDeep {
+    return ecs_ml_new_off();
+}
+
+fn ecs_ml_track(m: EcsMlDeep) -> i32 { return m.track; }
+fn ecs_ml_has_value(m: EcsMlDeep) -> bool { return m.has_value; }
+fn ecs_ml_value(m: EcsMlDeep) -> i64 { return m.value; }
+fn ecs_ml_is_option_layer(m: EcsMlDeep) -> bool { return m.is_option_layer; }
+
+// into_option: track ON → Some(value); track OFF → None
+fn ecs_ml_into_option(m: EcsMlDeep) -> (bool, i64) {
+    if m.track == ECS_ML_TRACK_OFF {
+        return (false, 0);
+    };
+    if m.is_option_layer {
+        if m.has_value != true {
+            return (true, 0); // Some(None) represented as has outer Some with sentinel? 
+            // For Option layer: into_option of MaybeLocation<Option<T>> is Option<Option>
+            // We model outer presence as track ON always Some outer; inner via has_value
+        };
+        return (true, m.value);
+    };
+    return (true, m.value);
+}
+
+// Simpler into_option for plain MaybeLocation<T>
+fn ecs_ml_into_option_plain(m: EcsMlDeep) -> (bool, i64) {
+    if m.track != ECS_ML_TRACK_ON {
+        return (false, 0);
+    };
+    return (true, m.value);
+}
+
+// unwrap_or_default: track ON → value; track OFF → 0 default
+fn ecs_ml_unwrap_or_default(m: EcsMlDeep) -> i64 {
+    if m.track != ECS_ML_TRACK_ON {
+        return 0;
+    };
+    if m.is_option_layer && m.has_value != true {
+        return 0;
+    };
+    return m.value;
+}
+
+fn ecs_ml_unwrap_or(m: EcsMlDeep, default_value: i64) -> i64 {
+    let opt = ecs_ml_into_option_plain(m);
+    if opt.0 {
+        return opt.1;
+    };
+    return default_value;
+}
+
+// map: when track ON apply f(value)->new; when OFF stay empty
+fn ecs_ml_map(m: EcsMlDeep, new_value: i64) -> EcsMlDeep {
+    if m.track != ECS_ML_TRACK_ON {
+        return ecs_ml_new_off();
+    };
+    return ecs_ml_new_on(new_value);
+}
+
+// zip: pair two MaybeLocations
+fn ecs_ml_zip(a: EcsMlDeep, b: EcsMlDeep) -> EcsMlDeep {
+    // Result track is ON only if both ON; value packs a*1_000_000 + b (limited)
+    if a.track != ECS_ML_TRACK_ON || b.track != ECS_ML_TRACK_ON {
+        return ecs_ml_new_off();
+    };
+    let packed = a.value * 1000000 + b.value;
+    return ecs_ml_new_on(packed);
+}
+
+fn ecs_ml_zip_left(packed: i64) -> i64 {
+    return packed / 1000000;
+}
+
+fn ecs_ml_zip_right(packed: i64) -> i64 {
+    return packed % 1000000;
+}
+
+// === Option layer: MaybeLocation<Option<T>> ===
+fn ecs_ml_option_some_on(value: i64) -> EcsMlDeep {
+    return EcsMlDeep {
+        track: ECS_ML_TRACK_ON,
+        has_value: true,
+        value: value,
+        is_option_layer: true,
+    };
+}
+
+fn ecs_ml_option_none_on() -> EcsMlDeep {
+    return EcsMlDeep {
+        track: ECS_ML_TRACK_ON,
+        has_value: false,
+        value: 0,
+        is_option_layer: true,
+    };
+}
+
+fn ecs_ml_option_off() -> EcsMlDeep {
+    return EcsMlDeep {
+        track: ECS_ML_TRACK_OFF,
+        has_value: false,
+        value: 0,
+        is_option_layer: true,
+    };
+}
+
+// new_with_flattened: closure returns Option<MaybeLocation<T>>
+// If None → MaybeLocation with None-ish; if Some(ml) unwrap inner when track on
+// Modeled: ok flag + value + track
+fn ecs_ml_new_with_flattened(has_outer: bool, inner_track_on: bool, inner_value: i64) -> EcsMlDeep {
+    if has_outer != true {
+        // None from closure → empty option-layer with track ON value none? Bevy: only runs f when track on
+        // When track off, returns empty MaybeLocation
+        return ecs_ml_option_off();
+    };
+    if inner_track_on != true {
+        return ecs_ml_new_off();
+    };
+    return ecs_ml_option_some_on(inner_value);
+}
+
+// transpose: MaybeLocation<Option<T>> → Option<MaybeLocation<T>>
+// track ON: Some(ml) if inner Some, None if inner None
+// track OFF: always Some(empty MaybeLocation)
+struct EcsMlTransposeDeep {
+    has_outer: bool,
+    ml: EcsMlDeep,
+}
+
+fn ecs_ml_transpose_has(t: EcsMlTransposeDeep) -> bool { return t.has_outer; }
+fn ecs_ml_transpose_ml(t: EcsMlTransposeDeep) -> EcsMlDeep { return t.ml; }
+
+fn ecs_ml_transpose(m: EcsMlDeep) -> EcsMlTransposeDeep {
+    if m.track != ECS_ML_TRACK_ON {
+        return EcsMlTransposeDeep {
+            has_outer: true,
+            ml: ecs_ml_new_off(),
+        };
+    };
+    if m.has_value != true {
+        return EcsMlTransposeDeep {
+            has_outer: false,
+            ml: ecs_ml_new_off(),
+        };
+    };
+    return EcsMlTransposeDeep {
+        has_outer: true,
+        ml: ecs_ml_new_on(m.value),
+    };
+}
+
+// copied: MaybeLocation<&T> → MaybeLocation<T> (same payload)
+fn ecs_ml_copied(m: EcsMlDeep) -> EcsMlDeep {
+    if m.track != ECS_ML_TRACK_ON {
+        return ecs_ml_new_off();
+    };
+    return ecs_ml_new_on(m.value);
+}
+
+// as_ref: keeps value id, marks still has_value
+fn ecs_ml_as_ref(m: EcsMlDeep) -> EcsMlDeep {
+    return m;
+}
+
+// assign: replace contents when track ON
+fn ecs_ml_assign(m: EcsMlDeep, value: i64) -> EcsMlDeep {
+    if m.track != ECS_ML_TRACK_ON {
+        return m;
+    };
+    m.value = value;
+    m.has_value = true;
+    return m;
+}
+
+// eq for plain
+fn ecs_ml_eq(a: EcsMlDeep, b: EcsMlDeep) -> bool {
+    if a.track != b.track { return false; };
+    if a.track != ECS_ML_TRACK_ON { return true; };
+    if a.is_option_layer != b.is_option_layer { return false; };
+    if a.has_value != b.has_value { return false; };
+    if a.has_value {
+        return a.value == b.value;
+    };
+    return true;
+}

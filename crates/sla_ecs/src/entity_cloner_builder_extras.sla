@@ -1,0 +1,156 @@
+// Bevy ECS EntityClonerBuilder clone-behavior/filter-scope gaps — with_default_clone_fn +
+// override_clone_behavior_with_id + remove_clone_behavior_override_with_id +
+// without_required_components + without_required_by_components.
+// Mirrors the EntityClonerBuilder pub surface in src/entity/clone_entities.rs
+// (lines 817-1004) not present in lib/entity_cloner.sla.
+//
+// Bevy semantics:
+//   - with_default_clone_fn(clone_fn): sets state.default_clone_fn. Modelled as setting a
+//     `default_clone_fn` id slot — ComponentCloneFn reduces to a single i32 id.
+//   - override_clone_behavior_with_id(component_id, clone_behavior): inserts a per-component override.
+//     Preserves insertion order semantics (override replaces an existing entry for the same id).
+//   - remove_clone_behavior_override_with_id(component_id): drops the override for the id if any.
+//   - without_required_components(builder): enters a scoped mode where new allow() additions skip
+//     auto-attaching required-components (filter.attach_required_components=false); the scope auto-
+//     reverts to true at scope exit. We model the scope as begin/end pairs.
+//   - without_required_by_components(builder): symmetric for OptOut — new deny() additions skip
+//     auto-attaching components that are "required by" the denied component.
+// The builder closures reduce to plain "scope-active-begin/end" toggles since sla has no Fn closure
+// over EntityClonerBuilder.
+//
+// Facade fns return the mutated builder (builder-semantics, matches lib/entity_cloner.sla).
+
+// === Result struct for clone-behavior override lookups (single-field accessors) ===
+struct CloneOverrideGet {
+    has: i32,
+    clone_fn_id: i32,
+}
+
+fn ecs_clone_override_has(r: CloneOverrideGet) -> i32 {
+    return r.has;
+}
+
+fn ecs_clone_override_fn_id(r: CloneOverrideGet) -> i32 {
+    return r.clone_fn_id;
+}
+
+// === Builder state: per-component override map + scope flags + default_clone_fn id ===
+struct EcsEntityClonerBuilderExtras {
+    default_clone_fn: i32,
+    // parallel keys + clone-fn ids (the override map; insertion-ordered)
+    override_keys: Vec<i32>,
+    override_fns: Vec<i32>,
+    // scoped-mode flags mirroring filter.attach_required_components / attach_required_by_components
+    attach_required_components: i32,
+    attach_required_by_components: i32,
+}
+
+fn ecs_cloner_builder_extras_new() -> EcsEntityClonerBuilderExtras {
+    let b = EcsEntityClonerBuilderExtras {
+        default_clone_fn: 0,
+        override_keys: Vec::new(),
+        override_fns: Vec::new(),
+        attach_required_components: 1,
+        attach_required_by_components: 1,
+    };
+    return b;
+}
+
+fn ecs_cloner_builder_extras_default_clone_fn(b: EcsEntityClonerBuilderExtras) -> i32 {
+    return b.default_clone_fn;
+}
+
+// with_default_clone_fn(clone_fn_id): builder mutator returning the mutated builder.
+fn ecs_cloner_builder_extras_with_default_clone_fn(b: EcsEntityClonerBuilderExtras, clone_fn_id: i32) -> EcsEntityClonerBuilderExtras {
+    b.default_clone_fn = clone_fn_id;
+    return b;
+}
+
+// internal: find override slot index for component_id (or -1)
+fn _ecs_cbe_override_index(b: EcsEntityClonerBuilderExtras, component_id: i32) -> i32 {
+    let n: i32 = len(b.override_keys) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if b.override_keys[i] == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// override_clone_behavior_with_id(component_id, clone_behavior_id): insert or replace.
+fn ecs_cloner_builder_extras_override_clone_behavior_with_id(b: EcsEntityClonerBuilderExtras, component_id: i32, clone_behavior_id: i32) -> EcsEntityClonerBuilderExtras {
+    let existing = _ecs_cbe_override_index(b, component_id);
+    if existing >= 0 {
+        b.override_fns[existing] = clone_behavior_id;
+        return b;
+    };
+    b.override_keys.push(component_id);
+    b.override_fns.push(clone_behavior_id);
+    return b;
+}
+
+// remove_clone_behavior_override_with_id(component_id): drop the override if present.
+fn ecs_cloner_builder_extras_remove_clone_behavior_override_with_id(b: EcsEntityClonerBuilderExtras, component_id: i32) -> EcsEntityClonerBuilderExtras {
+    let idx = _ecs_cbe_override_index(b, component_id);
+    if idx < 0 { return b; };
+    // remove by shifting trailing slots to fill the gap — VecRemoveAt absent in this model
+    let n: i32 = len(b.override_keys) as i32;
+    let i: i32 = idx;
+    // single-move-shift: rebuild two fresh Vecs from the kept slots
+    let kept_keys = Vec::new();
+    let kept_fns = Vec::new();
+    while i < n - 1 {
+        kept_keys.push(b.override_keys[i + 1]);
+        kept_fns.push(b.override_fns[i + 1]);
+        i = i + 1;
+    }
+    b.override_keys = kept_keys;
+    b.override_fns = kept_fns;
+    return b;
+}
+
+// override_at(component_id): returns CloneOverrideGet {has, clone_fn_id}.
+fn ecs_cloner_builder_extras_overridden_at(b: EcsEntityClonerBuilderExtras, component_id: i32) -> CloneOverrideGet {
+    let idx = _ecs_cbe_override_index(b, component_id);
+    if idx < 0 {
+        let none = CloneOverrideGet { has: 0, clone_fn_id: 0 };
+        return none;
+    };
+    let some = CloneOverrideGet { has: 1, clone_fn_id: b.override_fns[idx] };
+    return some;
+}
+
+fn ecs_cloner_builder_extras_override_count(b: EcsEntityClonerBuilderExtras) -> i32 {
+    return len(b.override_keys) as i32;
+}
+
+// === OptIn scope: without_required_components(builder) ===
+// Enter scoped mode: attach_required_components toggles to 0; tests use begin/end pairs explicitly.
+fn ecs_cloner_builder_extras_without_required_components_begin(b: EcsEntityClonerBuilderExtras) -> EcsEntityClonerBuilderExtras {
+    b.attach_required_components = 0;
+    return b;
+}
+
+fn ecs_cloner_builder_extras_without_required_components_end(b: EcsEntityClonerBuilderExtras) -> EcsEntityClonerBuilderExtras {
+    b.attach_required_components = 1;
+    return b;
+}
+
+fn ecs_cloner_builder_extras_attach_required_components(b: EcsEntityClonerBuilderExtras) -> i32 {
+    return b.attach_required_components;
+}
+
+// === OptOut scope: without_required_by_components(builder) ===
+fn ecs_cloner_builder_extras_without_required_by_components_begin(b: EcsEntityClonerBuilderExtras) -> EcsEntityClonerBuilderExtras {
+    b.attach_required_by_components = 0;
+    return b;
+}
+
+fn ecs_cloner_builder_extras_without_required_by_components_end(b: EcsEntityClonerBuilderExtras) -> EcsEntityClonerBuilderExtras {
+    b.attach_required_by_components = 1;
+    return b;
+}
+
+fn ecs_cloner_builder_extras_attach_required_by_components(b: EcsEntityClonerBuilderExtras) -> i32 {
+    return b.attach_required_by_components;
+}

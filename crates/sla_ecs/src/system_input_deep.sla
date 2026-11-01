@@ -1,0 +1,296 @@
+// Deepened Bevy ECS system::input + system_name SystemParam surface.
+// Mirrors src/system/input.rs: SystemInput::wrap, FromInput, Option, tuples up to 4,
+// In/InRef/InMut Deref semantics; and system_name.rs SystemParam get_param from SystemMeta.
+// Shallow lib/system_input.sla and lib/system_name.sla keep basic constructors.
+
+// === Input kind tags ===
+const ECS_IN_KIND_UNIT: i32 = 0;
+const ECS_IN_KIND_IN: i32 = 1;
+const ECS_IN_KIND_IN_REF: i32 = 2;
+const ECS_IN_KIND_IN_MUT: i32 = 3;
+const ECS_IN_KIND_OPTION: i32 = 4;
+const ECS_IN_KIND_STATIC: i32 = 5;
+const ECS_IN_KIND_TUPLE: i32 = 6;
+const ECS_IN_KIND_ON: i32 = 7;
+
+// Param representation after wrap (system function first arg)
+struct EcsInParam {
+    kind: i32,
+    // for unit/in/in_ref/in_mut/option/static: single value slot
+    value: i64,
+    // option present flag
+    has_value: bool,
+    // tuple slots (up to 4)
+    t0: i64,
+    t1: i64,
+    t2: i64,
+    t3: i64,
+    t_len: i32,
+    // for InMut: mutation applied flag / current value
+    mut_value: i64,
+}
+
+// Inner representation passed to System::run
+struct EcsInInner {
+    kind: i32,
+    value: i64,
+    has_value: bool,
+    t0: i64,
+    t1: i64,
+    t2: i64,
+    t3: i64,
+    t_len: i32,
+}
+
+fn ecs_in_inner_unit() -> EcsInInner {
+    return EcsInInner {
+        kind: ECS_IN_KIND_UNIT, value: 0, has_value: false,
+        t0: 0, t1: 0, t2: 0, t3: 0, t_len: 0,
+    };
+}
+
+fn ecs_in_inner_value(kind: i32, value: i64) -> EcsInInner {
+    return EcsInInner {
+        kind: kind, value: value, has_value: true,
+        t0: 0, t1: 0, t2: 0, t3: 0, t_len: 0,
+    };
+}
+
+fn ecs_in_inner_option_some(inner_kind: i32, value: i64) -> EcsInInner {
+    return EcsInInner {
+        kind: ECS_IN_KIND_OPTION, value: value, has_value: true,
+        t0: inner_kind, t1: 0, t2: 0, t3: 0, t_len: 0,
+    };
+}
+
+fn ecs_in_inner_option_none(inner_kind: i32) -> EcsInInner {
+    return EcsInInner {
+        kind: ECS_IN_KIND_OPTION, value: 0, has_value: false,
+        t0: inner_kind, t1: 0, t2: 0, t3: 0, t_len: 0,
+    };
+}
+
+fn ecs_in_inner_tuple2(a: i64, b: i64) -> EcsInInner {
+    return EcsInInner {
+        kind: ECS_IN_KIND_TUPLE, value: 0, has_value: true,
+        t0: a, t1: b, t2: 0, t3: 0, t_len: 2,
+    };
+}
+
+fn ecs_in_inner_tuple3(a: i64, b: i64, c: i64) -> EcsInInner {
+    return EcsInInner {
+        kind: ECS_IN_KIND_TUPLE, value: 0, has_value: true,
+        t0: a, t1: b, t2: c, t3: 0, t_len: 3,
+    };
+}
+
+fn ecs_in_inner_tuple4(a: i64, b: i64, c: i64, d: i64) -> EcsInInner {
+    return EcsInInner {
+        kind: ECS_IN_KIND_TUPLE, value: 0, has_value: true,
+        t0: a, t1: b, t2: c, t3: d, t_len: 4,
+    };
+}
+
+fn ecs_in_inner_kind(i: EcsInInner) -> i32 { return i.kind; }
+fn ecs_in_inner_get_value(i: EcsInInner) -> i64 { return i.value; }
+fn ecs_in_inner_has_value(i: EcsInInner) -> bool { return i.has_value; }
+fn ecs_in_inner_t_len(i: EcsInInner) -> i32 { return i.t_len; }
+fn ecs_in_inner_t_at(i: EcsInInner, idx: i32) -> i64 {
+    if idx == 0 { return i.t0; };
+    if idx == 1 { return i.t1; };
+    if idx == 2 { return i.t2; };
+    if idx == 3 { return i.t3; };
+    return 0;
+}
+
+// SystemInput::wrap: Inner -> Param
+fn ecs_system_input_wrap(inner: EcsInInner) -> EcsInParam {
+    return EcsInParam {
+        kind: inner.kind,
+        value: inner.value,
+        has_value: inner.has_value,
+        t0: inner.t0,
+        t1: inner.t1,
+        t2: inner.t2,
+        t3: inner.t3,
+        t_len: inner.t_len,
+        mut_value: inner.value,
+    };
+}
+
+fn ecs_in_param_kind(p: EcsInParam) -> i32 { return p.kind; }
+fn ecs_in_param_value(p: EcsInParam) -> i64 { return p.value; }
+fn ecs_in_param_has_value(p: EcsInParam) -> bool { return p.has_value; }
+fn ecs_in_param_mut_value(p: EcsInParam) -> i64 { return p.mut_value; }
+fn ecs_in_param_t_len(p: EcsInParam) -> i32 { return p.t_len; }
+fn ecs_in_param_t_at(p: EcsInParam, idx: i32) -> i64 {
+    if idx == 0 { return p.t0; };
+    if idx == 1 { return p.t1; };
+    if idx == 2 { return p.t2; };
+    if idx == 3 { return p.t3; };
+    return 0;
+}
+
+// In/InRef/InMut deref helpers on Param
+fn ecs_in_param_deref(p: EcsInParam) -> i64 { return p.value; }
+
+fn ecs_in_param_deref_mut_set(p: EcsInParam, new_value: i64) -> EcsInParam {
+    // only valid for InMut
+    p.mut_value = new_value;
+    p.value = new_value;
+    return p;
+}
+
+// InMut square example: *input *= *input
+fn ecs_in_mut_square(p: EcsInParam) -> EcsInParam {
+    let v = p.mut_value;
+    return ecs_in_param_deref_mut_set(p, v * v);
+}
+
+// Option wrap: None stays None; Some wraps inner
+fn ecs_system_input_wrap_option(inner: EcsInInner) -> EcsInParam {
+    // inner.kind should be OPTION; t0 holds inner kind for documentation
+    return ecs_system_input_wrap(inner);
+}
+
+// StaticSystemInput: Param == Self-like, wrap is identity on Inner
+fn ecs_static_system_input_wrap(inner: EcsInInner) -> EcsInParam {
+    let p = ecs_system_input_wrap(inner);
+    p.kind = ECS_IN_KIND_STATIC;
+    return p;
+}
+
+// FromInput: identity for same type; Static from In
+fn ecs_from_input_identity(inner: EcsInInner) -> EcsInInner {
+    return inner;
+}
+
+fn ecs_from_input_static_from_in(inner: EcsInInner) -> EcsInInner {
+    // StaticSystemInput from In: same inner value
+    return inner;
+}
+
+// Tuple wrap: each element wrap independently (modeled as copy)
+fn ecs_system_input_wrap_tuple(inner: EcsInInner) -> EcsInParam {
+    return ecs_system_input_wrap(inner);
+}
+
+// SystemIn shorthand: get Inner type tag from a system's In kind
+fn ecs_system_in_kind_from_param_kind(param_kind: i32) -> i32 {
+    // For In/InRef/InMut/Unit/Option/Static/Tuple/On the Inner kind matches Param kind
+    return param_kind;
+}
+
+// Validate: only first param of function may be tagged as input; system has 0 or 1 input.
+// Modeled as a predicate on declared input arity.
+fn ecs_system_input_arity_ok(input_count: i32) -> bool {
+    if input_count < 0 { return false; };
+    if input_count > 1 { return false; };
+    return true;
+}
+
+// Pipe-related: B::In Inner equals A::Out
+fn ecs_system_input_matches_pipe(a_out_kind: i32, b_in_kind: i32) -> bool {
+    return a_out_kind == b_in_kind;
+}
+
+// Multi-input tuple run example: (InMut, In) add
+// Returns new mut value = a + b
+fn ecs_in_tuple_add_mut(a_mut: i64, b: i64) -> i64 {
+    return a_mut + b;
+}
+
+// === SystemMeta name source for SystemName ===
+struct EcsSystemMetaName {
+    name_id: i64,
+    crate_id: i64,
+}
+
+fn ecs_system_meta_name_new(name_id: i64, crate_id: i64) -> EcsSystemMetaName {
+    return EcsSystemMetaName { name_id: name_id, crate_id: crate_id };
+}
+
+fn ecs_system_meta_name_id(m: EcsSystemMetaName) -> i64 { return m.name_id; }
+fn ecs_system_meta_name_crate(m: EcsSystemMetaName) -> i64 { return m.crate_id; }
+
+// SystemName SystemParam
+// init_state: ()
+// get_param: SystemName(system_meta.name.clone())
+struct EcsSystemNameDeep {
+    name_id: i64,
+    crate_id: i64,
+}
+
+fn ecs_system_name_deep_init_state() -> i32 {
+    // empty state
+    return 0;
+}
+
+fn ecs_system_name_deep_get_param(meta: EcsSystemMetaName) -> EcsSystemNameDeep {
+    return EcsSystemNameDeep {
+        name_id: meta.name_id,
+        crate_id: meta.crate_id,
+    };
+}
+
+// ExclusiveSystemParam get_param same as regular
+fn ecs_system_name_deep_get_param_exclusive(meta: EcsSystemMetaName) -> EcsSystemNameDeep {
+    return ecs_system_name_deep_get_param(meta);
+}
+
+fn ecs_system_name_deep_name_id(s: EcsSystemNameDeep) -> i64 { return s.name_id; }
+fn ecs_system_name_deep_crate_id(s: EcsSystemNameDeep) -> i64 { return s.crate_id; }
+
+// Display/Into proxy: name_id equality
+fn ecs_system_name_deep_eq(a: EcsSystemNameDeep, b: EcsSystemNameDeep) -> bool {
+    return a.name_id == b.name_id;
+}
+
+// with_name on system changes meta name used by SystemName param
+fn ecs_system_meta_name_with_name(m: EcsSystemMetaName, new_name_id: i64) -> EcsSystemMetaName {
+    return EcsSystemMetaName { name_id: new_name_id, crate_id: m.crate_id };
+}
+
+// ReadOnlySystemParam: SystemName only reads internal meta — always true
+fn ecs_system_name_deep_is_read_only() -> bool {
+    return true;
+}
+
+// init_access: no component access
+fn ecs_system_name_deep_init_access_adds_components() -> bool {
+    return false;
+}
+
+// ends_with helper for tests (name_id equality as suffix proxy)
+fn ecs_system_name_deep_matches(s: EcsSystemNameDeep, expected_name_id: i64) -> bool {
+    return s.name_id == expected_name_id;
+}
+
+// On<E,B> observer input: wrap identity
+fn ecs_system_input_wrap_on(event_id: i64) -> EcsInParam {
+    return EcsInParam {
+        kind: ECS_IN_KIND_ON,
+        value: event_id,
+        has_value: true,
+        t0: 0, t1: 0, t2: 0, t3: 0, t_len: 0,
+        mut_value: event_id,
+    };
+}
+
+// Unit wrap
+fn ecs_system_input_wrap_unit() -> EcsInParam {
+    return ecs_system_input_wrap(ecs_in_inner_unit());
+}
+
+// In wrap
+fn ecs_system_input_wrap_in(value: i64) -> EcsInParam {
+    return ecs_system_input_wrap(ecs_in_inner_value(ECS_IN_KIND_IN, value));
+}
+
+fn ecs_system_input_wrap_in_ref(value: i64) -> EcsInParam {
+    return ecs_system_input_wrap(ecs_in_inner_value(ECS_IN_KIND_IN_REF, value));
+}
+
+fn ecs_system_input_wrap_in_mut(value: i64) -> EcsInParam {
+    return ecs_system_input_wrap(ecs_in_inner_value(ECS_IN_KIND_IN_MUT, value));
+}

@@ -1,0 +1,317 @@
+// Deepened Bevy ECS EntityFetcher + WorldEntityFetch.
+// Mirrors src/world/entity_fetch.rs:
+//   EntityFetcher::{get, get_mut}
+//   WorldEntityFetch for Entity / array / slice / set
+//   EntityNotSpawnedError / EntityMutableFetchError::{NotSpawned, AliasedMutability}
+//   single-entity fetch; multi-entity unique check for mut
+// Fixed world entity table capacity: 8. Shallow lib/world_entity_fetch.sla retained.
+
+const ECS_WEF_OK: i32 = 0;
+const ECS_WEF_NOT_SPAWNED: i32 = 1;
+const ECS_WEF_ALIASED_MUTABILITY: i32 = 2;
+
+// World entity existence table (index == entity id for simplicity)
+struct EcsWefWorldDeep {
+    n: i32, // max entity id exclusive (spawned range 0..n if bit set)
+    // spawned flags for entities 0..7
+    s0: bool, s1: bool, s2: bool, s3: bool,
+    s4: bool, s5: bool, s6: bool, s7: bool,
+    // simple component payload for fetched views
+    v0: i64, v1: i64, v2: i64, v3: i64,
+    v4: i64, v5: i64, v6: i64, v7: i64,
+}
+
+fn ecs_wef_world_deep_new(n: i32) -> EcsWefWorldDeep {
+    return EcsWefWorldDeep {
+        n: n,
+        s0: false, s1: false, s2: false, s3: false,
+        s4: false, s5: false, s6: false, s7: false,
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+    };
+}
+
+fn ecs_wef_world_deep_spawn(w: EcsWefWorldDeep, entity: i32, value: i64) -> EcsWefWorldDeep {
+    let s0 = w.s0; let s1 = w.s1; let s2 = w.s2; let s3 = w.s3;
+    let s4 = w.s4; let s5 = w.s5; let s6 = w.s6; let s7 = w.s7;
+    let v0 = w.v0; let v1 = w.v1; let v2 = w.v2; let v3 = w.v3;
+    let v4 = w.v4; let v5 = w.v5; let v6 = w.v6; let v7 = w.v7;
+    if entity == 0 { s0 = true; v0 = value; };
+    if entity == 1 { s1 = true; v1 = value; };
+    if entity == 2 { s2 = true; v2 = value; };
+    if entity == 3 { s3 = true; v3 = value; };
+    if entity == 4 { s4 = true; v4 = value; };
+    if entity == 5 { s5 = true; v5 = value; };
+    if entity == 6 { s6 = true; v6 = value; };
+    if entity == 7 { s7 = true; v7 = value; };
+    let n = w.n;
+    if entity + 1 > n { n = entity + 1; };
+    return EcsWefWorldDeep {
+        n: n,
+        s0: s0, s1: s1, s2: s2, s3: s3, s4: s4, s5: s5, s6: s6, s7: s7,
+        v0: v0, v1: v1, v2: v2, v3: v3, v4: v4, v5: v5, v6: v6, v7: v7,
+    };
+}
+
+fn ecs_wef_world_deep_despawn(w: EcsWefWorldDeep, entity: i32) -> EcsWefWorldDeep {
+    let s0 = w.s0; let s1 = w.s1; let s2 = w.s2; let s3 = w.s3;
+    let s4 = w.s4; let s5 = w.s5; let s6 = w.s6; let s7 = w.s7;
+    if entity == 0 { s0 = false; };
+    if entity == 1 { s1 = false; };
+    if entity == 2 { s2 = false; };
+    if entity == 3 { s3 = false; };
+    if entity == 4 { s4 = false; };
+    if entity == 5 { s5 = false; };
+    if entity == 6 { s6 = false; };
+    if entity == 7 { s7 = false; };
+    return EcsWefWorldDeep {
+        n: w.n,
+        s0: s0, s1: s1, s2: s2, s3: s3, s4: s4, s5: s5, s6: s6, s7: s7,
+        v0: w.v0, v1: w.v1, v2: w.v2, v3: w.v3, v4: w.v4, v5: w.v5, v6: w.v6, v7: w.v7,
+    };
+}
+
+fn ecs_wef_world_deep_is_spawned(w: EcsWefWorldDeep, entity: i32) -> bool {
+    if entity == 0 { return w.s0; };
+    if entity == 1 { return w.s1; };
+    if entity == 2 { return w.s2; };
+    if entity == 3 { return w.s3; };
+    if entity == 4 { return w.s4; };
+    if entity == 5 { return w.s5; };
+    if entity == 6 { return w.s6; };
+    if entity == 7 { return w.s7; };
+    return false;
+}
+
+fn ecs_wef_world_deep_value(w: EcsWefWorldDeep, entity: i32) -> i64 {
+    if entity == 0 { return w.v0; };
+    if entity == 1 { return w.v1; };
+    if entity == 2 { return w.v2; };
+    if entity == 3 { return w.v3; };
+    if entity == 4 { return w.v4; };
+    if entity == 5 { return w.v5; };
+    if entity == 6 { return w.v6; };
+    if entity == 7 { return w.v7; };
+    return 0;
+}
+
+fn ecs_wef_world_deep_set_value(w: EcsWefWorldDeep, entity: i32, value: i64) -> EcsWefWorldDeep {
+    let v0 = w.v0; let v1 = w.v1; let v2 = w.v2; let v3 = w.v3;
+    let v4 = w.v4; let v5 = w.v5; let v6 = w.v6; let v7 = w.v7;
+    if entity == 0 { v0 = value; };
+    if entity == 1 { v1 = value; };
+    if entity == 2 { v2 = value; };
+    if entity == 3 { v3 = value; };
+    if entity == 4 { v4 = value; };
+    if entity == 5 { v5 = value; };
+    if entity == 6 { v6 = value; };
+    if entity == 7 { v7 = value; };
+    return EcsWefWorldDeep {
+        n: w.n,
+        s0: w.s0, s1: w.s1, s2: w.s2, s3: w.s3, s4: w.s4, s5: w.s5, s6: w.s6, s7: w.s7,
+        v0: v0, v1: v1, v2: v2, v3: v3, v4: v4, v5: v5, v6: v6, v7: v7,
+    };
+}
+
+// EntityFetcher
+struct EcsWefFetcherDeep {
+    world: EcsWefWorldDeep,
+    mut_access: bool,
+}
+
+fn ecs_wef_fetcher_deep_new(world: EcsWefWorldDeep) -> EcsWefFetcherDeep {
+    return EcsWefFetcherDeep { world: world, mut_access: false };
+}
+
+fn ecs_wef_fetcher_deep_mut(world: EcsWefWorldDeep) -> EcsWefFetcherDeep {
+    return EcsWefFetcherDeep { world: world, mut_access: true };
+}
+
+fn ecs_wef_fetcher_deep_world(f: EcsWefFetcherDeep) -> EcsWefWorldDeep { return f.world; }
+fn ecs_wef_fetcher_deep_is_mut(f: EcsWefFetcherDeep) -> bool { return f.mut_access; }
+
+// Single entity fetch result
+struct EcsWefEntityRef {
+    ok: bool,
+    err: i32,
+    entity: i32,
+    value: i64,
+    deferred: bool, // true for get_mut deferred (EntityMut-like, no structural)
+    structural: bool, // true for full EntityWorldMut
+}
+
+fn ecs_wef_ref_ok(r: EcsWefEntityRef) -> bool { return r.ok; }
+fn ecs_wef_ref_err(r: EcsWefEntityRef) -> i32 { return r.err; }
+fn ecs_wef_ref_entity(r: EcsWefEntityRef) -> i32 { return r.entity; }
+fn ecs_wef_ref_value(r: EcsWefEntityRef) -> i64 { return r.value; }
+fn ecs_wef_ref_is_deferred(r: EcsWefEntityRef) -> bool { return r.deferred; }
+fn ecs_wef_ref_is_structural(r: EcsWefEntityRef) -> bool { return r.structural; }
+
+fn ecs_wef_fetcher_deep_get(f: EcsWefFetcherDeep, entity: i32) -> EcsWefEntityRef {
+    if ecs_wef_world_deep_is_spawned(f.world, entity) != true {
+        return EcsWefEntityRef {
+            ok: false, err: ECS_WEF_NOT_SPAWNED, entity: entity, value: 0,
+            deferred: false, structural: false,
+        };
+    };
+    return EcsWefEntityRef {
+        ok: true, err: ECS_WEF_OK, entity: entity,
+        value: ecs_wef_world_deep_value(f.world, entity),
+        deferred: false, structural: false,
+    };
+}
+
+// get_mut deferred: EntityMut-like
+fn ecs_wef_fetcher_deep_get_mut(f: EcsWefFetcherDeep, entity: i32) -> EcsWefEntityRef {
+    if f.mut_access != true {
+        // still allow if caller constructed mut fetcher; model requires mut_access
+        return EcsWefEntityRef {
+            ok: false, err: ECS_WEF_NOT_SPAWNED, entity: entity, value: 0,
+            deferred: true, structural: false,
+        };
+    };
+    if ecs_wef_world_deep_is_spawned(f.world, entity) != true {
+        return EcsWefEntityRef {
+            ok: false, err: ECS_WEF_NOT_SPAWNED, entity: entity, value: 0,
+            deferred: true, structural: false,
+        };
+    };
+    return EcsWefEntityRef {
+        ok: true, err: ECS_WEF_OK, entity: entity,
+        value: ecs_wef_world_deep_value(f.world, entity),
+        deferred: true, structural: false,
+    };
+}
+
+// structural get_mut (EntityWorldMut) — same existence check
+fn ecs_wef_fetcher_deep_get_mut_structural(f: EcsWefFetcherDeep, entity: i32) -> EcsWefEntityRef {
+    let r = ecs_wef_fetcher_deep_get_mut(f, entity);
+    if ecs_wef_ref_ok(r) != true { return r; };
+    return EcsWefEntityRef {
+        ok: true, err: ECS_WEF_OK, entity: r.entity, value: r.value,
+        deferred: false, structural: true,
+    };
+}
+
+// Multi-entity mut fetch unique check (array of up to 4)
+struct EcsWefMultiResult {
+    ok: bool,
+    err: i32,
+    count: i32,
+    e0: i32, v0: i64,
+    e1: i32, v1: i64,
+    e2: i32, v2: i64,
+    e3: i32, v3: i64,
+}
+
+fn ecs_wef_multi_ok(r: EcsWefMultiResult) -> bool { return r.ok; }
+fn ecs_wef_multi_err(r: EcsWefMultiResult) -> i32 { return r.err; }
+fn ecs_wef_multi_count(r: EcsWefMultiResult) -> i32 { return r.count; }
+fn ecs_wef_multi_entity_at(r: EcsWefMultiResult, idx: i32) -> i32 {
+    if idx == 0 { return r.e0; };
+    if idx == 1 { return r.e1; };
+    if idx == 2 { return r.e2; };
+    if idx == 3 { return r.e3; };
+    return -1;
+}
+fn ecs_wef_multi_value_at(r: EcsWefMultiResult, idx: i32) -> i64 {
+    if idx == 0 { return r.v0; };
+    if idx == 1 { return r.v1; };
+    if idx == 2 { return r.v2; };
+    if idx == 3 { return r.v3; };
+    return 0;
+}
+
+fn ecs_wef_has_dup4(e0: i32, e1: i32, e2: i32, e3: i32, n: i32) -> bool {
+    if n >= 2 {
+        if e0 == e1 { return true; };
+    };
+    if n >= 3 {
+        if e0 == e2 { return true; };
+        if e1 == e2 { return true; };
+    };
+    if n >= 4 {
+        if e0 == e3 { return true; };
+        if e1 == e3 { return true; };
+        if e2 == e3 { return true; };
+    };
+    return false;
+}
+
+fn ecs_wef_fetcher_deep_get_many_ref(f: EcsWefFetcherDeep, e0: i32, e1: i32, e2: i32, e3: i32, n: i32) -> EcsWefMultiResult {
+    // read path: duplicates allowed
+    if n >= 1 {
+        if ecs_wef_world_deep_is_spawned(f.world, e0) != true {
+            return EcsWefMultiResult {
+                ok: false, err: ECS_WEF_NOT_SPAWNED, count: 0,
+                e0: e0, v0: 0, e1: -1, v1: 0, e2: -1, v2: 0, e3: -1, v3: 0,
+            };
+        };
+    };
+    if n >= 2 {
+        if ecs_wef_world_deep_is_spawned(f.world, e1) != true {
+            return EcsWefMultiResult {
+                ok: false, err: ECS_WEF_NOT_SPAWNED, count: 0,
+                e0: e0, v0: 0, e1: e1, v1: 0, e2: -1, v2: 0, e3: -1, v3: 0,
+            };
+        };
+    };
+    if n >= 3 {
+        if ecs_wef_world_deep_is_spawned(f.world, e2) != true {
+            return EcsWefMultiResult {
+                ok: false, err: ECS_WEF_NOT_SPAWNED, count: 0,
+                e0: e0, v0: 0, e1: e1, v1: 0, e2: e2, v2: 0, e3: -1, v3: 0,
+            };
+        };
+    };
+    if n >= 4 {
+        if ecs_wef_world_deep_is_spawned(f.world, e3) != true {
+            return EcsWefMultiResult {
+                ok: false, err: ECS_WEF_NOT_SPAWNED, count: 0,
+                e0: e0, v0: 0, e1: e1, v1: 0, e2: e2, v2: 0, e3: e3, v3: 0,
+            };
+        };
+    };
+    let v0: i64 = 0; let v1: i64 = 0; let v2: i64 = 0; let v3: i64 = 0;
+    if n >= 1 { v0 = ecs_wef_world_deep_value(f.world, e0); };
+    if n >= 2 { v1 = ecs_wef_world_deep_value(f.world, e1); };
+    if n >= 3 { v2 = ecs_wef_world_deep_value(f.world, e2); };
+    if n >= 4 { v3 = ecs_wef_world_deep_value(f.world, e3); };
+    return EcsWefMultiResult {
+        ok: true, err: ECS_WEF_OK, count: n,
+        e0: e0, v0: v0, e1: e1, v1: v1, e2: e2, v2: v2, e3: e3, v3: v3,
+    };
+}
+
+fn ecs_wef_fetcher_deep_get_many_mut(f: EcsWefFetcherDeep, e0: i32, e1: i32, e2: i32, e3: i32, n: i32) -> EcsWefMultiResult {
+    if f.mut_access != true {
+        return EcsWefMultiResult {
+            ok: false, err: ECS_WEF_NOT_SPAWNED, count: 0,
+            e0: -1, v0: 0, e1: -1, v1: 0, e2: -1, v2: 0, e3: -1, v3: 0,
+        };
+    };
+    if ecs_wef_has_dup4(e0, e1, e2, e3, n) {
+        return EcsWefMultiResult {
+            ok: false, err: ECS_WEF_ALIASED_MUTABILITY, count: 0,
+            e0: e0, v0: 0, e1: e1, v1: 0, e2: e2, v2: 0, e3: e3, v3: 0,
+        };
+    };
+    return ecs_wef_fetcher_deep_get_many_ref(f, e0, e1, e2, e3, n);
+}
+
+// apply set via deferred mut view
+struct EcsWefSetResult {
+    world: EcsWefWorldDeep,
+    ok: bool,
+}
+
+fn ecs_wef_set_world(r: EcsWefSetResult) -> EcsWefWorldDeep { return r.world; }
+fn ecs_wef_set_ok(r: EcsWefSetResult) -> bool { return r.ok; }
+
+fn ecs_wef_apply_set(f: EcsWefFetcherDeep, entity: i32, value: i64) -> EcsWefSetResult {
+    let r = ecs_wef_fetcher_deep_get_mut(f, entity);
+    if ecs_wef_ref_ok(r) != true {
+        return EcsWefSetResult { world: f.world, ok: false };
+    };
+    let w2 = ecs_wef_world_deep_set_value(f.world, entity, value);
+    return EcsWefSetResult { world: w2, ok: true };
+}

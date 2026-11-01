@@ -1,0 +1,211 @@
+// Bevy ECS observer (src/observer/centralized_storage.rs):
+// Observers struct + CachedObservers + CachedComponentObservers
+// The centralized observer storage caches observers for high-traffic lifecycle events.
+
+// Lifecycle event key constants
+const ECS_OBS_EVENT_ADD: i64 = 1;
+const ECS_OBS_EVENT_INSERT: i64 = 2;
+const ECS_OBS_EVENT_DISCARD: i64 = 3;
+const ECS_OBS_EVENT_REMOVE: i64 = 4;
+const ECS_OBS_EVENT_DESPAWN: i64 = 5;
+
+// ArchetypeFlags for cached observer types
+const ECS_ARCHETYPE_FLAG_ON_ADD: i32 = 1;
+const ECS_ARCHETYPE_FLAG_ON_INSERT: i32 = 2;
+const ECS_ARCHETYPE_FLAG_ON_DISCARD: i32 = 4;
+const ECS_ARCHETYPE_FLAG_ON_REMOVE: i32 = 8;
+const ECS_ARCHETYPE_FLAG_ON_DESPAWN: i32 = 16;
+
+struct EcsCachedComponentObservers {
+    // component_id -> list of observer runner handles
+    component_ids: Vec<i32>,
+    runner_lists: Vec<Vec<i64>>,
+}
+
+fn ecs_cached_component_observers_new() -> EcsCachedComponentObservers {
+    return EcsCachedComponentObservers { component_ids: Vec::new(), runner_lists: Vec::new() };
+}
+
+fn ecs_cached_component_observers_add(c: EcsCachedComponentObservers, component_id: i32, runner: i64) -> EcsCachedComponentObservers {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        if c.component_ids[i] == component_id {
+            c.runner_lists[i].push(runner);
+            return c;
+        };
+        i = i + 1;
+    }
+    c.component_ids.push(component_id);
+    let new_list = Vec::new();
+    new_list.push(runner);
+    c.runner_lists.push(new_list);
+    return c;
+}
+
+fn ecs_cached_component_observers_get(c: EcsCachedComponentObservers, component_id: i32) -> Vec<i64> {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        if c.component_ids[i] == component_id { return c.runner_lists[i]; };
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+fn ecs_cached_component_observers_count(c: EcsCachedComponentObservers) -> i64 { return len(c.component_ids) as i64; }
+
+struct EcsCachedObservers {
+    // Global observers (run for all entities)
+    global_runners: Vec<i64>,
+    // Component-specific observers
+    component_observers: EcsCachedComponentObservers,
+    // Entity-specific observers (parallel arrays)
+    entity_ids: Vec<i64>,
+    entity_runner_lists: Vec<Vec<i64>>,
+}
+
+fn ecs_cached_observers_new() -> EcsCachedObservers {
+    return EcsCachedObservers {
+        global_runners: Vec::new(),
+        component_observers: ecs_cached_component_observers_new(),
+        entity_ids: Vec::new(), entity_runner_lists: Vec::new()
+    };
+}
+
+fn ecs_cached_observers_add_global(c: EcsCachedObservers, runner: i64) -> EcsCachedObservers {
+    c.global_runners.push(runner);
+    return c;
+}
+
+fn ecs_cached_observers_add_component(c: EcsCachedObservers, component_id: i32, runner: i64) -> EcsCachedObservers {
+    c.component_observers = ecs_cached_component_observers_add(c.component_observers, component_id, runner);
+    return c;
+}
+
+fn ecs_cached_observers_add_entity(c: EcsCachedObservers, entity: i64, runner: i64) -> EcsCachedObservers {
+    let i: i64 = 0;
+    let n: i64 = len(c.entity_ids) as i64;
+    while i < n {
+        if c.entity_ids[i] == entity {
+            c.entity_runner_lists[i].push(runner);
+            return c;
+        };
+        i = i + 1;
+    }
+    c.entity_ids.push(entity);
+    let new_list = Vec::new();
+    new_list.push(runner);
+    c.entity_runner_lists.push(new_list);
+    return c;
+}
+
+fn ecs_cached_observers_global_count(c: EcsCachedObservers) -> i64 { return len(c.global_runners) as i64; }
+fn ecs_cached_observers_component_count(c: EcsCachedObservers) -> i64 { return ecs_cached_component_observers_count(c.component_observers); }
+fn ecs_cached_observers_entity_count(c: EcsCachedObservers) -> i64 { return len(c.entity_ids) as i64; }
+
+fn ecs_cached_observers_get_component_runners(c: EcsCachedObservers, component_id: i32) -> Vec<i64> {
+    return ecs_cached_component_observers_get(c.component_observers, component_id);
+}
+
+fn ecs_cached_observers_get_entity_runners(c: EcsCachedObservers, entity: i64) -> Vec<i64> {
+    let i: i64 = 0;
+    let n: i64 = len(c.entity_ids) as i64;
+    while i < n {
+        if c.entity_ids[i] == entity { return c.entity_runner_lists[i]; };
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+fn ecs_cached_observers_is_empty(c: EcsCachedObservers) -> bool {
+    if len(c.global_runners) > 0 { return false; };
+    if ecs_cached_component_observers_count(c.component_observers) > 0 { return false; };
+    if len(c.entity_ids) > 0 { return false; };
+    return true;
+}
+
+// === Observers (top-level centralized storage) ===
+struct EcsObservers {
+    add: EcsCachedObservers,
+    insert: EcsCachedObservers,
+    discard: EcsCachedObservers,
+    remove: EcsCachedObservers,
+    despawn: EcsCachedObservers,
+    // Additional event keys -> cached observers
+    extra_event_keys: Vec<i64>,
+    extra_cached: Vec<EcsCachedObservers>,
+}
+
+fn ecs_observers_new() -> EcsObservers {
+    return EcsObservers {
+        add: ecs_cached_observers_new(), insert: ecs_cached_observers_new(),
+        discard: ecs_cached_observers_new(), remove: ecs_cached_observers_new(),
+        despawn: ecs_cached_observers_new(),
+        extra_event_keys: Vec::new(), extra_cached: Vec::new()
+    };
+}
+
+// get_observers: get the CachedObservers for an event key
+fn ecs_observers_get(o: EcsObservers, event_key: i64) -> (bool, EcsCachedObservers) {
+    if event_key == ECS_OBS_EVENT_ADD { return (true, o.add); };
+    if event_key == ECS_OBS_EVENT_INSERT { return (true, o.insert); };
+    if event_key == ECS_OBS_EVENT_DISCARD { return (true, o.discard); };
+    if event_key == ECS_OBS_EVENT_REMOVE { return (true, o.remove); };
+    if event_key == ECS_OBS_EVENT_DESPAWN { return (true, o.despawn); };
+    // Check extra cache
+    let i: i64 = 0;
+    let n: i64 = len(o.extra_event_keys) as i64;
+    while i < n {
+        if o.extra_event_keys[i] == event_key { return (true, o.extra_cached[i]); };
+        i = i + 1;
+    }
+    return (false, ecs_cached_observers_new());
+}
+
+// get_or_create: get or create the CachedObservers for an event key
+fn ecs_observers_get_or_create(o: EcsObservers, event_key: i64) -> (EcsObservers, EcsCachedObservers) {
+    if event_key == ECS_OBS_EVENT_ADD { return (o, o.add); };
+    if event_key == ECS_OBS_EVENT_INSERT { return (o, o.insert); };
+    if event_key == ECS_OBS_EVENT_DISCARD { return (o, o.discard); };
+    if event_key == ECS_OBS_EVENT_REMOVE { return (o, o.remove); };
+    if event_key == ECS_OBS_EVENT_DESPAWN { return (o, o.despawn); };
+    // Check extra cache
+    let i: i64 = 0;
+    let n: i64 = len(o.extra_event_keys) as i64;
+    while i < n {
+        if o.extra_event_keys[i] == event_key { return (o, o.extra_cached[i]); };
+        i = i + 1;
+    }
+    // Create new
+    let cached = ecs_cached_observers_new();
+    o.extra_event_keys.push(event_key);
+    o.extra_cached.push(cached);
+    let idx = (len(o.extra_cached) as i64) - 1;
+    return (o, o.extra_cached[idx]);
+}
+
+// add_observer: add an observer runner for a specific event key
+fn ecs_observers_add_global(o: EcsObservers, event_key: i64, runner: i64) -> EcsObservers {
+    if event_key == ECS_OBS_EVENT_ADD { o.add = ecs_cached_observers_add_global(o.add, runner); return o; };
+    if event_key == ECS_OBS_EVENT_INSERT { o.insert = ecs_cached_observers_add_global(o.insert, runner); return o; };
+    if event_key == ECS_OBS_EVENT_DISCARD { o.discard = ecs_cached_observers_add_global(o.discard, runner); return o; };
+    if event_key == ECS_OBS_EVENT_REMOVE { o.remove = ecs_cached_observers_add_global(o.remove, runner); return o; };
+    if event_key == ECS_OBS_EVENT_DESPAWN { o.despawn = ecs_cached_observers_add_global(o.despawn, runner); return o; };
+    // Extra
+    let r = ecs_observers_get_or_create(o, event_key);
+    let o2 = r.0;
+    let cached = r.1;
+    cached.global_runners.push(runner);
+    return o2;
+}
+
+// is_archetype_cached: returns the archetype flag for cached lifecycle events
+fn ecs_observers_is_archetype_cached(event_key: i64) -> i32 {
+    if event_key == ECS_OBS_EVENT_ADD { return ECS_ARCHETYPE_FLAG_ON_ADD; };
+    if event_key == ECS_OBS_EVENT_INSERT { return ECS_ARCHETYPE_FLAG_ON_INSERT; };
+    if event_key == ECS_OBS_EVENT_DISCARD { return ECS_ARCHETYPE_FLAG_ON_DISCARD; };
+    if event_key == ECS_OBS_EVENT_REMOVE { return ECS_ARCHETYPE_FLAG_ON_REMOVE; };
+    if event_key == ECS_OBS_EVENT_DESPAWN { return ECS_ARCHETYPE_FLAG_ON_DESPAWN; };
+    return 0;
+}

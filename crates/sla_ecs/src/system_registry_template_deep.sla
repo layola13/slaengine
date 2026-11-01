@@ -1,0 +1,603 @@
+// Deep self-contained Bevy ECS system::system_registry templates — mirrors
+// lib/system_registry_template.sla (312 lines). Self-contained fixed-cap (cap-16) scalar-slot
+// families. No @import. All structs carry @derive(copy). Booleans are stored as i32 (0/1).
+// Nested @derive(copy) sub-structs are flattened inline to avoid the SA backend MemoryLeak
+// (see docs/issue.md).
+
+const ECS_SYS_DEEP_CAP: i32 = 16;
+
+// === SystemHandleOrValue (flat) ===
+const ECS_SYS_HOV_DEEP_HANDLE: i32 = 0;
+const ECS_SYS_HOV_DEEP_VALUE: i32 = 1;
+
+@derive(copy)
+struct EcsSystemHandleOrValueDeep {
+    kind: i32,
+    handle: i64,
+    has_system_value: i32,
+    system_id: i64,
+}
+
+fn ecs_sys_hov_deep_handle(handle_entity: i64) -> EcsSystemHandleOrValueDeep {
+    return EcsSystemHandleOrValueDeep { kind: ECS_SYS_HOV_DEEP_HANDLE, handle: handle_entity, has_system_value: 0, system_id: 0 };
+}
+
+fn ecs_sys_hov_deep_value(system_id: i64) -> EcsSystemHandleOrValueDeep {
+    return EcsSystemHandleOrValueDeep { kind: ECS_SYS_HOV_DEEP_VALUE, handle: 0, has_system_value: 1, system_id: system_id };
+}
+
+fn ecs_sys_hov_deep_is_handle(v: EcsSystemHandleOrValueDeep) -> bool { return v.kind == ECS_SYS_HOV_DEEP_HANDLE; }
+fn ecs_sys_hov_deep_is_value(v: EcsSystemHandleOrValueDeep) -> bool { return v.kind == ECS_SYS_HOV_DEEP_VALUE; }
+fn ecs_sys_hov_deep_handle_entity(v: EcsSystemHandleOrValueDeep) -> i64 { return v.handle; }
+fn ecs_sys_hov_deep_system_id(v: EcsSystemHandleOrValueDeep) -> i64 { return v.system_id; }
+fn ecs_sys_hov_deep_has_value(v: EcsSystemHandleOrValueDeep) -> bool { return v.has_system_value != 0; }
+
+// === SystemHandleValue (flat: ref_count + inlined inner fields) ===
+@derive(copy)
+struct EcsSystemHandleValueDeep {
+    ref_count: i64,
+    inner_kind: i32,
+    inner_handle: i64,
+    inner_has_system_value: i32,
+    inner_system_id: i64,
+}
+
+fn ecs_system_handle_value_deep_new(system_id: i64) -> EcsSystemHandleValueDeep {
+    return EcsSystemHandleValueDeep {
+        ref_count: 1,
+        inner_kind: ECS_SYS_HOV_DEEP_VALUE,
+        inner_handle: 0,
+        inner_has_system_value: 1,
+        inner_system_id: system_id,
+    };
+}
+
+fn ecs_system_handle_value_deep_clone(v: EcsSystemHandleValueDeep) -> EcsSystemHandleValueDeep {
+    v.ref_count = v.ref_count + 1;
+    return v;
+}
+
+fn ecs_system_handle_value_deep_drop_clone(v: EcsSystemHandleValueDeep) -> EcsSystemHandleValueDeep {
+    if v.ref_count > 0 {
+        v.ref_count = v.ref_count - 1;
+    };
+    return v;
+}
+
+fn ecs_system_handle_value_deep_ref_count(v: EcsSystemHandleValueDeep) -> i64 { return v.ref_count; }
+fn ecs_system_handle_value_deep_inner_kind(v: EcsSystemHandleValueDeep) -> i32 { return v.inner_kind; }
+fn ecs_system_handle_value_deep_has_value(v: EcsSystemHandleValueDeep) -> bool { return v.inner_has_system_value != 0; }
+fn ecs_system_handle_value_deep_handle(v: EcsSystemHandleValueDeep) -> i64 { return v.inner_handle; }
+
+// build: for Value variant, register the system and convert to Handle in-place
+fn ecs_system_handle_value_deep_build(v: EcsSystemHandleValueDeep, assigned_entity: i64) -> EcsSystemHandleValueDeep {
+    if v.inner_kind == ECS_SYS_HOV_DEEP_VALUE && v.inner_has_system_value != 0 {
+        v.inner_kind = ECS_SYS_HOV_DEEP_HANDLE;
+        v.inner_handle = assigned_entity;
+        v.inner_has_system_value = 0;
+    };
+    return v;
+}
+
+// === SystemHandleTemplate (flat: kind + handle + inlined value fields) ===
+const ECS_SYS_TEMPLATE_DEEP_HANDLE: i32 = 0;
+const ECS_SYS_TEMPLATE_DEEP_VALUE: i32 = 1;
+
+@derive(copy)
+struct EcsSystemHandleTemplateDeep {
+    kind: i32,
+    handle: i64,
+    // Inlined EcsSystemHandleValueDeep fields.
+    value_ref_count: i64,
+    value_inner_kind: i32,
+    value_inner_handle: i64,
+    value_inner_has_system_value: i32,
+    value_inner_system_id: i64,
+    // Inline companion for the build's tuple-return replacement (avoids the SA MemoryLeak).
+    last_build_entity: i64,
+}
+
+fn ecs_system_template_deep_handle_weak(entity: i64) -> EcsSystemHandleTemplateDeep {
+    return EcsSystemHandleTemplateDeep {
+        kind: ECS_SYS_TEMPLATE_DEEP_HANDLE, handle: entity,
+        value_ref_count: 1,
+        value_inner_kind: ECS_SYS_HOV_DEEP_VALUE,
+        value_inner_handle: 0,
+        value_inner_has_system_value: 1,
+        value_inner_system_id: 0,
+        last_build_entity: (0 - 1),
+    };
+}
+
+fn ecs_system_template_deep_value(system_id: i64) -> EcsSystemHandleTemplateDeep {
+    return EcsSystemHandleTemplateDeep {
+        kind: ECS_SYS_TEMPLATE_DEEP_VALUE, handle: 0,
+        value_ref_count: 1,
+        value_inner_kind: ECS_SYS_HOV_DEEP_VALUE,
+        value_inner_handle: 0,
+        value_inner_has_system_value: 1,
+        value_inner_system_id: system_id,
+        last_build_entity: (0 - 1),
+    };
+}
+
+fn ecs_system_template_deep_is_handle(t: EcsSystemHandleTemplateDeep) -> bool { return t.kind == ECS_SYS_TEMPLATE_DEEP_HANDLE; }
+fn ecs_system_template_deep_is_value(t: EcsSystemHandleTemplateDeep) -> bool { return t.kind == ECS_SYS_TEMPLATE_DEEP_VALUE; }
+fn ecs_system_template_deep_handle(t: EcsSystemHandleTemplateDeep) -> i64 { return t.handle; }
+fn ecs_system_template_deep_value_ref_count(t: EcsSystemHandleTemplateDeep) -> i64 { return t.value_ref_count; }
+fn ecs_system_template_deep_default() -> EcsSystemHandleTemplateDeep {
+    return ecs_system_template_deep_handle_weak((0 - 1));
+}
+
+fn ecs_system_template_deep_clone(t: EcsSystemHandleTemplateDeep) -> EcsSystemHandleTemplateDeep {
+    if t.kind == ECS_SYS_TEMPLATE_DEEP_HANDLE {
+        return ecs_system_template_deep_handle_weak(t.handle);
+    };
+    let t2 = t;
+    t2.value_ref_count = t2.value_ref_count + 1;
+    return t2;
+}
+
+fn ecs_system_template_deep_from_handle(handle_entity: i64) -> EcsSystemHandleTemplateDeep {
+    return ecs_system_template_deep_handle_weak(handle_entity);
+}
+
+fn ecs_system_template_deep_from_boxed(system_id: i64) -> EcsSystemHandleTemplateDeep {
+    return ecs_system_template_deep_value(system_id);
+}
+
+fn ecs_system_template_deep_from_id(id_entity: i64) -> EcsSystemHandleTemplateDeep {
+    return ecs_system_template_deep_handle_weak(id_entity);
+}
+
+// Accessor for build's tuple-companion entity (stored inline on the template).
+fn ecs_template_deep_last_build_entity(t: EcsSystemHandleTemplateDeep) -> i64 {
+    return t.last_build_entity;
+}
+
+// build_template: for Value variant, lazily register (consuming the value system), modifies the
+// template in place and returns the mutated template with last_build_entity populated. For Handle
+// variant, leaves the template unchanged and stores t.handle in last_build_entity.
+fn ecs_system_template_deep_build(t: EcsSystemHandleTemplateDeep, assigned_entity: i64) -> EcsSystemHandleTemplateDeep {
+    if t.kind == ECS_SYS_TEMPLATE_DEEP_HANDLE {
+        t.last_build_entity = t.handle;
+        return t;
+    };
+    let v = EcsSystemHandleValueDeep {
+        ref_count: t.value_ref_count,
+        inner_kind: t.value_inner_kind,
+        inner_handle: t.value_inner_handle,
+        inner_has_system_value: t.value_inner_has_system_value,
+        inner_system_id: t.value_inner_system_id,
+    };
+    let v2 = ecs_system_handle_value_deep_build(v, assigned_entity);
+    t.kind = ECS_SYS_TEMPLATE_DEEP_HANDLE;
+    t.handle = assigned_entity;
+    t.value_ref_count = v2.ref_count;
+    t.value_inner_kind = v2.inner_kind;
+    t.value_inner_handle = v2.inner_handle;
+    t.value_inner_has_system_value = v2.inner_has_system_value;
+    t.value_inner_system_id = v2.inner_system_id;
+    t.last_build_entity = assigned_entity;
+    return t;
+}
+
+fn ecs_system_value_deep_new(system_id: i64) -> EcsSystemHandleTemplateDeep {
+    return ecs_system_template_deep_value(system_id);
+}
+
+// === CachedSystemId ===
+@derive(copy)
+struct EcsCachedSystemIdDeep {
+    entity: i64,
+    type_id: i32,
+}
+
+fn ecs_cached_system_id_deep_new(entity: i64, type_id: i32) -> EcsCachedSystemIdDeep {
+    return EcsCachedSystemIdDeep { entity: entity, type_id: type_id };
+}
+
+fn ecs_cached_system_id_deep_entity(c: EcsCachedSystemIdDeep) -> i64 { return c.entity; }
+fn ecs_cached_system_id_deep_type_id(c: EcsCachedSystemIdDeep) -> i32 { return c.type_id; }
+
+// === Cap-16 i32 list for type_ids ===
+@derive(copy)
+struct EcsSysIdListDeepDeep {
+    t0: i32, t1: i32, t2: i32, t3: i32, t4: i32, t5: i32, t6: i32, t7: i32,
+    t8: i32, t9: i32, t10: i32, t11: i32, t12: i32, t13: i32, t14: i32, t15: i32,
+    tn: i32,
+}
+
+fn _ecssysidlist_deep_at(list: EcsSysIdListDeepDeep, idx: i32) -> i32 {
+    if idx == 0 { return list.t0; };
+    if idx == 1 { return list.t1; };
+    if idx == 2 { return list.t2; };
+    if idx == 3 { return list.t3; };
+    if idx == 4 { return list.t4; };
+    if idx == 5 { return list.t5; };
+    if idx == 6 { return list.t6; };
+    if idx == 7 { return list.t7; };
+    if idx == 8 { return list.t8; };
+    if idx == 9 { return list.t9; };
+    if idx == 10 { return list.t10; };
+    if idx == 11 { return list.t11; };
+    if idx == 12 { return list.t12; };
+    if idx == 13 { return list.t13; };
+    if idx == 14 { return list.t14; };
+    if idx == 15 { return list.t15; };
+    panic(146000);
+}
+
+fn _ecssysidlist_deep_set(list: EcsSysIdListDeepDeep, idx: i32, value: i32) -> EcsSysIdListDeepDeep {
+    if idx == 0 { list.t0 = value; return list; };
+    if idx == 1 { list.t1 = value; return list; };
+    if idx == 2 { list.t2 = value; return list; };
+    if idx == 3 { list.t3 = value; return list; };
+    if idx == 4 { list.t4 = value; return list; };
+    if idx == 5 { list.t5 = value; return list; };
+    if idx == 6 { list.t6 = value; return list; };
+    if idx == 7 { list.t7 = value; return list; };
+    if idx == 8 { list.t8 = value; return list; };
+    if idx == 9 { list.t9 = value; return list; };
+    if idx == 10 { list.t10 = value; return list; };
+    if idx == 11 { list.t11 = value; return list; };
+    if idx == 12 { list.t12 = value; return list; };
+    if idx == 13 { list.t13 = value; return list; };
+    if idx == 14 { list.t14 = value; return list; };
+    if idx == 15 { list.t15 = value; return list; };
+    panic(146001);
+}
+
+// === Cap-16 i64 entity list (entities parallel to type_ids) ===
+@derive(copy)
+struct EcsSysEntListDeepDeep {
+    e0: i64, e1: i64, e2: i64, e3: i64, e4: i64, e5: i64, e6: i64, e7: i64,
+    e8: i64, e9: i64, e10: i64, e11: i64, e12: i64, e13: i64, e14: i64, e15: i64,
+    en: i32,
+}
+
+fn _ecssysentlist_deep_at(list: EcsSysEntListDeepDeep, idx: i32) -> i64 {
+    if idx == 0 { return list.e0; };
+    if idx == 1 { return list.e1; };
+    if idx == 2 { return list.e2; };
+    if idx == 3 { return list.e3; };
+    if idx == 4 { return list.e4; };
+    if idx == 5 { return list.e5; };
+    if idx == 6 { return list.e6; };
+    if idx == 7 { return list.e7; };
+    if idx == 8 { return list.e8; };
+    if idx == 9 { return list.e9; };
+    if idx == 10 { return list.e10; };
+    if idx == 11 { return list.e11; };
+    if idx == 12 { return list.e12; };
+    if idx == 13 { return list.e13; };
+    if idx == 14 { return list.e14; };
+    if idx == 15 { return list.e15; };
+    panic(146002);
+}
+
+fn _ecssysentlist_deep_set(list: EcsSysEntListDeepDeep, idx: i32, value: i64) -> EcsSysEntListDeepDeep {
+    if idx == 0 { list.e0 = value; return list; };
+    if idx == 1 { list.e1 = value; return list; };
+    if idx == 2 { list.e2 = value; return list; };
+    if idx == 3 { list.e3 = value; return list; };
+    if idx == 4 { list.e4 = value; return list; };
+    if idx == 5 { list.e5 = value; return list; };
+    if idx == 6 { list.e6 = value; return list; };
+    if idx == 7 { list.e7 = value; return list; };
+    if idx == 8 { list.e8 = value; return list; };
+    if idx == 9 { list.e9 = value; return list; };
+    if idx == 10 { list.e10 = value; return list; };
+    if idx == 11 { list.e11 = value; return list; };
+    if idx == 12 { list.e12 = value; return list; };
+    if idx == 13 { list.e13 = value; return list; };
+    if idx == 14 { list.e14 = value; return list; };
+    if idx == 15 { list.e15 = value; return list; };
+    panic(146003);
+}
+
+// === EcsCachedSystemRegistry: cap-16 type_ids + entities slot families + count ===
+@derive(copy)
+struct EcsCachedSystemRegistryDeep {
+    t0: i32, t1: i32, t2: i32, t3: i32, t4: i32, t5: i32, t6: i32, t7: i32,
+    t8: i32, t9: i32, t10: i32, t11: i32, t12: i32, t13: i32, t14: i32, t15: i32,
+    tn: i32,
+    e0: i64, e1: i64, e2: i64, e3: i64, e4: i64, e5: i64, e6: i64, e7: i64,
+    e8: i64, e9: i64, e10: i64, e11: i64, e12: i64, e13: i64, e14: i64, e15: i64,
+    // Flatten the tuple-return replacement wrappers into inline fields to avoid nested
+    // @derive(copy) struct access leaking on the SA backend (see docs/issue.md).
+    last_registered_entity: i64,
+    last_unregister_success: i32,
+    last_run_with_entity: i64,
+    last_run_with_input: i64,
+}
+
+fn _ecsr_type_at(reg: EcsCachedSystemRegistryDeep, idx: i32) -> i32 {
+    if idx == 0 { return reg.t0; };
+    if idx == 1 { return reg.t1; };
+    if idx == 2 { return reg.t2; };
+    if idx == 3 { return reg.t3; };
+    if idx == 4 { return reg.t4; };
+    if idx == 5 { return reg.t5; };
+    if idx == 6 { return reg.t6; };
+    if idx == 7 { return reg.t7; };
+    if idx == 8 { return reg.t8; };
+    if idx == 9 { return reg.t9; };
+    if idx == 10 { return reg.t10; };
+    if idx == 11 { return reg.t11; };
+    if idx == 12 { return reg.t12; };
+    if idx == 13 { return reg.t13; };
+    if idx == 14 { return reg.t14; };
+    if idx == 15 { return reg.t15; };
+    panic(146004);
+}
+
+fn _ecsr_ent_at(reg: EcsCachedSystemRegistryDeep, idx: i32) -> i64 {
+    if idx == 0 { return reg.e0; };
+    if idx == 1 { return reg.e1; };
+    if idx == 2 { return reg.e2; };
+    if idx == 3 { return reg.e3; };
+    if idx == 4 { return reg.e4; };
+    if idx == 5 { return reg.e5; };
+    if idx == 6 { return reg.e6; };
+    if idx == 7 { return reg.e7; };
+    if idx == 8 { return reg.e8; };
+    if idx == 9 { return reg.e9; };
+    if idx == 10 { return reg.e10; };
+    if idx == 11 { return reg.e11; };
+    if idx == 12 { return reg.e12; };
+    if idx == 13 { return reg.e13; };
+    if idx == 14 { return reg.e14; };
+    if idx == 15 { return reg.e15; };
+    panic(146005);
+}
+
+fn _ecsr_type_set(reg: EcsCachedSystemRegistryDeep, idx: i32, v: i32) -> EcsCachedSystemRegistryDeep {
+    if idx == 0 { reg.t0 = v; return reg; };
+    if idx == 1 { reg.t1 = v; return reg; };
+    if idx == 2 { reg.t2 = v; return reg; };
+    if idx == 3 { reg.t3 = v; return reg; };
+    if idx == 4 { reg.t4 = v; return reg; };
+    if idx == 5 { reg.t5 = v; return reg; };
+    if idx == 6 { reg.t6 = v; return reg; };
+    if idx == 7 { reg.t7 = v; return reg; };
+    if idx == 8 { reg.t8 = v; return reg; };
+    if idx == 9 { reg.t9 = v; return reg; };
+    if idx == 10 { reg.t10 = v; return reg; };
+    if idx == 11 { reg.t11 = v; return reg; };
+    if idx == 12 { reg.t12 = v; return reg; };
+    if idx == 13 { reg.t13 = v; return reg; };
+    if idx == 14 { reg.t14 = v; return reg; };
+    if idx == 15 { reg.t15 = v; return reg; };
+    panic(146006);
+}
+
+fn _ecsr_ent_set(reg: EcsCachedSystemRegistryDeep, idx: i32, v: i64) -> EcsCachedSystemRegistryDeep {
+    if idx == 0 { reg.e0 = v; return reg; };
+    if idx == 1 { reg.e1 = v; return reg; };
+    if idx == 2 { reg.e2 = v; return reg; };
+    if idx == 3 { reg.e3 = v; return reg; };
+    if idx == 4 { reg.e4 = v; return reg; };
+    if idx == 5 { reg.e5 = v; return reg; };
+    if idx == 6 { reg.e6 = v; return reg; };
+    if idx == 7 { reg.e7 = v; return reg; };
+    if idx == 8 { reg.e8 = v; return reg; };
+    if idx == 9 { reg.e9 = v; return reg; };
+    if idx == 10 { reg.e10 = v; return reg; };
+    if idx == 11 { reg.e11 = v; return reg; };
+    if idx == 12 { reg.e12 = v; return reg; };
+    if idx == 13 { reg.e13 = v; return reg; };
+    if idx == 14 { reg.e14 = v; return reg; };
+    if idx == 15 { reg.e15 = v; return reg; };
+    panic(146007);
+}
+
+fn _ecsr_tn(reg: EcsCachedSystemRegistryDeep) -> i32 { return reg.tn; }
+
+fn ecs_cached_system_registry_deep_new() -> EcsCachedSystemRegistryDeep {
+    return EcsCachedSystemRegistryDeep {
+        t0: (0 - 1), t1: (0 - 1), t2: (0 - 1), t3: (0 - 1), t4: (0 - 1), t5: (0 - 1), t6: (0 - 1), t7: (0 - 1),
+        t8: (0 - 1), t9: (0 - 1), t10: (0 - 1), t11: (0 - 1), t12: (0 - 1), t13: (0 - 1), t14: (0 - 1), t15: (0 - 1),
+        tn: 0,
+        e0: (0 - 1), e1: (0 - 1), e2: (0 - 1), e3: (0 - 1), e4: (0 - 1), e5: (0 - 1), e6: (0 - 1), e7: (0 - 1),
+        e8: (0 - 1), e9: (0 - 1), e10: (0 - 1), e11: (0 - 1), e12: (0 - 1), e13: (0 - 1), e14: (0 - 1), e15: (0 - 1),
+        last_registered_entity: (0 - 1),
+        last_unregister_success: 0,
+        last_run_with_entity: (0 - 1),
+        last_run_with_input: 0,
+    };
+}
+
+fn ecs_cached_registry_deep_find(reg: EcsCachedSystemRegistryDeep, type_id: i32) -> i64 {
+    let i: i32 = 0;
+    while i < reg.tn {
+        if _ecsr_type_at(reg, i) == type_id {
+            return _ecsr_ent_at(reg, i);
+        };
+        i = i + 1;
+    }
+    return (0 - 1);
+}
+
+fn ecs_cached_registry_deep_contains(reg: EcsCachedSystemRegistryDeep, type_id: i32) -> bool {
+    return ecs_cached_registry_deep_find(reg, type_id) >= 0;
+}
+
+fn ecs_cached_registry_deep_count(reg: EcsCachedSystemRegistryDeep) -> i32 { return reg.tn; }
+
+// Accessor for register's tuple-companion entity (stored inline in the registry struct).
+fn ecs_cached_registry_deep_last_registered_entity(reg: EcsCachedSystemRegistryDeep) -> i64 {
+    return reg.last_registered_entity;
+}
+
+// register_system_cached: if type_id not yet cached, store entity; returns the registry with the
+// result entity stored in place of a (reg, i64) tuple.
+fn ecs_cached_registry_deep_register(reg: EcsCachedSystemRegistryDeep, type_id: i32, new_entity: i64) -> EcsCachedSystemRegistryDeep {
+    let existing = ecs_cached_registry_deep_find(reg, type_id);
+    if existing >= 0 {
+        reg.last_registered_entity = existing;
+        return reg;
+    };
+    if reg.tn < ECS_SYS_DEEP_CAP {
+        reg = _ecsr_type_set(reg, reg.tn, type_id);
+        reg = _ecsr_ent_set(reg, reg.tn, new_entity);
+        reg.tn = reg.tn + 1;
+    };
+    reg.last_registered_entity = new_entity;
+    return reg;
+}
+
+// Accessor for unregister's tuple-companion success flag (stored inline).
+fn ecs_cached_registry_deep_last_unregister_success(reg: EcsCachedSystemRegistryDeep) -> bool {
+    return reg.last_unregister_success != 0;
+}
+
+// unregister_system_cached: remove cached type_id. The slot is marked blank (-1) and the
+// remaining entries are compacted; the success flag is stored on the returned registry.
+fn ecs_cached_registry_deep_unregister(reg: EcsCachedSystemRegistryDeep, type_id: i32) -> EcsCachedSystemRegistryDeep {
+    let i: i32 = 0;
+    let found: i32 = 0;
+    let idx: i32 = (0 - 1);
+    while i < reg.tn {
+        if _ecsr_type_at(reg, i) == type_id {
+            found = 1;
+            idx = i;
+            i = reg.tn;
+        };
+        i = i + 1;
+    }
+    if found != 0 {
+        reg = _ecsr_type_set(reg, idx, (0 - 1));
+        reg = _ecsr_ent_set(reg, idx, (0 - 1));
+        let new_n: i32 = 0;
+        let k: i32 = 0;
+        while k < reg.tn {
+            let cur_t = _ecsr_type_at(reg, k);
+            let cur_e = _ecsr_ent_at(reg, k);
+            if cur_t != (0 - 1) {
+                reg = _ecsr_type_set(reg, new_n, cur_t);
+                reg = _ecsr_ent_set(reg, new_n, cur_e);
+                new_n = new_n + 1;
+            };
+            k = k + 1;
+        }
+        reg.tn = new_n;
+        reg.last_unregister_success = 1;
+        return reg;
+    };
+    reg.last_unregister_success = 0;
+    return reg;
+}
+
+// run_system_cached: returns handle entity
+fn ecs_cached_registry_deep_run(reg: EcsCachedSystemRegistryDeep, type_id: i32) -> i64 {
+    return ecs_cached_registry_deep_find(reg, type_id);
+}
+
+// Accessors for run_with's tuple-companion values (stored inline).
+fn ecs_cached_registry_deep_last_run_with_entity(reg: EcsCachedSystemRegistryDeep) -> i64 {
+    return reg.last_run_with_entity;
+}
+
+fn ecs_cached_registry_deep_last_run_with_input(reg: EcsCachedSystemRegistryDeep) -> i64 {
+    return reg.last_run_with_input;
+}
+
+// run_system_cached_with: look up; if missing, store (-1, input_value); else (entity, input_value).
+fn ecs_cached_registry_deep_run_with(reg: EcsCachedSystemRegistryDeep, type_id: i32, input_value: i64) -> EcsCachedSystemRegistryDeep {
+    let e = ecs_cached_registry_deep_find(reg, type_id);
+    reg.last_run_with_input = input_value;
+    if e < 0 {
+        reg.last_run_with_entity = (0 - 1);
+        return reg;
+    };
+    reg.last_run_with_entity = e;
+    return reg;
+}
+
+// === Single-field structs still exposed for parity (EcsSystemId, EcsRegisteredSystemDespawner) ===
+@derive(copy)
+struct EcsSystemIdDeep {
+    entity: i64,
+}
+
+@derive(copy)
+struct EcsRegisteredSystemDespawnerDeep {
+    entity: i64,
+}
+
+fn ecs_system_id_deep_entity(id: EcsSystemIdDeep) -> i64 { return id.entity; }
+fn ecs_registered_system_despawner_deep_entity(d: EcsRegisteredSystemDespawnerDeep) -> i64 { return d.entity; }
+
+fn ecs_system_id_deep_mk(entity: i64) -> EcsSystemIdDeep { return EcsSystemIdDeep { entity: entity }; }
+fn ecs_registered_system_despawner_deep_mk(entity: i64) -> EcsRegisteredSystemDespawnerDeep {
+    return EcsRegisteredSystemDespawnerDeep { entity: entity };
+}
+
+// === EcsTrackedSystem (flat: inlined system_id.entity + despawner.entity) ===
+@derive(copy)
+struct EcsTrackedSystemDeep {
+    system_entity: i64,
+    despawner_entity: i64,
+}
+
+fn ecs_tracked_system_deep_new(system_entity: i64, despawner_entity: i64) -> EcsTrackedSystemDeep {
+    return EcsTrackedSystemDeep { system_entity: system_entity, despawner_entity: despawner_entity };
+}
+
+fn ecs_tracked_system_deep_entity(t: EcsTrackedSystemDeep) -> i64 { return t.system_entity; }
+fn ecs_tracked_system_deep_despawner_entity(t: EcsTrackedSystemDeep) -> i64 { return t.despawner_entity; }
+
+fn ecs_tracked_boxed_deep_new(system_entity: i64, despawner_entity: i64) -> EcsTrackedSystemDeep {
+    return ecs_tracked_system_deep_new(system_entity, despawner_entity);
+}
+
+// === EcsStrippedSystemHandle ===
+@derive(copy)
+struct EcsStrippedSystemHandleDeep {
+    kind: i32,
+    entity: i64,
+}
+
+fn ecs_stripped_handle_deep_strong(entity: i64) -> EcsStrippedSystemHandleDeep {
+    return EcsStrippedSystemHandleDeep { kind: 0, entity: entity };
+}
+
+fn ecs_stripped_handle_deep_weak(entity: i64) -> EcsStrippedSystemHandleDeep {
+    return EcsStrippedSystemHandleDeep { kind: 1, entity: entity };
+}
+
+fn ecs_stripped_handle_deep_is_strong(h: EcsStrippedSystemHandleDeep) -> bool { return h.kind == 0; }
+fn ecs_stripped_handle_deep_is_weak(h: EcsStrippedSystemHandleDeep) -> bool { return h.kind == 1; }
+fn ecs_stripped_handle_deep_entity(h: EcsStrippedSystemHandleDeep) -> i64 { return h.entity; }
+
+// === EcsTemplateContext ===
+@derive(copy)
+struct EcsTemplateContextDeep {
+    world_entity_start: i64,
+    next_entity: i64,
+    // Inline companion for the tuple-return replacement so tests that allocate_entity in a
+    // chain do not need a nested wrapper (avoids the SA MemoryLeak, see docs/issue.md).
+    last_allocated_entity: i64,
+}
+
+fn ecs_template_context_deep_new(start_entity: i64) -> EcsTemplateContextDeep {
+    return EcsTemplateContextDeep { world_entity_start: start_entity, next_entity: start_entity, last_allocated_entity: (0 - 1) };
+}
+
+// allocate_entity returns the mutated context with last_allocated_entity populated.
+fn ecs_template_context_deep_allocate_entity(c: EcsTemplateContextDeep) -> EcsTemplateContextDeep {
+    let e = c.next_entity;
+    c.next_entity = c.next_entity + 1;
+    c.last_allocated_entity = e;
+    return c;
+}
+
+fn ecs_template_context_deep_last_allocated_entity(c: EcsTemplateContextDeep) -> i64 { return c.last_allocated_entity; }
+
+fn ecs_template_context_deep_next(c: EcsTemplateContextDeep) -> i64 { return c.next_entity; }
+
+// === clone_template entry-point wrapper ===
+fn ecs_template_deep_clone_template(t: EcsSystemHandleTemplateDeep) -> EcsSystemHandleTemplateDeep {
+    return ecs_system_template_deep_clone(t);
+}

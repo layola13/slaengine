@@ -1,0 +1,563 @@
+// Bevy ECS schedule (src/schedule/executor/single_threaded.rs):
+// SingleThreadedExecutor — runs systems one at a time in dependency/schedule order.
+// Tracks evaluated_sets, completed_systems, unapplied_systems, apply_final_deferred.
+
+struct EcsSingleThreadedExecutor {
+    // Bitsets modeled as Vec<bool>
+    evaluated_sets: Vec<bool>,
+    completed_systems: Vec<bool>,
+    unapplied_systems: Vec<bool>,
+    apply_final_deferred: bool,
+    system_count: i64,
+    set_count: i64,
+    // Running state
+    systems_run: i64,
+    systems_skipped: i64,
+    deferred_applied: i64,
+    panic_payload_pending: bool,
+    system_panic_payloads: i64,
+    deferred_panic_payloads: i64,
+    panic_payload_phase: i64,
+    panic_payload_system: i64,
+    panic_payload_rethrows: i64,
+    system_handled_errors: i64,
+    deferred_handled_errors: i64,
+    handled_error_phase: i64,
+    handled_error_system: i64,
+}
+
+struct EcsSingleThreadedSystemSpec {
+    system_index: i64,
+    should_run: bool,
+    is_apply_deferred: bool,
+}
+
+struct EcsSingleThreadedRunPlan {
+    executor: EcsSingleThreadedExecutor,
+    specs: Vec<EcsSingleThreadedSystemSpec>,
+    run_order: Vec<i64>,
+    skipped_order: Vec<i64>,
+    apply_order: Vec<i64>,
+}
+
+struct EcsSingleThreadedConditionFoldResult {
+    executor: EcsSingleThreadedExecutor,
+    should_run: bool,
+    evaluated_count: i64,
+    aborted: bool,
+}
+
+fn ecs_single_threaded_executor_new() -> EcsSingleThreadedExecutor {
+    return EcsSingleThreadedExecutor {
+        evaluated_sets: Vec::new(), completed_systems: Vec::new(),
+        unapplied_systems: Vec::new(), apply_final_deferred: true,
+        system_count: 0, set_count: 0,
+        systems_run: 0, systems_skipped: 0, deferred_applied: 0,
+        panic_payload_pending: false,
+        system_panic_payloads: 0,
+        deferred_panic_payloads: 0,
+        panic_payload_phase: 0,
+        panic_payload_system: -1,
+        panic_payload_rethrows: 0,
+        system_handled_errors: 0,
+        deferred_handled_errors: 0,
+        handled_error_phase: 0,
+        handled_error_system: -1
+    };
+}
+
+fn ecs_single_threaded_executor_init(e: EcsSingleThreadedExecutor, system_count: i64, set_count: i64) -> EcsSingleThreadedExecutor {
+    e.system_count = system_count;
+    e.set_count = set_count;
+    e.evaluated_sets = Vec::new();
+    e.completed_systems = Vec::new();
+    e.unapplied_systems = Vec::new();
+    let i: i64 = 0;
+    while i < set_count {
+        e.evaluated_sets.push(false);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    while j < system_count {
+        e.completed_systems.push(false);
+        e.unapplied_systems.push(false);
+        j = j + 1;
+    }
+    e.systems_run = 0;
+    e.systems_skipped = 0;
+    e.deferred_applied = 0;
+    e.panic_payload_pending = false;
+    e.system_panic_payloads = 0;
+    e.deferred_panic_payloads = 0;
+    e.panic_payload_phase = 0;
+    e.panic_payload_system = -1;
+    e.panic_payload_rethrows = 0;
+    e.system_handled_errors = 0;
+    e.deferred_handled_errors = 0;
+    e.handled_error_phase = 0;
+    e.handled_error_system = -1;
+    return e;
+}
+
+fn ecs_single_threaded_executor_set_apply_final_deferred(e: EcsSingleThreadedExecutor, apply: bool) -> EcsSingleThreadedExecutor {
+    e.apply_final_deferred = apply;
+    return e;
+}
+
+fn ecs_single_threaded_executor_apply_final_deferred(e: EcsSingleThreadedExecutor) -> bool { return e.apply_final_deferred; }
+
+fn ecs_single_threaded_panic_phase_none() -> i64 { return 0; }
+fn ecs_single_threaded_panic_phase_system() -> i64 { return 1; }
+fn ecs_single_threaded_panic_phase_apply_deferred() -> i64 { return 2; }
+fn ecs_single_threaded_panic_phase_run_condition() -> i64 { return 3; }
+
+fn ecs_single_threaded_condition_outcome_false() -> i64 { return 0; }
+fn ecs_single_threaded_condition_outcome_true() -> i64 { return 1; }
+fn ecs_single_threaded_condition_outcome_handled_error() -> i64 { return 2; }
+fn ecs_single_threaded_condition_outcome_error_handler_panic() -> i64 { return 3; }
+
+fn ecs_single_threaded_executor_record_system_panic_payload(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    e.panic_payload_pending = true;
+    e.system_panic_payloads = e.system_panic_payloads + 1;
+    e.panic_payload_phase = ecs_single_threaded_panic_phase_system();
+    e.panic_payload_system = system_index;
+    return e;
+}
+
+fn ecs_single_threaded_executor_record_deferred_panic_payload(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    e.panic_payload_pending = true;
+    e.deferred_panic_payloads = e.deferred_panic_payloads + 1;
+    e.panic_payload_phase = ecs_single_threaded_panic_phase_apply_deferred();
+    e.panic_payload_system = system_index;
+    return e;
+}
+
+fn ecs_single_threaded_executor_record_system_handled_error(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    e.system_handled_errors = e.system_handled_errors + 1;
+    e.handled_error_phase = ecs_single_threaded_panic_phase_system();
+    e.handled_error_system = system_index;
+    return e;
+}
+
+fn ecs_single_threaded_executor_record_deferred_handled_error(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    e.deferred_handled_errors = e.deferred_handled_errors + 1;
+    e.handled_error_phase = ecs_single_threaded_panic_phase_apply_deferred();
+    e.handled_error_system = system_index;
+    return e;
+}
+
+fn ecs_single_threaded_executor_has_panic_payload(e: EcsSingleThreadedExecutor) -> bool { return e.panic_payload_pending; }
+fn ecs_single_threaded_executor_system_panic_payload_count(e: EcsSingleThreadedExecutor) -> i64 { return e.system_panic_payloads; }
+fn ecs_single_threaded_executor_deferred_panic_payload_count(e: EcsSingleThreadedExecutor) -> i64 { return e.deferred_panic_payloads; }
+fn ecs_single_threaded_executor_panic_payload_phase(e: EcsSingleThreadedExecutor) -> i64 { return e.panic_payload_phase; }
+fn ecs_single_threaded_executor_panic_payload_system(e: EcsSingleThreadedExecutor) -> i64 { return e.panic_payload_system; }
+fn ecs_single_threaded_executor_panic_rethrow_count(e: EcsSingleThreadedExecutor) -> i64 { return e.panic_payload_rethrows; }
+fn ecs_single_threaded_executor_system_handled_error_count(e: EcsSingleThreadedExecutor) -> i64 { return e.system_handled_errors; }
+fn ecs_single_threaded_executor_deferred_handled_error_count(e: EcsSingleThreadedExecutor) -> i64 { return e.deferred_handled_errors; }
+fn ecs_single_threaded_executor_handled_error_phase(e: EcsSingleThreadedExecutor) -> i64 { return e.handled_error_phase; }
+fn ecs_single_threaded_executor_handled_error_system(e: EcsSingleThreadedExecutor) -> i64 { return e.handled_error_system; }
+
+fn ecs_single_threaded_executor_take_panic_payload(e: EcsSingleThreadedExecutor) -> EcsSingleThreadedExecutor {
+    if e.panic_payload_pending {
+        e.panic_payload_rethrows = e.panic_payload_rethrows + 1;
+    };
+    e.panic_payload_pending = false;
+    e.panic_payload_phase = ecs_single_threaded_panic_phase_none();
+    e.panic_payload_system = -1;
+    return e;
+}
+
+fn ecs_single_threaded_executor_mark_completed(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    if system_index >= 0 {
+        if system_index < len(e.completed_systems) as i64 {
+            e.completed_systems[system_index] = true;
+        };
+    };
+    return e;
+}
+
+fn ecs_single_threaded_executor_is_completed(e: EcsSingleThreadedExecutor, system_index: i64) -> bool {
+    if system_index < 0 { return false; };
+    if system_index >= len(e.completed_systems) as i64 { return false; };
+    return e.completed_systems[system_index];
+}
+
+fn ecs_single_threaded_executor_mark_set_evaluated(e: EcsSingleThreadedExecutor, set_index: i64) -> EcsSingleThreadedExecutor {
+    if set_index >= 0 {
+        if set_index < len(e.evaluated_sets) as i64 {
+            e.evaluated_sets[set_index] = true;
+        };
+    };
+    return e;
+}
+
+fn ecs_single_threaded_executor_is_set_evaluated(e: EcsSingleThreadedExecutor, set_index: i64) -> bool {
+    if set_index < 0 { return false; };
+    if set_index >= len(e.evaluated_sets) as i64 { return false; };
+    return e.evaluated_sets[set_index];
+}
+
+fn ecs_single_threaded_executor_mark_unapplied(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    if system_index >= 0 {
+        if system_index < len(e.unapplied_systems) as i64 {
+            e.unapplied_systems[system_index] = true;
+        };
+    };
+    return e;
+}
+
+fn ecs_single_threaded_executor_is_unapplied(e: EcsSingleThreadedExecutor, system_index: i64) -> bool {
+    if system_index < 0 { return false; };
+    if system_index >= len(e.unapplied_systems) as i64 { return false; };
+    return e.unapplied_systems[system_index];
+}
+
+// Bevy: non-ApplyDeferred systems are marked completed and unapplied after run.
+// ApplyDeferred systems apply every currently unapplied system and are not themselves marked unapplied.
+fn ecs_single_threaded_executor_run_system(e: EcsSingleThreadedExecutor, system_index: i64, is_apply_deferred: bool) -> EcsSingleThreadedExecutor {
+    if ecs_single_threaded_executor_is_completed(e, system_index) {
+        return e;
+    };
+    let e2 = ecs_single_threaded_executor_mark_completed(e, system_index);
+    if is_apply_deferred {
+        let e3 = ecs_single_threaded_executor_apply_deferred(e2);
+        e3.systems_run = e3.systems_run + 1;
+        return e3;
+    };
+    let e3 = ecs_single_threaded_executor_mark_unapplied(e2, system_index);
+    e3.systems_run = e3.systems_run + 1;
+    return e3;
+}
+
+fn ecs_single_threaded_executor_run_system_with_handled_error(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    e = ecs_single_threaded_executor_record_system_handled_error(e, system_index);
+    return ecs_single_threaded_executor_run_system(e, system_index, false);
+}
+
+fn ecs_single_threaded_executor_run_system_with_panic_payload(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    e = ecs_single_threaded_executor_record_system_panic_payload(e, system_index);
+    return ecs_single_threaded_executor_run_system(e, system_index, false);
+}
+
+// Bevy: skipped systems are marked completed and are not unapplied.
+fn ecs_single_threaded_executor_skip_system(e: EcsSingleThreadedExecutor, system_index: i64) -> EcsSingleThreadedExecutor {
+    if ecs_single_threaded_executor_is_completed(e, system_index) {
+        return e;
+    };
+    let e2 = ecs_single_threaded_executor_mark_completed(e, system_index);
+    e2.systems_skipped = e2.systems_skipped + 1;
+    return e2;
+}
+
+// Bevy apply_deferred: apply every currently unapplied system, then clear the bitset.
+fn ecs_single_threaded_executor_apply_deferred(e: EcsSingleThreadedExecutor) -> EcsSingleThreadedExecutor {
+    let i: i64 = 0;
+    let n: i64 = len(e.unapplied_systems) as i64;
+    while i < n {
+        if e.unapplied_systems[i] {
+            e.unapplied_systems[i] = false;
+            e.deferred_applied = e.deferred_applied + 1;
+        };
+        i = i + 1;
+    }
+    return e;
+}
+
+fn ecs_single_threaded_executor_apply_deferred_with_error(e: EcsSingleThreadedExecutor, fail_system_index: i64) -> EcsSingleThreadedExecutor {
+    let i: i64 = 0;
+    let n: i64 = len(e.unapplied_systems) as i64;
+    let failed: bool = false;
+    while i < n {
+        if e.unapplied_systems[i] {
+            if failed != true {
+                e.unapplied_systems[i] = false;
+                e.deferred_applied = e.deferred_applied + 1;
+                if i == fail_system_index {
+                    e = ecs_single_threaded_executor_record_deferred_panic_payload(e, i);
+                    failed = true;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    if failed {
+        // Bevy stops applying later unapplied systems after a deferred panic payload is recorded.
+        let j: i64 = 0;
+        while j < n {
+            e.unapplied_systems[j] = false;
+            j = j + 1;
+        }
+    };
+    return e;
+}
+
+fn ecs_single_threaded_executor_apply_deferred_with_handled_error(e: EcsSingleThreadedExecutor, handled_system_index: i64) -> EcsSingleThreadedExecutor {
+    let i: i64 = 0;
+    let n: i64 = len(e.unapplied_systems) as i64;
+    while i < n {
+        if e.unapplied_systems[i] {
+            e.unapplied_systems[i] = false;
+            e.deferred_applied = e.deferred_applied + 1;
+            if i == handled_system_index {
+                e = ecs_single_threaded_executor_record_deferred_handled_error(e, i);
+            };
+        };
+        i = i + 1;
+    }
+    return e;
+}
+
+// Bevy finish: optionally apply final deferred, then clear evaluated/completed only.
+// unapplied_systems remain when apply_final_deferred is false.
+fn ecs_single_threaded_executor_finish_run(e: EcsSingleThreadedExecutor) -> EcsSingleThreadedExecutor {
+    if e.apply_final_deferred {
+        e = ecs_single_threaded_executor_apply_deferred(e);
+    };
+    let i: i64 = 0;
+    let sn: i64 = len(e.evaluated_sets) as i64;
+    while i < sn {
+        e.evaluated_sets[i] = false;
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let cn: i64 = len(e.completed_systems) as i64;
+    while j < cn {
+        e.completed_systems[j] = false;
+        j = j + 1;
+    }
+    return e;
+}
+
+fn ecs_single_threaded_executor_finish_run_with_deferred_error(e: EcsSingleThreadedExecutor, fail_system_index: i64) -> EcsSingleThreadedExecutor {
+    if e.apply_final_deferred {
+        e = ecs_single_threaded_executor_apply_deferred_with_error(e, fail_system_index);
+    };
+    let i: i64 = 0;
+    let sn: i64 = len(e.evaluated_sets) as i64;
+    while i < sn {
+        e.evaluated_sets[i] = false;
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let cn: i64 = len(e.completed_systems) as i64;
+    while j < cn {
+        e.completed_systems[j] = false;
+        j = j + 1;
+    }
+    return e;
+}
+
+fn ecs_single_threaded_executor_finish(e: EcsSingleThreadedExecutor) -> EcsSingleThreadedExecutor {
+    return ecs_single_threaded_executor_finish_run(e);
+}
+
+// Bevy debug-stepping initial skips: mark systems completed before the main loop.
+fn ecs_single_threaded_executor_apply_initial_skips(e: EcsSingleThreadedExecutor, skipped: Vec<i64>) -> EcsSingleThreadedExecutor {
+    let i: i64 = 0;
+    let n: i64 = len(skipped) as i64;
+    while i < n {
+        let system_index = skipped[i];
+        if ecs_single_threaded_executor_is_completed(e, system_index) != true {
+            e = ecs_single_threaded_executor_mark_completed(e, system_index);
+            e.systems_skipped = e.systems_skipped + 1;
+        };
+        i = i + 1;
+    }
+    return e;
+}
+
+// Bevy set-condition failure: mark every system in the set completed and the set evaluated.
+fn ecs_single_threaded_executor_apply_failed_set_condition(e: EcsSingleThreadedExecutor, set_index: i64, systems_in_set: Vec<i64>) -> EcsSingleThreadedExecutor {
+    if ecs_single_threaded_executor_is_set_evaluated(e, set_index) {
+        return e;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(systems_in_set) as i64;
+    while i < n {
+        let system_index = systems_in_set[i];
+        if ecs_single_threaded_executor_is_completed(e, system_index) != true {
+            e = ecs_single_threaded_executor_mark_completed(e, system_index);
+            e.systems_skipped = e.systems_skipped + 1;
+        };
+        i = i + 1;
+    }
+    e = ecs_single_threaded_executor_mark_set_evaluated(e, set_index);
+    return e;
+}
+
+fn ecs_single_threaded_executor_apply_passed_set_condition(e: EcsSingleThreadedExecutor, set_index: i64) -> EcsSingleThreadedExecutor {
+    if ecs_single_threaded_executor_is_set_evaluated(e, set_index) {
+        return e;
+    };
+    return ecs_single_threaded_executor_mark_set_evaluated(e, set_index);
+}
+
+// Bevy process path for one schedule index:
+// - already completed systems are skipped
+// - system is marked completed before run/skip
+// - false should_run continues without unapplied
+// - ApplyDeferred applies all current unapplied systems
+fn ecs_single_threaded_executor_process_system(e: EcsSingleThreadedExecutor, system_index: i64, should_run: bool, is_apply_deferred: bool) -> EcsSingleThreadedExecutor {
+    if ecs_single_threaded_executor_is_completed(e, system_index) {
+        return e;
+    };
+    if should_run != true {
+        return ecs_single_threaded_executor_skip_system(e, system_index);
+    };
+    return ecs_single_threaded_executor_run_system(e, system_index, is_apply_deferred);
+}
+
+fn ecs_single_threaded_condition_fold_result(e: EcsSingleThreadedExecutor, should_run: bool, evaluated_count: i64, aborted: bool) -> EcsSingleThreadedConditionFoldResult {
+    return EcsSingleThreadedConditionFoldResult {
+        executor: e,
+        should_run: should_run,
+        evaluated_count: evaluated_count,
+        aborted: aborted,
+    };
+}
+
+// Bevy evaluate_and_fold_conditions: no short-circuit on false; error-handler panic aborts.
+fn ecs_single_threaded_executor_evaluate_and_fold_conditions(e: EcsSingleThreadedExecutor, for_system_index: i64, outcomes: Vec<i64>) -> EcsSingleThreadedConditionFoldResult {
+    let should_run: bool = true;
+    let evaluated: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(outcomes) as i64;
+    while i < n {
+        let outcome = outcomes[i];
+        if outcome == ecs_single_threaded_condition_outcome_error_handler_panic() {
+            e.panic_payload_pending = true;
+            e.system_panic_payloads = e.system_panic_payloads + 1;
+            e.panic_payload_phase = ecs_single_threaded_panic_phase_run_condition();
+            e.panic_payload_system = for_system_index;
+            return ecs_single_threaded_condition_fold_result(e, false, evaluated + 1, true);
+        };
+        if outcome == ecs_single_threaded_condition_outcome_handled_error() {
+            e.system_handled_errors = e.system_handled_errors + 1;
+            e.handled_error_phase = ecs_single_threaded_panic_phase_run_condition();
+            e.handled_error_system = for_system_index;
+            should_run = false;
+        } else {
+            if outcome != ecs_single_threaded_condition_outcome_true() {
+                should_run = false;
+            };
+        };
+        evaluated = evaluated + 1;
+        i = i + 1;
+    }
+    return ecs_single_threaded_condition_fold_result(e, should_run, evaluated, false);
+}
+
+fn ecs_single_threaded_condition_fold_should_run(r: EcsSingleThreadedConditionFoldResult) -> bool { return r.should_run; }
+fn ecs_single_threaded_condition_fold_evaluated_count(r: EcsSingleThreadedConditionFoldResult) -> i64 { return r.evaluated_count; }
+fn ecs_single_threaded_condition_fold_aborted(r: EcsSingleThreadedConditionFoldResult) -> bool { return r.aborted; }
+
+fn ecs_single_threaded_system_spec_new(system_index: i64, should_run: bool, is_apply_deferred: bool) -> EcsSingleThreadedSystemSpec {
+    return EcsSingleThreadedSystemSpec {
+        system_index: system_index,
+        should_run: should_run,
+        is_apply_deferred: is_apply_deferred,
+    };
+}
+
+fn ecs_single_threaded_run_plan_new(e: EcsSingleThreadedExecutor) -> EcsSingleThreadedRunPlan {
+    return EcsSingleThreadedRunPlan {
+        executor: e,
+        specs: Vec::new(),
+        run_order: Vec::new(),
+        skipped_order: Vec::new(),
+        apply_order: Vec::new(),
+    };
+}
+
+fn ecs_single_threaded_run_plan_add_system(p: EcsSingleThreadedRunPlan, spec: EcsSingleThreadedSystemSpec) -> EcsSingleThreadedRunPlan {
+    p.specs.push(spec);
+    return p;
+}
+
+fn ecs_single_threaded_run_plan_spec_at(p: EcsSingleThreadedRunPlan, system_index: i64) -> EcsSingleThreadedSystemSpec {
+    let i: i64 = 0;
+    let n: i64 = len(p.specs) as i64;
+    while i < n {
+        if p.specs[i].system_index == system_index {
+            return p.specs[i];
+        };
+        i = i + 1;
+    }
+    return ecs_single_threaded_system_spec_new(system_index, true, false);
+}
+
+// Bevy SingleThreadedExecutor::run walks systems in schedule order.
+fn ecs_single_threaded_run_plan_drive_all(p: EcsSingleThreadedRunPlan) -> EcsSingleThreadedRunPlan {
+    let i: i64 = 0;
+    let n = p.executor.system_count;
+    while i < n {
+        if ecs_single_threaded_executor_is_completed(p.executor, i) != true {
+            let spec = ecs_single_threaded_run_plan_spec_at(p, i);
+            let before_unapplied = ecs_single_threaded_executor_unapplied_count(p.executor);
+            if spec.should_run != true {
+                p.executor = ecs_single_threaded_executor_skip_system(p.executor, i);
+                p.skipped_order.push(i);
+            } else {
+                if spec.is_apply_deferred {
+                    p.executor = ecs_single_threaded_executor_run_system(p.executor, i, true);
+                    p.run_order.push(i);
+                    let after_unapplied = ecs_single_threaded_executor_unapplied_count(p.executor);
+                    if after_unapplied < before_unapplied || p.executor.deferred_applied > 0 {
+                        p.apply_order.push(i);
+                    };
+                } else {
+                    p.executor = ecs_single_threaded_executor_run_system(p.executor, i, false);
+                    p.run_order.push(i);
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return p;
+}
+
+fn ecs_single_threaded_run_plan_run_count(p: EcsSingleThreadedRunPlan) -> i64 { return len(p.run_order) as i64; }
+fn ecs_single_threaded_run_plan_skipped_count(p: EcsSingleThreadedRunPlan) -> i64 { return len(p.skipped_order) as i64; }
+fn ecs_single_threaded_run_plan_apply_count(p: EcsSingleThreadedRunPlan) -> i64 { return len(p.apply_order) as i64; }
+fn ecs_single_threaded_run_plan_run_at(p: EcsSingleThreadedRunPlan, index: i64) -> i64 { return p.run_order[index]; }
+fn ecs_single_threaded_run_plan_skipped_at(p: EcsSingleThreadedRunPlan, index: i64) -> i64 { return p.skipped_order[index]; }
+fn ecs_single_threaded_run_plan_apply_at(p: EcsSingleThreadedRunPlan, index: i64) -> i64 { return p.apply_order[index]; }
+
+fn ecs_single_threaded_executor_systems_run(e: EcsSingleThreadedExecutor) -> i64 { return e.systems_run; }
+fn ecs_single_threaded_executor_systems_skipped(e: EcsSingleThreadedExecutor) -> i64 { return e.systems_skipped; }
+fn ecs_single_threaded_executor_deferred_applied(e: EcsSingleThreadedExecutor) -> i64 { return e.deferred_applied; }
+fn ecs_single_threaded_executor_system_count(e: EcsSingleThreadedExecutor) -> i64 { return e.system_count; }
+fn ecs_single_threaded_executor_set_count(e: EcsSingleThreadedExecutor) -> i64 { return e.set_count; }
+
+fn ecs_single_threaded_executor_completed_count(e: EcsSingleThreadedExecutor) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(e.completed_systems) as i64;
+    while i < n {
+        if e.completed_systems[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_single_threaded_executor_unapplied_count(e: EcsSingleThreadedExecutor) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(e.unapplied_systems) as i64;
+    while i < n {
+        if e.unapplied_systems[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_single_threaded_executor_evaluated_set_count(e: EcsSingleThreadedExecutor) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(e.evaluated_sets) as i64;
+    while i < n {
+        if e.evaluated_sets[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}

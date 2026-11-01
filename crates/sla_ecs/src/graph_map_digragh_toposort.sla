@@ -1,0 +1,470 @@
+// Deepened Bevy ECS schedule::graph::graph_map DiGraph surface.
+// Mirrors src/schedule/graph/graph_map.rs: DiGraph::toposort, simple_cycles_in_component
+// (Johnson proxy), iter_sccs (Tarjan), DiGraphToposortError, Direction, DAG dirty cache.
+
+// === DiGraphToposortError (graph_map.rs lines 521-531) ===
+const ECS_DIGRAPH_TOPOSORT_OK: i32 = 0;
+const ECS_DIGRAPH_TOPOSORT_LOOP: i32 = 1;
+const ECS_DIGRAPH_TOPOSORT_CYCLE: i32 = 2;
+
+struct EcsDiGraphToposortResult {
+    kind: i32,
+    loop_node: i32,        // set when kind == LOOP
+    cycles: Vec<Vec<i32>>, // set when kind == CYCLE
+    order: Vec<i32>,       // set when kind == OK
+}
+
+fn ecs_digraph_toposort_ok(order: Vec<i32>) -> EcsDiGraphToposortResult {
+    return EcsDiGraphToposortResult {
+        kind: ECS_DIGRAPH_TOPOSORT_OK,
+        loop_node: -1,
+        cycles: Vec::new(),
+        order: order,
+    };
+}
+
+fn ecs_digraph_toposort_loop(node: i32) -> EcsDiGraphToposortResult {
+    return EcsDiGraphToposortResult {
+        kind: ECS_DIGRAPH_TOPOSORT_LOOP,
+        loop_node: node,
+        cycles: Vec::new(),
+        order: Vec::new(),
+    };
+}
+
+fn ecs_digraph_toposort_cycle(cycles: Vec<Vec<i32>>) -> EcsDiGraphToposortResult {
+    return EcsDiGraphToposortResult {
+        kind: ECS_DIGRAPH_TOPOSORT_CYCLE,
+        loop_node: -1,
+        cycles: cycles,
+        order: Vec::new(),
+    };
+}
+
+fn ecs_digraph_toposort_is_ok(r: EcsDiGraphToposortResult) -> bool { return r.kind == ECS_DIGRAPH_TOPOSORT_OK; }
+fn ecs_digraph_toposort_is_loop(r: EcsDiGraphToposortResult) -> bool { return r.kind == ECS_DIGRAPH_TOPOSORT_LOOP; }
+fn ecs_digraph_toposort_is_cycle(r: EcsDiGraphToposortResult) -> bool { return r.kind == ECS_DIGRAPH_TOPOSORT_CYCLE; }
+fn ecs_digraph_toposort_loop_node(r: EcsDiGraphToposortResult) -> i32 { return r.loop_node; }
+fn ecs_digraph_toposort_order(r: EcsDiGraphToposortResult) -> Vec<i32> { return r.order; }
+fn ecs_digraph_toposort_cycle_count(r: EcsDiGraphToposortResult) -> i64 { return len(r.cycles) as i64; }
+fn ecs_digraph_toposort_cycle_at(r: EcsDiGraphToposortResult, i: i64) -> Vec<i32> {
+    if i < 0 || i >= (len(r.cycles) as i64) { return Vec::new(); };
+    return r.cycles[i];
+}
+
+// === Direction (graph_map.rs lines 533-548) ===
+const ECS_GRAPH_DIRECTION_INCOMING: i32 = 0;
+const ECS_GRAPH_DIRECTION_OUTGOING: i32 = 1;
+
+fn ecs_graph_direction_opposite(d: i32) -> i32 {
+    if d == ECS_GRAPH_DIRECTION_INCOMING { return ECS_GRAPH_DIRECTION_OUTGOING; };
+    if d == ECS_GRAPH_DIRECTION_OUTGOING { return ECS_GRAPH_DIRECTION_INCOMING; };
+    return d;
+}
+
+fn ecs_graph_direction_is_incoming(d: i32) -> bool { return d == ECS_GRAPH_DIRECTION_INCOMING; }
+fn ecs_graph_direction_is_outgoing(d: i32) -> bool { return d == ECS_GRAPH_DIRECTION_OUTGOING; }
+
+// === DiGraph compact model: edges as flat (a,b) pairs over node ids in [0,nc) ===
+// We model a dedicated compact DiGraph (not the general EcsGraph from lib/graph_map.sla)
+// so the SCC/toposort algorithm has a fixed node-id space to index arrays by.
+struct EcsDiGraph {
+    node_count: i32,
+    edges_from: Vec<i32>,
+    edges_to: Vec<i32>,
+}
+
+fn ecs_digraph_new(node_count: i32) -> EcsDiGraph {
+    return EcsDiGraph { node_count: node_count, edges_from: Vec::new(), edges_to: Vec::new() };
+}
+
+fn ecs_digraph_node_count(g: EcsDiGraph) -> i32 { return g.node_count; }
+fn ecs_digraph_edge_count(g: EcsDiGraph) -> i64 { return len(g.edges_from) as i64; }
+
+fn ecs_digraph_add_edge(g: EcsDiGraph, a: i32, b: i32) -> EcsDiGraph {
+    g.edges_from.push(a);
+    g.edges_to.push(b);
+    return g;
+}
+
+fn ecs_digraph_contains_edge(g: EcsDiGraph, a: i32, b: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(g.edges_from) as i64;
+    while i < n {
+        if g.edges_from[i] == a && g.edges_to[i] == b { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// neighbors(a): all b such that a->b
+fn ecs_digraph_neighbors(g: EcsDiGraph, a: i32) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(g.edges_from) as i64;
+    while i < n {
+        if g.edges_from[i] == a { out.push(g.edges_to[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// all_edges(): flattened (a,b,a,b,...)
+fn ecs_digraph_all_edges(g: EcsDiGraph) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(g.edges_from) as i64;
+    while i < n {
+        out.push(g.edges_from[i]);
+        out.push(g.edges_to[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// === iter_sccs: Tarjan SCC over the compact DiGraph ===
+// Returns a Vec of SCCs (each an i32 Vec). Mirrors `super::tarjan_scc::new_tarjan_scc(self)`.
+struct EcsTarjanSccState {
+    index: i32,
+    indices: Vec<i32>,
+    lowlinks: Vec<i32>,
+    on_stack: Vec<bool>,
+    stack: Vec<i32>,
+    node_count: i32,
+}
+
+fn ecs_tarjan_scc_state_new(node_count: i32) -> EcsTarjanSccState {
+    let indices: Vec<i32> = Vec::new();
+    let lowlinks: Vec<i32> = Vec::new();
+    let on_stack: Vec<bool> = Vec::new();
+    let i: i32 = 0;
+    while i < node_count {
+        indices.push(-1);
+        lowlinks.push(-1);
+        on_stack.push(false);
+        i = i + 1;
+    }
+    return EcsTarjanSccState {
+        index: 0,
+        indices: indices,
+        lowlinks: lowlinks,
+        on_stack: on_stack,
+        stack: Vec::new(),
+        node_count: node_count,
+    };
+}
+
+// top-level entry: compute all SCCs
+fn ecs_digraph_iter_sccs(g: EcsDiGraph) -> Vec<Vec<i32>> {
+    let st = ecs_tarjan_scc_state_new(g.node_count);
+    let r = ecs_tarjan_scc_next(g, st, Vec::new(), 0);
+    return r.1;
+}
+
+// recurse on next unvisited node
+fn ecs_tarjan_scc_next(g: EcsDiGraph, st: EcsTarjanSccState, sccs: Vec<Vec<i32>>, v: i32) -> (EcsTarjanSccState, Vec<Vec<i32>>) {
+    if v >= g.node_count { return (st, sccs); };
+    if st.indices[v] != -1 { return ecs_tarjan_scc_next(g, st, sccs, v + 1); };
+    return ecs_tarjan_scc_strongconnect(g, st, sccs, v);
+}
+
+fn ecs_tarjan_scc_strongconnect(g: EcsDiGraph, st: EcsTarjanSccState, sccs: Vec<Vec<i32>>, v: i32) -> (EcsTarjanSccState, Vec<Vec<i32>>) {
+    st.indices[v] = st.index;
+    st.lowlinks[v] = st.index;
+    st.index = st.index + 1;
+    st.stack.push(v);
+    st.on_stack[v] = true;
+    let succ = ecs_digraph_neighbors(g, v);
+    let r = ecs_tarjan_scc_visit_succ(g, st, sccs, v, succ, 0);
+    let final_st = r.0;
+    let final_sccs = r.1;
+    if final_st.lowlinks[v] == final_st.indices[v] {
+        return ecs_tarjan_scc_pop(g, final_st, final_sccs, Vec::new(), v);
+    };
+    return ecs_tarjan_scc_next(g, final_st, final_sccs, v + 1);
+}
+
+// visit each successor w of v (from the succ list at index i)
+fn ecs_tarjan_scc_visit_succ(g: EcsDiGraph, st: EcsTarjanSccState, sccs: Vec<Vec<i32>>, v: i32, succ: Vec<i32>, i: i64) -> (EcsTarjanSccState, Vec<Vec<i32>>) {
+    if i >= (len(succ) as i64) { return (st, sccs); };
+    let w = succ[i];
+    if st.indices[w] == -1 {
+        let rec = ecs_tarjan_scc_strongconnect(g, st, sccs, w);
+        let st2 = rec.0;
+        let sccs2 = rec.1;
+        if st2.lowlinks[w] < st2.lowlinks[v] { st2.lowlinks[v] = st2.lowlinks[w]; };
+        return ecs_tarjan_scc_visit_succ(g, st2, sccs2, v, succ, i + 1);
+    };
+    if st.on_stack[w] {
+        if st.indices[w] < st.lowlinks[v] { st.lowlinks[v] = st.indices[w]; };
+    };
+    return ecs_tarjan_scc_visit_succ(g, st, sccs, v, succ, i + 1);
+}
+
+fn ecs_tarjan_scc_pop(g: EcsDiGraph, st: EcsTarjanSccState, sccs: Vec<Vec<i32>>, scc: Vec<i32>, root: i32) -> (EcsTarjanSccState, Vec<Vec<i32>>) {
+    let w = st.stack[len(st.stack) - 1];
+    st.stack.pop();
+    st.on_stack[w] = false;
+    scc.push(w);
+    if w != root { return ecs_tarjan_scc_pop(g, st, sccs, scc, root); };
+    sccs.push(scc);
+    return ecs_tarjan_scc_next(g, st, sccs, root + 1);
+}
+
+// === DiGraph::toposort (graph_map.rs lines 368-402) ===
+// 1. Report Loop(node) if any self-edge a==a exists.
+// 2. Run Tarjan SCC; extend the output with each SCC; collect SCCs of size > 1.
+// 3. If no cyclic SCCs, reverse -> topological order -> Ok.
+//    Else collect simple cycles per cyclic SCC and return Cycle(cycles).
+fn ecs_digraph_toposort(g: EcsDiGraph) -> EcsDiGraphToposortResult {
+    // self-loop scan
+    let i: i64 = 0;
+    let n: i64 = len(g.edges_from) as i64;
+    while i < n {
+        if g.edges_from[i] == g.edges_to[i] { return ecs_digraph_toposort_loop(g.edges_from[i]); };
+        i = i + 1;
+    }
+    let sccs = ecs_digraph_iter_sccs(g);
+    let order: Vec<i32> = Vec::new();
+    let cyclic: Vec<Vec<i32>> = Vec::new();
+    let j: i64 = 0;
+    while j < (len(sccs) as i64) {
+        let scc = sccs[j];
+        let k: i64 = 0;
+        while k < (len(scc) as i64) {
+            order.push(scc[k]);
+            k = k + 1;
+        }
+        if len(scc) > 1 { cyclic.push(scc); };
+        j = j + 1;
+    }
+    if len(cyclic) == 0 {
+        let reversed = ecs_vec_i32_reverse(order);
+        return ecs_digraph_toposort_ok(reversed);
+    };
+    let cycles: Vec<Vec<i32>> = Vec::new();
+    let c: i64 = 0;
+    while c < (len(cyclic) as i64) {
+        let found = ecs_digraph_simple_cycles_in_component(g, cyclic[c]);
+        let f: i64 = 0;
+        while f < (len(found) as i64) {
+            cycles.push(found[f]);
+            f = f + 1;
+        }
+        c = c + 1;
+    }
+    return ecs_digraph_toposort_cycle(cycles);
+}
+
+fn ecs_vec_i32_reverse(v: Vec<i32>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = (len(v) as i64) - 1;
+    while i >= 0 {
+        out.push(v[i]);
+        i = i - 1;
+    }
+    return out;
+}
+
+// === simple_cycles_in_component (graph_map.rs lines 411-507) ===
+// Johnson's elementary circuits algorithm. For a strongly-connected component
+// (a Vec of nodes), returns the simple cycles that begin and end at each chosen root.
+// We model the same DFS-with-blocking structure: root = pop last node from the working
+// SCC list, build a subgraph restricted to the SCC, walk successors, push a cycle when
+// we return to root, and divide the remaining subgraph into smaller SCCs after each root.
+fn ecs_digraph_simple_cycles_in_component(g: EcsDiGraph, scc_in: Vec<i32>) -> Vec<Vec<i32>> {
+    let cycles: Vec<Vec<i32>> = Vec::new();
+    let work: Vec<Vec<i32>> = Vec::new();
+    work.push(scc_in);
+    let found = ecs_digraph_johnson_loop(g, cycles, work);
+    return found;
+}
+
+// work stack of SCC slices to process; returns accumulated cycles
+fn ecs_digraph_johnson_loop(g: EcsDiGraph, cycles: Vec<Vec<i32>>, work: Vec<Vec<i32>>) -> Vec<Vec<i32>> {
+    if len(work) == 0 { return cycles; };
+    let scc = work[len(work) - 1];
+    work.pop();
+    if len(scc) <= 1 { return ecs_digraph_johnson_loop(g, cycles, work); };
+    // restricted subgraph
+    let sub = ecs_digraph_subgraph_for_scc(g, scc);
+    // root = last node of scc
+    let root = scc[len(scc) - 1];
+    let found = ecs_digraph_johnson_root(sub, cycles, root);
+    // remove root from subgraph and re-split remainder into smaller SCCs
+    let sub2 = ecs_digraph_remove_node(sub, root);
+    let more = ecs_digraph_iter_sccs(sub2);
+    let m: i64 = 0;
+    while m < (len(more) as i64) {
+        if len(more[m]) > 1 { work.push(more[m]); };
+        m = m + 1;
+    }
+    return ecs_digraph_johnson_loop(g, found, work);
+}
+
+// restricted subgraph: only the SCC nodes and edges that stay inside the SCC.
+fn ecs_digraph_subgraph_for_scc(g: EcsDiGraph, scc: Vec<i32>) -> EcsDiGraph {
+    let nodes = ecs_vec_i32_max_plus_one(scc);
+    let sub = ecs_digraph_new(nodes);
+    let i: i64 = 0;
+    let n: i64 = len(g.edges_from) as i64;
+    while i < n {
+        let a = g.edges_from[i];
+        let b = g.edges_to[i];
+        if ecs_vec_i32_contains(scc, a) && ecs_vec_i32_contains(scc, b) {
+            sub.edges_from.push(a);
+            sub.edges_to.push(b);
+        };
+        i = i + 1;
+    }
+    return sub;
+}
+
+// Johnson DFS rooted at `root`: pushes simple cycles found into `cycles`.
+fn ecs_digraph_johnson_root(sub: EcsDiGraph, cycles: Vec<Vec<i32>>, root: i32) -> Vec<Vec<i32>> {
+    let path: Vec<i32> = Vec::new();
+    path.push(root);
+    let r = ecs_digraph_johnson_dfs(sub, cycles, root, root, path, 1);
+    return r;
+}
+
+// DFS stack frames are recursed; `node` is the current endpoint of `path`.
+fn ecs_digraph_johnson_dfs(sub: EcsDiGraph, cycles: Vec<Vec<i32>>, root: i32, node: i32, path: Vec<i32>, depth: i32) -> Vec<Vec<i32>> {
+    let succ = ecs_digraph_neighbors(sub, node);
+    let i: i64 = 0;
+    while i < (len(succ) as i64) {
+        let w = succ[i];
+        if w == root && depth > 1 {
+            // found a simple cycle: clone path
+            let cycle = ecs_vec_i32_clone(path);
+            cycles.push(cycle);
+        } else {
+            if ecs_vec_i32_contains(path, w) == false {
+                let path2 = ecs_vec_i32_clone(path);
+                path2.push(w);
+                cycles = ecs_digraph_johnson_dfs(sub, cycles, root, w, path2, depth + 1);
+            };
+        };
+        i = i + 1;
+    }
+    return cycles;
+}
+
+// === small i32 Vec helpers ===
+fn ecs_vec_i32_contains(v: Vec<i32>, x: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_vec_i32_clone(v: Vec<i32>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        out.push(v[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_vec_i32_max_plus_one(v: Vec<i32>) -> i32 {
+    let m: i32 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] > m { m = v[i]; };
+        i = i + 1;
+    }
+    return m + 1;
+}
+
+// remove_node returns a subgraph copy with the given node's edges dropped.
+fn ecs_digraph_remove_node(g: EcsDiGraph, node: i32) -> EcsDiGraph {
+    let out = ecs_digraph_new(g.node_count);
+    let i: i64 = 0;
+    let n: i64 = len(g.edges_from) as i64;
+    while i < n {
+        if g.edges_from[i] != node && g.edges_to[i] != node {
+            out.edges_from.push(g.edges_from[i]);
+            out.edges_to.push(g.edges_to[i]);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// === DAG dirty cache model (graph/dag.rs struct + ensure_toposorted) ===
+struct EcsDagCache {
+    node_count: i32,
+    edges_from: Vec<i32>,
+    edges_to: Vec<i32>,
+    dirty: bool,
+    cached_toposort: Vec<i32>,
+    cached_error_kind: i32,   // 0 = ok, 1 = loop, 2 = cycle
+    cached_loop_node: i32,
+}
+
+fn ecs_dag_cache_new(node_count: i32) -> EcsDagCache {
+    return EcsDagCache {
+        node_count: node_count,
+        edges_from: Vec::new(),
+        edges_to: Vec::new(),
+        dirty: true,
+        cached_toposort: Vec::new(),
+        cached_error_kind: 0,
+        cached_loop_node: -1,
+    };
+}
+
+fn ecs_dag_cache_is_dirty(d: EcsDagCache) -> bool { return d.dirty; }
+
+fn ecs_dag_cache_is_toposorted(d: EcsDagCache) -> bool { return d.dirty == false; }
+
+fn ecs_dag_cache_add_edge(d: EcsDagCache, a: i32, b: i32) -> EcsDagCache {
+    d.edges_from.push(a);
+    d.edges_to.push(b);
+    d.dirty = true;
+    return d;
+}
+
+// recompute the toposort, clearing dirty on success; on failure, mark kind and keep dirty.
+fn ecs_dag_cache_ensure_toposorted(d: EcsDagCache) -> EcsDagCache {
+    if d.dirty == false { return d; };
+    let g = EcsDiGraph {
+        node_count: d.node_count,
+        edges_from: d.edges_from,
+        edges_to: d.edges_to,
+    };
+    let r = ecs_digraph_toposort(g);
+    if ecs_digraph_toposort_is_ok(r) {
+        d.cached_toposort = ecs_digraph_toposort_order(r);
+        d.cached_error_kind = 0;
+        d.cached_loop_node = -1;
+        d.dirty = false;
+        return d;
+    };
+    if ecs_digraph_toposort_is_loop(r) {
+        d.cached_error_kind = 1;
+        d.cached_loop_node = ecs_digraph_toposort_loop_node(r);
+        return d;
+    };
+    d.cached_error_kind = 2;
+    return d;
+}
+
+fn ecs_dag_cache_cached_toposort(d: EcsDagCache) -> Vec<i32> {
+    if d.dirty { return Vec::new(); };
+    return d.cached_toposort;
+}
+
+fn ecs_dag_cache_cached_error_kind(d: EcsDagCache) -> i32 {
+    if d.dirty == false { return 0; };
+    return d.cached_error_kind;
+}
+
+fn ecs_dag_cache_cached_loop_node(d: EcsDagCache) -> i32 { return d.cached_loop_node; }

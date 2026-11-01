@@ -1,0 +1,944 @@
+// Deepened Bevy ECS observer distributed storage surface.
+// Mirrors src/observer/distributed_storage.rs:
+//   Observer { system, descriptor, runner, conditions, last_trigger_id,
+//              despawned_watched_entities, error_handler, hook_on_add }
+//   ObserverDescriptor { event_keys, components, entities }
+//   ObservedBy(Vec<Entity>) SparseSet + on_remove despawn-when-empty
+//   Component hooks: Observer on_add/on_remove, ObservedBy on_remove
+//   IntoObserver / IntoEntityObserver / ObserverSystemExt::run_if
+// Shallow lib/observer_distributed_storage.sla retained.
+
+// === Storage / clone constants ===
+const ECS_ODS_STORAGE_SPARSE_SET: i32 = 1;
+const ECS_ODS_CLONE_IGNORE: i32 = 0;
+const ECS_ODS_HOOK_TYPED: i32 = 1;
+const ECS_ODS_HOOK_DYNAMIC: i32 = 2;
+
+fn ecs_ods_storage_sparse_set() -> i32 { return ECS_ODS_STORAGE_SPARSE_SET; }
+fn ecs_ods_clone_ignore() -> i32 { return ECS_ODS_CLONE_IGNORE; }
+
+// === ObserverDescriptor (fixed capacity 4) ===
+struct EcsOdsDescDeep {
+    k0: i64, k1: i64, k2: i64, k3: i64, k_len: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c_len: i32,
+    e0: i64, e1: i64, e2: i64, e3: i64, e_len: i32,
+}
+
+fn ecs_ods_desc_new() -> EcsOdsDescDeep {
+    return EcsOdsDescDeep {
+        k0: 0, k1: 0, k2: 0, k3: 0, k_len: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, c_len: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0, e_len: 0,
+    };
+}
+
+fn ecs_ods_desc_event_key_len(d: EcsOdsDescDeep) -> i32 { return d.k_len; }
+fn ecs_ods_desc_component_len(d: EcsOdsDescDeep) -> i32 { return d.c_len; }
+fn ecs_ods_desc_entity_len(d: EcsOdsDescDeep) -> i32 { return d.e_len; }
+
+fn ecs_ods_desc_event_key_at(d: EcsOdsDescDeep, idx: i32) -> i64 {
+    if idx == 0 { return d.k0; };
+    if idx == 1 { return d.k1; };
+    if idx == 2 { return d.k2; };
+    if idx == 3 { return d.k3; };
+    return 0;
+}
+
+fn ecs_ods_desc_component_at(d: EcsOdsDescDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.c0; };
+    if idx == 1 { return d.c1; };
+    if idx == 2 { return d.c2; };
+    if idx == 3 { return d.c3; };
+    return 0;
+}
+
+fn ecs_ods_desc_entity_at(d: EcsOdsDescDeep, idx: i32) -> i64 {
+    if idx == 0 { return d.e0; };
+    if idx == 1 { return d.e1; };
+    if idx == 2 { return d.e2; };
+    if idx == 3 { return d.e3; };
+    return 0;
+}
+
+fn ecs_ods_desc_has_entity(d: EcsOdsDescDeep, entity: i64) -> bool {
+    if d.e_len >= 1 && d.e0 == entity { return true; };
+    if d.e_len >= 2 && d.e1 == entity { return true; };
+    if d.e_len >= 3 && d.e2 == entity { return true; };
+    if d.e_len >= 4 && d.e3 == entity { return true; };
+    return false;
+}
+
+fn ecs_ods_desc_has_component(d: EcsOdsDescDeep, component: i32) -> bool {
+    if d.c_len >= 1 && d.c0 == component { return true; };
+    if d.c_len >= 2 && d.c1 == component { return true; };
+    if d.c_len >= 3 && d.c2 == component { return true; };
+    if d.c_len >= 4 && d.c3 == component { return true; };
+    return false;
+}
+
+fn ecs_ods_desc_has_event_key(d: EcsOdsDescDeep, key: i64) -> bool {
+    if d.k_len >= 1 && d.k0 == key { return true; };
+    if d.k_len >= 2 && d.k1 == key { return true; };
+    if d.k_len >= 3 && d.k2 == key { return true; };
+    if d.k_len >= 4 && d.k3 == key { return true; };
+    return false;
+}
+
+fn ecs_ods_desc_push_event_key(d: EcsOdsDescDeep, key: i64) -> EcsOdsDescDeep {
+    let k0=d.k0; let k1=d.k1; let k2=d.k2; let k3=d.k3; let k_len=d.k_len;
+    let c0=d.c0; let c1=d.c1; let c2=d.c2; let c3=d.c3; let c_len=d.c_len;
+    let e0=d.e0; let e1=d.e1; let e2=d.e2; let e3=d.e3; let e_len=d.e_len;
+    if k_len == 0 {
+        return EcsOdsDescDeep { k0: key, k1: k1, k2: k2, k3: k3, k_len: 1, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if k_len == 1 {
+        return EcsOdsDescDeep { k0: k0, k1: key, k2: k2, k3: k3, k_len: 2, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if k_len == 2 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: key, k3: k3, k_len: 3, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if k_len == 3 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: key, k_len: 4, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    return d;
+}
+
+fn ecs_ods_desc_push_component(d: EcsOdsDescDeep, component: i32) -> EcsOdsDescDeep {
+    let k0=d.k0; let k1=d.k1; let k2=d.k2; let k3=d.k3; let k_len=d.k_len;
+    let c0=d.c0; let c1=d.c1; let c2=d.c2; let c3=d.c3; let c_len=d.c_len;
+    let e0=d.e0; let e1=d.e1; let e2=d.e2; let e3=d.e3; let e_len=d.e_len;
+    if c_len == 0 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: component, c1: c1, c2: c2, c3: c3, c_len: 1, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if c_len == 1 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: component, c2: c2, c3: c3, c_len: 2, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if c_len == 2 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: c1, c2: component, c3: c3, c_len: 3, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if c_len == 3 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: c1, c2: c2, c3: component, c_len: 4, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    return d;
+}
+
+fn ecs_ods_desc_push_entity(d: EcsOdsDescDeep, entity: i64) -> EcsOdsDescDeep {
+    let k0=d.k0; let k1=d.k1; let k2=d.k2; let k3=d.k3; let k_len=d.k_len;
+    let c0=d.c0; let c1=d.c1; let c2=d.c2; let c3=d.c3; let c_len=d.c_len;
+    let e0=d.e0; let e1=d.e1; let e2=d.e2; let e3=d.e3; let e_len=d.e_len;
+    if e_len == 0 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: entity, e1: e1, e2: e2, e3: e3, e_len: 1 };
+    };
+    if e_len == 1 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: entity, e2: e2, e3: e3, e_len: 2 };
+    };
+    if e_len == 2 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: entity, e3: e3, e_len: 3 };
+    };
+    if e_len == 3 {
+        return EcsOdsDescDeep { k0: k0, k1: k1, k2: k2, k3: k3, k_len: k_len, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: entity, e_len: 4 };
+    };
+    return d;
+}
+
+fn ecs_ods_desc_with_event_keys(d: EcsOdsDescDeep, k0: i64, k1: i64, n: i32) -> EcsOdsDescDeep {
+    // replace event keys (Bevy with_event_keys sets whole vec)
+    let out = ecs_ods_desc_new();
+    let c0=d.c0; let c1=d.c1; let c2=d.c2; let c3=d.c3; let c_len=d.c_len;
+    let e0=d.e0; let e1=d.e1; let e2=d.e2; let e3=d.e3; let e_len=d.e_len;
+    if n <= 0 {
+        return EcsOdsDescDeep { k0: 0, k1: 0, k2: 0, k3: 0, k_len: 0, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    if n == 1 {
+        return EcsOdsDescDeep { k0: k0, k1: 0, k2: 0, k3: 0, k_len: 1, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+    };
+    return EcsOdsDescDeep { k0: k0, k1: k1, k2: 0, k3: 0, k_len: 2, c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len, e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len };
+}
+
+fn ecs_ods_desc_take(d: EcsOdsDescDeep) -> (EcsOdsDescDeep, EcsOdsDescDeep) {
+    // mem::take descriptor — returns (empty, previous)
+    return (ecs_ods_desc_new(), d);
+}
+
+// === Conditions (up to 4) ===
+struct EcsOdsConditionsDeep {
+    c0: i64, c1: i64, c2: i64, c3: i64,
+    init0: bool, init1: bool, init2: bool, init3: bool,
+    len: i32,
+}
+
+fn ecs_ods_conditions_new() -> EcsOdsConditionsDeep {
+    return EcsOdsConditionsDeep {
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        init0: false, init1: false, init2: false, init3: false,
+        len: 0,
+    };
+}
+
+fn ecs_ods_conditions_len(c: EcsOdsConditionsDeep) -> i32 { return c.len; }
+
+fn ecs_ods_conditions_push(c: EcsOdsConditionsDeep, id: i64) -> EcsOdsConditionsDeep {
+    let c0=c.c0; let c1=c.c1; let c2=c.c2; let c3=c.c3;
+    let i0=c.init0; let i1=c.init1; let i2=c.init2; let i3=c.init3; let n=c.len;
+    if n == 0 {
+        return EcsOdsConditionsDeep { c0: id, c1: c1, c2: c2, c3: c3, init0: false, init1: i1, init2: i2, init3: i3, len: 1 };
+    };
+    if n == 1 {
+        return EcsOdsConditionsDeep { c0: c0, c1: id, c2: c2, c3: c3, init0: i0, init1: false, init2: i2, init3: i3, len: 2 };
+    };
+    if n == 2 {
+        return EcsOdsConditionsDeep { c0: c0, c1: c1, c2: id, c3: c3, init0: i0, init1: i1, init2: false, init3: i3, len: 3 };
+    };
+    if n == 3 {
+        return EcsOdsConditionsDeep { c0: c0, c1: c1, c2: c2, c3: id, init0: i0, init1: i1, init2: i2, init3: false, len: 4 };
+    };
+    return c;
+}
+
+fn ecs_ods_conditions_initialize_all(c: EcsOdsConditionsDeep) -> EcsOdsConditionsDeep {
+    let n=c.len;
+    let c0=c.c0; let c1=c.c1; let c2=c.c2; let c3=c.c3;
+    let i0 = n >= 1;
+    let i1 = n >= 2;
+    let i2 = n >= 3;
+    let i3 = n >= 4;
+    return EcsOdsConditionsDeep {
+        c0: c0, c1: c1, c2: c2, c3: c3,
+        init0: i0, init1: i1, init2: i2, init3: i3,
+        len: n,
+    };
+}
+
+fn ecs_ods_conditions_take(c: EcsOdsConditionsDeep) -> (EcsOdsConditionsDeep, EcsOdsConditionsDeep) {
+    return (ecs_ods_conditions_new(), c);
+}
+
+fn ecs_ods_conditions_all_initialized(c: EcsOdsConditionsDeep) -> bool {
+    if c.len >= 1 && c.init0 != true { return false; };
+    if c.len >= 2 && c.init1 != true { return false; };
+    if c.len >= 3 && c.init2 != true { return false; };
+    if c.len >= 4 && c.init3 != true { return false; };
+    return true;
+}
+
+// === Observer component ===
+struct EcsOdsObserverDeep {
+    system_id: i64,
+    system_name: i64,
+    is_exclusive: bool,
+    system_initialized: bool,
+    runner: i64,
+    is_dynamic: bool,
+    hook_kind: i32,
+    error_handler: i32,
+    has_error_handler: bool,
+    last_trigger_id: i32,
+    despawned_watched_entities: i32,
+    descriptor: EcsOdsDescDeep,
+    conditions: EcsOdsConditionsDeep,
+    // typed event/bundle for hook_on_add
+    event_type: i64,
+    bundle_c0: i32,
+    bundle_c1: i32,
+    bundle_len: i32,
+    alive: bool,
+}
+
+fn ecs_ods_observer_new(system_id: i64, system_name: i64, is_exclusive: bool, event_type: i64, runner: i64) -> EcsOdsObserverDeep {
+    // Bevy panics if exclusive; we record flag and tests assert via try_new
+    return EcsOdsObserverDeep {
+        system_id: system_id,
+        system_name: system_name,
+        is_exclusive: is_exclusive,
+        system_initialized: false,
+        runner: runner,
+        is_dynamic: false,
+        hook_kind: ECS_ODS_HOOK_TYPED,
+        error_handler: 0,
+        has_error_handler: false,
+        last_trigger_id: 0,
+        despawned_watched_entities: 0,
+        descriptor: ecs_ods_desc_new(),
+        conditions: ecs_ods_conditions_new(),
+        event_type: event_type,
+        bundle_c0: 0,
+        bundle_c1: 0,
+        bundle_len: 0,
+        alive: true,
+    };
+}
+
+fn ecs_ods_observer_try_new(system_id: i64, system_name: i64, is_exclusive: bool, event_type: i64, runner: i64) -> (bool, EcsOdsObserverDeep) {
+    if is_exclusive {
+        return (false, ecs_ods_observer_new(0, 0, true, 0, 0));
+    };
+    return (true, ecs_ods_observer_new(system_id, system_name, false, event_type, runner));
+}
+
+fn ecs_ods_observer_with_dynamic_runner(runner: i64) -> EcsOdsObserverDeep {
+    return EcsOdsObserverDeep {
+        system_id: 0,
+        system_name: 0,
+        is_exclusive: false,
+        system_initialized: false,
+        runner: runner,
+        is_dynamic: true,
+        hook_kind: ECS_ODS_HOOK_DYNAMIC,
+        error_handler: 0,
+        has_error_handler: false,
+        last_trigger_id: 0,
+        despawned_watched_entities: 0,
+        descriptor: ecs_ods_desc_new(),
+        conditions: ecs_ods_conditions_new(),
+        event_type: 0,
+        bundle_c0: 0,
+        bundle_c1: 0,
+        bundle_len: 0,
+        alive: true,
+    };
+}
+
+fn ecs_ods_observer_with_bundle(o: EcsOdsObserverDeep, c0: i32, c1: i32, n: i32) -> EcsOdsObserverDeep {
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: o.descriptor, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: c0, bundle_c1: c1, bundle_len: n, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_watch_entity(o: EcsOdsObserverDeep, entity: i64) -> EcsOdsObserverDeep {
+    let d = ecs_ods_desc_push_entity(o.descriptor, entity);
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: d, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_with_entity(o: EcsOdsObserverDeep, entity: i64) -> EcsOdsObserverDeep {
+    return ecs_ods_observer_watch_entity(o, entity);
+}
+
+fn ecs_ods_observer_with_entities2(o: EcsOdsObserverDeep, e0: i64, e1: i64) -> EcsOdsObserverDeep {
+    o = ecs_ods_observer_watch_entity(o, e0);
+    o = ecs_ods_observer_watch_entity(o, e1);
+    return o;
+}
+
+fn ecs_ods_observer_with_component(o: EcsOdsObserverDeep, component: i32) -> EcsOdsObserverDeep {
+    let d = ecs_ods_desc_push_component(o.descriptor, component);
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: d, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_with_components2(o: EcsOdsObserverDeep, c0: i32, c1: i32) -> EcsOdsObserverDeep {
+    o = ecs_ods_observer_with_component(o, c0);
+    o = ecs_ods_observer_with_component(o, c1);
+    return o;
+}
+
+fn ecs_ods_observer_with_event_key(o: EcsOdsObserverDeep, key: i64) -> EcsOdsObserverDeep {
+    let d = ecs_ods_desc_push_event_key(o.descriptor, key);
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: d, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_with_error_handler(o: EcsOdsObserverDeep, handler: i32) -> EcsOdsObserverDeep {
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: handler, has_error_handler: true,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: o.descriptor, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_run_if(o: EcsOdsObserverDeep, condition_id: i64) -> EcsOdsObserverDeep {
+    let cond = ecs_ods_conditions_push(o.conditions, condition_id);
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: o.descriptor, conditions: cond, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_set_name(o: EcsOdsObserverDeep, name: i64) -> EcsOdsObserverDeep {
+    return EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: o.descriptor, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+}
+
+fn ecs_ods_observer_descriptor(o: EcsOdsObserverDeep) -> EcsOdsDescDeep { return o.descriptor; }
+fn ecs_ods_observer_system_name(o: EcsOdsObserverDeep) -> i64 { return o.system_name; }
+fn ecs_ods_observer_runner(o: EcsOdsObserverDeep) -> i64 { return o.runner; }
+fn ecs_ods_observer_is_dynamic(o: EcsOdsObserverDeep) -> bool { return o.is_dynamic; }
+fn ecs_ods_observer_is_exclusive(o: EcsOdsObserverDeep) -> bool { return o.is_exclusive; }
+fn ecs_ods_observer_last_trigger_id(o: EcsOdsObserverDeep) -> i32 { return o.last_trigger_id; }
+fn ecs_ods_observer_despawned_watched(o: EcsOdsObserverDeep) -> i32 { return o.despawned_watched_entities; }
+fn ecs_ods_observer_error_handler(o: EcsOdsObserverDeep) -> i32 { return o.error_handler; }
+fn ecs_ods_observer_has_error_handler(o: EcsOdsObserverDeep) -> bool { return o.has_error_handler; }
+fn ecs_ods_observer_conditions_len(o: EcsOdsObserverDeep) -> i32 { return ecs_ods_conditions_len(o.conditions); }
+fn ecs_ods_observer_system_initialized(o: EcsOdsObserverDeep) -> bool { return o.system_initialized; }
+fn ecs_ods_observer_alive(o: EcsOdsObserverDeep) -> bool { return o.alive; }
+fn ecs_ods_observer_hook_kind(o: EcsOdsObserverDeep) -> i32 { return o.hook_kind; }
+fn ecs_ods_observer_storage_type() -> i32 { return ECS_ODS_STORAGE_SPARSE_SET; }
+
+// ObservedBy: list of observer entities watching this target (capacity 4)
+struct EcsOdsObservedByDeep {
+    o0: i64, o1: i64, o2: i64, o3: i64, len: i32,
+}
+
+fn ecs_ods_observed_by_new() -> EcsOdsObservedByDeep {
+    return EcsOdsObservedByDeep { o0: 0, o1: 0, o2: 0, o3: 0, len: 0 };
+}
+
+fn ecs_ods_observed_by_len(o: EcsOdsObservedByDeep) -> i32 { return o.len; }
+
+fn ecs_ods_observed_by_at(o: EcsOdsObservedByDeep, idx: i32) -> i64 {
+    if idx == 0 { return o.o0; };
+    if idx == 1 { return o.o1; };
+    if idx == 2 { return o.o2; };
+    if idx == 3 { return o.o3; };
+    return 0;
+}
+
+fn ecs_ods_observed_by_get_len(o: EcsOdsObservedByDeep) -> i32 {
+    // ObservedBy::get returns &[Entity]
+    return o.len;
+}
+
+fn ecs_ods_observed_by_push(o: EcsOdsObservedByDeep, observer: i64) -> EcsOdsObservedByDeep {
+    let o0=o.o0; let o1=o.o1; let o2=o.o2; let o3=o.o3; let n=o.len;
+    if n == 0 { return EcsOdsObservedByDeep { o0: observer, o1: o1, o2: o2, o3: o3, len: 1 }; };
+    if n == 1 { return EcsOdsObservedByDeep { o0: o0, o1: observer, o2: o2, o3: o3, len: 2 }; };
+    if n == 2 { return EcsOdsObservedByDeep { o0: o0, o1: o1, o2: observer, o3: o3, len: 3 }; };
+    if n == 3 { return EcsOdsObservedByDeep { o0: o0, o1: o1, o2: o2, o3: observer, len: 4 }; };
+    return o;
+}
+
+fn ecs_ods_observed_by_contains(o: EcsOdsObservedByDeep, observer: i64) -> bool {
+    if o.len >= 1 && o.o0 == observer { return true; };
+    if o.len >= 2 && o.o1 == observer { return true; };
+    if o.len >= 3 && o.o2 == observer { return true; };
+    if o.len >= 4 && o.o3 == observer { return true; };
+    return false;
+}
+
+fn ecs_ods_observed_by_take(o: EcsOdsObservedByDeep) -> (EcsOdsObservedByDeep, EcsOdsObservedByDeep) {
+    return (ecs_ods_observed_by_new(), o);
+}
+
+fn ecs_ods_observed_by_storage_type() -> i32 { return ECS_ODS_STORAGE_SPARSE_SET; }
+fn ecs_ods_observed_by_clone_behavior() -> i32 { return ECS_ODS_CLONE_IGNORE; }
+
+
+// === World registry for hooks (fixed 2 observers + 4 entity ObservedBy) ===
+struct EcsOdsWorldDeep {
+    // registered observer entity ids (centralized registry log)
+    reg0: i64, reg1: i64, reg2: i64, reg3: i64, reg_len: i32,
+    unreg0: i64, unreg1: i64, unreg2: i64, unreg3: i64, unreg_len: i32,
+    // observer slots by entity id match
+    o0_entity: i64, o0: EcsOdsObserverDeep, o0_has: bool,
+    o1_entity: i64, o1: EcsOdsObserverDeep, o1_has: bool,
+    // ObservedBy per target entity (up to 4 targets)
+    t0: i64, t0_obs: EcsOdsObservedByDeep, t0_has: bool,
+    t1: i64, t1_obs: EcsOdsObservedByDeep, t1_has: bool,
+    t2: i64, t2_obs: EcsOdsObservedByDeep, t2_has: bool,
+    t3: i64, t3_obs: EcsOdsObservedByDeep, t3_has: bool,
+    fallback_error_handler: i32,
+    despawn_count: i32,
+    register_count: i32,
+    unregister_count: i32,
+}
+
+fn ecs_ods_empty_observer() -> EcsOdsObserverDeep {
+    return ecs_ods_observer_new(0, 0, false, 0, 0);
+}
+
+fn ecs_ods_world_new(fallback_error_handler: i32) -> EcsOdsWorldDeep {
+    return EcsOdsWorldDeep {
+        reg0: 0, reg1: 0, reg2: 0, reg3: 0, reg_len: 0,
+        unreg0: 0, unreg1: 0, unreg2: 0, unreg3: 0, unreg_len: 0,
+        o0_entity: 0, o0: ecs_ods_empty_observer(), o0_has: false,
+        o1_entity: 0, o1: ecs_ods_empty_observer(), o1_has: false,
+        t0: 0, t0_obs: ecs_ods_observed_by_new(), t0_has: false,
+        t1: 0, t1_obs: ecs_ods_observed_by_new(), t1_has: false,
+        t2: 0, t2_obs: ecs_ods_observed_by_new(), t2_has: false,
+        t3: 0, t3_obs: ecs_ods_observed_by_new(), t3_has: false,
+        fallback_error_handler: fallback_error_handler,
+        despawn_count: 0,
+        register_count: 0,
+        unregister_count: 0,
+    };
+}
+
+fn ecs_ods_world_register_count(w: EcsOdsWorldDeep) -> i32 { return w.register_count; }
+fn ecs_ods_world_unregister_count(w: EcsOdsWorldDeep) -> i32 { return w.unregister_count; }
+fn ecs_ods_world_despawn_count(w: EcsOdsWorldDeep) -> i32 { return w.despawn_count; }
+
+fn ecs_ods_world_is_registered(w: EcsOdsWorldDeep, entity: i64) -> bool {
+    if w.reg_len >= 1 && w.reg0 == entity { return true; };
+    if w.reg_len >= 2 && w.reg1 == entity { return true; };
+    if w.reg_len >= 3 && w.reg2 == entity { return true; };
+    if w.reg_len >= 4 && w.reg3 == entity { return true; };
+    return false;
+}
+
+fn ecs_ods_world_is_unregistered(w: EcsOdsWorldDeep, entity: i64) -> bool {
+    if w.unreg_len >= 1 && w.unreg0 == entity { return true; };
+    if w.unreg_len >= 2 && w.unreg1 == entity { return true; };
+    if w.unreg_len >= 3 && w.unreg2 == entity { return true; };
+    if w.unreg_len >= 4 && w.unreg3 == entity { return true; };
+    return false;
+}
+
+fn ecs_ods_world_push_reg(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let r0=w.reg0; let r1=w.reg1; let r2=w.reg2; let r3=w.reg3; let n=w.reg_len;
+    let nr = n + 1;
+    let rc = w.register_count + 1;
+    if n == 0 {
+        return EcsOdsWorldDeep {
+            reg0: entity, reg1: r1, reg2: r2, reg3: r3, reg_len: 1,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: rc, unregister_count: w.unregister_count,
+        };
+    };
+    if n == 1 {
+        return EcsOdsWorldDeep {
+            reg0: r0, reg1: entity, reg2: r2, reg3: r3, reg_len: 2,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: rc, unregister_count: w.unregister_count,
+        };
+    };
+    if n == 2 {
+        return EcsOdsWorldDeep {
+            reg0: r0, reg1: r1, reg2: entity, reg3: r3, reg_len: 3,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: rc, unregister_count: w.unregister_count,
+        };
+    };
+    if n == 3 {
+        return EcsOdsWorldDeep {
+            reg0: r0, reg1: r1, reg2: r2, reg3: entity, reg_len: 4,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: rc, unregister_count: w.unregister_count,
+        };
+    };
+    return w;
+}
+
+fn ecs_ods_world_push_unreg(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let u0=w.unreg0; let u1=w.unreg1; let u2=w.unreg2; let u3=w.unreg3; let n=w.unreg_len;
+    let uc = w.unregister_count + 1;
+    if n == 0 {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: entity, unreg1: u1, unreg2: u2, unreg3: u3, unreg_len: 1,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: uc,
+        };
+    };
+    if n == 1 {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: u0, unreg1: entity, unreg2: u2, unreg3: u3, unreg_len: 2,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: uc,
+        };
+    };
+    if n == 2 {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: u0, unreg1: u1, unreg2: entity, unreg3: u3, unreg_len: 3,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: uc,
+        };
+    };
+    if n == 3 {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: u0, unreg1: u1, unreg2: u2, unreg3: entity, unreg_len: 4,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: uc,
+        };
+    };
+    return w;
+}
+
+fn ecs_ods_world_set_observer(w: EcsOdsWorldDeep, entity: i64, o: EcsOdsObserverDeep) -> EcsOdsWorldDeep {
+    if w.o0_has != true {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: entity, o0: o, o0_has: true,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+        };
+    };
+    if w.o0_entity == entity {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: entity, o0: o, o0_has: true,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+        };
+    };
+    if w.o1_has != true || w.o1_entity == entity {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: entity, o1: o, o1_has: true,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+        };
+    };
+    return w;
+}
+
+fn ecs_ods_world_get_observer(w: EcsOdsWorldDeep, entity: i64) -> (bool, EcsOdsObserverDeep) {
+    if w.o0_has && w.o0_entity == entity { return (true, w.o0); };
+    if w.o1_has && w.o1_entity == entity { return (true, w.o1); };
+    return (false, ecs_ods_empty_observer());
+}
+
+fn ecs_ods_world_despawn_observer(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observer(w, entity);
+    if got.0 != true { return w; };
+    let dead = EcsOdsObserverDeep {
+        system_id: got.1.system_id, system_name: got.1.system_name, is_exclusive: got.1.is_exclusive,
+        system_initialized: got.1.system_initialized, runner: got.1.runner, is_dynamic: got.1.is_dynamic,
+        hook_kind: got.1.hook_kind, error_handler: got.1.error_handler, has_error_handler: got.1.has_error_handler,
+        last_trigger_id: got.1.last_trigger_id, despawned_watched_entities: got.1.despawned_watched_entities,
+        descriptor: got.1.descriptor, conditions: got.1.conditions, event_type: got.1.event_type,
+        bundle_c0: got.1.bundle_c0, bundle_c1: got.1.bundle_c1, bundle_len: got.1.bundle_len, alive: false,
+    };
+    w = ecs_ods_world_set_observer(w, entity, dead);
+    return EcsOdsWorldDeep {
+        reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+        unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+        o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+        o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+        t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+        t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+        t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+        t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+        fallback_error_handler: w.fallback_error_handler,
+        despawn_count: w.despawn_count + 1, register_count: w.register_count, unregister_count: w.unregister_count,
+    };
+}
+
+fn ecs_ods_world_set_observed_by(w: EcsOdsWorldDeep, target: i64, obs: EcsOdsObservedByDeep) -> EcsOdsWorldDeep {
+    if w.t0_has != true || w.t0 == target {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: target, t0_obs: obs, t0_has: true,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+        };
+    };
+    if w.t1_has != true || w.t1 == target {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: target, t1_obs: obs, t1_has: true,
+            t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+        };
+    };
+    if w.t2_has != true || w.t2 == target {
+        return EcsOdsWorldDeep {
+            reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+            unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+            o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+            o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+            t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+            t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+            t2: target, t2_obs: obs, t2_has: true,
+            t3: w.t3, t3_obs: w.t3_obs, t3_has: w.t3_has,
+            fallback_error_handler: w.fallback_error_handler,
+            despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+        };
+    };
+    return EcsOdsWorldDeep {
+        reg0: w.reg0, reg1: w.reg1, reg2: w.reg2, reg3: w.reg3, reg_len: w.reg_len,
+        unreg0: w.unreg0, unreg1: w.unreg1, unreg2: w.unreg2, unreg3: w.unreg3, unreg_len: w.unreg_len,
+        o0_entity: w.o0_entity, o0: w.o0, o0_has: w.o0_has,
+        o1_entity: w.o1_entity, o1: w.o1, o1_has: w.o1_has,
+        t0: w.t0, t0_obs: w.t0_obs, t0_has: w.t0_has,
+        t1: w.t1, t1_obs: w.t1_obs, t1_has: w.t1_has,
+        t2: w.t2, t2_obs: w.t2_obs, t2_has: w.t2_has,
+        t3: target, t3_obs: obs, t3_has: true,
+        fallback_error_handler: w.fallback_error_handler,
+        despawn_count: w.despawn_count, register_count: w.register_count, unregister_count: w.unregister_count,
+    };
+}
+
+fn ecs_ods_world_get_observed_by(w: EcsOdsWorldDeep, target: i64) -> (bool, EcsOdsObservedByDeep) {
+    if w.t0_has && w.t0 == target { return (true, w.t0_obs); };
+    if w.t1_has && w.t1 == target { return (true, w.t1_obs); };
+    if w.t2_has && w.t2 == target { return (true, w.t2_obs); };
+    if w.t3_has && w.t3 == target { return (true, w.t3_obs); };
+    return (false, ecs_ods_observed_by_new());
+}
+
+// typed hook_on_add: register event_key from E, extend bundle components, init system+conditions, register_observer
+fn ecs_ods_hook_on_add_typed(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observer(w, entity);
+    if got.0 != true { return w; };
+    let o = got.1;
+    let d = o.descriptor;
+    // register_event_key::<E> — use event_type as key
+    d = ecs_ods_desc_push_event_key(d, o.event_type);
+    if o.bundle_len >= 1 { d = ecs_ods_desc_push_component(d, o.bundle_c0); };
+    if o.bundle_len >= 2 { d = ecs_ods_desc_push_component(d, o.bundle_c1); };
+    let cond_take = ecs_ods_conditions_take(o.conditions);
+    let cond = ecs_ods_conditions_initialize_all(cond_take.1);
+    let o2 = EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: true, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: d, conditions: cond, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+    w = ecs_ods_world_set_observer(w, entity, o2);
+    w = ecs_ods_world_push_reg(w, entity);
+    return w;
+}
+
+// dynamic hook: if event_keys empty return; set fallback error handler; init conditions; register
+fn ecs_ods_hook_on_add_dynamic(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observer(w, entity);
+    if got.0 != true { return w; };
+    let o = got.1;
+    if ecs_ods_desc_event_key_len(o.descriptor) == 0 { return w; };
+    let eh = o.error_handler;
+    let has_eh = o.has_error_handler;
+    if has_eh != true {
+        eh = w.fallback_error_handler;
+        has_eh = true;
+    };
+    let cond_take = ecs_ods_conditions_take(o.conditions);
+    let cond = ecs_ods_conditions_initialize_all(cond_take.1);
+    let o2 = EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: true, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: eh, has_error_handler: has_eh,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: o.descriptor, conditions: cond, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+    w = ecs_ods_world_set_observer(w, entity, o2);
+    w = ecs_ods_world_push_reg(w, entity);
+    return w;
+}
+
+// Observer Component::on_add dispatches hook_kind
+fn ecs_ods_observer_component_on_add(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observer(w, entity);
+    if got.0 != true { return w; };
+    if got.1.hook_kind == ECS_ODS_HOOK_DYNAMIC {
+        return ecs_ods_hook_on_add_dynamic(w, entity);
+    };
+    return ecs_ods_hook_on_add_typed(w, entity);
+}
+
+// Observer Component::on_remove: take descriptor, unregister_observer
+fn ecs_ods_observer_component_on_remove(w: EcsOdsWorldDeep, entity: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observer(w, entity);
+    if got.0 != true { return w; };
+    let o = got.1;
+    let taken = ecs_ods_desc_take(o.descriptor);
+    let o2 = EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: o.despawned_watched_entities,
+        descriptor: taken.0, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+    w = ecs_ods_world_set_observer(w, entity, o2);
+    // unregister uses taken descriptor (entities/components/event_keys)
+    w = ecs_ods_world_push_unreg(w, entity);
+    return w;
+}
+
+// ObservedBy on_remove: for each observing entity, ++despawned; despawn observer if all sources gone
+fn ecs_ods_observed_by_on_remove(w: EcsOdsWorldDeep, target: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observed_by(w, target);
+    if got.0 != true { return w; };
+    let taken = ecs_ods_observed_by_take(got.1);
+    // clear ObservedBy on target
+    w = ecs_ods_world_set_observed_by(w, target, taken.0);
+    let list = taken.1;
+    let n = list.len;
+    // process up to 4 observers without while
+    if n >= 1 {
+        w = ecs_ods_observed_by_notify_one(w, ecs_ods_observed_by_at(list, 0));
+    };
+    if n >= 2 {
+        w = ecs_ods_observed_by_notify_one(w, ecs_ods_observed_by_at(list, 1));
+    };
+    if n >= 3 {
+        w = ecs_ods_observed_by_notify_one(w, ecs_ods_observed_by_at(list, 2));
+    };
+    if n >= 4 {
+        w = ecs_ods_observed_by_notify_one(w, ecs_ods_observed_by_at(list, 3));
+    };
+    return w;
+}
+
+fn ecs_ods_observed_by_notify_one(w: EcsOdsWorldDeep, observer_entity: i64) -> EcsOdsWorldDeep {
+    let got = ecs_ods_world_get_observer(w, observer_entity);
+    if got.0 != true { return w; };
+    let o = got.1;
+    let total = ecs_ods_desc_entity_len(o.descriptor);
+    let desp = o.despawned_watched_entities + 1;
+    let o2 = EcsOdsObserverDeep {
+        system_id: o.system_id, system_name: o.system_name, is_exclusive: o.is_exclusive,
+        system_initialized: o.system_initialized, runner: o.runner, is_dynamic: o.is_dynamic,
+        hook_kind: o.hook_kind, error_handler: o.error_handler, has_error_handler: o.has_error_handler,
+        last_trigger_id: o.last_trigger_id, despawned_watched_entities: desp,
+        descriptor: o.descriptor, conditions: o.conditions, event_type: o.event_type,
+        bundle_c0: o.bundle_c0, bundle_c1: o.bundle_c1, bundle_len: o.bundle_len, alive: o.alive,
+    };
+    w = ecs_ods_world_set_observer(w, observer_entity, o2);
+    if total == desp {
+        w = ecs_ods_world_despawn_observer(w, observer_entity);
+    };
+    return w;
+}
+
+// === IntoObserver / IntoEntityObserver facades ===
+fn ecs_ods_into_observer_identity(o: EcsOdsObserverDeep) -> EcsOdsObserverDeep {
+    return o;
+}
+
+fn ecs_ods_into_observer_from_system(system_id: i64, system_name: i64, event_type: i64, runner: i64) -> EcsOdsObserverDeep {
+    let t = ecs_ods_observer_try_new(system_id, system_name, false, event_type, runner);
+    return t.1;
+}
+
+fn ecs_ods_into_entity_observer(system_id: i64, system_name: i64, event_type: i64, runner: i64, entity: i64) -> EcsOdsObserverDeep {
+    let o = ecs_ods_into_observer_from_system(system_id, system_name, event_type, runner);
+    return ecs_ods_observer_with_entity(o, entity);
+}
+
+// ObserverWithCondition → Observer (take_conditions)
+fn ecs_ods_into_observer_with_condition(system_id: i64, system_name: i64, event_type: i64, runner: i64, c0: i64, c1: i64, n: i32) -> EcsOdsObserverDeep {
+    let o = ecs_ods_into_observer_from_system(system_id, system_name, event_type, runner);
+    if n >= 1 { o = ecs_ods_observer_run_if(o, c0); };
+    if n >= 2 { o = ecs_ods_observer_run_if(o, c1); };
+    return o;
+}
+
+fn ecs_ods_into_entity_observer_with_condition(system_id: i64, system_name: i64, event_type: i64, runner: i64, entity: i64, c0: i64, n: i32) -> EcsOdsObserverDeep {
+    let o = ecs_ods_into_observer_with_condition(system_id, system_name, event_type, runner, c0, 0, n);
+    return ecs_ods_observer_with_entity(o, entity);
+}

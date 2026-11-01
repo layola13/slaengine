@@ -1,0 +1,261 @@
+// Bevy ECS system::commands (src/system/commands/mod.rs):
+// EntityCommands conditional operations — insert_if, insert_if_new, insert_if_new_and,
+// insert_if_neq, try_insert, try_insert_if, try_insert_if_new, try_insert_if_new_and,
+// remove_if, try_remove, try_remove_if, try_despawn, retain, clear, entry.
+// These complement the existing entity_command.sla module with conditional/try variants.
+
+const ECS_CMD_INSERT: i32 = 0;
+const ECS_CMD_INSERT_IF_NEW: i32 = 1;
+const ECS_CMD_REMOVE: i32 = 2;
+const ECS_CMD_CLEAR: i32 = 3;
+const ECS_CMD_DESPAWN: i32 = 4;
+const ECS_CMD_RETAIN: i32 = 5;
+
+const ECS_CMD_OK: i32 = 0;
+const ECS_CMD_ERR_ENTITY_NOT_FOUND: i32 = 1;
+const ECS_CMD_ERR_COMPONENT_NOT_FOUND: i32 = 2;
+
+// EntityCommands: tracks an entity and its components, plus deferred command queue
+struct EcsEntityCommands2 {
+    entity: i64,
+    component_ids: Vec<i32>,
+    values: Vec<i64>,
+    spawned: bool,
+    command_log: Vec<i32>,  // log of command kinds executed
+}
+
+fn ecs_ec2_new(entity: i64) -> EcsEntityCommands2 {
+    return EcsEntityCommands2 {
+        entity: entity, component_ids: Vec::new(), values: Vec::new(),
+        spawned: true, command_log: Vec::new()
+    };
+}
+
+fn ecs_ec2_id(c: EcsEntityCommands2) -> i64 { return c.entity; }
+fn ecs_ec2_is_spawned(c: EcsEntityCommands2) -> bool { return c.spawned; }
+fn ecs_ec2_component_count(c: EcsEntityCommands2) -> i64 { return len(c.component_ids) as i64; }
+fn ecs_ec2_command_log_len(c: EcsEntityCommands2) -> i64 { return len(c.command_log) as i64; }
+
+// reborrow
+fn ecs_ec2_reborrow(c: EcsEntityCommands2) -> EcsEntityCommands2 { return c; }
+
+// === Contains & Get ===
+
+fn ecs_ec2_contains(c: EcsEntityCommands2, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        if c.component_ids[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_ec2_get(c: EcsEntityCommands2, component_id: i32) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        if c.component_ids[i] == component_id { return (true, c.values[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+// === Insert (unconditional) ===
+
+fn ecs_ec2_insert(c: EcsEntityCommands2, component_id: i32, value: i64) -> EcsEntityCommands2 {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        if c.component_ids[i] == component_id {
+            c.values[i] = value;
+            c.command_log.push(ECS_CMD_INSERT);
+            return c;
+        };
+        i = i + 1;
+    }
+    c.component_ids.push(component_id);
+    c.values.push(value);
+    c.command_log.push(ECS_CMD_INSERT);
+    return c;
+}
+
+// === insert_if: insert only if condition is true ===
+fn ecs_ec2_insert_if(c: EcsEntityCommands2, component_id: i32, value: i64, condition: bool) -> EcsEntityCommands2 {
+    if condition { return ecs_ec2_insert(c, component_id, value); };
+    return c;
+}
+
+// === insert_if_new: insert only if component doesn't already exist ===
+fn ecs_ec2_insert_if_new(c: EcsEntityCommands2, component_id: i32, value: i64) -> EcsEntityCommands2 {
+    if ecs_ec2_contains(c, component_id) { return c; };
+    c.component_ids.push(component_id);
+    c.values.push(value);
+    c.command_log.push(ECS_CMD_INSERT_IF_NEW);
+    return c;
+}
+
+// === insert_if_new_and: insert if new AND condition ===
+fn ecs_ec2_insert_if_new_and(c: EcsEntityCommands2, component_id: i32, value: i64, condition: bool) -> EcsEntityCommands2 {
+    if condition != true { return c; };
+    return ecs_ec2_insert_if_new(c, component_id, value);
+}
+
+// === insert_if_neq: insert only if existing value differs ===
+fn ecs_ec2_insert_if_neq(c: EcsEntityCommands2, component_id: i32, value: i64) -> EcsEntityCommands2 {
+    let g = ecs_ec2_get(c, component_id);
+    if g.0 {
+        if g.1 == value { return c; };
+    };
+    return ecs_ec2_insert(c, component_id, value);
+}
+
+// === try_insert: same as insert but returns error code (always OK if spawned) ===
+fn ecs_ec2_try_insert(c: EcsEntityCommands2, component_id: i32, value: i64) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    let c2 = ecs_ec2_insert(c, component_id, value);
+    return (c2, ECS_CMD_OK);
+}
+
+// === try_insert_if ===
+fn ecs_ec2_try_insert_if(c: EcsEntityCommands2, component_id: i32, value: i64, condition: bool) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    if condition {
+        let c2 = ecs_ec2_insert(c, component_id, value);
+        return (c2, ECS_CMD_OK);
+    };
+    return (c, ECS_CMD_OK);
+}
+
+// === try_insert_if_new ===
+fn ecs_ec2_try_insert_if_new(c: EcsEntityCommands2, component_id: i32, value: i64) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    let c2 = ecs_ec2_insert_if_new(c, component_id, value);
+    return (c2, ECS_CMD_OK);
+}
+
+// === try_insert_if_new_and ===
+fn ecs_ec2_try_insert_if_new_and(c: EcsEntityCommands2, component_id: i32, value: i64, condition: bool) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    let c2 = ecs_ec2_insert_if_new_and(c, component_id, value, condition);
+    return (c2, ECS_CMD_OK);
+}
+
+// === Remove (unconditional) ===
+fn ecs_ec2_remove(c: EcsEntityCommands2, component_id: i32) -> EcsEntityCommands2 {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        if c.component_ids[i] == component_id {
+            let last = n - 1;
+            if i != last {
+                c.component_ids[i] = c.component_ids[last];
+                c.values[i] = c.values[last];
+            };
+            c.component_ids.pop();
+            c.values.pop();
+            c.command_log.push(ECS_CMD_REMOVE);
+            return c;
+        };
+        i = i + 1;
+    }
+    return c;
+}
+
+// === remove_if ===
+fn ecs_ec2_remove_if(c: EcsEntityCommands2, component_id: i32, condition: bool) -> EcsEntityCommands2 {
+    if condition { return ecs_ec2_remove(c, component_id); };
+    return c;
+}
+
+// === remove_with_requires ===
+fn ecs_ec2_remove_with_requires(c: EcsEntityCommands2, component_id: i32) -> EcsEntityCommands2 {
+    return ecs_ec2_remove(c, component_id);
+}
+
+// === remove_by_id ===
+fn ecs_ec2_remove_by_id(c: EcsEntityCommands2, component_id: i32) -> EcsEntityCommands2 {
+    return ecs_ec2_remove(c, component_id);
+}
+
+// === try_remove ===
+fn ecs_ec2_try_remove(c: EcsEntityCommands2, component_id: i32) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    let c2 = ecs_ec2_remove(c, component_id);
+    return (c2, ECS_CMD_OK);
+}
+
+// === try_remove_if ===
+fn ecs_ec2_try_remove_if(c: EcsEntityCommands2, component_id: i32, condition: bool) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    let c2 = ecs_ec2_remove_if(c, component_id, condition);
+    return (c2, ECS_CMD_OK);
+}
+
+// === retain: keep only specified component ids ===
+fn ecs_ec2_retain(c: EcsEntityCommands2, retain_ids: Vec<i32>) -> EcsEntityCommands2 {
+    let new_ids = Vec::new();
+    let new_vals = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(c.component_ids) as i64;
+    while i < n {
+        let cid = c.component_ids[i];
+        let keep = ecs_ec2_retain_contains(retain_ids, cid);
+        if keep {
+            new_ids.push(cid);
+            new_vals.push(c.values[i]);
+        };
+        i = i + 1;
+    }
+    c.component_ids = new_ids;
+    c.values = new_vals;
+    c.command_log.push(ECS_CMD_RETAIN);
+    return c;
+}
+
+fn ecs_ec2_retain_contains(ids: Vec<i32>, target: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(ids) as i64;
+    while i < n {
+        if ids[i] == target { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === clear: remove all components ===
+fn ecs_ec2_clear(c: EcsEntityCommands2) -> EcsEntityCommands2 {
+    c.component_ids = Vec::new();
+    c.values = Vec::new();
+    c.command_log.push(ECS_CMD_CLEAR);
+    return c;
+}
+
+// === despawn ===
+fn ecs_ec2_despawn(c: EcsEntityCommands2) -> EcsEntityCommands2 {
+    c.spawned = false;
+    c.component_ids = Vec::new();
+    c.values = Vec::new();
+    c.command_log.push(ECS_CMD_DESPAWN);
+    return c;
+}
+
+// === try_despawn ===
+fn ecs_ec2_try_despawn(c: EcsEntityCommands2) -> (EcsEntityCommands2, i32) {
+    if c.spawned != true { return (c, ECS_CMD_ERR_ENTITY_NOT_FOUND); };
+    let c2 = ecs_ec2_despawn(c);
+    return (c2, ECS_CMD_OK);
+}
+
+// === entry: returns (occupied, component_id, value) ===
+fn ecs_ec2_entry(c: EcsEntityCommands2, component_id: i32) -> (bool, i32, i64) {
+    let g = ecs_ec2_get(c, component_id);
+    if g.0 { return (true, component_id, g.1); };
+    return (false, component_id, 0);
+}
+
+// === queue: log a command (deferred) ===
+fn ecs_ec2_queue(c: EcsEntityCommands2, command_kind: i32) -> EcsEntityCommands2 {
+    c.command_log.push(command_kind);
+    return c;
+}

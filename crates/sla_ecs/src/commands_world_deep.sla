@@ -1,0 +1,801 @@
+// Deep bed for lib/commands_world.sla (Batch 390).
+// Mirrors shallow lib/commands_world.sla's mutable Commands context (entity table, flat
+// (entity, comp_id, comp_value) component table, resource table, registered-systems list,
+// command queue, schedule label list) as a SELF-CONTAINED fixed-cap variant (NO `@import`) that
+// reifies each shallow `Vec<...>` + count pair into a flat scalar slot family cap-N (SA has no
+// fixed-array support in `_deep.sla`). Shallow uses generics / Vec / Vec-index `[i]` style and
+// tuple-return ops; the deep replaces each `[T; N]` with `field0..fieldN-1` scalar slot families
+// and each `(c, x)` tuple-return with a wrapper struct (EcsCmdSpawn / EcsCmdGetVal /
+// EcsCmdBool / EcsCmdRegister) per Batch 373 rule (NO tuple-return destructuring in tests).
+//
+// Following the Batch 368/380 convention the Vec-parameterized BATCH APIs (insert_batch,
+// spawn_batch, append[Vec<i32>]) are OMITTED in the deep — repeat the single-element ops to
+// exercise equivalent scripts. This leaves the deep with a slightly trimmed surface but still
+// covers spawn_empty / spawn / entity / get_entity / insert_entity / has_component /
+// get_component / insert_resource / init_resource / insert_resource_if_neq / remove_resource /
+// get_resource / resource_count / register_system / unregister_system / run_system /
+// system_count / run_schedule / queue / queue_handled / queue_silenced / write_message /
+// entity_count / queue_len / schedule_count / component_count.
+//
+// Caps (chosen to leave room beyond any realistic test scenario but exercise cap-reject for the
+// cap-aware variants): entity table cap-16; component table cap-32; resource table cap-8;
+// registered-systems cap-8; command queue cap-16; schedule label list cap-8. Spawn-cap reject
+// returns EcsCmdSpawn { commands: w (unchanged), entity_id: -1 } sentinel following the Batch
+// 388/389 NO-PANIC convention.
+
+const ECS_CMD_WD_CAP_ENTITIES: i32 = 16;
+const ECS_CMD_WD_CAP_COMPONENTS: i32 = 32;
+const ECS_CMD_WD_CAP_RESOURCES: i32 = 8;
+const ECS_CMD_WD_CAP_SYSTEMS: i32 = 8;
+const ECS_CMD_WD_CAP_QUEUE: i32 = 16;
+const ECS_CMD_WD_CAP_SCHEDULE: i32 = 8;
+const ECS_CMD_WD_NO_ID: i32 = -300;          // sentinel "no id" (positive: avoids SA codegen rejecting negative top-level consts as Batch 389 #3 established).
+const ECS_CMD_WD_INSERT_MODE_REPLACE: i32 = 0;
+const ECS_CMD_WD_INSERT_MODE_KEEP: i32 = 1;
+const ECS_CMD_WD_QUEUE: i32 = 0;
+const ECS_CMD_WD_QUEUE_HANDLED: i32 = 1;
+const ECS_CMD_WD_QUEUE_SILENCED: i32 = 2;
+
+// ── Wrapper structs (NO tuple-return destructuring in tests). ──────────────────────────────
+struct EcsCmdSpawn { commands: EcsCmdWorldDeep, entity_id: i32 }
+fn ecs_cmd_spawn_commands(s: EcsCmdSpawn) -> EcsCmdWorldDeep { return s.commands; }
+fn ecs_cmd_spawn_entity_id(s: EcsCmdSpawn) -> i32 { return s.entity_id; }
+
+struct EcsCmdGetVal { found: i32, value: i32 }
+fn ecs_cmd_get_val_found(g: EcsCmdGetVal) -> i32 { return g.found; }
+fn ecs_cmd_get_val_value(g: EcsCmdGetVal) -> i32 { return g.value; }
+
+struct EcsCmdBool { commands: EcsCmdWorldDeep, ok: i32 }
+fn ecs_cmd_bool_commands(b: EcsCmdBool) -> EcsCmdWorldDeep { return b.commands; }
+fn ecs_cmd_bool_ok(b: EcsCmdBool) -> i32 { return b.ok; }
+
+struct EcsCmdRegister { commands: EcsCmdWorldDeep, system_id: i32 }
+fn ecs_cmd_register_commands(r: EcsCmdRegister) -> EcsCmdWorldDeep { return r.commands; }
+fn ecs_cmd_register_system_id(r: EcsCmdRegister) -> i32 { return r.system_id; }
+
+// ── Mutable Commands context (cap-N flat scalar slot families). ───────────────────────────
+struct EcsCmdWorldDeep {
+    next_entity: i32,
+    // entity table (cap-16): e * entity_id
+    e0: i32, e1: i32, e2: i32, e3: i32, e4: i32, e5: i32, e6: i32, e7: i32,
+    e8: i32, e9: i32, e10: i32, e11: i32, e12: i32, e13: i32, e14: i32, e15: i32,
+    e_count: i32,
+    // component table (cap-32): per-row (entity_id, component_id, value)
+    ce0: i32, ce1: i32, ce2: i32, ce3: i32, ce4: i32, ce5: i32, ce6: i32, ce7: i32,
+    ce8: i32, ce9: i32, ce10: i32, ce11: i32, ce12: i32, ce13: i32, ce14: i32, ce15: i32,
+    ce16: i32, ce17: i32, ce18: i32, ce19: i32, ce20: i32, ce21: i32, ce22: i32, ce23: i32,
+    ce24: i32, ce25: i32, ce26: i32, ce27: i32, ce28: i32, ce29: i32, ce30: i32, ce31: i32,
+    cc0: i32, cc1: i32, cc2: i32, cc3: i32, cc4: i32, cc5: i32, cc6: i32, cc7: i32,
+    cc8: i32, cc9: i32, cc10: i32, cc11: i32, cc12: i32, cc13: i32, cc14: i32, cc15: i32,
+    cc16: i32, cc17: i32, cc18: i32, cc19: i32, cc20: i32, cc21: i32, cc22: i32, cc23: i32,
+    cc24: i32, cc25: i32, cc26: i32, cc27: i32, cc28: i32, cc29: i32, cc30: i32, cc31: i32,
+    cv0: i32, cv1: i32, cv2: i32, cv3: i32, cv4: i32, cv5: i32, cv6: i32, cv7: i32,
+    cv8: i32, cv9: i32, cv10: i32, cv11: i32, cv12: i32, cv13: i32, cv14: i32, cv15: i32,
+    cv16: i32, cv17: i32, cv18: i32, cv19: i32, cv20: i32, cv21: i32, cv22: i32, cv23: i32,
+    cv24: i32, cv25: i32, cv26: i32, cv27: i32, cv28: i32, cv29: i32, cv30: i32, cv31: i32,
+    c_count: i32,
+    // resource table (cap-8): per-slot (id, value)
+    ri0: i32, ri1: i32, ri2: i32, ri3: i32, ri4: i32, ri5: i32, ri6: i32, ri7: i32,
+    rv0: i32, rv1: i32, rv2: i32, rv3: i32, rv4: i32, rv5: i32, rv6: i32, rv7: i32,
+    r_count: i32,
+    // registered systems (cap-8): system id list + next_system_id
+    rs0: i32, rs1: i32, rs2: i32, rs3: i32, rs4: i32, rs5: i32, rs6: i32, rs7: i32,
+    rs_count: i32,
+    next_system_id: i32,
+    // command queue (cap-16): i32 code entries
+    cq0: i32, cq1: i32, cq2: i32, cq3: i32, cq4: i32, cq5: i32, cq6: i32, cq7: i32,
+    cq8: i32, cq9: i32, cq10: i32, cq11: i32, cq12: i32, cq13: i32, cq14: i32, cq15: i32,
+    cq_count: i32,
+    // schedule labels (cap-8): i32 label entries
+    sl0: i32, sl1: i32, sl2: i32, sl3: i32, sl4: i32, sl5: i32, sl6: i32, sl7: i32,
+    sl_count: i32,
+}
+
+fn ecs_commands_world_new() -> EcsCmdWorldDeep {
+    return EcsCmdWorldDeep {
+        next_entity: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        e8: 0, e9: 0, e10: 0, e11: 0, e12: 0, e13: 0, e14: 0, e15: 0,
+        e_count: 0,
+        ce0: 0, ce1: 0, ce2: 0, ce3: 0, ce4: 0, ce5: 0, ce6: 0, ce7: 0,
+        ce8: 0, ce9: 0, ce10: 0, ce11: 0, ce12: 0, ce13: 0, ce14: 0, ce15: 0,
+        ce16: 0, ce17: 0, ce18: 0, ce19: 0, ce20: 0, ce21: 0, ce22: 0, ce23: 0,
+        ce24: 0, ce25: 0, ce26: 0, ce27: 0, ce28: 0, ce29: 0, ce30: 0, ce31: 0,
+        cc0: 0, cc1: 0, cc2: 0, cc3: 0, cc4: 0, cc5: 0, cc6: 0, cc7: 0,
+        cc8: 0, cc9: 0, cc10: 0, cc11: 0, cc12: 0, cc13: 0, cc14: 0, cc15: 0,
+        cc16: 0, cc17: 0, cc18: 0, cc19: 0, cc20: 0, cc21: 0, cc22: 0, cc23: 0,
+        cc24: 0, cc25: 0, cc26: 0, cc27: 0, cc28: 0, cc29: 0, cc30: 0, cc31: 0,
+        cv0: 0, cv1: 0, cv2: 0, cv3: 0, cv4: 0, cv5: 0, cv6: 0, cv7: 0,
+        cv8: 0, cv9: 0, cv10: 0, cv11: 0, cv12: 0, cv13: 0, cv14: 0, cv15: 0,
+        cv16: 0, cv17: 0, cv18: 0, cv19: 0, cv20: 0, cv21: 0, cv22: 0, cv23: 0,
+        cv24: 0, cv25: 0, cv26: 0, cv27: 0, cv28: 0, cv29: 0, cv30: 0, cv31: 0,
+        c_count: 0,
+        ri0: 0, ri1: 0, ri2: 0, ri3: 0, ri4: 0, ri5: 0, ri6: 0, ri7: 0,
+        rv0: 0, rv1: 0, rv2: 0, rv3: 0, rv4: 0, rv5: 0, rv6: 0, rv7: 0,
+        r_count: 0,
+        rs0: 0, rs1: 0, rs2: 0, rs3: 0, rs4: 0, rs5: 0, rs6: 0, rs7: 0,
+        rs_count: 0,
+        next_system_id: 1,
+        cq0: 0, cq1: 0, cq2: 0, cq3: 0, cq4: 0, cq5: 0, cq6: 0, cq7: 0,
+        cq8: 0, cq9: 0, cq10: 0, cq11: 0, cq12: 0, cq13: 0, cq14: 0, cq15: 0,
+        cq_count: 0,
+        sl0: 0, sl1: 0, sl2: 0, sl3: 0, sl4: 0, sl5: 0, sl6: 0, sl7: 0,
+        sl_count: 0,
+    };
+}
+
+// ── Entity table scalar accessor helpers (cap-16). ─────────────────────────────────────────
+fn _ecs_cmd_e_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.e0; };
+    if idx == 1 { return c.e1; };
+    if idx == 2 { return c.e2; };
+    if idx == 3 { return c.e3; };
+    if idx == 4 { return c.e4; };
+    if idx == 5 { return c.e5; };
+    if idx == 6 { return c.e6; };
+    if idx == 7 { return c.e7; };
+    if idx == 8 { return c.e8; };
+    if idx == 9 { return c.e9; };
+    if idx == 10 { return c.e10; };
+    if idx == 11 { return c.e11; };
+    if idx == 12 { return c.e12; };
+    if idx == 13 { return c.e13; };
+    if idx == 14 { return c.e14; };
+    return c.e15;
+}
+
+fn _ecs_cmd_set_e(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.e0 = value; return c0; };
+    if idx == 1 { c0.e1 = value; return c0; };
+    if idx == 2 { c0.e2 = value; return c0; };
+    if idx == 3 { c0.e3 = value; return c0; };
+    if idx == 4 { c0.e4 = value; return c0; };
+    if idx == 5 { c0.e5 = value; return c0; };
+    if idx == 6 { c0.e6 = value; return c0; };
+    if idx == 7 { c0.e7 = value; return c0; };
+    if idx == 8 { c0.e8 = value; return c0; };
+    if idx == 9 { c0.e9 = value; return c0; };
+    if idx == 10 { c0.e10 = value; return c0; };
+    if idx == 11 { c0.e11 = value; return c0; };
+    if idx == 12 { c0.e12 = value; return c0; };
+    if idx == 13 { c0.e13 = value; return c0; };
+    if idx == 14 { c0.e14 = value; return c0; };
+    c0.e15 = value;
+    return c0;
+}
+
+// ── Component-table accessor helpers (cap-32). ─────────────────────────────────────────────
+fn _ecs_cmd_ce_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.ce0; };
+    if idx == 1 { return c.ce1; };
+    if idx == 2 { return c.ce2; };
+    if idx == 3 { return c.ce3; };
+    if idx == 4 { return c.ce4; };
+    if idx == 5 { return c.ce5; };
+    if idx == 6 { return c.ce6; };
+    if idx == 7 { return c.ce7; };
+    if idx == 8 { return c.ce8; };
+    if idx == 9 { return c.ce9; };
+    if idx == 10 { return c.ce10; };
+    if idx == 11 { return c.ce11; };
+    if idx == 12 { return c.ce12; };
+    if idx == 13 { return c.ce13; };
+    if idx == 14 { return c.ce14; };
+    if idx == 15 { return c.ce15; };
+    if idx == 16 { return c.ce16; };
+    if idx == 17 { return c.ce17; };
+    if idx == 18 { return c.ce18; };
+    if idx == 19 { return c.ce19; };
+    if idx == 20 { return c.ce20; };
+    if idx == 21 { return c.ce21; };
+    if idx == 22 { return c.ce22; };
+    if idx == 23 { return c.ce23; };
+    if idx == 24 { return c.ce24; };
+    if idx == 25 { return c.ce25; };
+    if idx == 26 { return c.ce26; };
+    if idx == 27 { return c.ce27; };
+    if idx == 28 { return c.ce28; };
+    if idx == 29 { return c.ce29; };
+    if idx == 30 { return c.ce30; };
+    return c.ce31;
+}
+
+fn _ecs_cmd_set_ce(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.ce0 = value; return c0; };
+    if idx == 1 { c0.ce1 = value; return c0; };
+    if idx == 2 { c0.ce2 = value; return c0; };
+    if idx == 3 { c0.ce3 = value; return c0; };
+    if idx == 4 { c0.ce4 = value; return c0; };
+    if idx == 5 { c0.ce5 = value; return c0; };
+    if idx == 6 { c0.ce6 = value; return c0; };
+    if idx == 7 { c0.ce7 = value; return c0; };
+    if idx == 8 { c0.ce8 = value; return c0; };
+    if idx == 9 { c0.ce9 = value; return c0; };
+    if idx == 10 { c0.ce10 = value; return c0; };
+    if idx == 11 { c0.ce11 = value; return c0; };
+    if idx == 12 { c0.ce12 = value; return c0; };
+    if idx == 13 { c0.ce13 = value; return c0; };
+    if idx == 14 { c0.ce14 = value; return c0; };
+    if idx == 15 { c0.ce15 = value; return c0; };
+    if idx == 16 { c0.ce16 = value; return c0; };
+    if idx == 17 { c0.ce17 = value; return c0; };
+    if idx == 18 { c0.ce18 = value; return c0; };
+    if idx == 19 { c0.ce19 = value; return c0; };
+    if idx == 20 { c0.ce20 = value; return c0; };
+    if idx == 21 { c0.ce21 = value; return c0; };
+    if idx == 22 { c0.ce22 = value; return c0; };
+    if idx == 23 { c0.ce23 = value; return c0; };
+    if idx == 24 { c0.ce24 = value; return c0; };
+    if idx == 25 { c0.ce25 = value; return c0; };
+    if idx == 26 { c0.ce26 = value; return c0; };
+    if idx == 27 { c0.ce27 = value; return c0; };
+    if idx == 28 { c0.ce28 = value; return c0; };
+    if idx == 29 { c0.ce29 = value; return c0; };
+    if idx == 30 { c0.ce30 = value; return c0; };
+    c0.ce31 = value;
+    return c0;
+}
+
+fn _ecs_cmd_cc_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.cc0; };
+    if idx == 1 { return c.cc1; };
+    if idx == 2 { return c.cc2; };
+    if idx == 3 { return c.cc3; };
+    if idx == 4 { return c.cc4; };
+    if idx == 5 { return c.cc5; };
+    if idx == 6 { return c.cc6; };
+    if idx == 7 { return c.cc7; };
+    if idx == 8 { return c.cc8; };
+    if idx == 9 { return c.cc9; };
+    if idx == 10 { return c.cc10; };
+    if idx == 11 { return c.cc11; };
+    if idx == 12 { return c.cc12; };
+    if idx == 13 { return c.cc13; };
+    if idx == 14 { return c.cc14; };
+    if idx == 15 { return c.cc15; };
+    if idx == 16 { return c.cc16; };
+    if idx == 17 { return c.cc17; };
+    if idx == 18 { return c.cc18; };
+    if idx == 19 { return c.cc19; };
+    if idx == 20 { return c.cc20; };
+    if idx == 21 { return c.cc21; };
+    if idx == 22 { return c.cc22; };
+    if idx == 23 { return c.cc23; };
+    if idx == 24 { return c.cc24; };
+    if idx == 25 { return c.cc25; };
+    if idx == 26 { return c.cc26; };
+    if idx == 27 { return c.cc27; };
+    if idx == 28 { return c.cc28; };
+    if idx == 29 { return c.cc29; };
+    if idx == 30 { return c.cc30; };
+    return c.cc31;
+}
+
+fn _ecs_cmd_set_cc(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.cc0 = value; return c0; };
+    if idx == 1 { c0.cc1 = value; return c0; };
+    if idx == 2 { c0.cc2 = value; return c0; };
+    if idx == 3 { c0.cc3 = value; return c0; };
+    if idx == 4 { c0.cc4 = value; return c0; };
+    if idx == 5 { c0.cc5 = value; return c0; };
+    if idx == 6 { c0.cc6 = value; return c0; };
+    if idx == 7 { c0.cc7 = value; return c0; };
+    if idx == 8 { c0.cc8 = value; return c0; };
+    if idx == 9 { c0.cc9 = value; return c0; };
+    if idx == 10 { c0.cc10 = value; return c0; };
+    if idx == 11 { c0.cc11 = value; return c0; };
+    if idx == 12 { c0.cc12 = value; return c0; };
+    if idx == 13 { c0.cc13 = value; return c0; };
+    if idx == 14 { c0.cc14 = value; return c0; };
+    if idx == 15 { c0.cc15 = value; return c0; };
+    if idx == 16 { c0.cc16 = value; return c0; };
+    if idx == 17 { c0.cc17 = value; return c0; };
+    if idx == 18 { c0.cc18 = value; return c0; };
+    if idx == 19 { c0.cc19 = value; return c0; };
+    if idx == 20 { c0.cc20 = value; return c0; };
+    if idx == 21 { c0.cc21 = value; return c0; };
+    if idx == 22 { c0.cc22 = value; return c0; };
+    if idx == 23 { c0.cc23 = value; return c0; };
+    if idx == 24 { c0.cc24 = value; return c0; };
+    if idx == 25 { c0.cc25 = value; return c0; };
+    if idx == 26 { c0.cc26 = value; return c0; };
+    if idx == 27 { c0.cc27 = value; return c0; };
+    if idx == 28 { c0.cc28 = value; return c0; };
+    if idx == 29 { c0.cc29 = value; return c0; };
+    if idx == 30 { c0.cc30 = value; return c0; };
+    c0.cc31 = value;
+    return c0;
+}
+
+fn _ecs_cmd_cv_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.cv0; };
+    if idx == 1 { return c.cv1; };
+    if idx == 2 { return c.cv2; };
+    if idx == 3 { return c.cv3; };
+    if idx == 4 { return c.cv4; };
+    if idx == 5 { return c.cv5; };
+    if idx == 6 { return c.cv6; };
+    if idx == 7 { return c.cv7; };
+    if idx == 8 { return c.cv8; };
+    if idx == 9 { return c.cv9; };
+    if idx == 10 { return c.cv10; };
+    if idx == 11 { return c.cv11; };
+    if idx == 12 { return c.cv12; };
+    if idx == 13 { return c.cv13; };
+    if idx == 14 { return c.cv14; };
+    if idx == 15 { return c.cv15; };
+    if idx == 16 { return c.cv16; };
+    if idx == 17 { return c.cv17; };
+    if idx == 18 { return c.cv18; };
+    if idx == 19 { return c.cv19; };
+    if idx == 20 { return c.cv20; };
+    if idx == 21 { return c.cv21; };
+    if idx == 22 { return c.cv22; };
+    if idx == 23 { return c.cv23; };
+    if idx == 24 { return c.cv24; };
+    if idx == 25 { return c.cv25; };
+    if idx == 26 { return c.cv26; };
+    if idx == 27 { return c.cv27; };
+    if idx == 28 { return c.cv28; };
+    if idx == 29 { return c.cv29; };
+    if idx == 30 { return c.cv30; };
+    return c.cv31;
+}
+
+fn _ecs_cmd_set_cv(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.cv0 = value; return c0; };
+    if idx == 1 { c0.cv1 = value; return c0; };
+    if idx == 2 { c0.cv2 = value; return c0; };
+    if idx == 3 { c0.cv3 = value; return c0; };
+    if idx == 4 { c0.cv4 = value; return c0; };
+    if idx == 5 { c0.cv5 = value; return c0; };
+    if idx == 6 { c0.cv6 = value; return c0; };
+    if idx == 7 { c0.cv7 = value; return c0; };
+    if idx == 8 { c0.cv8 = value; return c0; };
+    if idx == 9 { c0.cv9 = value; return c0; };
+    if idx == 10 { c0.cv10 = value; return c0; };
+    if idx == 11 { c0.cv11 = value; return c0; };
+    if idx == 12 { c0.cv12 = value; return c0; };
+    if idx == 13 { c0.cv13 = value; return c0; };
+    if idx == 14 { c0.cv14 = value; return c0; };
+    if idx == 15 { c0.cv15 = value; return c0; };
+    if idx == 16 { c0.cv16 = value; return c0; };
+    if idx == 17 { c0.cv17 = value; return c0; };
+    if idx == 18 { c0.cv18 = value; return c0; };
+    if idx == 19 { c0.cv19 = value; return c0; };
+    if idx == 20 { c0.cv20 = value; return c0; };
+    if idx == 21 { c0.cv21 = value; return c0; };
+    if idx == 22 { c0.cv22 = value; return c0; };
+    if idx == 23 { c0.cv23 = value; return c0; };
+    if idx == 24 { c0.cv24 = value; return c0; };
+    if idx == 25 { c0.cv25 = value; return c0; };
+    if idx == 26 { c0.cv26 = value; return c0; };
+    if idx == 27 { c0.cv27 = value; return c0; };
+    if idx == 28 { c0.cv28 = value; return c0; };
+    if idx == 29 { c0.cv29 = value; return c0; };
+    if idx == 30 { c0.cv30 = value; return c0; };
+    c0.cv31 = value;
+    return c0;
+}
+
+// ── Resource table scalar accessor helpers (cap-8). ────────────────────────────────────────
+fn _ecs_cmd_ri_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.ri0; };
+    if idx == 1 { return c.ri1; };
+    if idx == 2 { return c.ri2; };
+    if idx == 3 { return c.ri3; };
+    if idx == 4 { return c.ri4; };
+    if idx == 5 { return c.ri5; };
+    if idx == 6 { return c.ri6; };
+    return c.ri7;
+}
+
+fn _ecs_cmd_set_ri(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.ri0 = value; return c0; };
+    if idx == 1 { c0.ri1 = value; return c0; };
+    if idx == 2 { c0.ri2 = value; return c0; };
+    if idx == 3 { c0.ri3 = value; return c0; };
+    if idx == 4 { c0.ri4 = value; return c0; };
+    if idx == 5 { c0.ri5 = value; return c0; };
+    if idx == 6 { c0.ri6 = value; return c0; };
+    c0.ri7 = value;
+    return c0;
+}
+
+fn _ecs_cmd_rv_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.rv0; };
+    if idx == 1 { return c.rv1; };
+    if idx == 2 { return c.rv2; };
+    if idx == 3 { return c.rv3; };
+    if idx == 4 { return c.rv4; };
+    if idx == 5 { return c.rv5; };
+    if idx == 6 { return c.rv6; };
+    return c.rv7;
+}
+
+fn _ecs_cmd_set_rv(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.rv0 = value; return c0; };
+    if idx == 1 { c0.rv1 = value; return c0; };
+    if idx == 2 { c0.rv2 = value; return c0; };
+    if idx == 3 { c0.rv3 = value; return c0; };
+    if idx == 4 { c0.rv4 = value; return c0; };
+    if idx == 5 { c0.rv5 = value; return c0; };
+    if idx == 6 { c0.rv6 = value; return c0; };
+    c0.rv7 = value;
+    return c0;
+}
+
+// ── Registered-systems scalar accessor helpers (cap-8). ────────────────────────────────────
+fn _ecs_cmd_rs_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.rs0; };
+    if idx == 1 { return c.rs1; };
+    if idx == 2 { return c.rs2; };
+    if idx == 3 { return c.rs3; };
+    if idx == 4 { return c.rs4; };
+    if idx == 5 { return c.rs5; };
+    if idx == 6 { return c.rs6; };
+    return c.rs7;
+}
+
+fn _ecs_cmd_set_rs(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.rs0 = value; return c0; };
+    if idx == 1 { c0.rs1 = value; return c0; };
+    if idx == 2 { c0.rs2 = value; return c0; };
+    if idx == 3 { c0.rs3 = value; return c0; };
+    if idx == 4 { c0.rs4 = value; return c0; };
+    if idx == 5 { c0.rs5 = value; return c0; };
+    if idx == 6 { c0.rs6 = value; return c0; };
+    c0.rs7 = value;
+    return c0;
+}
+
+// ── Command queue scalar accessor helpers (cap-16). ────────────────────────────────────────
+fn _ecs_cmd_cq_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.cq0; };
+    if idx == 1 { return c.cq1; };
+    if idx == 2 { return c.cq2; };
+    if idx == 3 { return c.cq3; };
+    if idx == 4 { return c.cq4; };
+    if idx == 5 { return c.cq5; };
+    if idx == 6 { return c.cq6; };
+    if idx == 7 { return c.cq7; };
+    if idx == 8 { return c.cq8; };
+    if idx == 9 { return c.cq9; };
+    if idx == 10 { return c.cq10; };
+    if idx == 11 { return c.cq11; };
+    if idx == 12 { return c.cq12; };
+    if idx == 13 { return c.cq13; };
+    if idx == 14 { return c.cq14; };
+    return c.cq15;
+}
+
+fn _ecs_cmd_set_cq(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.cq0 = value; return c0; };
+    if idx == 1 { c0.cq1 = value; return c0; };
+    if idx == 2 { c0.cq2 = value; return c0; };
+    if idx == 3 { c0.cq3 = value; return c0; };
+    if idx == 4 { c0.cq4 = value; return c0; };
+    if idx == 5 { c0.cq5 = value; return c0; };
+    if idx == 6 { c0.cq6 = value; return c0; };
+    if idx == 7 { c0.cq7 = value; return c0; };
+    if idx == 8 { c0.cq8 = value; return c0; };
+    if idx == 9 { c0.cq9 = value; return c0; };
+    if idx == 10 { c0.cq10 = value; return c0; };
+    if idx == 11 { c0.cq11 = value; return c0; };
+    if idx == 12 { c0.cq12 = value; return c0; };
+    if idx == 13 { c0.cq13 = value; return c0; };
+    if idx == 14 { c0.cq14 = value; return c0; };
+    c0.cq15 = value;
+    return c0;
+}
+
+// ── Schedule label scalar accessor helpers (cap-8). ─────────────────────────────────────────
+fn _ecs_cmd_sl_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.sl0; };
+    if idx == 1 { return c.sl1; };
+    if idx == 2 { return c.sl2; };
+    if idx == 3 { return c.sl3; };
+    if idx == 4 { return c.sl4; };
+    if idx == 5 { return c.sl5; };
+    if idx == 6 { return c.sl6; };
+    return c.sl7;
+}
+
+fn _ecs_cmd_set_sl(c0: EcsCmdWorldDeep, idx: i32, value: i32) -> EcsCmdWorldDeep {
+    if idx == 0 { c0.sl0 = value; return c0; };
+    if idx == 1 { c0.sl1 = value; return c0; };
+    if idx == 2 { c0.sl2 = value; return c0; };
+    if idx == 3 { c0.sl3 = value; return c0; };
+    if idx == 4 { c0.sl4 = value; return c0; };
+    if idx == 5 { c0.sl5 = value; return c0; };
+    if idx == 6 { c0.sl6 = value; return c0; };
+    c0.sl7 = value;
+    return c0;
+}
+
+// ── Internal: enqueue a command-code onto the queue if cap-room allows (otherwise no-op). ───
+fn _ecs_cmd_enqueue(c0: EcsCmdWorldDeep, code: i32) -> EcsCmdWorldDeep {
+    if c0.cq_count >= ECS_CMD_WD_CAP_QUEUE { return c0; };
+    let slot = c0.cq_count;
+    c0 = _ecs_cmd_set_cq(c0, slot, code);
+    c0.cq_count = slot + 1;
+    return c0;
+}
+
+// ── Stats: counts return the relevant cap-slot family live count. ──────────────────────────
+fn ecs_commands_entity_count(c: EcsCmdWorldDeep) -> i32 { return c.e_count; }
+fn ecs_commands_component_count(c: EcsCmdWorldDeep) -> i32 { return c.c_count; }
+fn ecs_commands_resource_count(c: EcsCmdWorldDeep) -> i32 { return c.r_count; }
+fn ecs_commands_system_count(c: EcsCmdWorldDeep) -> i32 { return c.rs_count; }
+fn ecs_commands_queue_len(c: EcsCmdWorldDeep) -> i32 { return c.cq_count; }
+fn ecs_commands_schedule_count(c: EcsCmdWorldDeep) -> i32 { return c.sl_count; }
+fn ecs_commands_next_entity_id(c: EcsCmdWorldDeep) -> i32 { return c.next_entity; }
+fn ecs_commands_next_system_id(c: EcsCmdWorldDeep) -> i32 { return c.next_system_id; }
+
+// ── spawn_empty: append a new entity id to the entity table + queue a queue-code. ──────────
+// At cap returns EcsCmdSpawn { commands: w unchanged, entity_id: -1 } sentinel (Batch 388/389
+// no-panic convention).
+fn ecs_commands_spawn_empty(c0: EcsCmdWorldDeep) -> EcsCmdSpawn {
+    if c0.e_count >= ECS_CMD_WD_CAP_ENTITIES {
+        return EcsCmdSpawn { commands: c0, entity_id: -1 };
+    };
+    let entity_id = c0.next_entity;
+    let slot = c0.e_count;
+    c0 = _ecs_cmd_set_e(c0, slot, entity_id);
+    c0.e_count = slot + 1;
+    c0.next_entity = entity_id + 1;
+    c0 = _ecs_cmd_enqueue(c0, ECS_CMD_WD_QUEUE);
+    return EcsCmdSpawn { commands: c0, entity_id: entity_id };
+}
+
+// ── spawn: spawn_empty then insert_entity (initial component). Returns EcsCmdSpawn. ─────────
+fn ecs_commands_spawn(c0: EcsCmdWorldDeep, component_id: i32, value: i32) -> EcsCmdSpawn {
+    let sp = ecs_commands_spawn_empty(c0);
+    let c1 = ecs_cmd_spawn_commands(sp);
+    let entity_id = ecs_cmd_spawn_entity_id(sp);
+    if entity_id < 0 { return sp; };
+    let c2 = ecs_commands_insert_entity(c1, entity_id, component_id, value);
+    return EcsCmdSpawn { commands: c2, entity_id: entity_id };
+}
+
+// ── entity: returns the entity-table index for an entity_id, or -1 if not present. ─────────
+fn ecs_commands_entity(c: EcsCmdWorldDeep, entity_id: i32) -> i32 {
+    let i: i32 = 0;
+    while i < c.e_count {
+        if _ecs_cmd_e_at(c, i) == entity_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ── get_entity: returns EcsCmdGetVal { found: 1/0, value: idx_or_-1 }. ─────────────────────
+fn ecs_commands_get_entity(c: EcsCmdWorldDeep, entity_id: i32) -> EcsCmdGetVal {
+    let idx = ecs_commands_entity(c, entity_id);
+    if idx >= 0 { return EcsCmdGetVal { found: 1, value: idx }; };
+    return EcsCmdGetVal { found: 0, value: -1 };
+}
+
+// ── insert_entity: insert a (entity_id, component_id, value) row; overwrite if the (entity_id,
+//    component_id) pair already exists; else append. No-op at cap when the pair is new.
+fn ecs_commands_insert_entity(c0: EcsCmdWorldDeep, entity_id: i32, component_id: i32, value: i32) -> EcsCmdWorldDeep {
+    let i: i32 = 0;
+    while i < c0.c_count {
+        if _ecs_cmd_ce_at(c0, i) == entity_id {
+            if _ecs_cmd_cc_at(c0, i) == component_id {
+                c0 = _ecs_cmd_set_cv(c0, i, value);
+                return c0;
+            };
+        };
+        i = i + 1;
+    }
+    if c0.c_count >= ECS_CMD_WD_CAP_COMPONENTS { return c0; };
+    let slot = c0.c_count;
+    c0 = _ecs_cmd_set_ce(c0, slot, entity_id);
+    c0 = _ecs_cmd_set_cc(c0, slot, component_id);
+    c0 = _ecs_cmd_set_cv(c0, slot, value);
+    c0.c_count = slot + 1;
+    return c0;
+}
+
+// ── has_component: returns true iff an (entity_id, component_id) row exists. ──────────────
+fn ecs_commands_has_component(c: EcsCmdWorldDeep, entity_id: i32, component_id: i32) -> bool {
+    let i: i32 = 0;
+    while i < c.c_count {
+        if _ecs_cmd_ce_at(c, i) == entity_id {
+            if _ecs_cmd_cc_at(c, i) == component_id { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── get_component: returns EcsCmdGetVal { found: 1/0, value: row_value_or_0 }. ─────────────
+fn ecs_commands_get_component(c: EcsCmdWorldDeep, entity_id: i32, component_id: i32) -> EcsCmdGetVal {
+    let i: i32 = 0;
+    while i < c.c_count {
+        if _ecs_cmd_ce_at(c, i) == entity_id {
+            if _ecs_cmd_cc_at(c, i) == component_id {
+                return EcsCmdGetVal { found: 1, value: _ecs_cmd_cv_at(c, i) };
+            };
+        };
+        i = i + 1;
+    }
+    return EcsCmdGetVal { found: 0, value: 0 };
+}
+
+// ── Resources ──────────────────────────────────────────────────────────────────────────────
+// insert_resource: overwrite value if resource_id exists; else append. No-op at cap if new.
+fn ecs_commands_insert_resource(c0: EcsCmdWorldDeep, resource_id: i32, value: i32) -> EcsCmdWorldDeep {
+    let i: i32 = 0;
+    while i < c0.r_count {
+        if _ecs_cmd_ri_at(c0, i) == resource_id {
+            c0 = _ecs_cmd_set_rv(c0, i, value);
+            return c0;
+        };
+        i = i + 1;
+    }
+    if c0.r_count >= ECS_CMD_WD_CAP_RESOURCES { return c0; };
+    let slot = c0.r_count;
+    c0 = _ecs_cmd_set_ri(c0, slot, resource_id);
+    c0 = _ecs_cmd_set_rv(c0, slot, value);
+    c0.r_count = slot + 1;
+    return c0;
+}
+
+// init_resource: idempotent init-to-zero if missing; no-op if already present.
+fn ecs_commands_init_resource(c0: EcsCmdWorldDeep, resource_id: i32) -> EcsCmdWorldDeep {
+    let i: i32 = 0;
+    while i < c0.r_count {
+        if _ecs_cmd_ri_at(c0, i) == resource_id { return c0; };
+        i = i + 1;
+    }
+    if c0.r_count >= ECS_CMD_WD_CAP_RESOURCES { return c0; };
+    let slot = c0.r_count;
+    c0 = _ecs_cmd_set_ri(c0, slot, resource_id);
+    c0 = _ecs_cmd_set_rv(c0, slot, 0);
+    c0.r_count = slot + 1;
+    return c0;
+}
+
+// insert_resource_if_neq: overwrite value only if the existing value differs; else append.
+fn ecs_commands_insert_resource_if_neq(c0: EcsCmdWorldDeep, resource_id: i32, value: i32) -> EcsCmdWorldDeep {
+    let i: i32 = 0;
+    while i < c0.r_count {
+        if _ecs_cmd_ri_at(c0, i) == resource_id {
+            if _ecs_cmd_rv_at(c0, i) != value {
+                c0 = _ecs_cmd_set_rv(c0, i, value);
+            };
+            return c0;
+        };
+        i = i + 1;
+    }
+    if c0.r_count >= ECS_CMD_WD_CAP_RESOURCES { return c0; };
+    let slot = c0.r_count;
+    c0 = _ecs_cmd_set_ri(c0, slot, resource_id);
+    c0 = _ecs_cmd_set_rv(c0, slot, value);
+    c0.r_count = slot + 1;
+    return c0;
+}
+
+// remove_resource: swap-remove; no-op if not present. Mirrors shallow's swap-remove.
+fn ecs_commands_remove_resource(c0: EcsCmdWorldDeep, resource_id: i32) -> EcsCmdWorldDeep {
+    let i: i32 = 0;
+    while i < c0.r_count {
+        if _ecs_cmd_ri_at(c0, i) == resource_id {
+            let last = c0.r_count - 1;
+            if i != last {
+                let last_ri = _ecs_cmd_ri_at(c0, last);
+                let last_rv = _ecs_cmd_rv_at(c0, last);
+                c0 = _ecs_cmd_set_ri(c0, i, last_ri);
+                c0 = _ecs_cmd_set_rv(c0, i, last_rv);
+            };
+            c0 = _ecs_cmd_set_ri(c0, last, 0);
+            c0 = _ecs_cmd_set_rv(c0, last, 0);
+            c0.r_count = last;
+            return c0;
+        };
+        i = i + 1;
+    }
+    return c0;
+}
+
+// get_resource: returns EcsCmdGetVal { found: 1/0, value: row_value_or_0 }.
+fn ecs_commands_get_resource(c: EcsCmdWorldDeep, resource_id: i32) -> EcsCmdGetVal {
+    let i: i32 = 0;
+    while i < c.r_count {
+        if _ecs_cmd_ri_at(c, i) == resource_id {
+            return EcsCmdGetVal { found: 1, value: _ecs_cmd_rv_at(c, i) };
+        };
+        i = i + 1;
+    }
+    return EcsCmdGetVal { found: 0, value: 0 };
+}
+
+// ── System registration ─────────────────────────────────────────────────────────────────
+// register_system: returns EcsCmdRegister { commands: updated, system_id: next_id }. At cap
+// returns EcsCmdRegister { commands: w unchanged, system_id: -1 } sentinel.
+fn ecs_commands_register_system(c0: EcsCmdWorldDeep) -> EcsCmdRegister {
+    if c0.rs_count >= ECS_CMD_WD_CAP_SYSTEMS {
+        return EcsCmdRegister { commands: c0, system_id: -1 };
+    };
+    let system_id = c0.next_system_id;
+    let slot = c0.rs_count;
+    c0 = _ecs_cmd_set_rs(c0, slot, system_id);
+    c0.rs_count = slot + 1;
+    c0.next_system_id = system_id + 1;
+    return EcsCmdRegister { commands: c0, system_id: system_id };
+}
+
+// unregister_system: swap-remove; returns EcsCmdBool { commands, ok }.
+fn ecs_commands_unregister_system(c0: EcsCmdWorldDeep, system_id: i32) -> EcsCmdBool {
+    let i: i32 = 0;
+    while i < c0.rs_count {
+        if _ecs_cmd_rs_at(c0, i) == system_id {
+            let last = c0.rs_count - 1;
+            if i != last {
+                let last_rs = _ecs_cmd_rs_at(c0, last);
+                c0 = _ecs_cmd_set_rs(c0, i, last_rs);
+            };
+            c0 = _ecs_cmd_set_rs(c0, last, 0);
+            c0.rs_count = last;
+            return EcsCmdBool { commands: c0, ok: 1 };
+        };
+        i = i + 1;
+    }
+    return EcsCmdBool { commands: c0, ok: 0 };
+}
+
+// run_system: enqueue ECS_CMD_WD_QUEUE onto the queue + return EcsCmdBool { ok: 1 }; else ok=0.
+fn ecs_commands_run_system(c0: EcsCmdWorldDeep, system_id: i32) -> EcsCmdBool {
+    let i: i32 = 0;
+    while i < c0.rs_count {
+        if _ecs_cmd_rs_at(c0, i) == system_id {
+            c0 = _ecs_cmd_enqueue(c0, ECS_CMD_WD_QUEUE);
+            return EcsCmdBool { commands: c0, ok: 1 };
+        };
+        i = i + 1;
+    }
+    return EcsCmdBool { commands: c0, ok: 0 };
+}
+
+// ── run_schedule: append label to schedule_labels list; no-op at cap. ────────────────────
+fn ecs_commands_run_schedule(c0: EcsCmdWorldDeep, label: i32) -> EcsCmdWorldDeep {
+    if c0.sl_count >= ECS_CMD_WD_CAP_SCHEDULE { return c0; };
+    let slot = c0.sl_count;
+    c0 = _ecs_cmd_set_sl(c0, slot, label);
+    c0.sl_count = slot + 1;
+    return c0;
+}
+
+// ── Queue / queue_handled / queue_silenced: enqueue the matching code. ─────────────────────
+fn ecs_commands_queue(c0: EcsCmdWorldDeep) -> EcsCmdWorldDeep {
+    return _ecs_cmd_enqueue(c0, ECS_CMD_WD_QUEUE);
+}
+
+fn ecs_commands_queue_handled(c0: EcsCmdWorldDeep) -> EcsCmdWorldDeep {
+    return _ecs_cmd_enqueue(c0, ECS_CMD_WD_QUEUE_HANDLED);
+}
+
+fn ecs_commands_queue_silenced(c0: EcsCmdWorldDeep) -> EcsCmdWorldDeep {
+    return _ecs_cmd_enqueue(c0, ECS_CMD_WD_QUEUE_SILENCED);
+}
+
+// ── write_message: enqueue the message_id code (mirrors shallow which pushes message_id to the
+//    command queue — the id is the discriminator).
+fn ecs_commands_write_message(c0: EcsCmdWorldDeep, message_id: i32) -> EcsCmdWorldDeep {
+    return _ecs_cmd_enqueue(c0, message_id);
+}
+
+// ── queue code introspection (used by tests for queue ordering asserts). ──────────────────
+fn ecs_commands_queue_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx < 0 { return -1; };
+    if idx >= c.cq_count { return -1; };
+    return _ecs_cmd_cq_at(c, idx);
+}
+
+// ── schedule label introspection (returned label at idx). ─────────────────────────────────
+fn ecs_commands_schedule_at(c: EcsCmdWorldDeep, idx: i32) -> i32 {
+    if idx < 0 { return -1; };
+    if idx >= c.sl_count { return -1; };
+    return _ecs_cmd_sl_at(c, idx);
+}

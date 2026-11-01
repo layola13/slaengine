@@ -1,0 +1,376 @@
+// Deepened Bevy ECS RequiredComponents surface.
+// Mirrors src/component/required.rs:
+//   RequiredComponent { id, constructor, depth }
+//   RequiredComponents direct vs all (depth-first), shallowest-depth wins for inherited
+//   register_dynamic_with: direct duplicate error; inherited override by shallower depth
+//   recursion/cycle detection
+//   RequiredComponentsError kinds
+//   RequiredComponentsRegistrator facade
+// Shallow lib/component_required.sla + required_components_dynamic.sla retained.
+// Fixed capacity: 8 entries in direct/all.
+
+// Error kinds
+fn ecs_rq_err_duplicate() -> i32 { return 0; }
+fn ecs_rq_err_cyclic() -> i32 { return 1; }
+fn ecs_rq_err_archetype_exists() -> i32 { return 2; }
+fn ecs_rq_err_none() -> i32 { return -1; }
+
+struct EcsRqComp {
+    component_id: i32,
+    constructor_id: i32,
+    depth: i32, // 0 = direct
+}
+
+fn ecs_rq_comp_new(component_id: i32, constructor_id: i32, depth: i32) -> EcsRqComp {
+    return EcsRqComp {
+        component_id: component_id, constructor_id: constructor_id, depth: depth,
+    };
+}
+
+struct EcsRqDeep {
+    // direct list
+    d_len: i32,
+    d0: EcsRqComp, d1: EcsRqComp, d2: EcsRqComp, d3: EcsRqComp,
+    // all list (including inherited)
+    a_len: i32,
+    a0: EcsRqComp, a1: EcsRqComp, a2: EcsRqComp, a3: EcsRqComp,
+    a4: EcsRqComp, a5: EcsRqComp, a6: EcsRqComp, a7: EcsRqComp,
+    last_ok: bool,
+    last_err: i32,
+}
+
+fn ecs_rq_empty_comp() -> EcsRqComp {
+    return EcsRqComp { component_id: -1, constructor_id: -1, depth: 0 };
+}
+
+fn ecs_rq_new() -> EcsRqDeep {
+    let e = ecs_rq_empty_comp();
+    return EcsRqDeep {
+        d_len: 0, d0: e, d1: e, d2: e, d3: e,
+        a_len: 0, a0: e, a1: e, a2: e, a3: e, a4: e, a5: e, a6: e, a7: e,
+        last_ok: true, last_err: -1,
+    };
+}
+
+fn ecs_rq_direct_len(r: EcsRqDeep) -> i32 { return r.d_len; }
+fn ecs_rq_all_len(r: EcsRqDeep) -> i32 { return r.a_len; }
+fn ecs_rq_last_ok(r: EcsRqDeep) -> bool { return r.last_ok; }
+fn ecs_rq_last_err(r: EcsRqDeep) -> i32 { return r.last_err; }
+
+fn ecs_rq_with_status(r: EcsRqDeep, ok: bool, err: i32) -> EcsRqDeep {
+    return EcsRqDeep {
+        d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+        a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+        last_ok: ok, last_err: err,
+    };
+}
+
+fn ecs_rq_direct_at(r: EcsRqDeep, idx: i32) -> EcsRqComp {
+    if idx == 0 { return r.d0; };
+    if idx == 1 { return r.d1; };
+    if idx == 2 { return r.d2; };
+    if idx == 3 { return r.d3; };
+    return ecs_rq_empty_comp();
+}
+
+fn ecs_rq_all_at(r: EcsRqDeep, idx: i32) -> EcsRqComp {
+    if idx == 0 { return r.a0; };
+    if idx == 1 { return r.a1; };
+    if idx == 2 { return r.a2; };
+    if idx == 3 { return r.a3; };
+    if idx == 4 { return r.a4; };
+    if idx == 5 { return r.a5; };
+    if idx == 6 { return r.a6; };
+    if idx == 7 { return r.a7; };
+    return ecs_rq_empty_comp();
+}
+
+fn ecs_rq_set_direct(r: EcsRqDeep, idx: i32, c: EcsRqComp) -> EcsRqDeep {
+    if idx == 0 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: c, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 1 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: c, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 2 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: c, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 3 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: c,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    return r;
+}
+
+fn ecs_rq_set_all(r: EcsRqDeep, idx: i32, c: EcsRqComp) -> EcsRqDeep {
+    if idx == 0 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: c, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 1 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: c, a2: r.a2, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 2 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: c, a3: r.a3, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 3 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: c, a4: r.a4, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 4 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: c, a5: r.a5, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    if idx == 5 {
+        return EcsRqDeep {
+            d_len: r.d_len, d0: r.d0, d1: r.d1, d2: r.d2, d3: r.d3,
+            a_len: r.a_len, a0: r.a0, a1: r.a1, a2: r.a2, a3: r.a3, a4: r.a4, a5: c, a6: r.a6, a7: r.a7,
+            last_ok: r.last_ok, last_err: r.last_err,
+        };
+    };
+    return r;
+}
+
+fn ecs_rq_find_direct(r: EcsRqDeep, component_id: i32) -> i32 {
+    if r.d_len >= 1 { if r.d0.component_id == component_id { return 0; }; };
+    if r.d_len >= 2 { if r.d1.component_id == component_id { return 1; }; };
+    if r.d_len >= 3 { if r.d2.component_id == component_id { return 2; }; };
+    if r.d_len >= 4 { if r.d3.component_id == component_id { return 3; }; };
+    return -1;
+}
+
+fn ecs_rq_find_all(r: EcsRqDeep, component_id: i32) -> i32 {
+    if r.a_len >= 1 { if r.a0.component_id == component_id { return 0; }; };
+    if r.a_len >= 2 { if r.a1.component_id == component_id { return 1; }; };
+    if r.a_len >= 3 { if r.a2.component_id == component_id { return 2; }; };
+    if r.a_len >= 4 { if r.a3.component_id == component_id { return 3; }; };
+    if r.a_len >= 5 { if r.a4.component_id == component_id { return 4; }; };
+    if r.a_len >= 6 { if r.a5.component_id == component_id { return 5; }; };
+    return -1;
+}
+
+fn ecs_rq_contains_all(r: EcsRqDeep, component_id: i32) -> bool {
+    if ecs_rq_find_all(r, component_id) >= 0 { return true; };
+    return false;
+}
+
+fn ecs_rq_contains_direct(r: EcsRqDeep, component_id: i32) -> bool {
+    if ecs_rq_find_direct(r, component_id) >= 0 { return true; };
+    return false;
+}
+
+fn ecs_rq_push_direct(r: EcsRqDeep, c: EcsRqComp) -> EcsRqDeep {
+    if r.d_len >= 4 { return r; };
+    let idx = r.d_len;
+    let r2 = ecs_rq_set_direct(r, idx, c);
+    return EcsRqDeep {
+        d_len: idx + 1, d0: r2.d0, d1: r2.d1, d2: r2.d2, d3: r2.d3,
+        a_len: r2.a_len, a0: r2.a0, a1: r2.a1, a2: r2.a2, a3: r2.a3, a4: r2.a4, a5: r2.a5, a6: r2.a6, a7: r2.a7,
+        last_ok: r2.last_ok, last_err: r2.last_err,
+    };
+}
+
+fn ecs_rq_push_all(r: EcsRqDeep, c: EcsRqComp) -> EcsRqDeep {
+    if r.a_len >= 6 { return r; };
+    let idx = r.a_len;
+    let r2 = ecs_rq_set_all(r, idx, c);
+    return EcsRqDeep {
+        d_len: r2.d_len, d0: r2.d0, d1: r2.d1, d2: r2.d2, d3: r2.d3,
+        a_len: idx + 1, a0: r2.a0, a1: r2.a1, a2: r2.a2, a3: r2.a3, a4: r2.a4, a5: r2.a5, a6: r2.a6, a7: r2.a7,
+        last_ok: r2.last_ok, last_err: r2.last_err,
+    };
+}
+
+// upsert into all: if missing insert; if present and new depth shallower, replace constructor+depth
+fn ecs_rq_upsert_all(r: EcsRqDeep, c: EcsRqComp) -> EcsRqDeep {
+    let idx = ecs_rq_find_all(r, c.component_id);
+    if idx < 0 {
+        return ecs_rq_push_all(r, c);
+    };
+    let old = ecs_rq_all_at(r, idx);
+    if c.depth < old.depth {
+        return ecs_rq_set_all(r, idx, c);
+    };
+    // equal depth on inherited: keep existing (Bevy keeps first)
+    return r;
+}
+
+// register direct required component (depth 0). Duplicate direct => error.
+fn ecs_rq_register_direct(r: EcsRqDeep, component_id: i32, constructor_id: i32) -> EcsRqDeep {
+    if ecs_rq_contains_direct(r, component_id) {
+        return ecs_rq_with_status(r, false, ecs_rq_err_duplicate());
+    };
+    let c = ecs_rq_comp_new(component_id, constructor_id, 0);
+    let r2 = ecs_rq_push_direct(r, c);
+    // direct also updates all, overriding inherited constructor
+    let idx = ecs_rq_find_all(r2, component_id);
+    if idx < 0 {
+        r2 = ecs_rq_push_all(r2, c);
+    } else {
+        r2 = ecs_rq_set_all(r2, idx, c);
+    };
+    return ecs_rq_with_status(r2, true, ecs_rq_err_none());
+}
+
+// register inherited required at depth > 0 (does not go into direct)
+fn ecs_rq_register_inherited(r: EcsRqDeep, component_id: i32, constructor_id: i32, depth: i32) -> EcsRqDeep {
+    if depth <= 0 {
+        return ecs_rq_register_direct(r, component_id, constructor_id);
+    };
+    // if already direct, keep direct (depth 0 always wins)
+    if ecs_rq_contains_direct(r, component_id) {
+        return ecs_rq_with_status(r, true, ecs_rq_err_none());
+    };
+    let c = ecs_rq_comp_new(component_id, constructor_id, depth);
+    let r2 = ecs_rq_upsert_all(r, c);
+    return ecs_rq_with_status(r2, true, ecs_rq_err_none());
+}
+
+// Model recursive inheritance: when registering direct X that itself requires [Y@d1, Z@d2],
+// append inherited with depth+1.
+// Here parent_required is a flat list of up to 2 inherited component ids + constructors.
+fn ecs_rq_register_direct_with_inherited(
+    r: EcsRqDeep,
+    component_id: i32,
+    constructor_id: i32,
+    inh0: i32, inh0c: i32,
+    inh1: i32, inh1c: i32,
+    inh_len: i32
+) -> EcsRqDeep {
+    let r2 = ecs_rq_register_direct(r, component_id, constructor_id);
+    if r2.last_ok != true {
+        return r2;
+    };
+    // inherited first in DFS: insert inherited before/around direct is complex;
+    // Bevy depth-first puts inherited requirements first. We append inherited then ensure order by depth.
+    if inh_len >= 1 {
+        r2 = ecs_rq_register_inherited(r2, inh0, inh0c, 1);
+    };
+    if inh_len >= 2 {
+        r2 = ecs_rq_register_inherited(r2, inh1, inh1c, 1);
+    };
+    return r2;
+}
+
+// Cycle detection against recursion stack (up to 4)
+fn ecs_rq_check_cycle(stack0: i32, stack1: i32, stack2: i32, stack3: i32, stack_len: i32, required: i32) -> bool {
+    // true if cycle
+    if stack_len >= 1 { if stack0 == required { return true; }; };
+    if stack_len >= 2 { if stack1 == required { return true; }; };
+    if stack_len >= 3 { if stack2 == required { return true; }; };
+    if stack_len >= 4 { if stack3 == required { return true; }; };
+    return false;
+}
+
+fn ecs_rq_register_checked(
+    r: EcsRqDeep,
+    component_id: i32,
+    constructor_id: i32,
+    stack0: i32, stack1: i32, stack2: i32, stack3: i32, stack_len: i32
+) -> EcsRqDeep {
+    if ecs_rq_check_cycle(stack0, stack1, stack2, stack3, stack_len, component_id) {
+        return ecs_rq_with_status(r, false, ecs_rq_err_cyclic());
+    };
+    return ecs_rq_register_direct(r, component_id, constructor_id);
+}
+
+fn ecs_rq_depth_of(r: EcsRqDeep, component_id: i32) -> (bool, i32) {
+    let idx = ecs_rq_find_all(r, component_id);
+    if idx < 0 { return (false, 0); };
+    let c = ecs_rq_all_at(r, idx);
+    return (true, c.depth);
+}
+
+fn ecs_rq_constructor_of(r: EcsRqDeep, component_id: i32) -> (bool, i32) {
+    let idx = ecs_rq_find_all(r, component_id);
+    if idx < 0 { return (false, 0); };
+    let c = ecs_rq_all_at(r, idx);
+    return (true, c.constructor_id);
+}
+
+fn ecs_rq_iter_ids_at(r: EcsRqDeep, idx: i32) -> i32 {
+    let c = ecs_rq_all_at(r, idx);
+    return c.component_id;
+}
+
+// Registrator facade
+struct EcsRqRegDeep {
+    target: i32,
+    required: EcsRqDeep,
+    next_component_id: i32,
+    archetype_exists: bool,
+}
+
+fn ecs_rq_reg_new(target: i32, next_component_id: i32) -> EcsRqRegDeep {
+    return EcsRqRegDeep {
+        target: target, required: ecs_rq_new(), next_component_id: next_component_id, archetype_exists: false,
+    };
+}
+
+fn ecs_rq_reg_target(r: EcsRqRegDeep) -> i32 { return r.target; }
+fn ecs_rq_reg_next_id(r: EcsRqRegDeep) -> i32 { return r.next_component_id; }
+fn ecs_rq_reg_required(r: EcsRqRegDeep) -> EcsRqDeep { return r.required; }
+fn ecs_rq_reg_set_archetype_exists(r: EcsRqRegDeep, exists: bool) -> EcsRqRegDeep {
+    return EcsRqRegDeep {
+        target: r.target, required: r.required, next_component_id: r.next_component_id, archetype_exists: exists,
+    };
+}
+
+fn ecs_rq_reg_register_required(r: EcsRqRegDeep, component_id: i32, constructor_id: i32) -> EcsRqRegDeep {
+    if r.archetype_exists {
+        let req = ecs_rq_with_status(r.required, false, ecs_rq_err_archetype_exists());
+        return EcsRqRegDeep {
+            target: r.target, required: req, next_component_id: r.next_component_id, archetype_exists: r.archetype_exists,
+        };
+    };
+    // cycle if required is target itself
+    if component_id == r.target {
+        let req = ecs_rq_with_status(r.required, false, ecs_rq_err_cyclic());
+        return EcsRqRegDeep {
+            target: r.target, required: req, next_component_id: r.next_component_id, archetype_exists: r.archetype_exists,
+        };
+    };
+    let req = ecs_rq_register_direct(r.required, component_id, constructor_id);
+    return EcsRqRegDeep {
+        target: r.target, required: req, next_component_id: r.next_component_id, archetype_exists: r.archetype_exists,
+    };
+}
+
+fn ecs_rq_reg_register_inherited(r: EcsRqRegDeep, component_id: i32, constructor_id: i32, depth: i32) -> EcsRqRegDeep {
+    let req = ecs_rq_register_inherited(r.required, component_id, constructor_id, depth);
+    return EcsRqRegDeep {
+        target: r.target, required: req, next_component_id: r.next_component_id, archetype_exists: r.archetype_exists,
+    };
+}

@@ -1,0 +1,435 @@
+// Deepened Bevy ECS UnsafeWorldCell + UnsafeEntityCell surface.
+// Mirrors src/world/unsafe_world_cell.rs (+ world/error tags used by get_entity).
+// Shallow lib/unsafe_world_cell.sla retained.
+// Fixed capacity: 4 resource slots, 4 entity component slots.
+
+const ECS_UWC_MODE_READONLY: i32 = 0;
+const ECS_UWC_MODE_MUTABLE: i32 = 1;
+
+const ECS_UWC_ENTITY_NOT_SPAWNED: i32 = 0;
+const ECS_UWC_ENTITY_SPAWNED: i32 = 1;
+
+const ECS_UWC_RES_MISSING: i32 = 0;
+const ECS_UWC_RES_PRESENT: i32 = 1;
+const ECS_UWC_RES_FORBIDDEN_MUT: i32 = 2;
+
+const ECS_UWC_COMP_MISSING: i32 = 0;
+const ECS_UWC_COMP_PRESENT: i32 = 1;
+const ECS_UWC_COMP_FORBIDDEN_MUT: i32 = 2;
+
+struct EcsUwcDeep {
+    world_id: i64,
+    mode: i32,
+    change_tick: i32,
+    last_change_tick: i32,
+    last_trigger_id: i32,
+    entity_count: i64,
+    archetype_count: i64,
+    component_count: i64,
+    bundle_count: i64,
+    // resource registry fixed 4: id + value + present flag
+    res_len: i32,
+    r0_id: i32, r0_val: i64, r0_on: i32,
+    r1_id: i32, r1_val: i64, r1_on: i32,
+    r2_id: i32, r2_val: i64, r2_on: i32,
+    r3_id: i32, r3_val: i64, r3_on: i32,
+    // entity component sparse: entity -> up to 4 component ids present
+    // modeled globally as entity-id-keyed presence for one "active" entity table simplified:
+    // for deep parity we track one entity's components via UnsafeEntityCell separately.
+}
+
+fn ecs_uwc_deep_new_readonly(world_id: i64) -> EcsUwcDeep {
+    return EcsUwcDeep {
+        world_id: world_id, mode: ECS_UWC_MODE_READONLY,
+        change_tick: 0, last_change_tick: 0, last_trigger_id: 0,
+        entity_count: 0, archetype_count: 0, component_count: 0, bundle_count: 0,
+        res_len: 0,
+        r0_id: -1, r0_val: 0, r0_on: 0,
+        r1_id: -1, r1_val: 0, r1_on: 0,
+        r2_id: -1, r2_val: 0, r2_on: 0,
+        r3_id: -1, r3_val: 0, r3_on: 0,
+    };
+}
+
+fn ecs_uwc_deep_new_mutable(world_id: i64) -> EcsUwcDeep {
+    let c = ecs_uwc_deep_new_readonly(world_id);
+    return EcsUwcDeep {
+        world_id: c.world_id, mode: ECS_UWC_MODE_MUTABLE,
+        change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+        entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+        res_len: c.res_len,
+        r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+        r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+        r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+        r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+    };
+}
+
+fn ecs_uwc_deep_id(c: EcsUwcDeep) -> i64 { return c.world_id; }
+fn ecs_uwc_deep_mode(c: EcsUwcDeep) -> i32 { return c.mode; }
+fn ecs_uwc_deep_is_mutable(c: EcsUwcDeep) -> bool {
+    if c.mode == ECS_UWC_MODE_MUTABLE { return true; };
+    return false;
+}
+fn ecs_uwc_deep_change_tick(c: EcsUwcDeep) -> i32 { return c.change_tick; }
+fn ecs_uwc_deep_last_change_tick(c: EcsUwcDeep) -> i32 { return c.last_change_tick; }
+fn ecs_uwc_deep_last_trigger_id(c: EcsUwcDeep) -> i32 { return c.last_trigger_id; }
+fn ecs_uwc_deep_entity_count(c: EcsUwcDeep) -> i64 { return c.entity_count; }
+fn ecs_uwc_deep_archetype_count(c: EcsUwcDeep) -> i64 { return c.archetype_count; }
+fn ecs_uwc_deep_component_count(c: EcsUwcDeep) -> i64 { return c.component_count; }
+fn ecs_uwc_deep_bundle_count(c: EcsUwcDeep) -> i64 { return c.bundle_count; }
+
+fn ecs_uwc_deep_set_counts(c: EcsUwcDeep, entities: i64, archetypes: i64, components: i64, bundles: i64) -> EcsUwcDeep {
+    return EcsUwcDeep {
+        world_id: c.world_id, mode: c.mode,
+        change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+        entity_count: entities, archetype_count: archetypes, component_count: components, bundle_count: bundles,
+        res_len: c.res_len,
+        r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+        r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+        r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+        r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+    };
+}
+
+fn ecs_uwc_deep_set_last_change_tick(c: EcsUwcDeep, tick: i32) -> EcsUwcDeep {
+    return EcsUwcDeep {
+        world_id: c.world_id, mode: c.mode,
+        change_tick: c.change_tick, last_change_tick: tick, last_trigger_id: c.last_trigger_id,
+        entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+        res_len: c.res_len,
+        r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+        r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+        r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+        r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+    };
+}
+
+// assert_allows_mutable_access: returns true if ok
+fn ecs_uwc_deep_assert_mutable(c: EcsUwcDeep) -> bool {
+    if c.mode == ECS_UWC_MODE_MUTABLE { return true; };
+    return false;
+}
+
+fn ecs_uwc_deep_increment_change_tick(c: EcsUwcDeep) -> EcsUwcDeep {
+    return EcsUwcDeep {
+        world_id: c.world_id, mode: c.mode,
+        change_tick: c.change_tick + 1, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+        entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+        res_len: c.res_len,
+        r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+        r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+        r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+        r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+    };
+}
+
+fn ecs_uwc_deep_increment_trigger_id(c: EcsUwcDeep) -> EcsUwcDeep {
+    return EcsUwcDeep {
+        world_id: c.world_id, mode: c.mode,
+        change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id + 1,
+        entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+        res_len: c.res_len,
+        r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+        r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+        r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+        r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+    };
+}
+
+struct EcsUwcEntityResultDeep {
+    kind: i32,
+    entity: i64,
+}
+
+fn ecs_uwc_entity_result_kind(r: EcsUwcEntityResultDeep) -> i32 { return r.kind; }
+fn ecs_uwc_entity_result_entity(r: EcsUwcEntityResultDeep) -> i64 { return r.entity; }
+fn ecs_uwc_entity_result_ok(r: EcsUwcEntityResultDeep) -> bool {
+    if r.kind == ECS_UWC_ENTITY_SPAWNED { return true; };
+    return false;
+}
+
+fn ecs_uwc_deep_get_entity(c: EcsUwcDeep, entity: i64) -> EcsUwcEntityResultDeep {
+    if entity < 0 {
+        return EcsUwcEntityResultDeep { kind: ECS_UWC_ENTITY_NOT_SPAWNED, entity: entity };
+    };
+    if entity >= c.entity_count {
+        return EcsUwcEntityResultDeep { kind: ECS_UWC_ENTITY_NOT_SPAWNED, entity: entity };
+    };
+    return EcsUwcEntityResultDeep { kind: ECS_UWC_ENTITY_SPAWNED, entity: entity };
+}
+
+// resource insert by id
+fn ecs_uwc_deep_insert_resource(c: EcsUwcDeep, rid: i32, val: i64) -> EcsUwcDeep {
+    // update existing
+    if c.res_len >= 1 { if c.r0_id == rid {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: c.res_len,
+            r0_id: rid, r0_val: val, r0_on: 1,
+            r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+            r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+            r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+        };
+    }; };
+    if c.res_len >= 2 { if c.r1_id == rid {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: c.res_len,
+            r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+            r1_id: rid, r1_val: val, r1_on: 1,
+            r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+            r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+        };
+    }; };
+    if c.res_len >= 3 { if c.r2_id == rid {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: c.res_len,
+            r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+            r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+            r2_id: rid, r2_val: val, r2_on: 1,
+            r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+        };
+    }; };
+    if c.res_len >= 4 { if c.r3_id == rid {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: c.res_len,
+            r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+            r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+            r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+            r3_id: rid, r3_val: val, r3_on: 1,
+        };
+    }; };
+    if c.res_len >= 4 { return c; };
+    let n = c.res_len;
+    if n == 0 {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: 1,
+            r0_id: rid, r0_val: val, r0_on: 1,
+            r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+            r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+            r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+        };
+    };
+    if n == 1 {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: 2,
+            r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+            r1_id: rid, r1_val: val, r1_on: 1,
+            r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+            r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+        };
+    };
+    if n == 2 {
+        return EcsUwcDeep {
+            world_id: c.world_id, mode: c.mode,
+            change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+            entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+            res_len: 3,
+            r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+            r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+            r2_id: rid, r2_val: val, r2_on: 1,
+            r3_id: c.r3_id, r3_val: c.r3_val, r3_on: c.r3_on,
+        };
+    };
+    return EcsUwcDeep {
+        world_id: c.world_id, mode: c.mode,
+        change_tick: c.change_tick, last_change_tick: c.last_change_tick, last_trigger_id: c.last_trigger_id,
+        entity_count: c.entity_count, archetype_count: c.archetype_count, component_count: c.component_count, bundle_count: c.bundle_count,
+        res_len: 4,
+        r0_id: c.r0_id, r0_val: c.r0_val, r0_on: c.r0_on,
+        r1_id: c.r1_id, r1_val: c.r1_val, r1_on: c.r1_on,
+        r2_id: c.r2_id, r2_val: c.r2_val, r2_on: c.r2_on,
+        r3_id: rid, r3_val: val, r3_on: 1,
+    };
+}
+
+struct EcsUwcResResultDeep {
+    kind: i32,
+    value: i64,
+    cell: EcsUwcDeep,
+}
+
+fn ecs_uwc_res_result_kind(r: EcsUwcResResultDeep) -> i32 { return r.kind; }
+fn ecs_uwc_res_result_value(r: EcsUwcResResultDeep) -> i64 { return r.value; }
+fn ecs_uwc_res_result_cell(r: EcsUwcResResultDeep) -> EcsUwcDeep { return r.cell; }
+fn ecs_uwc_res_result_ok(r: EcsUwcResResultDeep) -> bool {
+    if r.kind == ECS_UWC_RES_PRESENT { return true; };
+    return false;
+}
+
+fn ecs_uwc_deep_find_res(c: EcsUwcDeep, rid: i32) -> (bool, i64) {
+    if c.res_len >= 1 { if c.r0_id == rid { if c.r0_on != 0 { return (true, c.r0_val); }; }; };
+    if c.res_len >= 2 { if c.r1_id == rid { if c.r1_on != 0 { return (true, c.r1_val); }; }; };
+    if c.res_len >= 3 { if c.r2_id == rid { if c.r2_on != 0 { return (true, c.r2_val); }; }; };
+    if c.res_len >= 4 { if c.r3_id == rid { if c.r3_on != 0 { return (true, c.r3_val); }; }; };
+    return (false, 0);
+}
+
+fn ecs_uwc_deep_get_resource_by_id(c: EcsUwcDeep, rid: i32) -> EcsUwcResResultDeep {
+    let found = ecs_uwc_deep_find_res(c, rid);
+    if found.0 {
+        return EcsUwcResResultDeep { kind: ECS_UWC_RES_PRESENT, value: found.1, cell: c };
+    };
+    return EcsUwcResResultDeep { kind: ECS_UWC_RES_MISSING, value: 0, cell: c };
+}
+
+fn ecs_uwc_deep_get_resource_mut_by_id(c: EcsUwcDeep, rid: i32, new_val: i64) -> EcsUwcResResultDeep {
+    if ecs_uwc_deep_assert_mutable(c) != true {
+        return EcsUwcResResultDeep { kind: ECS_UWC_RES_FORBIDDEN_MUT, value: 0, cell: c };
+    };
+    let found = ecs_uwc_deep_find_res(c, rid);
+    if found.0 != true {
+        return EcsUwcResResultDeep { kind: ECS_UWC_RES_MISSING, value: 0, cell: c };
+    };
+    let c2 = ecs_uwc_deep_insert_resource(c, rid, new_val);
+    return EcsUwcResResultDeep { kind: ECS_UWC_RES_PRESENT, value: new_val, cell: c2 };
+}
+
+// UnsafeEntityCell
+struct EcsUecDeep {
+    world_id: i64,
+    mode: i32,
+    entity: i64,
+    spawn_tick: i32,
+    // components fixed 4
+    len: i32,
+    c0: i32, v0: i64,
+    c1: i32, v1: i64,
+    c2: i32, v2: i64,
+    c3: i32, v3: i64,
+}
+
+fn ecs_uec_deep_new(world: EcsUwcDeep, entity: i64) -> EcsUecDeep {
+    return EcsUecDeep {
+        world_id: world.world_id, mode: world.mode, entity: entity, spawn_tick: world.change_tick,
+        len: 0, c0: -1, v0: 0, c1: -1, v1: 0, c2: -1, v2: 0, c3: -1, v3: 0,
+    };
+}
+
+fn ecs_uec_deep_id(e: EcsUecDeep) -> i64 { return e.entity; }
+fn ecs_uec_deep_world_id(e: EcsUecDeep) -> i64 { return e.world_id; }
+fn ecs_uec_deep_spawn_tick(e: EcsUecDeep) -> i32 { return e.spawn_tick; }
+fn ecs_uec_deep_len(e: EcsUecDeep) -> i32 { return e.len; }
+
+fn ecs_uec_deep_insert(e: EcsUecDeep, cid: i32, val: i64) -> EcsUecDeep {
+    if e.len >= 1 { if e.c0 == cid {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: e.len, c0: cid, v0: val, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+        };
+    }; };
+    if e.len >= 2 { if e.c1 == cid {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: e.len, c0: e.c0, v0: e.v0, c1: cid, v1: val, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+        };
+    }; };
+    if e.len >= 3 { if e.c2 == cid {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: e.len, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: cid, v2: val, c3: e.c3, v3: e.v3,
+        };
+    }; };
+    if e.len >= 4 { if e.c3 == cid {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: e.len, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: cid, v3: val,
+        };
+    }; };
+    if e.len >= 4 { return e; };
+    if e.len == 0 {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: 1, c0: cid, v0: val, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+        };
+    };
+    if e.len == 1 {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: 2, c0: e.c0, v0: e.v0, c1: cid, v1: val, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+        };
+    };
+    if e.len == 2 {
+        return EcsUecDeep {
+            world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+            len: 3, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: cid, v2: val, c3: e.c3, v3: e.v3,
+        };
+    };
+    return EcsUecDeep {
+        world_id: e.world_id, mode: e.mode, entity: e.entity, spawn_tick: e.spawn_tick,
+        len: 4, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: cid, v3: val,
+    };
+}
+
+fn ecs_uec_deep_contains_id(e: EcsUecDeep, cid: i32) -> bool {
+    if e.len >= 1 { if e.c0 == cid { return true; }; };
+    if e.len >= 2 { if e.c1 == cid { return true; }; };
+    if e.len >= 3 { if e.c2 == cid { return true; }; };
+    if e.len >= 4 { if e.c3 == cid { return true; }; };
+    return false;
+}
+
+struct EcsUecCompResultDeep {
+    kind: i32,
+    value: i64,
+    cell: EcsUecDeep,
+}
+
+fn ecs_uec_comp_result_kind(r: EcsUecCompResultDeep) -> i32 { return r.kind; }
+fn ecs_uec_comp_result_value(r: EcsUecCompResultDeep) -> i64 { return r.value; }
+fn ecs_uec_comp_result_cell(r: EcsUecCompResultDeep) -> EcsUecDeep { return r.cell; }
+fn ecs_uec_comp_result_ok(r: EcsUecCompResultDeep) -> bool {
+    if r.kind == ECS_UWC_COMP_PRESENT { return true; };
+    return false;
+}
+
+fn ecs_uec_deep_get_by_id(e: EcsUecDeep, cid: i32) -> EcsUecCompResultDeep {
+    if e.len >= 1 { if e.c0 == cid {
+        return EcsUecCompResultDeep { kind: ECS_UWC_COMP_PRESENT, value: e.v0, cell: e };
+    }; };
+    if e.len >= 2 { if e.c1 == cid {
+        return EcsUecCompResultDeep { kind: ECS_UWC_COMP_PRESENT, value: e.v1, cell: e };
+    }; };
+    if e.len >= 3 { if e.c2 == cid {
+        return EcsUecCompResultDeep { kind: ECS_UWC_COMP_PRESENT, value: e.v2, cell: e };
+    }; };
+    if e.len >= 4 { if e.c3 == cid {
+        return EcsUecCompResultDeep { kind: ECS_UWC_COMP_PRESENT, value: e.v3, cell: e };
+    }; };
+    return EcsUecCompResultDeep { kind: ECS_UWC_COMP_MISSING, value: 0, cell: e };
+}
+
+fn ecs_uec_deep_get_mut_by_id(e: EcsUecDeep, cid: i32, new_val: i64) -> EcsUecCompResultDeep {
+    if e.mode != ECS_UWC_MODE_MUTABLE {
+        return EcsUecCompResultDeep { kind: ECS_UWC_COMP_FORBIDDEN_MUT, value: 0, cell: e };
+    };
+    if ecs_uec_deep_contains_id(e, cid) != true {
+        return EcsUecCompResultDeep { kind: ECS_UWC_COMP_MISSING, value: 0, cell: e };
+    };
+    let e2 = ecs_uec_deep_insert(e, cid, new_val);
+    return EcsUecCompResultDeep { kind: ECS_UWC_COMP_PRESENT, value: new_val, cell: e2 };
+}
+
+// metadata-only access always allowed even in readonly
+fn ecs_uwc_deep_metadata_ok(c: EcsUwcDeep) -> bool {
+    // always true; presence of function documents Bevy world_metadata safety
+    if c.world_id >= 0 { return true; };
+    return true;
+}

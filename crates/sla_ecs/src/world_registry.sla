@@ -1,0 +1,318 @@
+// Registry-driven component membership index.
+// This is the runtime sidecar that removes A/B-shaped lifecycle tracking from
+// entity/component membership. Typed value columns still live in typed stores.
+@import "component.sla"
+@import "entity_dynamic.sla"
+
+struct RegistryColumn {
+    info: ComponentInfo,
+    entity_ids: Vec<i32>,
+    added_ticks: Vec<i32>,
+    changed_ticks: Vec<i32>,
+}
+
+struct RegistryWorld {
+    entities: DynamicEntityAllocator,
+    registry: ComponentRegistry,
+    columns: Vec<RegistryColumn>,
+    change_tick: i32,
+}
+
+struct RegistryEntityQuery {
+    items: Vec<Entity>,
+}
+
+impl RegistryEntityQuery {
+    fn iter_len(&self) -> i64 {
+        return len(self.items) as i64;
+    }
+
+    fn iter_at(&self, index: i64) -> Entity {
+        return self.items[index];
+    }
+}
+
+fn registry_column_new(info: ComponentInfo) -> RegistryColumn {
+    let entity_ids: Vec<i32> = Vec::new();
+    let added_ticks: Vec<i32> = Vec::new();
+    let changed_ticks: Vec<i32> = Vec::new();
+    return RegistryColumn {
+        info: info,
+        entity_ids: entity_ids,
+        added_ticks: added_ticks,
+        changed_ticks: changed_ticks,
+    };
+}
+
+fn registry_entity_query_new() -> RegistryEntityQuery {
+    let items: Vec<Entity> = Vec::new();
+    return RegistryEntityQuery { items: items };
+}
+
+fn registry_world_new() -> RegistryWorld {
+    let columns: Vec<RegistryColumn> = Vec::new();
+    return RegistryWorld {
+        entities: dyn_allocator_new(),
+        registry: component_registry_new(),
+        columns: columns,
+        change_tick: 1,
+    };
+}
+
+fn registry_world_increment_tick(world: RegistryWorld) -> RegistryWorld {
+    world.change_tick = world.change_tick + 1;
+    return world;
+}
+
+fn registry_world_register_table(world: RegistryWorld) -> (RegistryWorld, ComponentInfo) {
+    let (next_registry, info) = component_register_table(world.registry);
+    world.registry = next_registry;
+    world.columns.push(registry_column_new(info));
+    return (world, info);
+}
+
+fn registry_world_register_sparse_set(world: RegistryWorld) -> (RegistryWorld, ComponentInfo) {
+    let (next_registry, info) = component_register_sparse_set(world.registry);
+    world.registry = next_registry;
+    world.columns.push(registry_column_new(info));
+    return (world, info);
+}
+
+fn registry_world_component_count(world: RegistryWorld) -> i64 {
+    return len(world.columns) as i64;
+}
+
+fn registry_world_column_slot(world: RegistryWorld, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.columns) as i64;
+    while i < cnt {
+        if world.columns[i].info.id == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn registry_world_spawn(world: RegistryWorld) -> (RegistryWorld, Entity) {
+    let (allocator, entity) = dyn_alloc_entity(world.entities);
+    world.entities = allocator;
+    return (world, entity);
+}
+
+fn registry_world_is_alive(world: RegistryWorld, entity: Entity) -> bool {
+    return dyn_is_alive(world.entities, entity);
+}
+
+fn registry_world_entity_count(world: RegistryWorld) -> i32 {
+    let count: i32 = 0;
+    let i: i32 = 1;
+    let cnt = len(world.entities.occupied) as i32;
+    while i < cnt {
+        if world.entities.occupied[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn registry_world_insert_component(world: RegistryWorld, entity: Entity, component_id: i32) -> RegistryWorld {
+    if registry_world_is_alive(world, entity) != true { panic(8701); };
+    let column_slot = registry_world_column_slot(world, component_id);
+    if column_slot < 0 { panic(8702); };
+    let entity_slot: i64 = -1;
+    let scan: i64 = 0;
+    let scan_count = len(world.columns[column_slot].entity_ids) as i64;
+    while scan < scan_count {
+        if world.columns[column_slot].entity_ids[scan] == entity.id { entity_slot = scan + 0; };
+        scan = scan + 1;
+    }
+    if entity_slot >= 0 {
+        world.columns[column_slot].changed_ticks[entity_slot] = world.change_tick;
+        return world;
+    };
+    world.columns[column_slot].entity_ids.push(entity.id);
+    world.columns[column_slot].added_ticks.push(world.change_tick);
+    world.columns[column_slot].changed_ticks.push(world.change_tick);
+    return world;
+}
+
+fn registry_world_remove_component(world: RegistryWorld, entity: Entity, component_id: i32) -> RegistryWorld {
+    let column_slot = registry_world_column_slot(world, component_id);
+    if column_slot < 0 { return world; };
+    let entity_slot: i64 = -1;
+    let scan: i64 = 0;
+    let scan_count = len(world.columns[column_slot].entity_ids) as i64;
+    while scan < scan_count {
+        if world.columns[column_slot].entity_ids[scan] == entity.id { entity_slot = scan + 0; };
+        scan = scan + 1;
+    }
+    if entity_slot < 0 { return world; };
+    let last = (len(world.columns[column_slot].entity_ids) as i64) - 1;
+    if entity_slot != last {
+        world.columns[column_slot].entity_ids[entity_slot] = world.columns[column_slot].entity_ids[last];
+        world.columns[column_slot].added_ticks[entity_slot] = world.columns[column_slot].added_ticks[last];
+        world.columns[column_slot].changed_ticks[entity_slot] = world.columns[column_slot].changed_ticks[last];
+    };
+    let removed_entity = world.columns[column_slot].entity_ids.remove(last);
+    let removed_added = world.columns[column_slot].added_ticks.remove(last);
+    let removed_changed = world.columns[column_slot].changed_ticks.remove(last);
+    return world;
+}
+
+fn registry_world_has_component(world: RegistryWorld, entity: Entity, component_id: i32) -> bool {
+    if registry_world_is_alive(world, entity) != true { return false; };
+    let column_slot = registry_world_column_slot(world, component_id);
+    if column_slot < 0 { return false; };
+    let scan: i64 = 0;
+    let scan_count = len(world.columns[column_slot].entity_ids) as i64;
+    while scan < scan_count {
+        if world.columns[column_slot].entity_ids[scan] == entity.id { return true; };
+        scan = scan + 1;
+    }
+    return false;
+}
+
+fn registry_world_component_added_since(world: RegistryWorld, entity: Entity, component_id: i32, tick: i32) -> bool {
+    if registry_world_has_component(world, entity, component_id) != true { return false; };
+    let column_slot = registry_world_column_slot(world, component_id);
+    let entity_slot: i64 = -1;
+    let scan: i64 = 0;
+    let scan_count = len(world.columns[column_slot].entity_ids) as i64;
+    while scan < scan_count {
+        if world.columns[column_slot].entity_ids[scan] == entity.id { entity_slot = scan + 0; };
+        scan = scan + 1;
+    }
+    return world.columns[column_slot].added_ticks[entity_slot] > tick;
+}
+
+fn registry_world_component_changed_since(world: RegistryWorld, entity: Entity, component_id: i32, tick: i32) -> bool {
+    if registry_world_has_component(world, entity, component_id) != true { return false; };
+    let column_slot = registry_world_column_slot(world, component_id);
+    let entity_slot: i64 = -1;
+    let scan: i64 = 0;
+    let scan_count = len(world.columns[column_slot].entity_ids) as i64;
+    while scan < scan_count {
+        if world.columns[column_slot].entity_ids[scan] == entity.id { entity_slot = scan + 0; };
+        scan = scan + 1;
+    }
+    return world.columns[column_slot].changed_ticks[entity_slot] > tick;
+}
+
+fn registry_world_query_component(world: RegistryWorld, component_id: i32) -> RegistryEntityQuery {
+    let query = registry_entity_query_new();
+    let column_slot = registry_world_column_slot(world, component_id);
+    if column_slot < 0 { return query; };
+    let column = world.columns[column_slot];
+    let i: i64 = 0;
+    let cnt = len(column.entity_ids) as i64;
+    while i < cnt {
+        let eid = column.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if registry_world_is_alive(world, entity) {
+            query.items.push(entity);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_world_query_with_without(world: RegistryWorld, with_component_id: i32, without_component_id: i32) -> RegistryEntityQuery {
+    let query = registry_entity_query_new();
+    let base = registry_world_query_component(world, with_component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let entity = base.items[i];
+        if registry_world_has_component(world, entity, without_component_id) != true {
+            query.items.push(entity);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_world_query_changed_since(world: RegistryWorld, component_id: i32, tick: i32) -> RegistryEntityQuery {
+    let query = registry_entity_query_new();
+    let base = registry_world_query_component(world, component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let entity = base.items[i];
+        if registry_world_component_changed_since(world, entity, component_id, tick) {
+            query.items.push(entity);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_world_despawn(world: RegistryWorld, entity: Entity) -> RegistryWorld {
+    if registry_world_is_alive(world, entity) != true { return world; };
+    let i: i64 = 0;
+    let cnt = len(world.columns) as i64;
+    while i < cnt {
+        let component_id = world.columns[i].info.id;
+        world = registry_world_remove_component(world, entity, component_id);
+        i = i + 1;
+    }
+    world.entities = dyn_free_entity(world.entities, entity);
+    return world;
+}
+
+@test "registry world tracks arbitrary component membership"() {
+    let w0 = registry_world_new();
+    let (w1, position) = registry_world_register_table(w0);
+    let (w2, velocity) = registry_world_register_table(w1);
+    let (w3, marker) = registry_world_register_sparse_set(w2);
+    if registry_world_component_count(w3) != 3 { panic(8710); };
+    if storage_kind_is_table(^position.storage) != true { panic(8711); };
+    if storage_kind_is_sparse_set(^marker.storage) != true { panic(8712); };
+    let (w4, e1) = registry_world_spawn(w3);
+    let (w5, e2) = registry_world_spawn(w4);
+    let w6 = registry_world_insert_component(w5, e1, position.id);
+    let w7 = registry_world_insert_component(w6, e1, velocity.id);
+    let w8 = registry_world_insert_component(w7, e2, position.id);
+    let w9 = registry_world_insert_component(w8, e2, marker.id);
+    if registry_world_has_component(w9, e1, position.id) != true { panic(8713); };
+    if registry_world_has_component(w9, e1, marker.id) != false { panic(8714); };
+    let q = registry_world_query_component(w9, position.id);
+    if len(q.items) != 2 { panic(8715); };
+    let filtered = registry_world_query_with_without(w9, position.id, marker.id);
+    if len(filtered.items) != 1 { panic(8716); };
+    if filtered.items[0].id != e1.id { panic(8717); };
+}
+
+@test "registry world added changed and despawn cleanup"() {
+    let w0 = registry_world_new();
+    let (w1, health) = registry_world_register_table(w0);
+    let (w2, tag) = registry_world_register_sparse_set(w1);
+    let (w3, entity) = registry_world_spawn(w2);
+    let before = w3.change_tick;
+    let w4 = registry_world_insert_component(w3, entity, health.id);
+    if registry_world_component_added_since(w4, entity, health.id, before - 1) != true { panic(8720); };
+    if registry_world_component_changed_since(w4, entity, health.id, before - 1) != true { panic(8721); };
+    let w5 = registry_world_increment_tick(w4);
+    let w6 = registry_world_insert_component(w5, entity, health.id);
+    if registry_world_component_added_since(w6, entity, health.id, before) != false { panic(8722); };
+    if registry_world_component_changed_since(w6, entity, health.id, before) != true { panic(8723); };
+    let changed = registry_world_query_changed_since(w6, health.id, before);
+    if len(changed.items) != 1 { panic(8724); };
+    let w7 = registry_world_insert_component(w6, entity, tag.id);
+    let w8 = registry_world_despawn(w7, entity);
+    if registry_world_is_alive(w8, entity) != false { panic(8725); };
+    if registry_world_has_component(w8, entity, health.id) != false { panic(8726); };
+    if registry_world_query_component(w8, health.id).iter_len() != 0 { panic(8727); };
+}
+
+@test "registry entity query supports for in"() {
+    let w0 = registry_world_new();
+    let (w1, component) = registry_world_register_table(w0);
+    let (w2, e1) = registry_world_spawn(w1);
+    let (w3, e2) = registry_world_spawn(w2);
+    let w4 = registry_world_insert_component(w3, e1, component.id);
+    let w5 = registry_world_insert_component(w4, e2, component.id);
+    let q = registry_world_query_component(w5, component.id);
+    let total: i32 = 0;
+    for entity in q {
+        total = total + entity.id;
+    }
+    if total != e1.id + e2.id { panic(8730); };
+}

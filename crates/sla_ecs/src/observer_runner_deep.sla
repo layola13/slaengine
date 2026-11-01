@@ -1,0 +1,352 @@
+// Deepened Bevy ECS observer runner surface.
+// Mirrors src/observer/runner.rs:
+//   ObserverRunner(DeferredWorld, observer, TriggerContext, event_ptr, trigger_ptr)
+//   observer_system_runner:
+//     - reentrancy guard via last_trigger_id == world.last_trigger_id
+//     - evaluate conditions with AND, non-short-circuit for bookkeeping
+//     - build On payload; run system; map RunSystemError::Failed to error handler
+//     - ErrorContext::Observer { name, last_run }
+//     - fallback error handler when Observer has none
+// Shallow lib/observer_runner.sla retained.
+
+// === Result / skip codes ===
+const ECS_OR_OK: i32 = 0;
+const ECS_OR_SKIP_SAME_TRIGGER: i32 = 1;
+const ECS_OR_SKIP_CONDITION: i32 = 2;
+const ECS_OR_SYSTEM_FAILED: i32 = 3;
+const ECS_OR_MISSING_OBSERVER: i32 = 4;
+
+fn ecs_or_ok() -> i32 { return ECS_OR_OK; }
+fn ecs_or_skip_same_trigger() -> i32 { return ECS_OR_SKIP_SAME_TRIGGER; }
+fn ecs_or_skip_condition() -> i32 { return ECS_OR_SKIP_CONDITION; }
+fn ecs_or_system_failed() -> i32 { return ECS_OR_SYSTEM_FAILED; }
+fn ecs_or_missing_observer() -> i32 { return ECS_OR_MISSING_OBSERVER; }
+
+// === TriggerContext (event_key + caller) ===
+struct EcsOrTriggerContextDeep {
+    event_key: i64,
+    caller: i64,
+    has_caller: bool,
+}
+
+fn ecs_or_ctx_new(event_key: i64, caller: i64, has_caller: bool) -> EcsOrTriggerContextDeep {
+    return EcsOrTriggerContextDeep {
+        event_key: event_key,
+        caller: caller,
+        has_caller: has_caller,
+    };
+}
+
+fn ecs_or_ctx_event_key(c: EcsOrTriggerContextDeep) -> i64 { return c.event_key; }
+fn ecs_or_ctx_caller(c: EcsOrTriggerContextDeep) -> i64 { return c.caller; }
+fn ecs_or_ctx_has_caller(c: EcsOrTriggerContextDeep) -> bool { return c.has_caller; }
+
+// === On payload built by runner ===
+struct EcsOrOnDeep {
+    event_value: i64,
+    observer: i64,
+    trigger_target: i64,
+    event_key: i64,
+    caller: i64,
+}
+
+fn ecs_or_on_event(o: EcsOrOnDeep) -> i64 { return o.event_value; }
+fn ecs_or_on_observer(o: EcsOrOnDeep) -> i64 { return o.observer; }
+fn ecs_or_on_target(o: EcsOrOnDeep) -> i64 { return o.trigger_target; }
+fn ecs_or_on_event_key(o: EcsOrOnDeep) -> i64 { return o.event_key; }
+fn ecs_or_on_caller(o: EcsOrOnDeep) -> i64 { return o.caller; }
+
+// === ErrorContext::Observer ===
+struct EcsOrErrorContextDeep {
+    name_id: i64,
+    last_run: i64,
+    is_observer: bool,
+}
+
+fn ecs_or_err_ctx_name(c: EcsOrErrorContextDeep) -> i64 { return c.name_id; }
+fn ecs_or_err_ctx_last_run(c: EcsOrErrorContextDeep) -> i64 { return c.last_run; }
+fn ecs_or_err_ctx_is_observer(c: EcsOrErrorContextDeep) -> bool { return c.is_observer; }
+
+// === Observer component state (simplified) ===
+// conditions: up to 4 bool results (AND, evaluate all)
+// system modeled by func_id + last_run + name_id + fail_mode
+const ECS_OR_SYS_OK: i32 = 0;
+const ECS_OR_SYS_FAILED: i32 = 1; // RunSystemError::Failed
+const ECS_OR_SYS_SKIPPED: i32 = 2; // other RunSystemError — not handled as Failed
+
+struct EcsOrObserverDeep {
+    entity: i64,
+    last_trigger_id: i64,
+    cond0: bool,
+    cond1: bool,
+    cond2: bool,
+    cond3: bool,
+    cond_len: i32,
+    system_name_id: i64,
+    system_last_run: i64,
+    system_fail_mode: i32,
+    has_error_handler: bool,
+    error_handler_id: i64,
+    run_count: i64,
+    last_event_value: i64,
+}
+
+fn ecs_or_observer_new(entity: i64, name_id: i64) -> EcsOrObserverDeep {
+    return EcsOrObserverDeep {
+        entity: entity,
+        last_trigger_id: -1,
+        cond0: true,
+        cond1: true,
+        cond2: true,
+        cond3: true,
+        cond_len: 0,
+        system_name_id: name_id,
+        system_last_run: 0,
+        system_fail_mode: ECS_OR_SYS_OK,
+        has_error_handler: false,
+        error_handler_id: 0,
+        run_count: 0,
+        last_event_value: 0,
+    };
+}
+
+fn ecs_or_observer_entity(o: EcsOrObserverDeep) -> i64 { return o.entity; }
+fn ecs_or_observer_last_trigger(o: EcsOrObserverDeep) -> i64 { return o.last_trigger_id; }
+fn ecs_or_observer_run_count(o: EcsOrObserverDeep) -> i64 { return o.run_count; }
+fn ecs_or_observer_last_event(o: EcsOrObserverDeep) -> i64 { return o.last_event_value; }
+fn ecs_or_observer_name(o: EcsOrObserverDeep) -> i64 { return o.system_name_id; }
+fn ecs_or_observer_last_run(o: EcsOrObserverDeep) -> i64 { return o.system_last_run; }
+fn ecs_or_observer_has_handler(o: EcsOrObserverDeep) -> bool { return o.has_error_handler; }
+fn ecs_or_observer_handler_id(o: EcsOrObserverDeep) -> i64 { return o.error_handler_id; }
+fn ecs_or_observer_cond_len(o: EcsOrObserverDeep) -> i32 { return o.cond_len; }
+
+fn ecs_or_observer_set_fail_mode(o: EcsOrObserverDeep, mode: i32) -> EcsOrObserverDeep {
+    o.system_fail_mode = mode;
+    return o;
+}
+
+fn ecs_or_observer_set_handler(o: EcsOrObserverDeep, handler_id: i64) -> EcsOrObserverDeep {
+    o.has_error_handler = true;
+    o.error_handler_id = handler_id;
+    return o;
+}
+
+fn ecs_or_observer_clear_handler(o: EcsOrObserverDeep) -> EcsOrObserverDeep {
+    o.has_error_handler = false;
+    o.error_handler_id = 0;
+    return o;
+}
+
+fn ecs_or_observer_push_condition(o: EcsOrObserverDeep, result: bool) -> EcsOrObserverDeep {
+    if o.cond_len == 0 {
+        o.cond0 = result;
+        o.cond_len = 1;
+        return o;
+    };
+    if o.cond_len == 1 {
+        o.cond1 = result;
+        o.cond_len = 2;
+        return o;
+    };
+    if o.cond_len == 2 {
+        o.cond2 = result;
+        o.cond_len = 3;
+        return o;
+    };
+    if o.cond_len == 3 {
+        o.cond3 = result;
+        o.cond_len = 4;
+        return o;
+    };
+    return o;
+}
+
+// Non-short-circuit AND fold (still evaluates all for change-detection parity)
+fn ecs_or_observer_eval_conditions(o: EcsOrObserverDeep) -> (bool, i32) {
+    let should = true;
+    let checked: i32 = 0;
+    if o.cond_len >= 1 {
+        should = should && o.cond0;
+        checked = checked + 1;
+    };
+    if o.cond_len >= 2 {
+        should = should && o.cond1;
+        checked = checked + 1;
+    };
+    if o.cond_len >= 3 {
+        should = should && o.cond2;
+        checked = checked + 1;
+    };
+    if o.cond_len >= 4 {
+        should = should && o.cond3;
+        checked = checked + 1;
+    };
+    return (should, checked);
+}
+
+// === World trigger state for runner ===
+struct EcsOrWorldDeep {
+    last_trigger_id: i64,
+    fallback_handler_id: i64,
+    // last run diagnostics
+    last_status: i32,
+    last_handler_id: i64,
+    last_err_name: i64,
+    last_err_last_run: i64,
+    last_on_event: i64,
+    last_on_observer: i64,
+    last_conditions_checked: i32,
+    run_invocations: i64,
+}
+
+fn ecs_or_world_new(fallback_handler_id: i64) -> EcsOrWorldDeep {
+    return EcsOrWorldDeep {
+        last_trigger_id: 0,
+        fallback_handler_id: fallback_handler_id,
+        last_status: ECS_OR_OK,
+        last_handler_id: 0,
+        last_err_name: 0,
+        last_err_last_run: 0,
+        last_on_event: 0,
+        last_on_observer: 0,
+        last_conditions_checked: 0,
+        run_invocations: 0,
+    };
+}
+
+fn ecs_or_world_bump_trigger(w: EcsOrWorldDeep) -> EcsOrWorldDeep {
+    w.last_trigger_id = w.last_trigger_id + 1;
+    return w;
+}
+
+fn ecs_or_world_set_trigger(w: EcsOrWorldDeep, id: i64) -> EcsOrWorldDeep {
+    w.last_trigger_id = id;
+    return w;
+}
+
+fn ecs_or_world_last_trigger(w: EcsOrWorldDeep) -> i64 { return w.last_trigger_id; }
+fn ecs_or_world_last_status(w: EcsOrWorldDeep) -> i32 { return w.last_status; }
+fn ecs_or_world_last_handler(w: EcsOrWorldDeep) -> i64 { return w.last_handler_id; }
+fn ecs_or_world_last_err_name(w: EcsOrWorldDeep) -> i64 { return w.last_err_name; }
+fn ecs_or_world_last_err_last_run(w: EcsOrWorldDeep) -> i64 { return w.last_err_last_run; }
+fn ecs_or_world_last_on_event(w: EcsOrWorldDeep) -> i64 { return w.last_on_event; }
+fn ecs_or_world_last_on_observer(w: EcsOrWorldDeep) -> i64 { return w.last_on_observer; }
+fn ecs_or_world_last_conditions_checked(w: EcsOrWorldDeep) -> i32 { return w.last_conditions_checked; }
+fn ecs_or_world_run_invocations(w: EcsOrWorldDeep) -> i64 { return w.run_invocations; }
+fn ecs_or_world_fallback(w: EcsOrWorldDeep) -> i64 { return w.fallback_handler_id; }
+
+// Core runner: returns (world, observer, status)
+fn ecs_or_run(
+    w: EcsOrWorldDeep,
+    o: EcsOrObserverDeep,
+    ctx: EcsOrTriggerContextDeep,
+    event_value: i64,
+    trigger_target: i64
+) -> (EcsOrWorldDeep, EcsOrObserverDeep, i32) {
+    w.run_invocations = w.run_invocations + 1;
+
+    // Reentrancy / same-trigger guard
+    if o.last_trigger_id == w.last_trigger_id {
+        w.last_status = ECS_OR_SKIP_SAME_TRIGGER;
+        return (w, o, ECS_OR_SKIP_SAME_TRIGGER);
+    };
+    o.last_trigger_id = w.last_trigger_id;
+
+    // Conditions AND (non-short-circuit count)
+    let cond = ecs_or_observer_eval_conditions(o);
+    let should = cond.0;
+    let checked = cond.1;
+    w.last_conditions_checked = checked;
+    if should != true {
+        w.last_status = ECS_OR_SKIP_CONDITION;
+        return (w, o, ECS_OR_SKIP_CONDITION);
+    };
+
+    // Build On
+    let on = EcsOrOnDeep {
+        event_value: event_value,
+        observer: o.entity,
+        trigger_target: trigger_target,
+        event_key: ctx.event_key,
+        caller: ctx.caller,
+    };
+    w.last_on_event = on.event_value;
+    w.last_on_observer = on.observer;
+
+    // Run system
+    let fail_mode = o.system_fail_mode;
+    if fail_mode == ECS_OR_SYS_FAILED {
+        // ErrorContext::Observer
+        let name_id = o.system_name_id;
+        let last_run = o.system_last_run;
+        w.last_err_name = name_id;
+        w.last_err_last_run = last_run;
+        let handler = w.fallback_handler_id;
+        if o.has_error_handler {
+            handler = o.error_handler_id;
+        };
+        w.last_handler_id = handler;
+        w.last_status = ECS_OR_SYSTEM_FAILED;
+        // last_run still advances on attempt
+        o.system_last_run = o.system_last_run + 1;
+        return (w, o, ECS_OR_SYSTEM_FAILED);
+    };
+
+    // Success (Skipped other errors not treated as Failed — still count as OK path without handler)
+    o.run_count = o.run_count + 1;
+    o.last_event_value = event_value;
+    o.system_last_run = o.system_last_run + 1;
+    w.last_handler_id = 0;
+    w.last_status = ECS_OR_OK;
+    return (w, o, ECS_OR_OK);
+}
+
+// Convenience: trigger world then run
+fn ecs_or_trigger_and_run(
+    w: EcsOrWorldDeep,
+    o: EcsOrObserverDeep,
+    ctx: EcsOrTriggerContextDeep,
+    event_value: i64,
+    trigger_target: i64
+) -> (EcsOrWorldDeep, EcsOrObserverDeep, i32) {
+    w = ecs_or_world_bump_trigger(w);
+    return ecs_or_run(w, o, ctx, event_value, trigger_target);
+}
+
+// Multi-observer fanout: run up to 3 observers against same world trigger id
+struct EcsOrFanoutResultDeep {
+    status0: i32,
+    status1: i32,
+    status2: i32,
+    count: i32,
+}
+
+fn ecs_or_fanout_status0(r: EcsOrFanoutResultDeep) -> i32 { return r.status0; }
+fn ecs_or_fanout_status1(r: EcsOrFanoutResultDeep) -> i32 { return r.status1; }
+fn ecs_or_fanout_status2(r: EcsOrFanoutResultDeep) -> i32 { return r.status2; }
+fn ecs_or_fanout_count(r: EcsOrFanoutResultDeep) -> i32 { return r.count; }
+
+fn ecs_or_run_two(
+    w: EcsOrWorldDeep,
+    a: EcsOrObserverDeep,
+    b: EcsOrObserverDeep,
+    ctx: EcsOrTriggerContextDeep,
+    event_value: i64,
+    trigger_target: i64
+) -> (EcsOrWorldDeep, EcsOrObserverDeep, EcsOrObserverDeep, EcsOrFanoutResultDeep) {
+    let r0 = ecs_or_run(w, a, ctx, event_value, trigger_target);
+    w = r0.0;
+    a = r0.1;
+    let s0 = r0.2;
+    let r1 = ecs_or_run(w, b, ctx, event_value, trigger_target);
+    w = r1.0;
+    b = r1.1;
+    let s1 = r1.2;
+    let fan = EcsOrFanoutResultDeep {
+        status0: s0,
+        status1: s1,
+        status2: ECS_OR_OK,
+        count: 2,
+    };
+    return (w, a, b, fan);
+}

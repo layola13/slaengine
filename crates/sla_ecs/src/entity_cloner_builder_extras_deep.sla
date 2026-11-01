@@ -1,0 +1,631 @@
+// Deepened Bevy ECS EntityClonerBuilder extras surface.
+// Mirrors src/entity/clone_entities.rs EntityClonerBuilder gaps:
+//   with_default_clone_fn
+//   override_clone_behavior_with_id / remove_clone_behavior_override_with_id
+//   without_required_components (OptIn scope: attach_required_components=false)
+//   without_required_by_components (OptOut scope: attach_required_by_components=false)
+//   allow/deny with optional required-component expansion via registry table
+// Fixed capacity: 4 overrides, 4 allow, 4 deny, 4 required edges.
+// Shallow lib/entity_cloner_builder_extras.sla retained.
+
+const ECS_ECBE_MODE_OPT_OUT: i32 = 0;
+const ECS_ECBE_MODE_OPT_IN: i32 = 1;
+
+const ECS_ECBE_BEH_IGNORE: i32 = 0;
+const ECS_ECBE_BEH_CLONE: i32 = 1;
+const ECS_ECBE_BEH_REFLECT: i32 = 2;
+const ECS_ECBE_BEH_CUSTOM: i32 = 3;
+
+// Required-component edge table: component -> required component
+struct EcsEcbeReqDeep {
+    r0s: i32, r0t: i32,
+    r1s: i32, r1t: i32,
+    r2s: i32, r2t: i32,
+    r3s: i32, r3t: i32,
+    len: i32,
+}
+
+fn ecs_ecbe_req_new() -> EcsEcbeReqDeep {
+    return EcsEcbeReqDeep {
+        r0s: -1, r0t: -1, r1s: -1, r1t: -1, r2s: -1, r2t: -1, r3s: -1, r3t: -1, len: 0,
+    };
+}
+
+fn ecs_ecbe_req_rebuild(
+    r0s: i32, r0t: i32, r1s: i32, r1t: i32, r2s: i32, r2t: i32, r3s: i32, r3t: i32, len: i32
+) -> EcsEcbeReqDeep {
+    return EcsEcbeReqDeep {
+        r0s: r0s, r0t: r0t, r1s: r1s, r1t: r1t, r2s: r2s, r2t: r2t, r3s: r3s, r3t: r3t, len: len,
+    };
+}
+
+fn ecs_ecbe_req_add(r: EcsEcbeReqDeep, source: i32, required: i32) -> EcsEcbeReqDeep {
+    if r.len == 0 {
+        return ecs_ecbe_req_rebuild(source, required, r.r1s, r.r1t, r.r2s, r.r2t, r.r3s, r.r3t, 1);
+    };
+    if r.len == 1 {
+        return ecs_ecbe_req_rebuild(r.r0s, r.r0t, source, required, r.r2s, r.r2t, r.r3s, r.r3t, 2);
+    };
+    if r.len == 2 {
+        return ecs_ecbe_req_rebuild(r.r0s, r.r0t, r.r1s, r.r1t, source, required, r.r3s, r.r3t, 3);
+    };
+    if r.len == 3 {
+        return ecs_ecbe_req_rebuild(r.r0s, r.r0t, r.r1s, r.r1t, r.r2s, r.r2t, source, required, 4);
+    };
+    return r;
+}
+
+fn ecs_ecbe_req_len(r: EcsEcbeReqDeep) -> i32 { return r.len; }
+
+// Builder extras deep state
+struct EcsEcbeDeep {
+    mode: i32,
+    default_clone_fn: i32,
+    // overrides
+    o_len: i32,
+    o0: i32, ob0: i32,
+    o1: i32, ob1: i32,
+    o2: i32, ob2: i32,
+    o3: i32, ob3: i32,
+    // allow list (OptIn)
+    a_len: i32,
+    a0: i32, a1: i32, a2: i32, a3: i32,
+    // deny list (OptOut)
+    d_len: i32,
+    d0: i32, d1: i32, d2: i32, d3: i32,
+    // scope flags
+    attach_required: bool,
+    attach_required_by: bool,
+    // required edges
+    req: EcsEcbeReqDeep,
+}
+
+fn ecs_ecbe_deep_opt_out() -> EcsEcbeDeep {
+    return EcsEcbeDeep {
+        mode: ECS_ECBE_MODE_OPT_OUT,
+        default_clone_fn: ECS_ECBE_BEH_CLONE,
+        o_len: 0, o0: -1, ob0: 0, o1: -1, ob1: 0, o2: -1, ob2: 0, o3: -1, ob3: 0,
+        a_len: 0, a0: -1, a1: -1, a2: -1, a3: -1,
+        d_len: 0, d0: -1, d1: -1, d2: -1, d3: -1,
+        attach_required: true,
+        attach_required_by: true,
+        req: ecs_ecbe_req_new(),
+    };
+}
+
+fn ecs_ecbe_deep_opt_in() -> EcsEcbeDeep {
+    return EcsEcbeDeep {
+        mode: ECS_ECBE_MODE_OPT_IN,
+        default_clone_fn: ECS_ECBE_BEH_CLONE,
+        o_len: 0, o0: -1, ob0: 0, o1: -1, ob1: 0, o2: -1, ob2: 0, o3: -1, ob3: 0,
+        a_len: 0, a0: -1, a1: -1, a2: -1, a3: -1,
+        d_len: 0, d0: -1, d1: -1, d2: -1, d3: -1,
+        attach_required: true,
+        attach_required_by: true,
+        req: ecs_ecbe_req_new(),
+    };
+}
+
+fn ecs_ecbe_deep_is_opt_in(b: EcsEcbeDeep) -> bool { return b.mode == ECS_ECBE_MODE_OPT_IN; }
+fn ecs_ecbe_deep_default_fn(b: EcsEcbeDeep) -> i32 { return b.default_clone_fn; }
+fn ecs_ecbe_deep_override_len(b: EcsEcbeDeep) -> i32 { return b.o_len; }
+fn ecs_ecbe_deep_allow_len(b: EcsEcbeDeep) -> i32 { return b.a_len; }
+fn ecs_ecbe_deep_deny_len(b: EcsEcbeDeep) -> i32 { return b.d_len; }
+fn ecs_ecbe_deep_attach_required(b: EcsEcbeDeep) -> bool { return b.attach_required; }
+fn ecs_ecbe_deep_attach_required_by(b: EcsEcbeDeep) -> bool { return b.attach_required_by; }
+
+fn ecs_ecbe_deep_rebuild(
+    mode: i32, default_clone_fn: i32,
+    o_len: i32, o0: i32, ob0: i32, o1: i32, ob1: i32, o2: i32, ob2: i32, o3: i32, ob3: i32,
+    a_len: i32, a0: i32, a1: i32, a2: i32, a3: i32,
+    d_len: i32, d0: i32, d1: i32, d2: i32, d3: i32,
+    attach_required: bool, attach_required_by: bool, req: EcsEcbeReqDeep
+) -> EcsEcbeDeep {
+    return EcsEcbeDeep {
+        mode: mode, default_clone_fn: default_clone_fn,
+        o_len: o_len, o0: o0, ob0: ob0, o1: o1, ob1: ob1, o2: o2, ob2: ob2, o3: o3, ob3: ob3,
+        a_len: a_len, a0: a0, a1: a1, a2: a2, a3: a3,
+        d_len: d_len, d0: d0, d1: d1, d2: d2, d3: d3,
+        attach_required: attach_required, attach_required_by: attach_required_by, req: req,
+    };
+}
+
+fn ecs_ecbe_deep_with_default_clone_fn(b: EcsEcbeDeep, clone_fn: i32) -> EcsEcbeDeep {
+    return ecs_ecbe_deep_rebuild(
+        b.mode, clone_fn,
+        b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+        b.a_len, b.a0, b.a1, b.a2, b.a3,
+        b.d_len, b.d0, b.d1, b.d2, b.d3,
+        b.attach_required, b.attach_required_by, b.req
+    );
+}
+
+fn ecs_ecbe_deep_set_req(b: EcsEcbeDeep, req: EcsEcbeReqDeep) -> EcsEcbeDeep {
+    return ecs_ecbe_deep_rebuild(
+        b.mode, b.default_clone_fn,
+        b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+        b.a_len, b.a0, b.a1, b.a2, b.a3,
+        b.d_len, b.d0, b.d1, b.d2, b.d3,
+        b.attach_required, b.attach_required_by, req
+    );
+}
+
+// Scope: without_required_components begin/end (OptIn)
+fn ecs_ecbe_deep_without_required_begin(b: EcsEcbeDeep) -> EcsEcbeDeep {
+    return ecs_ecbe_deep_rebuild(
+        b.mode, b.default_clone_fn,
+        b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+        b.a_len, b.a0, b.a1, b.a2, b.a3,
+        b.d_len, b.d0, b.d1, b.d2, b.d3,
+        false, b.attach_required_by, b.req
+    );
+}
+
+fn ecs_ecbe_deep_without_required_end(b: EcsEcbeDeep) -> EcsEcbeDeep {
+    return ecs_ecbe_deep_rebuild(
+        b.mode, b.default_clone_fn,
+        b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+        b.a_len, b.a0, b.a1, b.a2, b.a3,
+        b.d_len, b.d0, b.d1, b.d2, b.d3,
+        true, b.attach_required_by, b.req
+    );
+}
+
+// Scope: without_required_by_components begin/end (OptOut)
+fn ecs_ecbe_deep_without_required_by_begin(b: EcsEcbeDeep) -> EcsEcbeDeep {
+    return ecs_ecbe_deep_rebuild(
+        b.mode, b.default_clone_fn,
+        b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+        b.a_len, b.a0, b.a1, b.a2, b.a3,
+        b.d_len, b.d0, b.d1, b.d2, b.d3,
+        b.attach_required, false, b.req
+    );
+}
+
+fn ecs_ecbe_deep_without_required_by_end(b: EcsEcbeDeep) -> EcsEcbeDeep {
+    return ecs_ecbe_deep_rebuild(
+        b.mode, b.default_clone_fn,
+        b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+        b.a_len, b.a0, b.a1, b.a2, b.a3,
+        b.d_len, b.d0, b.d1, b.d2, b.d3,
+        b.attach_required, true, b.req
+    );
+}
+
+// Override insert/replace
+fn ecs_ecbe_deep_override_with_id(b: EcsEcbeDeep, component_id: i32, behavior: i32) -> EcsEcbeDeep {
+    if b.o_len >= 1 {
+        if b.o0 == component_id {
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                b.o_len, b.o0, behavior, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len >= 2 {
+        if b.o1 == component_id {
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                b.o_len, b.o0, b.ob0, b.o1, behavior, b.o2, b.ob2, b.o3, b.ob3,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len >= 3 {
+        if b.o2 == component_id {
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, behavior, b.o3, b.ob3,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len >= 4 {
+        if b.o3 == component_id {
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, behavior,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len == 0 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            1, component_id, behavior, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.o_len == 1 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            2, b.o0, b.ob0, component_id, behavior, b.o2, b.ob2, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.o_len == 2 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            3, b.o0, b.ob0, b.o1, b.ob1, component_id, behavior, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.o_len == 3 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            4, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, component_id, behavior,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    return b;
+}
+
+// remove override by swap-from-end
+fn ecs_ecbe_deep_remove_override(b: EcsEcbeDeep, component_id: i32) -> EcsEcbeDeep {
+    if b.o_len >= 1 {
+        if b.o0 == component_id {
+            if b.o_len == 1 {
+                return ecs_ecbe_deep_rebuild(
+                    b.mode, b.default_clone_fn,
+                    0, -1, 0, -1, 0, -1, 0, -1, 0,
+                    b.a_len, b.a0, b.a1, b.a2, b.a3,
+                    b.d_len, b.d0, b.d1, b.d2, b.d3,
+                    b.attach_required, b.attach_required_by, b.req
+                );
+            };
+            if b.o_len == 2 {
+                return ecs_ecbe_deep_rebuild(
+                    b.mode, b.default_clone_fn,
+                    1, b.o1, b.ob1, -1, 0, -1, 0, -1, 0,
+                    b.a_len, b.a0, b.a1, b.a2, b.a3,
+                    b.d_len, b.d0, b.d1, b.d2, b.d3,
+                    b.attach_required, b.attach_required_by, b.req
+                );
+            };
+            if b.o_len == 3 {
+                return ecs_ecbe_deep_rebuild(
+                    b.mode, b.default_clone_fn,
+                    2, b.o2, b.ob2, b.o1, b.ob1, -1, 0, -1, 0,
+                    b.a_len, b.a0, b.a1, b.a2, b.a3,
+                    b.d_len, b.d0, b.d1, b.d2, b.d3,
+                    b.attach_required, b.attach_required_by, b.req
+                );
+            };
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                3, b.o3, b.ob3, b.o1, b.ob1, b.o2, b.ob2, -1, 0,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len >= 2 {
+        if b.o1 == component_id {
+            if b.o_len == 2 {
+                return ecs_ecbe_deep_rebuild(
+                    b.mode, b.default_clone_fn,
+                    1, b.o0, b.ob0, -1, 0, -1, 0, -1, 0,
+                    b.a_len, b.a0, b.a1, b.a2, b.a3,
+                    b.d_len, b.d0, b.d1, b.d2, b.d3,
+                    b.attach_required, b.attach_required_by, b.req
+                );
+            };
+            if b.o_len == 3 {
+                return ecs_ecbe_deep_rebuild(
+                    b.mode, b.default_clone_fn,
+                    2, b.o0, b.ob0, b.o2, b.ob2, -1, 0, -1, 0,
+                    b.a_len, b.a0, b.a1, b.a2, b.a3,
+                    b.d_len, b.d0, b.d1, b.d2, b.d3,
+                    b.attach_required, b.attach_required_by, b.req
+                );
+            };
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                3, b.o0, b.ob0, b.o3, b.ob3, b.o2, b.ob2, -1, 0,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len >= 3 {
+        if b.o2 == component_id {
+            if b.o_len == 3 {
+                return ecs_ecbe_deep_rebuild(
+                    b.mode, b.default_clone_fn,
+                    2, b.o0, b.ob0, b.o1, b.ob1, -1, 0, -1, 0,
+                    b.a_len, b.a0, b.a1, b.a2, b.a3,
+                    b.d_len, b.d0, b.d1, b.d2, b.d3,
+                    b.attach_required, b.attach_required_by, b.req
+                );
+            };
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                3, b.o0, b.ob0, b.o1, b.ob1, b.o3, b.ob3, -1, 0,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    if b.o_len >= 4 {
+        if b.o3 == component_id {
+            return ecs_ecbe_deep_rebuild(
+                b.mode, b.default_clone_fn,
+                3, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, -1, 0,
+                b.a_len, b.a0, b.a1, b.a2, b.a3,
+                b.d_len, b.d0, b.d1, b.d2, b.d3,
+                b.attach_required, b.attach_required_by, b.req
+            );
+        };
+    };
+    return b;
+}
+
+struct EcsEcbeOverrideGet {
+    has: bool,
+    behavior: i32,
+}
+
+fn ecs_ecbe_ov_has(g: EcsEcbeOverrideGet) -> bool { return g.has; }
+fn ecs_ecbe_ov_behavior(g: EcsEcbeOverrideGet) -> i32 { return g.behavior; }
+
+fn ecs_ecbe_deep_overridden_at(b: EcsEcbeDeep, component_id: i32) -> EcsEcbeOverrideGet {
+    if b.o_len >= 1 {
+        if b.o0 == component_id {
+            return EcsEcbeOverrideGet { has: true, behavior: b.ob0 };
+        };
+    };
+    if b.o_len >= 2 {
+        if b.o1 == component_id {
+            return EcsEcbeOverrideGet { has: true, behavior: b.ob1 };
+        };
+    };
+    if b.o_len >= 3 {
+        if b.o2 == component_id {
+            return EcsEcbeOverrideGet { has: true, behavior: b.ob2 };
+        };
+    };
+    if b.o_len >= 4 {
+        if b.o3 == component_id {
+            return EcsEcbeOverrideGet { has: true, behavior: b.ob3 };
+        };
+    };
+    return EcsEcbeOverrideGet { has: false, behavior: 0 };
+}
+
+fn ecs_ecbe_deep_behavior_of(b: EcsEcbeDeep, component_id: i32) -> i32 {
+    let g = ecs_ecbe_deep_overridden_at(b, component_id);
+    if g.has { return g.behavior; };
+    return b.default_clone_fn;
+}
+
+// allow list helpers
+fn ecs_ecbe_deep_has_allow(b: EcsEcbeDeep, cid: i32) -> bool {
+    if b.a_len >= 1 {
+        if b.a0 == cid { return true; };
+    };
+    if b.a_len >= 2 {
+        if b.a1 == cid { return true; };
+    };
+    if b.a_len >= 3 {
+        if b.a2 == cid { return true; };
+    };
+    if b.a_len >= 4 {
+        if b.a3 == cid { return true; };
+    };
+    return false;
+}
+
+fn ecs_ecbe_deep_push_allow_raw(b: EcsEcbeDeep, cid: i32) -> EcsEcbeDeep {
+    if ecs_ecbe_deep_has_allow(b, cid) { return b; };
+    if b.a_len == 0 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            1, cid, b.a1, b.a2, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.a_len == 1 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            2, b.a0, cid, b.a2, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.a_len == 2 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            3, b.a0, b.a1, cid, b.a3,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.a_len == 3 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            4, b.a0, b.a1, b.a2, cid,
+            b.d_len, b.d0, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    return b;
+}
+
+fn ecs_ecbe_deep_has_deny(b: EcsEcbeDeep, cid: i32) -> bool {
+    if b.d_len >= 1 {
+        if b.d0 == cid { return true; };
+    };
+    if b.d_len >= 2 {
+        if b.d1 == cid { return true; };
+    };
+    if b.d_len >= 3 {
+        if b.d2 == cid { return true; };
+    };
+    if b.d_len >= 4 {
+        if b.d3 == cid { return true; };
+    };
+    return false;
+}
+
+fn ecs_ecbe_deep_push_deny_raw(b: EcsEcbeDeep, cid: i32) -> EcsEcbeDeep {
+    if ecs_ecbe_deep_has_deny(b, cid) { return b; };
+    if b.d_len == 0 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            1, cid, b.d1, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.d_len == 1 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            2, b.d0, cid, b.d2, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.d_len == 2 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            3, b.d0, b.d1, cid, b.d3,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    if b.d_len == 3 {
+        return ecs_ecbe_deep_rebuild(
+            b.mode, b.default_clone_fn,
+            b.o_len, b.o0, b.ob0, b.o1, b.ob1, b.o2, b.ob2, b.o3, b.ob3,
+            b.a_len, b.a0, b.a1, b.a2, b.a3,
+            4, b.d0, b.d1, b.d2, cid,
+            b.attach_required, b.attach_required_by, b.req
+        );
+    };
+    return b;
+}
+
+// expand required targets of source (source requires target)
+fn ecs_ecbe_deep_expand_required(b: EcsEcbeDeep, source: i32) -> EcsEcbeDeep {
+    let r0s = b.req.r0s; let r0t = b.req.r0t;
+    let r1s = b.req.r1s; let r1t = b.req.r1t;
+    let r2s = b.req.r2s; let r2t = b.req.r2t;
+    let r3s = b.req.r3s; let r3t = b.req.r3t;
+    let rlen = b.req.len;
+    let cur = b;
+    if rlen >= 1 {
+        if r0s == source {
+            cur = ecs_ecbe_deep_push_allow_raw(cur, r0t);
+        };
+    };
+    if rlen >= 2 {
+        if r1s == source {
+            cur = ecs_ecbe_deep_push_allow_raw(cur, r1t);
+        };
+    };
+    if rlen >= 3 {
+        if r2s == source {
+            cur = ecs_ecbe_deep_push_allow_raw(cur, r2t);
+        };
+    };
+    if rlen >= 4 {
+        if r3s == source {
+            cur = ecs_ecbe_deep_push_allow_raw(cur, r3t);
+        };
+    };
+    return cur;
+}
+
+// expand required_by: when denying source, also deny components that require source (sources of edges where target==source)
+fn ecs_ecbe_deep_expand_required_by(b: EcsEcbeDeep, denied: i32) -> EcsEcbeDeep {
+    let r0s = b.req.r0s; let r0t = b.req.r0t;
+    let r1s = b.req.r1s; let r1t = b.req.r1t;
+    let r2s = b.req.r2s; let r2t = b.req.r2t;
+    let r3s = b.req.r3s; let r3t = b.req.r3t;
+    let rlen = b.req.len;
+    let cur = b;
+    if rlen >= 1 {
+        if r0t == denied {
+            cur = ecs_ecbe_deep_push_deny_raw(cur, r0s);
+        };
+    };
+    if rlen >= 2 {
+        if r1t == denied {
+            cur = ecs_ecbe_deep_push_deny_raw(cur, r1s);
+        };
+    };
+    if rlen >= 3 {
+        if r2t == denied {
+            cur = ecs_ecbe_deep_push_deny_raw(cur, r2s);
+        };
+    };
+    if rlen >= 4 {
+        if r3t == denied {
+            cur = ecs_ecbe_deep_push_deny_raw(cur, r3s);
+        };
+    };
+    return cur;
+}
+
+// allow(): OptIn — add cid, and if attach_required, add required components
+fn ecs_ecbe_deep_allow(b: EcsEcbeDeep, cid: i32) -> EcsEcbeDeep {
+    let cur = ecs_ecbe_deep_push_allow_raw(b, cid);
+    let attach = cur.attach_required;
+    if attach {
+        return ecs_ecbe_deep_expand_required(cur, cid);
+    };
+    return cur;
+}
+
+// deny(): OptOut — add cid, and if attach_required_by, deny components that require it
+fn ecs_ecbe_deep_deny(b: EcsEcbeDeep, cid: i32) -> EcsEcbeDeep {
+    let cur = ecs_ecbe_deep_push_deny_raw(b, cid);
+    let attach = cur.attach_required_by;
+    if attach {
+        return ecs_ecbe_deep_expand_required_by(cur, cid);
+    };
+    return cur;
+}
+
+fn ecs_ecbe_deep_should_clone(b: EcsEcbeDeep, cid: i32) -> bool {
+    if b.mode == ECS_ECBE_MODE_OPT_IN {
+        return ecs_ecbe_deep_has_allow(b, cid);
+    };
+    if ecs_ecbe_deep_has_deny(b, cid) { return false; };
+    return true;
+}
+
+fn ecs_ecbe_deep_would_clone(b: EcsEcbeDeep, cid: i32) -> bool {
+    if ecs_ecbe_deep_should_clone(b, cid) != true { return false; };
+    let beh = ecs_ecbe_deep_behavior_of(b, cid);
+    if beh == ECS_ECBE_BEH_IGNORE { return false; };
+    return true;
+}

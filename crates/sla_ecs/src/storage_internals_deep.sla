@@ -1,0 +1,400 @@
+// Deepened Bevy ECS storage internals (src/storage/blob_array.rs, thin_array_ptr.rs,
+// table/column.rs) — BlobArray / ThinArrayPtr / Column — low-level SoA storage primitives.
+// Shallow: lib/storage_internals.sla (Vec-backed BlobArray / ThinArrayPtr / Column).
+//
+// The deep variant mirrors all three with fixed-cap-16 parallel-array i64 storage (data0..data15
+// + len). No Vec, no recursion. Pair/tuple-return callsites (BlobArray::swap_remove / Column::
+// swap_remove each return (struct, removed_value) tuples in the shallow) are exposed as scalar
+// wrapper-result structs (Batch 373 observation: let (a, b) = tuple_fn() retroactively corrupts
+// prior assertions referencing the struct on the SA backend) — the deep tests read scalar fields
+// off those wrappers and use the updated-state accessors. Field-assign on struct-by-value params
+// is SLA-legal on SA (verified in Batch 374) so the depth uses direct field-assign (no slot-view
+// rebuild) for cap-handling and swap_remove. Cap-16 reject silently truncates append.
+//
+// Intentional leave-outs: ZST drop semantics over Vec; no real heap allocation (replaced by cap-16
+// slot buffer); no recursion.
+
+const ECS_STORAGE_CAP_DEEP: i32 = 16;
+
+// === EcsBlobArrayDeep ===
+struct EcsBlobArrayDeep {
+    item_size: i64,
+    item_align: i64,
+    is_zst: bool,
+    d0: i64, d1: i64, d2: i64, d3: i64, d4: i64, d5: i64, d6: i64, d7: i64,
+    d8: i64, d9: i64, d10: i64, d11: i64, d12: i64, d13: i64, d14: i64, d15: i64,
+    len: i32,
+}
+
+struct EcsBlobArraySwapRemoveDeep { new_arr: EcsBlobArrayDeep, removed: i64 }
+
+fn ecs_blob_array_deep_new(item_size: i64, item_align: i64, is_zst: bool) -> EcsBlobArrayDeep {
+    return EcsBlobArrayDeep {
+        item_size: item_size, item_align: item_align, is_zst: is_zst,
+        d0: 0, d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, d6: 0, d7: 0,
+        d8: 0, d9: 0, d10: 0, d11: 0, d12: 0, d13: 0, d14: 0, d15: 0,
+        len: 0,
+    };
+}
+
+fn ecs_blob_array_deep_layout_size(b: EcsBlobArrayDeep) -> i64 { return b.item_size; }
+fn ecs_blob_array_deep_layout_align(b: EcsBlobArrayDeep) -> i64 { return b.item_align; }
+fn ecs_blob_array_deep_is_zst(b: EcsBlobArrayDeep) -> bool { return b.is_zst; }
+fn ecs_blob_array_deep_len(b: EcsBlobArrayDeep) -> i32 { return b.len; }
+
+// get by index — out-of-range returns 0 (consistent with the slot being unset).
+fn ecs_blob_array_deep_get(b: EcsBlobArrayDeep, idx: i32) -> i64 {
+    if idx == 0 { return b.d0; };
+    if idx == 1 { return b.d1; };
+    if idx == 2 { return b.d2; };
+    if idx == 3 { return b.d3; };
+    if idx == 4 { return b.d4; };
+    if idx == 5 { return b.d5; };
+    if idx == 6 { return b.d6; };
+    if idx == 7 { return b.d7; };
+    if idx == 8 { return b.d8; };
+    if idx == 9 { return b.d9; };
+    if idx == 10 { return b.d10; };
+    if idx == 11 { return b.d11; };
+    if idx == 12 { return b.d12; };
+    if idx == 13 { return b.d13; };
+    if idx == 14 { return b.d14; };
+    if idx == 15 { return b.d15; };
+    return 0;
+}
+
+fn ecs_blob_array_deep_get_mut(b: EcsBlobArrayDeep, idx: i32) -> i64 {
+    return ecs_blob_array_deep_get(b, idx);
+}
+
+// push: append value to end. Cap-16 reject (returns array unchanged).
+fn ecs_blob_array_deep_push(b: EcsBlobArrayDeep, value: i64) -> EcsBlobArrayDeep {
+    if b.len >= ECS_STORAGE_CAP_DEEP { return b; };
+    if b.len == 0 { b.d0 = value; };
+    if b.len == 1 { b.d1 = value; };
+    if b.len == 2 { b.d2 = value; };
+    if b.len == 3 { b.d3 = value; };
+    if b.len == 4 { b.d4 = value; };
+    if b.len == 5 { b.d5 = value; };
+    if b.len == 6 { b.d6 = value; };
+    if b.len == 7 { b.d7 = value; };
+    if b.len == 8 { b.d8 = value; };
+    if b.len == 9 { b.d9 = value; };
+    if b.len == 10 { b.d10 = value; };
+    if b.len == 11 { b.d11 = value; };
+    if b.len == 12 { b.d12 = value; };
+    if b.len == 13 { b.d13 = value; };
+    if b.len == 14 { b.d14 = value; };
+    if b.len == 15 { b.d15 = value; };
+    b.len = b.len + 1;
+    return b;
+}
+
+// swap_remove: pull last into slot idx, decrement len, return removed-value + new struct via wrapper.
+fn ecs_blob_array_deep_swap_remove(b: EcsBlobArrayDeep, idx: i32) -> EcsBlobArraySwapRemoveDeep {
+    if b.len <= 0 { return EcsBlobArraySwapRemoveDeep { new_arr: b, removed: 0 }; };
+    if idx < 0 { return EcsBlobArraySwapRemoveDeep { new_arr: b, removed: 0 }; };
+    if idx >= b.len { return EcsBlobArraySwapRemoveDeep { new_arr: b, removed: 0 }; };
+    let removed = ecs_blob_array_deep_get(b, idx);
+    let last_idx = b.len - 1;
+    let last = ecs_blob_array_deep_get(b, last_idx);
+    // write last into idx slot
+    if idx == 0 { b.d0 = last; };
+    if idx == 1 { b.d1 = last; };
+    if idx == 2 { b.d2 = last; };
+    if idx == 3 { b.d3 = last; };
+    if idx == 4 { b.d4 = last; };
+    if idx == 5 { b.d5 = last; };
+    if idx == 6 { b.d6 = last; };
+    if idx == 7 { b.d7 = last; };
+    if idx == 8 { b.d8 = last; };
+    if idx == 9 { b.d9 = last; };
+    if idx == 10 { b.d10 = last; };
+    if idx == 11 { b.d11 = last; };
+    if idx == 12 { b.d12 = last; };
+    if idx == 13 { b.d13 = last; };
+    if idx == 14 { b.d14 = last; };
+    if idx == 15 { b.d15 = last; };
+    // Optionally zero the freed tail slot (mirrors Vec::pop). Zero last_idx since it's now removed.
+    if last_idx == 0 { b.d0 = 0; };
+    if last_idx == 1 { b.d1 = 0; };
+    if last_idx == 2 { b.d2 = 0; };
+    if last_idx == 3 { b.d3 = 0; };
+    if last_idx == 4 { b.d4 = 0; };
+    if last_idx == 5 { b.d5 = 0; };
+    if last_idx == 6 { b.d6 = 0; };
+    if last_idx == 7 { b.d7 = 0; };
+    if last_idx == 8 { b.d8 = 0; };
+    if last_idx == 9 { b.d9 = 0; };
+    if last_idx == 10 { b.d10 = 0; };
+    if last_idx == 11 { b.d11 = 0; };
+    if last_idx == 12 { b.d12 = 0; };
+    if last_idx == 13 { b.d13 = 0; };
+    if last_idx == 14 { b.d14 = 0; };
+    if last_idx == 15 { b.d15 = 0; };
+    b.len = b.len - 1;
+    return EcsBlobArraySwapRemoveDeep { new_arr: b, removed: removed };
+}
+
+// Wrapper-result accessors (avoid tuple-return callsites).
+fn ecs_blob_swap_remove_new_arr(r: EcsBlobArraySwapRemoveDeep) -> EcsBlobArrayDeep {
+    return r.new_arr;
+}
+fn ecs_blob_swap_remove_removed(r: EcsBlobArraySwapRemoveDeep) -> i64 { return r.removed; }
+
+fn ecs_blob_array_deep_get_drop(b: EcsBlobArrayDeep) -> i32 {
+    if b.is_zst { return 0; };
+    return 1;
+}
+
+// === EcsThinArrayPtrDeep ===
+struct EcsThinArrayPtrDeep {
+    capacity: i64,
+    d0: i64, d1: i64, d2: i64, d3: i64, d4: i64, d5: i64, d6: i64, d7: i64,
+    d8: i64, d9: i64, d10: i64, d11: i64, d12: i64, d13: i64, d14: i64, d15: i64,
+    len: i32,
+}
+
+fn ecs_thin_array_ptr_deep_with_capacity(capacity: i64) -> EcsThinArrayPtrDeep {
+    return EcsThinArrayPtrDeep {
+        capacity: capacity,
+        d0: 0, d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, d6: 0, d7: 0,
+        d8: 0, d9: 0, d10: 0, d11: 0, d12: 0, d13: 0, d14: 0, d15: 0,
+        len: 0,
+    };
+}
+
+fn ecs_thin_array_ptr_deep_alloc(t: EcsThinArrayPtrDeep, capacity: i64) -> EcsThinArrayPtrDeep {
+    t.capacity = capacity;
+    return t;
+}
+
+fn ecs_thin_array_ptr_deep_capacity(t: EcsThinArrayPtrDeep) -> i64 { return t.capacity; }
+fn ecs_thin_array_ptr_deep_len(t: EcsThinArrayPtrDeep) -> i32 { return t.len; }
+fn ecs_thin_array_ptr_deep_is_empty(t: EcsThinArrayPtrDeep) -> bool { return t.len == 0; }
+
+fn ecs_thin_array_ptr_deep_get(t: EcsThinArrayPtrDeep, idx: i32) -> i64 {
+    if idx == 0 { return t.d0; };
+    if idx == 1 { return t.d1; };
+    if idx == 2 { return t.d2; };
+    if idx == 3 { return t.d3; };
+    if idx == 4 { return t.d4; };
+    if idx == 5 { return t.d5; };
+    if idx == 6 { return t.d6; };
+    if idx == 7 { return t.d7; };
+    if idx == 8 { return t.d8; };
+    if idx == 9 { return t.d9; };
+    if idx == 10 { return t.d10; };
+    if idx == 11 { return t.d11; };
+    if idx == 12 { return t.d12; };
+    if idx == 13 { return t.d13; };
+    if idx == 14 { return t.d14; };
+    if idx == 15 { return t.d15; };
+    return 0;
+}
+
+fn ecs_thin_array_ptr_deep_get_mut(t: EcsThinArrayPtrDeep, idx: i32) -> i64 {
+    return ecs_thin_array_ptr_deep_get(t, idx);
+}
+
+fn ecs_thin_array_ptr_deep_push(t: EcsThinArrayPtrDeep, value: i64) -> EcsThinArrayPtrDeep {
+    if t.len >= ECS_STORAGE_CAP_DEEP { return t; };
+    if t.len == 0 { t.d0 = value; };
+    if t.len == 1 { t.d1 = value; };
+    if t.len == 2 { t.d2 = value; };
+    if t.len == 3 { t.d3 = value; };
+    if t.len == 4 { t.d4 = value; };
+    if t.len == 5 { t.d5 = value; };
+    if t.len == 6 { t.d6 = value; };
+    if t.len == 7 { t.d7 = value; };
+    if t.len == 8 { t.d8 = value; };
+    if t.len == 9 { t.d9 = value; };
+    if t.len == 10 { t.d10 = value; };
+    if t.len == 11 { t.d11 = value; };
+    if t.len == 12 { t.d12 = value; };
+    if t.len == 13 { t.d13 = value; };
+    if t.len == 14 { t.d14 = value; };
+    if t.len == 15 { t.d15 = value; };
+    t.len = t.len + 1;
+    return t;
+}
+
+// clear: reset len (data stays dirty)
+fn ecs_thin_array_ptr_deep_clear(t: EcsThinArrayPtrDeep) -> EcsThinArrayPtrDeep {
+    t.len = 0;
+    return t;
+}
+
+// === EcsColumnDeep ===
+struct EcsColumnDeep {
+    component_id: i32,
+    capacity: i64,
+    d0: i64, d1: i64, d2: i64, d3: i64, d4: i64, d5: i64, d6: i64, d7: i64,
+    d8: i64, d9: i64, d10: i64, d11: i64, d12: i64, d13: i64, d14: i64, d15: i64,
+    len: i32,
+}
+
+struct EcsColumnSwapRemoveDeep { new_col: EcsColumnDeep, removed: i64 }
+
+fn ecs_column_deep_with_capacity(component_id: i32, capacity: i64) -> EcsColumnDeep {
+    return EcsColumnDeep {
+        component_id: component_id, capacity: capacity,
+        d0: 0, d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, d6: 0, d7: 0,
+        d8: 0, d9: 0, d10: 0, d11: 0, d12: 0, d13: 0, d14: 0, d15: 0,
+        len: 0,
+    };
+}
+
+fn ecs_column_deep_component_id(c: EcsColumnDeep) -> i32 { return c.component_id; }
+fn ecs_column_deep_capacity(c: EcsColumnDeep) -> i64 { return c.capacity; }
+fn ecs_column_deep_len(c: EcsColumnDeep) -> i32 { return c.len; }
+fn ecs_column_deep_is_empty(c: EcsColumnDeep) -> bool { return c.len == 0; }
+
+fn ecs_column_deep_get(c: EcsColumnDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.d0; };
+    if idx == 1 { return c.d1; };
+    if idx == 2 { return c.d2; };
+    if idx == 3 { return c.d3; };
+    if idx == 4 { return c.d4; };
+    if idx == 5 { return c.d5; };
+    if idx == 6 { return c.d6; };
+    if idx == 7 { return c.d7; };
+    if idx == 8 { return c.d8; };
+    if idx == 9 { return c.d9; };
+    if idx == 10 { return c.d10; };
+    if idx == 11 { return c.d11; };
+    if idx == 12 { return c.d12; };
+    if idx == 13 { return c.d13; };
+    if idx == 14 { return c.d14; };
+    if idx == 15 { return c.d15; };
+    return 0;
+}
+
+fn ecs_column_deep_get_mut(c: EcsColumnDeep, idx: i32) -> i64 {
+    return ecs_column_deep_get(c, idx);
+}
+
+fn ecs_column_deep_push(c: EcsColumnDeep, value: i64) -> EcsColumnDeep {
+    if c.len >= ECS_STORAGE_CAP_DEEP { return c; };
+    if c.len == 0 { c.d0 = value; };
+    if c.len == 1 { c.d1 = value; };
+    if c.len == 2 { c.d2 = value; };
+    if c.len == 3 { c.d3 = value; };
+    if c.len == 4 { c.d4 = value; };
+    if c.len == 5 { c.d5 = value; };
+    if c.len == 6 { c.d6 = value; };
+    if c.len == 7 { c.d7 = value; };
+    if c.len == 8 { c.d8 = value; };
+    if c.len == 9 { c.d9 = value; };
+    if c.len == 10 { c.d10 = value; };
+    if c.len == 11 { c.d11 = value; };
+    if c.len == 12 { c.d12 = value; };
+    if c.len == 13 { c.d13 = value; };
+    if c.len == 14 { c.d14 = value; };
+    if c.len == 15 { c.d15 = value; };
+    c.len = c.len + 1;
+    return c;
+}
+
+fn ecs_column_deep_swap(c: EcsColumnDeep, a: i32, b: i32) -> EcsColumnDeep {
+    let va = ecs_column_deep_get(c, a);
+    let vb = ecs_column_deep_get(c, b);
+    // write vb into a
+    if a == 0 { c.d0 = vb; };
+    if a == 1 { c.d1 = vb; };
+    if a == 2 { c.d2 = vb; };
+    if a == 3 { c.d3 = vb; };
+    if a == 4 { c.d4 = vb; };
+    if a == 5 { c.d5 = vb; };
+    if a == 6 { c.d6 = vb; };
+    if a == 7 { c.d7 = vb; };
+    if a == 8 { c.d8 = vb; };
+    if a == 9 { c.d9 = vb; };
+    if a == 10 { c.d10 = vb; };
+    if a == 11 { c.d11 = vb; };
+    if a == 12 { c.d12 = vb; };
+    if a == 13 { c.d13 = vb; };
+    if a == 14 { c.d14 = vb; };
+    if a == 15 { c.d15 = vb; };
+    // write va into b
+    if b == 0 { c.d0 = va; };
+    if b == 1 { c.d1 = va; };
+    if b == 2 { c.d2 = va; };
+    if b == 3 { c.d3 = va; };
+    if b == 4 { c.d4 = va; };
+    if b == 5 { c.d5 = va; };
+    if b == 6 { c.d6 = va; };
+    if b == 7 { c.d7 = va; };
+    if b == 8 { c.d8 = va; };
+    if b == 9 { c.d9 = va; };
+    if b == 10 { c.d10 = va; };
+    if b == 11 { c.d11 = va; };
+    if b == 12 { c.d12 = va; };
+    if b == 13 { c.d13 = va; };
+    if b == 14 { c.d14 = va; };
+    if b == 15 { c.d15 = va; };
+    return c;
+}
+
+fn ecs_column_deep_swap_remove(c: EcsColumnDeep, idx: i32) -> EcsColumnSwapRemoveDeep {
+    if c.len <= 0 { return EcsColumnSwapRemoveDeep { new_col: c, removed: 0 }; };
+    if idx < 0 { return EcsColumnSwapRemoveDeep { new_col: c, removed: 0 }; };
+    if idx >= c.len { return EcsColumnSwapRemoveDeep { new_col: c, removed: 0 }; };
+    let removed = ecs_column_deep_get(c, idx);
+    let last_idx = c.len - 1;
+    let last = ecs_column_deep_get(c, last_idx);
+    if idx == 0 { c.d0 = last; };
+    if idx == 1 { c.d1 = last; };
+    if idx == 2 { c.d2 = last; };
+    if idx == 3 { c.d3 = last; };
+    if idx == 4 { c.d4 = last; };
+    if idx == 5 { c.d5 = last; };
+    if idx == 6 { c.d6 = last; };
+    if idx == 7 { c.d7 = last; };
+    if idx == 8 { c.d8 = last; };
+    if idx == 9 { c.d9 = last; };
+    if idx == 10 { c.d10 = last; };
+    if idx == 11 { c.d11 = last; };
+    if idx == 12 { c.d12 = last; };
+    if idx == 13 { c.d13 = last; };
+    if idx == 14 { c.d14 = last; };
+    if idx == 15 { c.d15 = last; };
+    if last_idx == 0 { c.d0 = 0; };
+    if last_idx == 1 { c.d1 = 0; };
+    if last_idx == 2 { c.d2 = 0; };
+    if last_idx == 3 { c.d3 = 0; };
+    if last_idx == 4 { c.d4 = 0; };
+    if last_idx == 5 { c.d5 = 0; };
+    if last_idx == 6 { c.d6 = 0; };
+    if last_idx == 7 { c.d7 = 0; };
+    if last_idx == 8 { c.d8 = 0; };
+    if last_idx == 9 { c.d9 = 0; };
+    if last_idx == 10 { c.d10 = 0; };
+    if last_idx == 11 { c.d11 = 0; };
+    if last_idx == 12 { c.d12 = 0; };
+    if last_idx == 13 { c.d13 = 0; };
+    if last_idx == 14 { c.d14 = 0; };
+    if last_idx == 15 { c.d15 = 0; };
+    c.len = c.len - 1;
+    return EcsColumnSwapRemoveDeep { new_col: c, removed: removed };
+}
+
+// Wrapper-result accessors.
+fn ecs_column_swap_remove_new_col(r: EcsColumnSwapRemoveDeep) -> EcsColumnDeep {
+    return r.new_col;
+}
+fn ecs_column_swap_remove_removed(r: EcsColumnSwapRemoveDeep) -> i64 { return r.removed; }
+
+// clear: reset data + len to 0 (model the shallow's Vec::new()).
+fn ecs_column_deep_clear(c: EcsColumnDeep) -> EcsColumnDeep {
+    c.d0 = 0; c.d1 = 0; c.d2 = 0; c.d3 = 0; c.d4 = 0; c.d5 = 0; c.d6 = 0; c.d7 = 0;
+    c.d8 = 0; c.d9 = 0; c.d10 = 0; c.d11 = 0; c.d12 = 0; c.d13 = 0; c.d14 = 0; c.d15 = 0;
+    c.len = 0;
+    return c;
+}
+
+fn ecs_column_deep_get_drop(c: EcsColumnDeep) -> i32 {
+    // Real component columns have a drop fn (id 1); ZSTs would be 0 — the deep column has no
+    // is_zst flag (the shallow always reports 1) so we mirror.
+    return 1;
+}

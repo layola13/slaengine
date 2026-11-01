@@ -1,0 +1,176 @@
+// Bevy ECS EntityAllocator gap surface — mirrors src/entity/mod.rs (lines 706-810).
+//
+// pub struct EntityAllocator { inner: remote_allocator::Allocator }
+//   pub fn build_remote_allocator(&self) -> RemoteAllocator       — clone the remote-allocator view
+//   pub fn has_remote_allocator(&self, allocator: &RemoteAllocator) -> bool — true iff connected+still valid
+//   pub fn free(&mut self, freed: Entity)                          — push freed [Entity] to pending free
+//   pub fn free_many(&mut self, freed: &[Entity])                 — bulk-free
+//   pub fn alloc(&self) -> Entity                                  — pop freed-or-next new entity
+//   pub fn alloc_many(&self, count: u32) -> iterator               — emits N allocated Entities
+//
+// Also models AllocEntitiesIterator public-surface minimal accessors len/is_empty/next.
+// `Entity` is modelled as the lower-bit packed id i64 in our linear model.
+
+// === Result struct for alloc_many (iterator-shaped accessors) ===
+struct EntityAllocatorAllocManyResult {
+    entities: Vec<i64>,
+    cursor: i32,
+}
+
+struct EntityAllocatorAllocManyNextResult {
+    iter: EntityAllocatorAllocManyResult,
+    has: i32,
+    entity: i64,
+}
+
+struct EntityAllocatorAllocManySizeHint {
+    lower: i32,
+    upper: i32,
+}
+
+fn ecs_eam_count(r: EntityAllocatorAllocManyResult) -> i32 {
+    let remaining = len(r.entities) as i32 - r.cursor;
+    if remaining < 0 { return 0; };
+    return remaining;
+}
+
+fn ecs_eam_first(r: EntityAllocatorAllocManyResult) -> i64 {
+    if r.cursor < 0 { return -1; };
+    let idx = r.cursor;
+    if idx >= len(r.entities) as i32 { return -1; };
+    return r.entities[idx];
+}
+
+fn ecs_eam_next(r: EntityAllocatorAllocManyResult) -> EntityAllocatorAllocManyNextResult {
+    if r.cursor >= len(r.entities) as i32 {
+        return EntityAllocatorAllocManyNextResult { iter: r, has: 0, entity: -1 };
+    };
+    let entity = r.entities[r.cursor];
+    r.cursor = r.cursor + 1;
+    return EntityAllocatorAllocManyNextResult { iter: r, has: 1, entity: entity };
+}
+
+fn ecs_eam_size_hint(r: EntityAllocatorAllocManyResult) -> EntityAllocatorAllocManySizeHint {
+    let remaining = ecs_eam_count(r);
+    return EntityAllocatorAllocManySizeHint { lower: remaining, upper: remaining };
+}
+
+// === EcsEntityAllocator model: a free-stack of recycled [Entity] ids + next-fresh counter ===
+struct EcsEntityAllocator {
+    next_entity_id: i64,
+    // free stack of entities that were free()d and can be returned again via alloc
+    freed_queue: Vec<i64>,
+    // total allocated (for sanity)
+    allocated_count: i32,
+    // tentatively "is connected to a RemoteAllocator" flag mirrored to model build_remote_allocator
+    remote_generation: i32,
+}
+
+// === EcsRemoteAllocator-proxy: hand back a handle that mirrors the underlying entity-allocator ===
+struct EcsRemoteAllocatorProxy {
+    generation: i32,
+    underlying_next: i64,
+    underlying_freed_len: i32,
+}
+
+fn ecs_rap_generation(p: EcsRemoteAllocatorProxy) -> i32 {
+    return p.generation;
+}
+
+fn ecs_rap_next(p: EcsRemoteAllocatorProxy) -> i64 {
+    return p.underlying_next;
+}
+
+fn ecs_rap_freed_len(p: EcsRemoteAllocatorProxy) -> i32 {
+    return p.underlying_freed_len;
+}
+
+fn ecs_entity_allocator_new() -> EcsEntityAllocator {
+    let a = EcsEntityAllocator { next_entity_id: 1, freed_queue: Vec::new(), allocated_count: 0, remote_generation: 1 };
+    return a;
+}
+
+fn ecs_entity_allocator_allocated_count(a: EcsEntityAllocator) -> i32 {
+    return a.allocated_count;
+}
+
+fn ecs_entity_allocator_next_entity_id(a: EcsEntityAllocator) -> i64 {
+    return a.next_entity_id;
+}
+
+fn ecs_entity_allocator_pending_free_count(a: EcsEntityAllocator) -> i32 {
+    return len(a.freed_queue) as i32;
+}
+
+// alloc(): return freed (LIFO pop tail-most) or fresh next_entity_id++
+fn ecs_entity_allocator_alloc(a: EcsEntityAllocator) -> (EcsEntityAllocator, i64) {
+    let pending: i32 = len(a.freed_queue) as i32;
+    if pending > 0 {
+        let e = a.freed_queue[pending - 1];
+        a.freed_queue.pop();
+        a.allocated_count = a.allocated_count + 1;
+        return (a, e);
+    };
+    let fresh = a.next_entity_id;
+    a.next_entity_id = a.next_entity_id + 1;
+    a.allocated_count = a.allocated_count + 1;
+    return (a, fresh);
+}
+
+// free(freed): push onto the pending-free stack.
+fn ecs_entity_allocator_free(a: EcsEntityAllocator, freed: i64) -> EcsEntityAllocator {
+    a.freed_queue.push(freed);
+    return a;
+}
+
+// free_many(freed): bulk-free by pushing each.
+fn ecs_entity_allocator_free_many(a: EcsEntityAllocator, freed: Vec<i64>) -> EcsEntityAllocator {
+    let n: i32 = len(freed) as i32;
+    let i: i32 = 0;
+    while i < n { a.freed_queue.push(freed[i]); i = i + 1; }
+    return a;
+}
+
+// alloc_many(count) -> AllocEntitiesIterator-emulates bulk alloc. Returns count + first-allocated.
+fn ecs_entity_allocator_alloc_many(a: EcsEntityAllocator, count: i32) -> (EcsEntityAllocator, EntityAllocatorAllocManyResult) {
+    let entities: Vec<i64> = Vec::new();
+    if count <= 0 {
+        let none = EntityAllocatorAllocManyResult { entities: entities, cursor: 0 };
+        return (a, none);
+    };
+    let i: i32 = 0;
+    while i < count {
+        let (a2, e) = ecs_entity_allocator_alloc(a);
+        a = a2;
+        entities.push(e);
+        i = i + 1;
+    }
+    let res = EntityAllocatorAllocManyResult { entities: entities, cursor: 0 };
+    return (a, res);
+}
+
+// build_remote_allocator(): produces a snapshot proxy (carrying generation to compare with succceeding has_remote_allocator).
+fn ecs_entity_allocator_build_remote_allocator(a: EcsEntityAllocator) -> EcsRemoteAllocatorProxy {
+    let p = EcsRemoteAllocatorProxy {
+        generation: a.remote_generation,
+        underlying_next: a.next_entity_id,
+        underlying_freed_len: len(a.freed_queue) as i32,
+    };
+    return p;
+}
+
+// has_remote_allocator(allocator): returns true iff the proxy's generation matches this allocator's
+// (Bevy semantics: a stale proxy from a restarted allocator returns false).
+fn ecs_entity_allocator_has_remote_allocator(a: EcsEntityAllocator, p: EcsRemoteAllocatorProxy) -> bool {
+    return p.generation == a.remote_generation;
+}
+
+// restart(): mirrors Bevy's `restart` (resets entities + bumps generation, invalidating all stale remote allocators).
+fn ecs_entity_allocator_restart(a: EcsEntityAllocator) -> EcsEntityAllocator {
+    a.next_entity_id = 1;
+    let empty = Vec::new();
+    a.freed_queue = empty;
+    a.allocated_count = 0;
+    a.remote_generation = a.remote_generation + 1;
+    return a;
+}

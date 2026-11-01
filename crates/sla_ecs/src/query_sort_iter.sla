@@ -1,0 +1,245 @@
+// Bevy ECS QueryIter sort family — sort/sort_unstable/sort_by/sort_unstable_by/sort_by_key/
+// sort_unstable_by_key/sort_by_cached_key. Mirrors src/query/iter.rs (gaps not in lib/query_iter.sla).
+//
+// Bevy semantics modelled:
+//  - sort_impl panics if next() has been called before sort (modelled via consumed flag).
+//  - Each sort returns a QuerySortedIter yielding entities in sorted order.
+//  - The lens L produces the sort key per entity; variants differ only in the comparator used.
+//  - sort_by_cached_key caches the extracted key once (we model that via a key array index state).
+//
+// SLA constraints honoured: no closures (compare modes encoded as integers), no bitwise ops,
+// single-field result accessors to escape the SA-backend tuple .1 corruption.
+
+// Compare-mode enums:
+// 0 = ascending by key (sort / sort_unstable)
+// 1 = descending by key  (for parity tests)
+// 2 = by-supplied-comparator-id (sort_by / sort_unstable_by)
+
+// A QueryIter model: entities + their per-entity sort key (Lens) value, plus a `consumed` flag.
+struct EcsQuerySortIter {
+    entities: Vec<i32>,
+    keys: Vec<i32>,
+    consumed: bool,
+}
+
+fn ecs_query_sort_iter_new() -> EcsQuerySortIter {
+    let q = EcsQuerySortIter { entities: Vec::new(), keys: Vec::new(), consumed: false };
+    return q;
+}
+
+// push: add an (entity, key) entry before any iteration (would-be entity from the match).
+fn ecs_query_sort_iter_push(q: EcsQuerySortIter, entity: i32, key: i32) -> EcsQuerySortIter {
+    q.entities.push(entity);
+    q.keys.push(key);
+    return q;
+}
+
+// mark next() consumed — calling sort afterward must panic (modeled by ok=0).
+fn ecs_query_sort_iter_mark_consumed(q: EcsQuerySortIter) -> EcsQuerySortIter {
+    q.consumed = true;
+    return q;
+}
+
+fn ecs_query_sort_iter_len(q: EcsQuerySortIter) -> i32 {
+    return len(q.entities) as i32;
+}
+
+fn ecs_query_sort_iter_is_empty(q: EcsQuerySortIter) -> bool {
+    return len(q.entities) == 0;
+}
+
+// The sorted result: a fresh "QuerySortedIter" model with the (entity, key) pairs sorted.
+struct EcsQuerySortedIter {
+    entities: Vec<i32>,
+    keys: Vec<i32>,
+    cursor: i32,
+    cached: bool,
+}
+
+fn ecs_query_sorted_iter_len(q: EcsQuerySortedIter) -> i32 {
+    return len(q.entities) as i32;
+}
+
+fn ecs_query_sorted_iter_is_empty(q: EcsQuerySortedIter) -> bool {
+    return len(q.entities) == 0;
+}
+
+// fetch_next: returns (found, entity, key) — we use dedicated accessors to dodge tuple .1 corruption.
+// Returns the next sorted (entity, key), advancing the cursor.
+struct SortedFetchNextResult {
+    found: i32,
+    entity: i32,
+    key: i32,
+}
+
+fn ecs_sorted_fetch_next(s: EcsQuerySortedIter) -> (EcsQuerySortedIter, SortedFetchNextResult) {
+    if s.cursor < len(s.entities) as i32 {
+        let e = s.entities[s.cursor];
+        let k = s.keys[s.cursor];
+        s.cursor = s.cursor + 1;
+        let r = SortedFetchNextResult { found: 1, entity: e, key: k };
+        return (s, r);
+    };
+    let r = SortedFetchNextResult { found: 0, entity: 0, key: 0 };
+    return (s, r);
+}
+
+fn ecs_sfn_found(r: SortedFetchNextResult) -> bool {
+    return r.found == 1;
+}
+
+fn ecs_sfn_entity(r: SortedFetchNextResult) -> i32 {
+    return r.entity;
+}
+
+fn ecs_sfn_key(r: SortedFetchNextResult) -> i32 {
+    return r.key;
+}
+
+// An entity-at accessor: safe front/back access over the sorted vec.
+fn ecs_query_sorted_iter_first(s: EcsQuerySortedIter) -> SortedFetchNextResult {
+    if len(s.entities) == 0 { let r = SortedFetchNextResult { found: 0, entity: 0, key: 0 }; return r; };
+    let r = SortedFetchNextResult { found: 1, entity: s.entities[0], key: s.keys[0] };
+    return r;
+}
+
+fn ecs_query_sorted_iter_last(s: EcsQuerySortedIter) -> SortedFetchNextResult {
+    let m = len(s.entities) as i32;
+    if m == 0 { let r = SortedFetchNextResult { found: 0, entity: 0, key: 0 }; return r; };
+    let r = SortedFetchNextResult { found: 1, entity: s.entities[m - 1], key: s.keys[m - 1] };
+    return r;
+}
+
+// === Sort results — sort_impl-shaped Result structs (multi-value => dedicated accessors) ===
+
+// SortResult: ok=1 on success, ok=0 with err_code=1 if next() had already been called.
+struct SortResult {
+    ok: i32,
+    err_code: i32,
+    iter: EcsQuerySortedIter,
+}
+
+fn ecs_sort_ok(r: SortResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_sort_err_code(r: SortResult) -> i32 {
+    return r.err_code;
+}
+
+fn ecs_sort_iter(r: SortResult) -> EcsQuerySortedIter {
+    return r.iter;
+}
+
+// Internal: stable insertion sort by key ascending (compare mode-encoded).
+// mode: 0 = asc, 1 = desc, 2 = asc-by-comparator-id (semantically identical to asc for distinct keys in our model)
+fn ecs_query_sort_impl(q: EcsQuerySortIter, mode: i32, cached: bool) -> SortResult {
+    // Bevy panics if next() has been consumed; an empty iter is allowed.
+    if q.consumed {
+        let empty = EcsQuerySortedIter { entities: Vec::new(), keys: Vec::new(), cursor: 0, cached: false };
+        let r = SortResult { ok: 0, err_code: 1, iter: empty };
+        return r;
+    };
+    let n: i32 = len(q.entities) as i32;
+    let out_entities = Vec::new();
+    let out_keys = Vec::new();
+    // copy input into out
+    let i: i32 = 0;
+    while i < n { out_entities.push(q.entities[i]); out_keys.push(q.keys[i]); i = i + 1; }
+    // Stable bubblesort over the keyed copy — robust under the SLA backend.
+    let pass: i32 = 0;
+    while pass < n {
+        let did_swap: bool = false;
+        let k: i32 = 0;
+        while k + 1 < n {
+            let ka = out_keys[k];
+            let kb = out_keys[k + 1];
+            let cmp_result = ecs_query_sort_compare(ka, kb, mode);
+            if cmp_result > 0 {
+                let ek = out_entities[k];
+                out_entities[k] = out_entities[k + 1];
+                out_entities[k + 1] = ek;
+                out_keys[k] = kb;
+                out_keys[k + 1] = ka;
+                did_swap = true;
+            };
+            k = k + 1;
+        }
+        if !did_swap { break; };
+        pass = pass + 1;
+    }
+    let sorted = EcsQuerySortedIter { entities: out_entities, keys: out_keys, cursor: 0, cached: cached };
+    let r = SortResult { ok: 1, err_code: 0, iter: sorted };
+    return r;
+}
+
+// comparator returning positive if a > b, zero on equal, negative if a < b — but SLA may not love negative sentinel in const.
+// We use: 1 if a > b, -1 if a < b, 0 otherwise. Caller flips sign based on mode.
+fn ecs_query_sort_compare(a: i32, b: i32, mode: i32) -> i32 {
+    if mode == 1 {
+        // descending: swap the comparison
+        if b > a { return 1; };
+        if a > b { return -1; };
+        return 0;
+    };
+    // ascending modes (0 and 2 identity in our key-only model)
+    if a > b { return 1; };
+    if b > a { return -1; };
+    return 0;
+}
+
+// === Public Bevy-shaped sort entry points ===
+
+// sort<L> where lens key is an Ord lens — stable ascending by key.
+fn ecs_query_sort_iter_sort(q: EcsQuerySortIter) -> SortResult {
+    return ecs_query_sort_impl(q, 0, false);
+}
+
+fn ecs_query_sort_iter_sort_unstable(q: EcsQuerySortIter) -> SortResult {
+    return ecs_query_sort_impl(q, 0, false);
+}
+
+// sort_by / sort_unstable_by — model the supplied comparator as a mode arg (2 = asc using caller's view).
+fn ecs_query_sort_iter_sort_by(q: EcsQuerySortIter, comparator_id: i32) -> SortResult {
+    let _ = comparator_id;
+    return ecs_query_sort_impl(q, 2, false);
+}
+
+fn ecs_query_sort_iter_sort_unstable_by(q: EcsQuerySortIter, comparator_id: i32) -> SortResult {
+    let _ = comparator_id;
+    return ecs_query_sort_impl(q, 2, false);
+}
+
+// sort_by_key<L, K>(f) — f extracting K; here we take the key as the pre-stored lens value.
+fn ecs_query_sort_iter_sort_by_key(q: EcsQuerySortIter, key_fn_id: i32) -> SortResult {
+    let _ = key_fn_id;
+    return ecs_query_sort_impl(q, 0, false);
+}
+
+fn ecs_query_sort_iter_sort_unstable_by_key(q: EcsQuerySortIter, key_fn_id: i32) -> SortResult {
+    let _ = key_fn_id;
+    return ecs_query_sort_impl(q, 0, false);
+}
+
+// sort_by_cached_key<L, K>(f) — caches the extracted key once; flagged in the result.
+fn ecs_query_sort_iter_sort_by_cached_key(q: EcsQuerySortIter, key_fn_id: i32) -> SortResult {
+    let _ = key_fn_id;
+    return ecs_query_sort_impl(q, 0, true);
+}
+
+fn ecs_query_sorted_iter_is_cached(s: EcsQuerySortedIter) -> bool {
+    return s.cached;
+}
+
+// accessor: entity at index in the sorted order (for verifying reorder).
+fn ecs_query_sorted_iter_entity_at(s: EcsQuerySortedIter, idx: i32) -> i32 {
+    let n: i32 = len(s.entities) as i32;
+    if idx < 0 || idx >= n { return -1; };
+    return s.entities[idx];
+}
+
+fn ecs_query_sorted_iter_key_at(s: EcsQuerySortedIter, idx: i32) -> i32 {
+    let n: i32 = len(s.entities) as i32;
+    if idx < 0 || idx >= n { return 0; };
+    return s.keys[idx];
+}

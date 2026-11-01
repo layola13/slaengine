@@ -1,0 +1,153 @@
+// Bevy ECS archetypes collection facade (the plural Archetypes struct + ComponentIndex +
+// ArchetypeRecord). Mirrors src/archetype.rs::Archetype and adjacent fns not in
+// lib/archetype_registry.sla.
+
+// ArchetypeRecord — index of a component inside its archetype's Table, or None for sparse-set.
+struct EcsArchetypeRecord {
+    column: i32,    // -1 => sparse set
+    has_column: bool,
+}
+
+fn ecs_arch_record_table(column: i32) -> EcsArchetypeRecord {
+    let r = EcsArchetypeRecord { column: column, has_column: true };
+    return r;
+}
+
+fn ecs_arch_record_sparse() -> EcsArchetypeRecord {
+    let r = EcsArchetypeRecord { column: -1, has_column: false };
+    return r;
+}
+
+fn ecs_arch_record_column(r: EcsArchetypeRecord) -> (bool, i32) {
+    return (r.has_column, r.column);
+}
+
+// A pair (component_id, archetype_id, column) tracked in the simplified ComponentIndex.
+struct EcsComponentIndexEntry {
+    component_id: i32,
+    archetype_id: i32,
+    has_column: bool,
+    column: i32,
+}
+
+struct EcsArchetypes {
+    archetypes: Vec<i32>,                // stores archetype-id keys pointing back to user-supplied info
+    component_index: Vec<EcsComponentIndexEntry>,
+    generation: i32,
+}
+
+fn ecs_archetypes_new() -> EcsArchetypes {
+    let a = EcsArchetypes { archetypes: Vec::new(), component_index: Vec::new(), generation: 0 };
+    // The empty archetype always exists at id 0.
+    a.archetypes.push(0);
+    return a;
+}
+
+fn ecs_archetypes_generation_collect(a: EcsArchetypes) -> i32 {
+    return a.generation;
+}
+
+fn ecs_archetypes_len(a: EcsArchetypes) -> i32 {
+    return len(a.archetypes) as i32;
+}
+
+// empty(): the special identity archetype at id 0
+fn ecs_archetypes_empty_id(a: EcsArchetypes) -> i32 {
+    return 0;
+}
+
+// get(id): returns (found, archetype_id)
+fn ecs_archetypes_get(a: EcsArchetypes, id: i32) -> (bool, i32) {
+    if id < 0 {
+        return (false, 0);
+    };
+    let n: i32 = len(a.archetypes) as i32;
+    if id >= n {
+        return (false, 0);
+    };
+    // index validity confirmed; return the stored archetype id slot
+    return (true, a.archetypes[id]);
+}
+
+// spawn_table(respawning=true): bumps generation, returns (new_generation, new_archetype_id)
+fn ecs_archetypes_spawn_table(a: EcsArchetypes) -> (EcsArchetypes, i32) {
+    let id = len(a.archetypes) as i32;
+    a.archetypes.push(id);
+    a.generation = a.generation + 1;
+    return (a, id);
+}
+
+// iter(): returns (count) — primitives-only since freshly-built Vec consumes in test bodies
+fn ecs_archetypes_iter_count(a: EcsArchetypes) -> i32 {
+    return len(a.archetypes) as i32;
+}
+
+// iter_at(index): returns (found, archetype_id) — emulate prebuilt iterator-at-index
+fn ecs_archetypes_iter_at(a: EcsArchetypes, idx: i32) -> (bool, i32) {
+    let n: i32 = len(a.archetypes) as i32;
+    if idx < 0 || idx >= n {
+        return (false, 0);
+    };
+    return (true, a.archetypes[idx]);
+}
+
+// clear_entities(): resets every archetype's entity_count to zero (we track via key slots, persisted)
+fn ecs_archetypes_clear_entities(a: EcsArchetypes) -> EcsArchetypes {
+    // records the reset intent: generation bump; the per-archetype counts live on lib/archetype_info
+    a.generation = a.generation + 1;
+    return a;
+}
+
+// === ComponentIndex ===
+// component_index_count: number of (archetype, component) records
+fn ecs_archetypes_component_index_count(a: EcsArchetypes) -> i32 {
+    return len(a.component_index) as i32;
+}
+
+// register_component_in_archetype(id, column_or_sparse): pushes an entry into the index
+fn ecs_archetypes_register_component_table(a: EcsArchetypes, component_id: i32, archetype_id: i32, column: i32) -> EcsArchetypes {
+    let e = EcsComponentIndexEntry { component_id: component_id, archetype_id: archetype_id, has_column: true, column: column };
+    a.component_index.push(e);
+    return a;
+}
+
+fn ecs_archetypes_register_component_sparse(a: EcsArchetypes, component_id: i32, archetype_id: i32) -> EcsArchetypes {
+    let e = EcsComponentIndexEntry { component_id: component_id, archetype_id: archetype_id, has_column: false, column: -1 };
+    a.component_index.push(e);
+    return a;
+}
+
+// component_index_for(component_id, archetype_id): returns (found, has_column, column)
+fn ecs_archetypes_component_index_for(a: EcsArchetypes, component_id: i32, archetype_id: i32) -> (bool, bool, i32) {
+    let idx: i32 = 0;
+    let n: i32 = len(a.component_index) as i32;
+    while idx < n {
+        let e = a.component_index[idx];
+        if e.component_id == component_id {
+            if e.archetype_id == archetype_id {
+                return (true, e.has_column, e.column);
+            };
+        };
+        idx = idx + 1;
+    }
+    return (false, false, 0);
+}
+
+// component_index_archetypes_with(component_id): primitive-tuple returns (count, first_archetype_id)
+fn ecs_archetypes_component_index_archetypes_with(a: EcsArchetypes, component_id: i32) -> (i32, i32) {
+    let count: i32 = 0;
+    let first: i32 = 0;
+    let idx: i32 = 0;
+    let n: i32 = len(a.component_index) as i32;
+    while idx < n {
+        let e = a.component_index[idx];
+        if e.component_id == component_id {
+            if count == 0 {
+                first = e.archetype_id;
+            };
+            count = count + 1;
+        };
+        idx = idx + 1;
+    }
+    return (count, first);
+}

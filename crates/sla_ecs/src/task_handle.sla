@@ -1,0 +1,245 @@
+// Bevy async_task::Task-style handle state model over i32 task results.
+//
+// This complements `thread_executor.sla` and `task_future.sla` by modelling the
+// public Task handle operations Bevy exposes: detach, cancel, polling readiness,
+// and one-shot result take. It is an explicit task registry, not a Rust Future
+// runtime.
+@import "sa_std/vec.sa"
+
+struct EcsTaskHandleI32 {
+    task_id: i64,
+}
+
+struct EcsTaskRegistryI32 {
+    next_task_id: i64,
+    pending_ids: Vec<i64>,
+    pending_values: Vec<i32>,
+    completed_ids: Vec<i64>,
+    completed_values: Vec<i32>,
+    canceled_ids: Vec<i64>,
+    detached_ids: Vec<i64>,
+    tick_count: i64,
+}
+
+struct EcsTaskOptionalI32 {
+    has: bool,
+    value: i32,
+}
+
+struct EcsTaskCancelResultI32 {
+    registry: EcsTaskRegistryI32,
+    canceled: bool,
+    result: EcsTaskOptionalI32,
+}
+
+struct EcsTaskTakeResultI32 {
+    registry: EcsTaskRegistryI32,
+    result: EcsTaskOptionalI32,
+}
+
+fn ecs_task_handle_i32(task_id: i64) -> EcsTaskHandleI32 {
+    return EcsTaskHandleI32 { task_id: task_id };
+}
+
+fn ecs_task_optional_i32(has: bool, value: i32) -> EcsTaskOptionalI32 {
+    return EcsTaskOptionalI32 { has: has, value: value };
+}
+
+fn ecs_task_registry_i32_new() -> EcsTaskRegistryI32 {
+    let pending_ids: Vec<i64> = Vec::new();
+    let pending_values: Vec<i32> = Vec::new();
+    let completed_ids: Vec<i64> = Vec::new();
+    let completed_values: Vec<i32> = Vec::new();
+    let canceled_ids: Vec<i64> = Vec::new();
+    let detached_ids: Vec<i64> = Vec::new();
+    return EcsTaskRegistryI32 { next_task_id: 0, pending_ids: pending_ids, pending_values: pending_values, completed_ids: completed_ids, completed_values: completed_values, canceled_ids: canceled_ids, detached_ids: detached_ids, tick_count: 0 };
+}
+
+fn ecs_task_registry_spawn_pending_i32(registry: EcsTaskRegistryI32, value: i32) -> (EcsTaskRegistryI32, EcsTaskHandleI32) {
+    let task_id = registry.next_task_id;
+    registry.next_task_id = registry.next_task_id + 1;
+    registry.pending_ids.push(task_id);
+    registry.pending_values.push(value);
+    return (registry, ecs_task_handle_i32(task_id));
+}
+
+fn ecs_task_registry_spawn_ready_i32(registry: EcsTaskRegistryI32, value: i32) -> (EcsTaskRegistryI32, EcsTaskHandleI32) {
+    let task_id = registry.next_task_id;
+    registry.next_task_id = registry.next_task_id + 1;
+    registry.completed_ids.push(task_id);
+    registry.completed_values.push(value);
+    return (registry, ecs_task_handle_i32(task_id));
+}
+
+fn ecs_task_id_slot(ids: Vec<i64>, task_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(ids) as i64;
+    while i < n {
+        if ids[i] == task_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_task_registry_pending_slot_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> i64 {
+    return ecs_task_id_slot(registry.pending_ids, handle.task_id);
+}
+
+fn ecs_task_registry_completed_slot_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> i64 {
+    return ecs_task_id_slot(registry.completed_ids, handle.task_id);
+}
+
+fn ecs_task_registry_is_canceled_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> bool {
+    return ecs_task_id_slot(registry.canceled_ids, handle.task_id) >= 0;
+}
+
+fn ecs_task_registry_is_detached_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> bool {
+    return ecs_task_id_slot(registry.detached_ids, handle.task_id) >= 0;
+}
+
+fn ecs_task_registry_is_finished_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> bool {
+    return ecs_task_registry_completed_slot_i32(registry, handle) >= 0;
+}
+
+fn ecs_task_registry_pending_count_i32(registry: EcsTaskRegistryI32) -> i64 {
+    return len(registry.pending_ids) as i64;
+}
+
+fn ecs_task_registry_completed_count_i32(registry: EcsTaskRegistryI32) -> i64 {
+    return len(registry.completed_ids) as i64;
+}
+
+fn ecs_task_registry_without_pending_slot_i32(registry: EcsTaskRegistryI32, skip_slot: i64) -> EcsTaskRegistryI32 {
+    let next_ids: Vec<i64> = Vec::new();
+    let next_values: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n = len(registry.pending_ids) as i64;
+    while i < n {
+        if i != skip_slot {
+            next_ids.push(registry.pending_ids[i]);
+            next_values.push(registry.pending_values[i]);
+        };
+        i = i + 1;
+    }
+    registry.pending_ids = next_ids;
+    registry.pending_values = next_values;
+    return registry;
+}
+
+fn ecs_task_registry_without_completed_slot_i32(registry: EcsTaskRegistryI32, skip_slot: i64) -> EcsTaskRegistryI32 {
+    let next_ids: Vec<i64> = Vec::new();
+    let next_values: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n = len(registry.completed_ids) as i64;
+    while i < n {
+        if i != skip_slot {
+            next_ids.push(registry.completed_ids[i]);
+            next_values.push(registry.completed_values[i]);
+        };
+        i = i + 1;
+    }
+    registry.completed_ids = next_ids;
+    registry.completed_values = next_values;
+    return registry;
+}
+
+fn ecs_task_registry_tick_one_i32(registry: EcsTaskRegistryI32) -> EcsTaskRegistryI32 {
+    if len(registry.pending_ids) == 0 { return registry; };
+    let task_id = registry.pending_ids[0];
+    let value = registry.pending_values[0];
+    registry = ecs_task_registry_without_pending_slot_i32(registry, 0);
+    if ecs_task_id_slot(registry.canceled_ids, task_id) < 0 {
+        registry.completed_ids.push(task_id);
+        registry.completed_values.push(value);
+    };
+    registry.tick_count = registry.tick_count + 1;
+    return registry;
+}
+
+fn ecs_task_handle_detach_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> EcsTaskRegistryI32 {
+    if ecs_task_registry_is_detached_i32(registry, handle) != true {
+        registry.detached_ids.push(handle.task_id);
+    };
+    return registry;
+}
+
+fn ecs_task_cancel_result_i32(registry: EcsTaskRegistryI32, canceled: bool, result: EcsTaskOptionalI32) -> EcsTaskCancelResultI32 {
+    return EcsTaskCancelResultI32 { registry: registry, canceled: canceled, result: result };
+}
+
+fn ecs_task_handle_cancel_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> EcsTaskCancelResultI32 {
+    let completed_slot = ecs_task_registry_completed_slot_i32(registry, handle);
+    if completed_slot >= 0 {
+        let value = registry.completed_values[completed_slot];
+        registry = ecs_task_registry_without_completed_slot_i32(registry, completed_slot);
+        return ecs_task_cancel_result_i32(registry, false, ecs_task_optional_i32(true, value));
+    };
+    let pending_slot = ecs_task_registry_pending_slot_i32(registry, handle);
+    if pending_slot >= 0 {
+        registry = ecs_task_registry_without_pending_slot_i32(registry, pending_slot);
+        if ecs_task_registry_is_canceled_i32(registry, handle) != true { registry.canceled_ids.push(handle.task_id); };
+        return ecs_task_cancel_result_i32(registry, true, ecs_task_optional_i32(false, 0));
+    };
+    return ecs_task_cancel_result_i32(registry, false, ecs_task_optional_i32(false, 0));
+}
+
+fn ecs_task_take_result_i32(registry: EcsTaskRegistryI32, handle: EcsTaskHandleI32) -> EcsTaskTakeResultI32 {
+    let completed_slot = ecs_task_registry_completed_slot_i32(registry, handle);
+    if completed_slot < 0 {
+        return EcsTaskTakeResultI32 { registry: registry, result: ecs_task_optional_i32(false, 0) };
+    };
+    let value = registry.completed_values[completed_slot];
+    registry = ecs_task_registry_without_completed_slot_i32(registry, completed_slot);
+    return EcsTaskTakeResultI32 { registry: registry, result: ecs_task_optional_i32(true, value) };
+}
+
+@test "task handle pending needs executor tick"() {
+    let r0 = ecs_task_registry_i32_new();
+    let (r1, task) = ecs_task_registry_spawn_pending_i32(r0, 11);
+    if ecs_task_registry_is_finished_i32(r1, task) { panic(31510); };
+    let r2 = ecs_task_registry_tick_one_i32(r1);
+    if ecs_task_registry_is_finished_i32(r2, task) != true { panic(31511); };
+    if ecs_task_registry_pending_count_i32(r2) != 0 { panic(31512); };
+    if ecs_task_registry_completed_count_i32(r2) != 1 { panic(31513); };
+}
+
+@test "task handle detach lets pending task continue"() {
+    let r0 = ecs_task_registry_i32_new();
+    let (r1, task) = ecs_task_registry_spawn_pending_i32(r0, 22);
+    let r2 = ecs_task_handle_detach_i32(r1, task);
+    if ecs_task_registry_is_detached_i32(r2, task) != true { panic(31520); };
+    let r3 = ecs_task_registry_tick_one_i32(r2);
+    if ecs_task_registry_is_finished_i32(r3, task) != true { panic(31521); };
+}
+
+@test "task handle cancel pending prevents completion"() {
+    let r0 = ecs_task_registry_i32_new();
+    let (r1, task) = ecs_task_registry_spawn_pending_i32(r0, 33);
+    let canceled = ecs_task_handle_cancel_i32(r1, task);
+    if canceled.canceled != true { panic(31530); };
+    if canceled.result.has { panic(31531); };
+    if ecs_task_registry_is_canceled_i32(canceled.registry, task) != true { panic(31532); };
+    let r2 = ecs_task_registry_tick_one_i32(canceled.registry);
+    if ecs_task_registry_is_finished_i32(r2, task) { panic(31533); };
+    if r2.tick_count != 0 { panic(31534); };
+}
+
+@test "task handle cancel completed returns result"() {
+    let r0 = ecs_task_registry_i32_new();
+    let (r1, task) = ecs_task_registry_spawn_ready_i32(r0, 44);
+    let canceled = ecs_task_handle_cancel_i32(r1, task);
+    if canceled.canceled { panic(31540); };
+    if canceled.result.has != true { panic(31541); };
+    if canceled.result.value != 44 { panic(31542); };
+    if ecs_task_registry_is_finished_i32(canceled.registry, task) { panic(31543); };
+}
+
+@test "task handle result is one shot"() {
+    let r0 = ecs_task_registry_i32_new();
+    let (r1, task) = ecs_task_registry_spawn_ready_i32(r0, 55);
+    let first = ecs_task_take_result_i32(r1, task);
+    if first.result.has != true { panic(31550); };
+    if first.result.value != 55 { panic(31551); };
+    let second = ecs_task_take_result_i32(first.registry, task);
+    if second.result.has { panic(31552); };
+}

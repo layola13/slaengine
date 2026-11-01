@@ -1,0 +1,145 @@
+// Bevy ECS storage (src/storage/non_send.rs):
+// NonSendData + NonSends — storage for non-Send resources (must stay on main thread).
+
+struct EcsNonSendData {
+    component_id: i32,
+    // Data handle (opaque i64 in SLA)
+    data: i64,
+    is_present: bool,
+    // Change ticks
+    added_tick: i64,
+    changed_tick: i64,
+    changed_by: i64,
+}
+
+fn ecs_non_send_data_new(component_id: i32) -> EcsNonSendData {
+    return EcsNonSendData {
+        component_id: component_id, data: 0, is_present: false,
+        added_tick: 0, changed_tick: 0, changed_by: 0
+    };
+}
+
+fn ecs_non_send_data_insert(d: EcsNonSendData, data: i64, tick: i64) -> EcsNonSendData {
+    d.data = data;
+    d.is_present = true;
+    d.added_tick = tick;
+    d.changed_tick = tick;
+    return d;
+}
+
+fn ecs_non_send_data_remove(d: EcsNonSendData) -> EcsNonSendData {
+    d.is_present = false;
+    d.data = 0;
+    return d;
+}
+
+fn ecs_non_send_data_is_present(d: EcsNonSendData) -> bool { return d.is_present; }
+
+fn ecs_non_send_data_get_data(d: EcsNonSendData) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.data);
+}
+
+fn ecs_non_send_data_get_ticks(d: EcsNonSendData) -> (bool, i64, i64) {
+    if d.is_present != true { return (false, 0, 0); };
+    return (true, d.added_tick, d.changed_tick);
+}
+
+fn ecs_non_send_data_get_added_tick(d: EcsNonSendData) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.added_tick);
+}
+
+fn ecs_non_send_data_get_changed_tick(d: EcsNonSendData) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.changed_tick);
+}
+
+fn ecs_non_send_data_get_changed_by(d: EcsNonSendData) -> (bool, i64) {
+    if d.is_present != true { return (false, 0); };
+    return (true, d.changed_by);
+}
+
+fn ecs_non_send_data_set_changed(d: EcsNonSendData, tick: i64, changed_by: i64) -> EcsNonSendData {
+    d.changed_tick = tick;
+    d.changed_by = changed_by;
+    return d;
+}
+
+fn ecs_non_send_data_component_id(d: EcsNonSendData) -> i32 { return d.component_id; }
+
+// === NonSends collection ===
+struct EcsNonSends {
+    component_ids: Vec<i32>,
+    data: Vec<EcsNonSendData>,
+}
+
+fn ecs_non_sends_new() -> EcsNonSends {
+    return EcsNonSends { component_ids: Vec::new(), data: Vec::new() };
+}
+
+fn ecs_non_sends_len(s: EcsNonSends) -> i64 { return len(s.component_ids) as i64; }
+fn ecs_non_sends_is_empty(s: EcsNonSends) -> bool { return len(s.component_ids) == 0; }
+
+fn ecs_non_sends_get_index(s: EcsNonSends, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(s.component_ids) as i64;
+    while i < n {
+        if s.component_ids[i] == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_non_sends_get(s: EcsNonSends, component_id: i32) -> (bool, EcsNonSendData) {
+    let idx = ecs_non_sends_get_index(s, component_id);
+    if idx < 0 { return (false, ecs_non_send_data_new(0)); };
+    return (true, s.data[idx]);
+}
+
+fn ecs_non_sends_get_or_insert(s: EcsNonSends, component_id: i32) -> (EcsNonSends, i64) {
+    let idx = ecs_non_sends_get_index(s, component_id);
+    if idx >= 0 { return (s, idx); };
+    s.component_ids.push(component_id);
+    s.data.push(ecs_non_send_data_new(component_id));
+    let new_idx = (len(s.data) as i64) - 1;
+    return (s, new_idx);
+}
+
+fn ecs_non_sends_insert(s: EcsNonSends, component_id: i32, data: i64, tick: i64) -> EcsNonSends {
+    let r = ecs_non_sends_get_or_insert(s, component_id);
+    let s2 = r.0;
+    let idx = r.1;
+    s2.data[idx] = ecs_non_send_data_insert(s2.data[idx], data, tick);
+    return s2;
+}
+
+fn ecs_non_sends_remove(s: EcsNonSends, component_id: i32) -> (EcsNonSends, bool) {
+    let idx = ecs_non_sends_get_index(s, component_id);
+    if idx < 0 { return (s, false); };
+    s.data[idx] = ecs_non_send_data_remove(s.data[idx]);
+    return (s, true);
+}
+
+fn ecs_non_sends_clear(s: EcsNonSends) -> EcsNonSends {
+    s.component_ids = Vec::new();
+    s.data = Vec::new();
+    return s;
+}
+
+fn ecs_non_sends_contains(s: EcsNonSends, component_id: i32) -> bool {
+    let idx = ecs_non_sends_get_index(s, component_id);
+    if idx < 0 { return false; };
+    return s.data[idx].is_present;
+}
+
+fn ecs_non_sends_count_present(s: EcsNonSends) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(s.data) as i64;
+    while i < n {
+        if s.data[i].is_present { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}

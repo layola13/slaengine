@@ -1,0 +1,185 @@
+// Bevy ECS System trait gaps not covered by lib/system_trait.sla.
+//
+// Mirrors src/system/system.rs System trait surface:
+//   is_send              (negation of NON_SEND flag — must thread a NON_SEND bit)
+//   system_type           (returns TypeId; modelled as an i64 type-id slot stored on the system)
+//   refresh_hotpatch      (no-op stub mirroring Bevy's default — returns the system)
+//   queue_deferred        (queue deferred commands onto a DeferredWorld; modelled as bumping a counter)
+//   check_change_tick     (advance the last-check tick; modelled as updating last_run)
+//   default_system_sets   (Vec<InternedSystemSet>; modelled as a count + at-idx accessor)
+//   get_last_run / set_last_run  (mutable last-run Tick read/write)
+//   run_readonly          (run without deferred side-effects; modelled as read-only executing and bumping run count)
+//   run_without_applying_deferred (run; queue deferred but don't apply — mirrors System::run_without_applying_deferred)
+//
+// Our module introduces EcsSystemExtras with its own bitfield (NONE_SEND bit) + type_id + last_run +
+// run_count + deferred_count + default_set_ids Vec so we don't perturb lib/system_trait.sla's EcsSystem
+// (its own design requires its flags bitfield). All multi-value returns use single-field result structs.
+
+// Result struct for default_system_sets lookup.
+struct SysSetResult {
+    count: i32,
+    first_id: i64,
+}
+
+fn ecs_sys_set_count(r: SysSetResult) -> i32 {
+    return r.count;
+}
+
+fn ecs_sys_set_first_id(r: SysSetResult) -> i64 {
+    return r.first_id;
+}
+
+// Result struct for run_readonly.
+struct RunReadonlyResult {
+    ran_count: i64,
+    queued_deferred: i32,
+}
+
+fn ecs_run_rd_count(r: RunReadonlyResult) -> i64 {
+    return r.ran_count;
+}
+
+fn ecs_run_rd_queued(r: RunReadonlyResult) -> i32 {
+    return r.queued_deferred;
+}
+
+// === Model: EcsSystemExtras ===
+struct EcsSystemExtras {
+    type_id: i64,
+    flags_bits: i32,
+    last_run: i64,
+    run_count: i64,
+    deferred_count: i32,
+    default_set_ids: Vec<i64>,
+}
+
+const ECS_SYSEX_INITIALIZED: i32 = 1;
+const ECS_SYSEX_EXCLUSIVE: i32 = 2;
+const ECS_SYSEX_HAS_DEFERRED: i32 = 4;
+const ECS_SYSEX_NON_SEND: i32 = 8;
+
+fn ecs_system_extras_new(type_id: i64) -> EcsSystemExtras {
+    let s = EcsSystemExtras {
+        type_id: type_id,
+        flags_bits: 0,
+        last_run: 0,
+        run_count: 0,
+        deferred_count: 0,
+        default_set_ids: Vec::new(),
+    };
+    return s;
+}
+
+fn ecs_system_extras_type_id(s: EcsSystemExtras) -> i64 {
+    return s.type_id;
+}
+
+// flags_set / flags_has / flags_unset mirroring lib/system_trait.sla bit-with-AND pattern.
+fn _ecs_se_flags_set(s: EcsSystemExtras, bit: i32) -> i32 {
+    return s.flags_bits | bit;
+}
+
+fn _ecs_se_flags_has(bits: i32, bit: i32) -> bool {
+    return (bits & bit) != 0;
+}
+
+// is_send: Bevy true iff NON_SEND flag is NOT set on flags().intersects(NON_SEND).
+fn ecs_system_extras_is_send(s: EcsSystemExtras) -> bool {
+    return !_ecs_se_flags_has(s.flags_bits, ECS_SYSEX_NON_SEND);
+}
+
+fn ecs_system_extras_set_non_send(s: EcsSystemExtras, on: bool) -> EcsSystemExtras {
+    if on {
+        s.flags_bits = _ecs_se_flags_set(s, ECS_SYSEX_NON_SEND);
+    };
+    return s;
+}
+
+// refresh_hotpatch: no-op stub mirroring Bevy's default impl — return self.
+fn ecs_system_extras_refresh_hotpatch(s: EcsSystemExtras) -> EcsSystemExtras {
+    return s;
+}
+
+// queue_deferred: increment the deferred queue counter (model DeferredWorld command queue).
+fn ecs_system_extras_queue_deferred(s: EcsSystemExtras, cmds: i32) -> EcsSystemExtras {
+    s.deferred_count = s.deferred_count + cmds;
+    return s;
+}
+
+fn ecs_system_extras_deferred_count(s: EcsSystemExtras) -> i32 {
+    return s.deferred_count;
+}
+
+// check_change_tick: Bevy updates the system's last-check Tick. Model: set last_run to given tick.
+fn ecs_system_extras_check_change_tick(s: EcsSystemExtras, tick: i64) -> EcsSystemExtras {
+    s.last_run = tick;
+    return s;
+}
+
+// get_last_run / set_last_run.
+fn ecs_system_extras_get_last_run(s: EcsSystemExtras) -> i64 {
+    return s.last_run;
+}
+
+fn ecs_system_extras_set_last_run(s: EcsSystemExtras, last_run: i64) -> EcsSystemExtras {
+    s.last_run = last_run;
+    return s;
+}
+
+// default_system_sets: modelled as a Vec of set ids on the system; getter returns count + first.
+fn ecs_system_extras_default_system_sets(s: EcsSystemExtras) -> SysSetResult {
+    if len(s.default_set_ids) as i32 == 0 {
+        let none = SysSetResult { count: 0, first_id: -1 };
+        return none;
+    };
+    let first = s.default_set_ids[0];
+    let res = SysSetResult { count: len(s.default_set_ids) as i32, first_id: first };
+    return res;
+}
+
+// helper: add a default set id (mirrors Bevy systems returning their built-in set list)
+fn ecs_system_extras_add_default_system_set(s: EcsSystemExtras, set_id: i64) -> EcsSystemExtras {
+    s.default_set_ids.push(set_id);
+    return s;
+}
+
+// run_without_applying_deferred: run the system (bump run_count) but do NOT apply deferred — mirrors
+// Bevy System::run_without_applying_deferred (queues deferred but applies later). Returns (run_count, last_run).
+struct RunWithoutDeferredResult {
+    run_count: i64,
+    last_run: i64,
+    deferred_count: i32,
+}
+
+fn ecs_run_wod_count(r: RunWithoutDeferredResult) -> i64 {
+    return r.run_count;
+}
+
+fn ecs_run_wod_last_run(r: RunWithoutDeferredResult) -> i64 {
+    return r.last_run;
+}
+
+fn ecs_run_wod_deferred(r: RunWithoutDeferredResult) -> i32 {
+    return r.deferred_count;
+}
+
+fn ecs_system_extras_run_without_applying_deferred(s: EcsSystemExtras, input: i64) -> (EcsSystemExtras, RunWithoutDeferredResult) {
+    s.run_count = s.run_count + 1;
+    s.last_run = input;
+    s.flags_bits = _ecs_se_flags_set(s, ECS_SYSEX_HAS_DEFERRED);
+    let res = RunWithoutDeferredResult { run_count: s.run_count, last_run: input, deferred_count: s.deferred_count };
+    return (s, res);
+}
+
+// run_readonly: run without deferred side-effects (Bevy System::run_readonly is Safe + read-only).
+// Mirrors: bumps run_count ONLY, NOT setting HAS_DEFERRED, and returns RunReadonlyResult.
+fn ecs_system_extras_run_readonly(s: EcsSystemExtras, input: i64) -> (EcsSystemExtras, RunReadonlyResult) {
+    s.run_count = s.run_count + 1;
+    s.last_run = input;
+    let res = RunReadonlyResult { ran_count: s.run_count, queued_deferred: 0 };
+    return (s, res);
+}
+
+fn ecs_system_extras_run_count(s: EcsSystemExtras) -> i64 {
+    return s.run_count;
+}

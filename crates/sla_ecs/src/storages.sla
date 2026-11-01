@@ -1,0 +1,252 @@
+// Bevy ECS Storages top-level container — mirrors src/storage/mod.rs.
+//
+//   pub struct Storages { sparse_sets: SparseSets, tables: Tables, non_sends: NonSends }
+//   impl Storages {
+//       pub fn prepare_component(&mut self, component: &ComponentInfo) {
+//           match component.storage_type() {
+//               StorageType::Table => { /* no-op */ }
+//               StorageType::SparseSet => { self.sparse_sets.get_or_insert(component); }
+//           }
+//       }
+//   }
+//
+// This module models the *outer* Storages container + the `prepare_component` dispatch (the
+// inner SparseSets/Tables/NonSends are each modelled separately in sparse_set.sla,
+// sparse_set_extras.sla, table_mod.sla, non_send_storage.sla). We model minimal observable
+// state here: a sparse-set count, a table count, a non-send count, plus a Vec of
+// (prepared_component_id, storage_type) pairs so the dispatch decision is observable & testable.
+//
+// storage_type: 0 => Table (no-op on prepare), 1 => SparseSet (bump sparse_set_count).
+// Builder-style mutators return the mutated model (per SLA rule 6 — lib-fn mutations do not
+// ripple to caller bindings).
+//
+// Also models the SparseSets-level iterate + get gaps not present elsewhere: iter returns the
+// (component_id, index) pairs in insertion order; get returns the stored sparse-set index for a
+// given component_id (or -1 when absent).
+
+// === Result struct for iter step (single-field accessors — avoids scalar-tuple .1 corruption) ===
+struct StoragePrepareResult {
+    storage: EcsStorages,
+    prepared_kind: i32,
+}
+
+fn ecs_spr_storage(r: StoragePrepareResult) -> EcsStorages {
+    return r.storage;
+}
+
+fn ecs_spr_kind(r: StoragePrepareResult) -> i32 {
+    return r.prepared_kind;
+}
+
+// === Result struct for SparseSets::iter step ===
+struct SparseSetsIterStep {
+    component_id: i32,
+    index: i32,
+}
+
+fn ecs_ss_iter_cid(r: SparseSetsIterStep) -> i32 {
+    return r.component_id;
+}
+
+fn ecs_ss_iter_index(r: SparseSetsIterStep) -> i32 {
+    return r.index;
+}
+
+// === EcsStorages model ===
+//   sparse_set_count: number of sparse-set components prepared via StorageType::SparseSet
+//   table_count: number of table components registered (Table storage needs no prepare action,
+//                but the Storages container still tracks that a column was registered — mirrors
+//                Tables.len which counts allocated tables, not prepared components)
+//   non_send_count: number of non-send components registered
+//   prepared_component_ids: Vec<i32> of component ids that prepare_component has been called on
+//   prepared_storage_kinds: Vec<i32> 0=Table / 1=SparseSet, parallel to prepared_component_ids
+struct EcsStorages {
+    sparse_set_count: i32,
+    table_count: i32,
+    non_send_count: i32,
+    prepared_component_ids: Vec<i32>,
+    prepared_storage_kinds: Vec<i32>,
+}
+
+fn ecs_storages_new() -> EcsStorages {
+    let s = EcsStorages {
+        sparse_set_count: 0,
+        table_count: 0,
+        non_send_count: 0,
+        prepared_component_ids: Vec::new(),
+        prepared_storage_kinds: Vec::new(),
+    };
+    return s;
+}
+
+fn ecs_storages_sparse_set_count(s: EcsStorages) -> i32 {
+    return s.sparse_set_count;
+}
+
+fn ecs_storages_table_count(s: EcsStorages) -> i32 {
+    return s.table_count;
+}
+
+fn ecs_storages_non_send_count(s: EcsStorages) -> i32 {
+    return s.non_send_count;
+}
+
+fn ecs_storages_prepared_len(s: EcsStorages) -> i32 {
+    return len(s.prepared_component_ids) as i32;
+}
+
+// === SparseSets::get_or_insert dispatch — the core of prepare_component ===
+// Mirrors Bevy: `match component.storage_type() { StorageType::Table => {}, StorageType::SparseSet
+//   => { self.sparse_sets.get_or_insert(component); } }`.
+// We model the observable effect: only SparseSet storage bumps sparse_set_count and records the
+// insert. Table storage records the prepare call (for idempotency testing) but bumps table_count
+// only when the component is first registered (Bevy's Tables::create happens via bundle-spawn
+// not prepare_component; here we keep the count stable to mirror "table needs no preparation").
+fn ecs_storages_prepare_component(s: EcsStorages, component_id: i32, storage_type: i32) -> StoragePrepareResult {
+    let already = ecs_storages_is_prepared(s, component_id);
+    if already {
+        // Bevy's SparseSets.get_or_insert is idempotent (returns the existing set); prepare_component
+        // called twice on the same component is a no-op the second time.
+        return StoragePrepareResult { storage: s, prepared_kind: storage_type };
+    };
+    let mut new_ids = Vec::new();
+    let mut new_kinds = Vec::new();
+    let copy_i = 0;
+    while copy_i < len(s.prepared_component_ids) as i32 {
+        new_ids.push(s.prepared_component_ids[copy_i]);
+        new_kinds.push(s.prepared_storage_kinds[copy_i]);
+        copy_i = copy_i + 1;
+    }
+    new_ids.push(component_id);
+    new_kinds.push(storage_type);
+    let new_sparse_count = s.sparse_set_count;
+    let new_table_count = s.table_count;
+    let actual_kind = storage_type;
+    if storage_type == 1 {
+        // StorageType::SparseSet -> SparseSets.get_or_insert -> bumps sparse-set count.
+        new_sparse_count = s.sparse_set_count + 1;
+    } else {
+        // StorageType::Table -> no-op, count unchanged.
+        actual_kind = 0;
+    };
+    let out = EcsStorages {
+        sparse_set_count: new_sparse_count,
+        table_count: new_table_count,
+        non_send_count: s.non_send_count,
+        prepared_component_ids: new_ids,
+        prepared_storage_kinds: new_kinds,
+    };
+    return StoragePrepareResult { storage: out, prepared_kind: actual_kind };
+}
+
+// === Has a component been prepared already? (idempotency check used by prepare_component) ===
+fn ecs_storages_is_prepared(s: EcsStorages, component_id: i32) -> bool {
+    let i = 0;
+    let found = false;
+    while i < len(s.prepared_component_ids) as i32 {
+        if s.prepared_component_ids[i] == component_id { found = true; };
+        i = i + 1;
+    }
+    return found;
+}
+
+// === Prepared-component lookup — returns (has, storage_kind) for a given prepared id ===
+struct PreparedLookupResult {
+    has: bool,
+    storage_kind: i32,
+}
+
+fn ecs_plr_has(r: PreparedLookupResult) -> bool {
+    return r.has;
+}
+
+fn ecs_plr_kind(r: PreparedLookupResult) -> i32 {
+    return r.storage_kind;
+}
+
+fn ecs_storages_get_prepared(s: EcsStorages, component_id: i32) -> PreparedLookupResult {
+    let i = 0;
+    while i < len(s.prepared_component_ids) as i32 {
+        if s.prepared_component_ids[i] == component_id {
+            return PreparedLookupResult { has: true, storage_kind: s.prepared_storage_kinds[i] };
+        };
+        i = i + 1;
+    }
+    return PreparedLookupResult { has: false, storage_kind: (0 - 1) };
+}
+
+// === SparseSets::iter (gap not in sparse_set*.sla) — returns the i-th prepared (cid, index) pair.
+// index counts the order in which the sparse set was inserted (0-based among SparseSet-prepared).
+fn ecs_storages_sparse_set_iter_at(s: EcsStorages, position: i32) -> SparseSetsIterStep {
+    let i = 0;
+    let ss_index = 0;
+    let emitted = 0;
+    while i < len(s.prepared_component_ids) as i32 {
+        if s.prepared_storage_kinds[i] == 1 {
+            if emitted == position {
+                return SparseSetsIterStep { component_id: s.prepared_component_ids[i], index: ss_index };
+            };
+            ss_index = ss_index + 1;
+            emitted = emitted + 1;
+        };
+        i = i + 1;
+    }
+    return SparseSetsIterStep { component_id: (0 - 1), index: (0 - 1) };
+}
+
+// === SparseSets::get (component_id) -> Option<&ComponentSparseSet>
+// Returns the insertion-index among SparseSet-prepared ids, or -1 if absent (modelled Option).
+fn ecs_storages_sparse_set_get(s: EcsStorages, component_id: i32) -> i32 {
+    let i = 0;
+    let ss_index = 0;
+    while i < len(s.prepared_component_ids) as i32 {
+        if s.prepared_storage_kinds[i] == 1 {
+            if s.prepared_component_ids[i] == component_id {
+                return ss_index;
+            };
+            ss_index = ss_index + 1;
+        };
+        i = i + 1;
+    }
+    return (0 - 1);
+}
+
+// === Tables::get(id) -> Option<&Table> — modelled as table-count tracking via table registration.
+// Bevy's Tables are created during bundle spawn, not prepare_component. We expose a
+// register_table mutator that bumps table_count (mirrors Tables::create returning a new TableId).
+fn ecs_storages_register_table(s: EcsStorages) -> EcsStorages {
+    let out = EcsStorages {
+        sparse_set_count: s.sparse_set_count,
+        table_count: s.table_count + 1,
+        non_send_count: s.non_send_count,
+        prepared_component_ids: s.prepared_component_ids,
+        prepared_storage_kinds: s.prepared_storage_kinds,
+    };
+    return out;
+}
+
+// === NonSends::get_or_insert(model) — bump non_send_count (mirrors sparse-set get_or_insert
+// for the !Send storage class).
+fn ecs_storages_register_non_send(s: EcsStorages) -> EcsStorages {
+    let out = EcsStorages {
+        sparse_set_count: s.sparse_set_count,
+        table_count: s.table_count,
+        non_send_count: s.non_send_count + 1,
+        prepared_component_ids: s.prepared_component_ids,
+        prepared_storage_kinds: s.prepared_storage_kinds,
+    };
+    return out;
+}
+
+// === Is-empty predicates mirroring SparseSets/Tables/NonSends.is_empty() ===
+fn ecs_storages_sparse_sets_is_empty(s: EcsStorages) -> bool {
+    return s.sparse_set_count == 0;
+}
+
+fn ecs_storages_tables_is_empty(s: EcsStorages) -> bool {
+    return s.table_count == 0;
+}
+
+fn ecs_storages_non_sends_is_empty(s: EcsStorages) -> bool {
+    return s.non_send_count == 0;
+}

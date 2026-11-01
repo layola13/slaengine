@@ -1,0 +1,184 @@
+// Bevy ECS query::state extension — QueryState static-state surface + StorageSwitch<T,S> +
+// fetch wrappers (ReadFetch/WriteFetch/RefFetch). Mirrors src/query/state.rs + src/query/fetch.rs.
+
+// === StorageSwitch<T, S> — spus5 variant dispatch by StorageType ===
+struct EcsStorageSwitch<T, S> {
+    table: T,
+    sparse_set: S,
+}
+
+fn ecs_storage_switch_new<T, S>(table: T, sparse_set: S) -> EcsStorageSwitch<T, S> {
+    let sw = EcsStorageSwitch<T, S> { table: table, sparse_set: sparse_set };
+    return sw;
+}
+
+// extract: dispatches table branch (StorageType::Table=0) or sparse_set branch.
+fn ecs_storage_switch_extract_table<T, S>(sw: EcsStorageSwitch<T, S>) -> T {
+    return sw.table;
+}
+
+fn ecs_storage_switch_extract_sparse<T, S>(sw: EcsStorageSwitch<T, S>) -> S {
+    return sw.sparse_set;
+}
+
+// extract_index: returns the variant chosen by storage_type id (0 = Table, 1 = SparseSet).
+fn ecs_storage_switch_extract_by_id<T, S>(sw: EcsStorageSwitch<T, S>, storage_type: i32) -> (i32, T, S) {
+    if storage_type == 0 {
+        return (0, sw.table, sw.sparse_set);
+    };
+    return (1, sw.table, sw.sparse_set);
+}
+
+// === Fetch wrappers — ReadFetch<T> / WriteFetch<T> / RefFetch<T> — read-side / write-side items ===
+struct EcsReadFetch<T> { ptr: T }
+struct EcsWriteFetch<T> { ptr: T }
+struct EcsRefFetch<T> { ptr: T }
+
+fn ecs_read_fetch_new<T>(value: T) -> EcsReadFetch<T> { let f = EcsReadFetch<T> { ptr: value }; return f; }
+fn ecs_read_fetch_get<T>(f: EcsReadFetch<T>) -> T { return f.ptr; }
+
+fn ecs_write_fetch_new<T>(value: T) -> EcsWriteFetch<T> { let f = EcsWriteFetch<T> { ptr: value }; return f; }
+fn ecs_write_fetch_get<T>(f: EcsWriteFetch<T>) -> T { return f.ptr; }
+fn ecs_write_fetch_set<T>(f: EcsWriteFetch<T>, value: T) -> EcsWriteFetch<T> { f.ptr = value; return f; }
+
+fn ecs_ref_fetch_new<T>(value: T) -> EcsRefFetch<T> { let f = EcsRefFetch<T> { ptr: value }; return f; }
+fn ecs_ref_fetch_get<T>(f: EcsRefFetch<T>) -> T { return f.ptr; }
+
+// === QueryState extension surface (static-state) ===
+struct EcsQueryStateV2 {
+    component_access: Vec<i32>,
+    component_access_writes: Vec<i32>,
+    matched_tables: Vec<i32>,
+    matched_archetypes: Vec<i32>,
+    world_id: i32,
+    generation: i32,
+    is_readonly: bool,
+}
+
+fn ecs_query_state_v2_new(world_id: i32) -> EcsQueryStateV2 {
+    let s = EcsQueryStateV2 { component_access: Vec::new(), component_access_writes: Vec::new(), matched_tables: Vec::new(), matched_archetypes: Vec::new(), world_id: world_id, generation: 0, is_readonly: false };
+    return s;
+}
+
+fn ecs_query_state_v2_add_read(s: EcsQueryStateV2, component_id: i32) -> EcsQueryStateV2 {
+    s.component_access.push(component_id);
+    return s;
+}
+
+fn ecs_query_state_v2_add_write(s: EcsQueryStateV2, component_id: i32) -> EcsQueryStateV2 {
+    s.component_access.push(component_id);
+    s.component_access_writes.push(component_id);
+    return s;
+}
+
+fn ecs_query_state_v2_as_readonly(s: EcsQueryStateV2) -> EcsQueryStateV2 {
+    s.is_readonly = true;
+    return s;
+}
+
+fn ecs_query_state_v2_component_access(s: EcsQueryStateV2) -> Vec<i32> {
+    return s.component_access;
+}
+
+fn ecs_query_state_v2_matched_tables(s: EcsQueryStateV2) -> Vec<i32> {
+    return s.matched_tables;
+}
+
+fn ecs_query_state_v2_matched_archetypes(s: EcsQueryStateV2) -> Vec<i32> {
+    return s.matched_archetypes;
+}
+
+fn ecs_query_state_v2_add_matched_table(s: EcsQueryStateV2, table_id: i32) -> EcsQueryStateV2 {
+    s.matched_tables.push(table_id);
+    return s;
+}
+
+fn ecs_query_state_v2_add_matched_archetype(s: EcsQueryStateV2, archetype_id: i32) -> EcsQueryStateV2 {
+    s.matched_archetypes.push(archetype_id);
+    return s;
+}
+
+// validate_world(id): no-op for static; records the requested world_id and bumps generation if mismatch
+fn ecs_query_state_v2_validate_world(s: EcsQueryStateV2, world_id: i32) -> (EcsQueryStateV2, bool) {
+    if s.world_id == world_id {
+        return (s, true);
+    };
+    s.generation = s.generation + 1;
+    return (s, false);
+}
+
+// matches_component_set(set_contains: fn(ComponentId) -> bool) — whether any read component in our access is in the set.
+fn ecs_query_state_v2_matches_component_set(s: EcsQueryStateV2, set: Vec<i32>) -> bool {
+    let idx: i32 = 0;
+    let n: i32 = len(s.component_access) as i32;
+    while idx < n {
+        let cid = s.component_access[idx];
+        let j: i32 = 0;
+        let m: i32 = len(set) as i32;
+        while j < m {
+            if set[j] == cid {
+                return true;
+            };
+            j = j + 1;
+        }
+        idx = idx + 1;
+    }
+    return false;
+}
+
+// transmute tag: marks a transmute / does not change data
+fn ecs_query_state_v2_transmute_filtered(s: EcsQueryStateV2, new_generation: i32) -> EcsQueryStateV2 {
+    s.generation = new_generation;
+    return s;
+}
+
+// join tag: mark a join, bump generation
+fn ecs_query_state_v2_join_filtered(s: EcsQueryStateV2, other_generation: i32) -> EcsQueryStateV2 {
+    s.generation = s.generation + other_generation;
+    return s;
+}
+
+fn ecs_query_state_v2_world_id(s: EcsQueryStateV2) -> i32 {
+    return s.world_id;
+}
+
+fn ecs_query_state_v2_generation(s: EcsQueryStateV2) -> i32 {
+    return s.generation;
+}
+
+fn ecs_query_state_v2_is_readonly(s: EcsQueryStateV2) -> bool {
+    return s.is_readonly;
+}
+
+fn ecs_query_state_v2_matched_table_count(s: EcsQueryStateV2) -> i32 {
+    return len(s.matched_tables) as i32;
+}
+
+fn ecs_query_state_v2_matched_archetype_count(s: EcsQueryStateV2) -> i32 {
+    return len(s.matched_archetypes) as i32;
+}
+
+// Component access presence queries
+fn ecs_query_state_v2_has_read(s: EcsQueryStateV2, component_id: i32) -> bool {
+    let idx: i32 = 0;
+    let n: i32 = len(s.component_access) as i32;
+    while idx < n {
+        if s.component_access[idx] == component_id {
+            return true;
+        };
+        idx = idx + 1;
+    }
+    return false;
+}
+
+fn ecs_query_state_v2_has_write(s: EcsQueryStateV2, component_id: i32) -> bool {
+    let idx: i32 = 0;
+    let n: i32 = len(s.component_access_writes) as i32;
+    while idx < n {
+        if s.component_access_writes[idx] == component_id {
+            return true;
+        };
+        idx = idx + 1;
+    }
+    return false;
+}

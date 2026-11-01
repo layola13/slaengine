@@ -1,0 +1,1005 @@
+// Bevy ECS schedule::stepping — Stepping controller for step-debugging schedules.
+// Mirrors src/schedule/stepping.rs.
+
+const ECS_STEPPING_ACTION_RUN_ALL: i32 = 0;
+const ECS_STEPPING_ACTION_WAITING: i32 = 1;
+const ECS_STEPPING_ACTION_CONTINUE: i32 = 2;
+const ECS_STEPPING_ACTION_STEP: i32 = 3;
+
+const ECS_SB_ALWAYS_RUN: i32 = 0;
+const ECS_SB_NEVER_RUN: i32 = 1;
+const ECS_SB_BREAK: i32 = 2;
+const ECS_SB_CONTINUE: i32 = 3;
+
+// Behaviour for a (label, node) pair; absent entries default to Break/Continue semantics.
+struct EcsSteppingNodeBehavior {
+    label: i32,
+    node: i32,
+    behavior: i32,
+}
+
+struct EcsSteppingScheduleState {
+    label: i32,
+    cursor_node: i32,
+    start_node: i32,
+}
+
+struct EcsStepping {
+    enabled: bool,
+    action: i32,
+    schedules: Vec<i32>,
+    schedule_states: Vec<EcsSteppingScheduleState>,
+    schedule_order: Vec<i32>,
+    previous_schedule: i32,
+    behaviors: Vec<EcsSteppingNodeBehavior>,
+    ready: bool,
+}
+
+fn ecs_stepping_new() -> EcsStepping {
+    let s = EcsStepping { enabled: false, action: ECS_STEPPING_ACTION_RUN_ALL, schedules: Vec::new(), schedule_states: Vec::new(), schedule_order: Vec::new(), previous_schedule: 0, behaviors: Vec::new(), ready: false };
+    return s;
+}
+
+// begin_frame: marks schedules ready for stepping this frame
+fn ecs_stepping_begin_frame(s: EcsStepping) -> EcsStepping {
+    s.ready = true;
+    return s;
+}
+
+// schedules(): returns NotReady if !ready, else the Vec<i32>
+fn ecs_stepping_schedules(s: EcsStepping) -> (bool, Vec<i32>) {
+    if s.ready != true {
+        return (false, Vec::new());
+    };
+    return (true, s.schedules);
+}
+
+// cursor(): returns (found, label, node)
+fn ecs_stepping_cursor(s: EcsStepping) -> (bool, i32, i32) {
+    let n: i32 = len(s.schedule_states) as i32;
+    if n == 0 {
+        return (false, 0, 0);
+    };
+    let idx: i32 = 0;
+    let lb = s.schedule_states[idx].label;
+    let nd = s.schedule_states[idx].cursor_node;
+    return (true, lb, nd);
+}
+
+fn ecs_stepping_add_schedule(s: EcsStepping, label: i32) -> EcsStepping {
+    s.schedules.push(label);
+    let state = EcsSteppingScheduleState { label: label, cursor_node: 0, start_node: 0 };
+    s.schedule_states.push(state);
+    return s;
+}
+
+fn ecs_stepping_remove_schedule(s: EcsStepping, label: i32) -> EcsStepping {
+    let out = Vec::new();
+    let idx: i32 = 0;
+    let n: i32 = len(s.schedules) as i32;
+    while idx < n {
+        if s.schedules[idx] != label {
+            out.push(s.schedules[idx]);
+        };
+        idx = idx + 1;
+    }
+    s.schedules = out;
+    return s;
+}
+
+fn ecs_stepping_clear_schedule(s: EcsStepping, label: i32) -> EcsStepping {
+    // reset cursor/start for the matching schedule state
+    let idx: i32 = 0;
+    let n: i32 = len(s.schedule_states) as i32;
+    while idx < n {
+        if s.schedule_states[idx].label == label {
+            s.schedule_states[idx].cursor_node = 0;
+            s.schedule_states[idx].start_node = 0;
+        };
+        idx = idx + 1;
+    }
+    return s;
+}
+
+fn ecs_stepping_enable(s: EcsStepping) -> EcsStepping {
+    s.enabled = true;
+    s.action = ECS_STEPPING_ACTION_WAITING;
+    return s;
+}
+
+fn ecs_stepping_disable(s: EcsStepping) -> EcsStepping {
+    s.enabled = false;
+    s.action = ECS_STEPPING_ACTION_RUN_ALL;
+    return s;
+}
+
+fn ecs_stepping_is_enabled(s: EcsStepping) -> bool {
+    return s.enabled;
+}
+
+fn ecs_stepping_step_frame(s: EcsStepping) -> EcsStepping {
+    if s.enabled != true {
+        return s;
+    };
+    s.action = ECS_STEPPING_ACTION_STEP;
+    return s;
+}
+
+fn ecs_stepping_continue_frame(s: EcsStepping) -> EcsStepping {
+    if s.enabled != true {
+        return s;
+    };
+    s.action = ECS_STEPPING_ACTION_CONTINUE;
+    return s;
+}
+
+fn ecs_stepping_action(s: EcsStepping) -> i32 {
+    return s.action;
+}
+
+// always_run_node: sets behavior for (label, node) to AlwaysRun
+fn ecs_stepping_always_run_node(s: EcsStepping, label: i32, node: i32) -> EcsStepping {
+    let b = EcsSteppingNodeBehavior { label: label, node: node, behavior: ECS_SB_ALWAYS_RUN };
+    s.behaviors.push(b);
+    return s;
+}
+
+fn ecs_stepping_never_run_node(s: EcsStepping, label: i32, node: i32) -> EcsStepping {
+    let b = EcsSteppingNodeBehavior { label: label, node: node, behavior: ECS_SB_NEVER_RUN };
+    s.behaviors.push(b);
+    return s;
+}
+
+fn ecs_stepping_set_breakpoint_node(s: EcsStepping, label: i32, node: i32) -> EcsStepping {
+    let b = EcsSteppingNodeBehavior { label: label, node: node, behavior: ECS_SB_BREAK };
+    s.behaviors.push(b);
+    return s;
+}
+
+fn ecs_stepping_clear_breakpoint_node(s: EcsStepping, label: i32, node: i32) -> EcsStepping {
+    let out = Vec::new();
+    let idx: i32 = 0;
+    let n: i32 = len(s.behaviors) as i32;
+    while idx < n {
+        let b = s.behaviors[idx];
+        if b.label != label || b.node != node {
+            out.push(b);
+        };
+        idx = idx + 1;
+    }
+    s.behaviors = out;
+    return s;
+}
+
+fn ecs_stepping_clear_node(s: EcsStepping, label: i32, node: i32) -> EcsStepping {
+    let out = Vec::new();
+    let idx: i32 = 0;
+    let n: i32 = len(s.behaviors) as i32;
+    while idx < n {
+        let b = s.behaviors[idx];
+        if b.label != label || b.node != node {
+            out.push(b);
+        };
+        idx = idx + 1;
+    }
+    s.behaviors = out;
+    return s;
+}
+
+// skipped_systems(schedule): when action == RunAll returns None; else returns (found, bitset vec)
+fn ecs_stepping_skipped_systems(s: EcsStepping, label: i32) -> (bool, i32, i32) {
+    // returns (found, count, first_node) - primitives-only API to avoid SA backend leak on returned freshly-built Vec
+    let act = s.action;
+    let states = s.schedule_states;
+    let behaviors = s.behaviors;
+    let _sv = s.schedules;
+    let _so = s.schedule_order;
+    let _en = s.enabled;
+    let _pr = s.previous_schedule;
+    let _rdy = s.ready;
+    if act == ECS_STEPPING_ACTION_RUN_ALL {
+        return (false, 0, 0);
+    };
+    let count: i32 = 0;
+    let first_node: i32 = 0;
+    let found: bool = false;
+    let idx: i32 = 0;
+    let n: i32 = len(states) as i32;
+    while idx < n {
+        if states[idx].label == label {
+            found = true;
+        };
+        idx = idx + 1;
+    }
+    if found == true {
+        let bi: i32 = 0;
+        let nb: i32 = len(behaviors) as i32;
+        while bi < nb {
+            let b_label = behaviors[bi].label;
+            if b_label == label {
+                let b_beh = behaviors[bi].behavior;
+                let b_node = behaviors[bi].node;
+                if b_beh == ECS_SB_NEVER_RUN {
+                    if count == 0 {
+                        first_node = b_node;
+                    };
+                    count = count + 1;
+                };
+                if b_beh == ECS_SB_BREAK && act == ECS_STEPPING_ACTION_WAITING {
+                    if count == 0 {
+                        first_node = b_node;
+                    };
+                    count = count + 1;
+                };
+            };
+            bi = bi + 1;
+        }
+    };
+    return (found, count, first_node);
+}
+fn ecs_stepping_behavior_for(s: EcsStepping, label: i32, node: i32) -> i32 {
+    let idx: i32 = 0;
+    let n: i32 = len(s.behaviors) as i32;
+    while idx < n {
+        if s.behaviors[idx].label == label && s.behaviors[idx].node == node {
+            return s.behaviors[idx].behavior;
+        };
+        idx = idx + 1;
+    }
+    return ECS_SB_CONTINUE;
+}
+
+fn ecs_stepping_has_schedule(s: EcsStepping, label: i32) -> bool {
+    let idx: i32 = 0;
+    let n: i32 = len(s.schedules) as i32;
+    while idx < n {
+        if s.schedules[idx] == label {
+            return true;
+        };
+        idx = idx + 1;
+    }
+    return false;
+}
+
+
+// ---------------------------------------------------------------------------
+// Batch 169 — Deepened Bevy stepping model:
+// Bevy next_frame update queue + ScheduleState::skipped_systems full traversal.
+// This layer models the queued-update semantics and full Action × SystemBehavior
+// cursor scan from bevy/crates/bevy_ecs/src/schedule/stepping.rs (lines 380-790).
+// The direct-mutator API above is preserved for backward compatibility; these
+// functions model the exact Bevy deferred-apply semantics.
+// ---------------------------------------------------------------------------
+
+// Update variants matching Bevy's enum Update
+const ECS_STEPPING_UPDATE_SET_ACTION: i32 = 0;
+const ECS_STEPPING_UPDATE_ADD_SCHEDULE: i32 = 1;
+const ECS_STEPPING_UPDATE_REMOVE_SCHEDULE: i32 = 2;
+const ECS_STEPPING_UPDATE_CLEAR_SCHEDULE: i32 = 3;
+const ECS_STEPPING_UPDATE_SET_BEHAVIOR: i32 = 4;
+const ECS_STEPPING_UPDATE_CLEAR_BEHAVIOR: i32 = 5;
+
+// SystemIdentifier: Type(0) or Node(1) — modeled as kind + id
+const ECS_SID_TYPE: i32 = 0;
+const ECS_SID_NODE: i32 = 1;
+
+struct EcsSteppingSystemIdentifier {
+    kind: i32,
+    id: i32,
+}
+
+struct EcsSteppingUpdate {
+    variant: i32,
+    // For SetAction: action_val; for AddSchedule/RemoveSchedule/ClearSchedule: label
+    // For SetBehavior/ClearBehavior: label_sid
+    action_or_label: i32,
+    // For SetBehavior/ClearBehavior only
+    sid: EcsSteppingSystemIdentifier,
+    // For SetBehavior only
+    behavior_val: i32,
+}
+
+// Per-schedule deepened state matching Bevy's ScheduleState
+struct EcsSteppingScheduleStateDeep {
+    label: i32,
+    // per-system behaviors keyed by system index (node parallel in this model)
+    behaviors: Vec<i32>,          // -1 = unset (defaults to Continue), else ECS_SB_*
+    // node_ids in schedule order (system indices this maps to)
+    node_count: i32,
+    // first steppable system index (nil/unset = -1)
+    first: i32,
+    // queued behavior updates by system index, -1 = no pending, else behavior
+    behavior_updates: Vec<i32>,
+    // true if behavior_updates has pending entries
+    has_pending_updates: bool,
+    // cursor within this schedule (system index)
+    cursor_system: i32,
+    // start position where last run left off
+    start: i32,
+}
+
+struct EcsSteppingDeep {
+    // the queued updates
+    updates: Vec<EcsSteppingUpdate>,
+    // current action (applied)
+    action: i32,
+    // schedule order (dynamic, built as schedules call skipped_systems)
+    schedule_order: Vec<i32>,
+    // schedule states per label
+    states: Vec<EcsSteppingScheduleStateDeep>,
+    // cursor: schedule index in schedule_order, system index within schedule
+    cursor_schedule: i32,
+    cursor_system: i32,
+    // previous schedule index (for dynamic order insertion)
+    previous_schedule: i32,
+    // true if at least one begin_frame has run
+    initialized: bool,
+}
+
+fn ecs_stepping_deep_new() -> EcsSteppingDeep {
+    return EcsSteppingDeep {
+        updates: Vec::new(),
+        action: ECS_STEPPING_ACTION_RUN_ALL,
+        schedule_order: Vec::new(),
+        states: Vec::new(),
+        cursor_schedule: 0,
+        cursor_system: 0,
+        previous_schedule: -1,
+        initialized: false,
+    };
+}
+
+fn ecs_stepping_deep_queue_set_action(d: EcsSteppingDeep, action: i32) -> EcsSteppingDeep {
+    let u = EcsSteppingUpdate { variant: ECS_STEPPING_UPDATE_SET_ACTION, action_or_label: action, sid: EcsSteppingSystemIdentifier { kind: 0, id: 0 }, behavior_val: 0 };
+    d.updates.push(u);
+    return d;
+}
+
+fn ecs_stepping_deep_queue_add_schedule(d: EcsSteppingDeep, label: i32) -> EcsSteppingDeep {
+    let u = EcsSteppingUpdate { variant: ECS_STEPPING_UPDATE_ADD_SCHEDULE, action_or_label: label, sid: EcsSteppingSystemIdentifier { kind: 0, id: 0 }, behavior_val: 0 };
+    d.updates.push(u);
+    return d;
+}
+
+fn ecs_stepping_deep_queue_remove_schedule(d: EcsSteppingDeep, label: i32) -> EcsSteppingDeep {
+    let u = EcsSteppingUpdate { variant: ECS_STEPPING_UPDATE_REMOVE_SCHEDULE, action_or_label: label, sid: EcsSteppingSystemIdentifier { kind: 0, id: 0 }, behavior_val: 0 };
+    d.updates.push(u);
+    return d;
+}
+
+fn ecs_stepping_deep_queue_clear_schedule(d: EcsSteppingDeep, label: i32) -> EcsSteppingDeep {
+    let u = EcsSteppingUpdate { variant: ECS_STEPPING_UPDATE_CLEAR_SCHEDULE, action_or_label: label, sid: EcsSteppingSystemIdentifier { kind: 0, id: 0 }, behavior_val: 0 };
+    d.updates.push(u);
+    return d;
+}
+
+fn ecs_stepping_deep_queue_set_behavior(d: EcsSteppingDeep, label: i32, system_index: i32, behavior: i32) -> EcsSteppingDeep {
+    let sid = EcsSteppingSystemIdentifier { kind: ECS_SID_NODE, id: system_index };
+    let u = EcsSteppingUpdate { variant: ECS_STEPPING_UPDATE_SET_BEHAVIOR, action_or_label: label, sid: sid, behavior_val: behavior };
+    d.updates.push(u);
+    return d;
+}
+
+fn ecs_stepping_deep_queue_clear_behavior(d: EcsSteppingDeep, label: i32, system_index: i32) -> EcsSteppingDeep {
+    let sid = EcsSteppingSystemIdentifier { kind: ECS_SID_NODE, id: system_index };
+    let u = EcsSteppingUpdate { variant: ECS_STEPPING_UPDATE_CLEAR_BEHAVIOR, action_or_label: label, sid: sid, behavior_val: 0 };
+    d.updates.push(u);
+    return d;
+}
+
+fn ecs_stepping_deep_enable(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    return ecs_stepping_deep_queue_set_action(d, ECS_STEPPING_ACTION_WAITING);
+}
+
+fn ecs_stepping_deep_disable(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    return ecs_stepping_deep_queue_set_action(d, ECS_STEPPING_ACTION_RUN_ALL);
+}
+
+fn ecs_stepping_deep_step_frame(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    return ecs_stepping_deep_queue_set_action(d, ECS_STEPPING_ACTION_STEP);
+}
+
+fn ecs_stepping_deep_continue_frame(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    return ecs_stepping_deep_queue_set_action(d, ECS_STEPPING_ACTION_CONTINUE);
+}
+
+fn ecs_stepping_deep_is_enabled(d: EcsSteppingDeep) -> bool {
+    return d.action != ECS_STEPPING_ACTION_RUN_ALL;
+}
+
+fn ecs_stepping_deep_state_index(d: EcsSteppingDeep, label: i32) -> i32 {
+    let idx: i32 = 0;
+    let n: i32 = len(d.states) as i32;
+    while idx < n {
+        if d.states[idx].label == label {
+            return idx;
+        };
+        idx = idx + 1;
+    }
+    return -1;
+}
+
+fn ecs_stepping_deep_state_exists(d: EcsSteppingDeep, label: i32) -> bool {
+    return ecs_stepping_deep_state_index(d, label) >= 0;
+}
+
+// first_system_index_for_schedule: return first steppable system for schedule at order-index
+fn ecs_stepping_deep_first_system(d: EcsSteppingDeep, order_idx: i32) -> i32 {
+    if order_idx < 0 {
+        return 0;
+    };
+    let n: i32 = len(d.schedule_order) as i32;
+    if order_idx >= n {
+        return 0;
+    };
+    let lbl = d.schedule_order[order_idx];
+    let si = ecs_stepping_deep_state_index(d, lbl);
+    if si < 0 {
+        return 0;
+    };
+    let f = d.states[si].first;
+    if f < 0 {
+        return 0;
+    };
+    return f;
+}
+
+// reset_cursor: move to start of first schedule
+fn ecs_stepping_deep_reset_cursor(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    d.cursor_schedule = 0;
+    d.cursor_system = ecs_stepping_deep_first_system(d, 0);
+    return d;
+}
+
+// Make a fresh schedule state with node_count systems, all behaviors Continue, first = -1
+fn ecs_stepping_deep_state_new(label: i32, node_count: i32) -> EcsSteppingScheduleStateDeep {
+    let beh = Vec::new();
+    let bu = Vec::new();
+    let idx: i32 = 0;
+    while idx < node_count {
+        beh.push(ECS_SB_CONTINUE);
+        bu.push(-1);
+        idx = idx + 1;
+    }
+    return EcsSteppingScheduleStateDeep {
+        label: label,
+        behaviors: beh,
+        node_count: node_count,
+        first: -1,
+        behavior_updates: bu,
+        has_pending_updates: false,
+        cursor_system: 0,
+        start: 0,
+    };
+}
+
+// compute first steppable system: skip AlwaysRun and NeverRun, return first Continue/Break index
+fn ecs_stepping_deep_compute_first(st: EcsSteppingScheduleStateDeep) -> i32 {
+    let idx: i32 = 0;
+    let n: i32 = st.node_count;
+    while idx < n {
+        let beh = st.behaviors[idx];
+        if beh == ECS_SB_ALWAYS_RUN || beh == ECS_SB_NEVER_RUN {
+            // skip
+        } else {
+            return idx;
+        };
+        idx = idx + 1;
+    }
+    return -1;
+}
+
+// apply_behavior_updates: drain pending behavior_updates into behaviors
+fn ecs_stepping_deep_state_apply_updates(st: EcsSteppingScheduleStateDeep) -> EcsSteppingScheduleStateDeep {
+    if st.has_pending_updates != true {
+        return st;
+    };
+    let idx: i64 = 0;
+    let n: i64 = len(st.behavior_updates) as i64;
+    while idx < n {
+        let upd = st.behavior_updates[idx];
+        if upd == -1 {
+            // clear behavior
+            st.behaviors[idx] = ECS_SB_CONTINUE;
+            // Note: Bevy remove behavior removes from HashMap; here we reset to Continue (default)
+        } else {
+            if upd >= 0 {
+                st.behaviors[idx] = upd;
+            };
+        };
+        idx = idx + 1;
+    }
+    // Clear pending
+    let cleared = Vec::new();
+    let ci: i32 = 0;
+    let cn: i32 = st.node_count;
+    while ci < cn {
+        cleared.push(-1);
+        ci = ci + 1;
+    }
+    st.behavior_updates = cleared;
+    st.has_pending_updates = false;
+    st.first = -1;
+    return st;
+}
+
+// set_behavior on a state for system_index
+fn ecs_stepping_deep_state_set_behavior(st: EcsSteppingScheduleStateDeep, system_index: i32, behavior: i32) -> EcsSteppingScheduleStateDeep {
+    if system_index < 0 {
+        return st;
+    };
+    // auto-resize to fit this system_index (may not know full node_count yet)
+    if system_index >= st.node_count {
+        let idx: i32 = st.node_count;
+        while idx <= system_index {
+            st.behaviors.push(ECS_SB_CONTINUE);
+            st.behavior_updates.push(-1);
+            idx = idx + 1;
+        }
+        st.node_count = system_index + 1;
+    };
+    st.behaviors[system_index] = behavior;
+    st.first = -1;
+    return st;
+}
+
+// clear_behavior on a state for system_index
+fn ecs_stepping_deep_state_clear_behavior(st: EcsSteppingScheduleStateDeep, system_index: i32) -> EcsSteppingScheduleStateDeep {
+    if system_index < 0 {
+        return st;
+    };
+    if system_index >= st.node_count {
+        let idx: i32 = st.node_count;
+        while idx <= system_index {
+            st.behaviors.push(ECS_SB_CONTINUE);
+            st.behavior_updates.push(-1);
+            idx = idx + 1;
+        }
+        st.node_count = system_index + 1;
+    };
+    st.behaviors[system_index] = ECS_SB_CONTINUE;
+    st.first = -1;
+    return st;
+}
+
+// clear_behaviors on a state
+fn ecs_stepping_deep_state_clear_all(st: EcsSteppingScheduleStateDeep) -> EcsSteppingScheduleStateDeep {
+    let idx: i32 = 0;
+    let n: i32 = st.node_count;
+    while idx < n {
+        st.behaviors[idx] = ECS_SB_CONTINUE;
+        idx = idx + 1;
+    }
+    st.first = -1;
+    return st;
+}
+
+// next_frame: apply all queued updates with Bevy action-transition filtering.
+// Mirrors Stepping::next_frame (lines 386-508).
+fn ecs_stepping_deep_next_frame(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    // if stepping enabled, reset action to Waiting, clear previous_schedule
+    // and reset cursor if past end of schedule_order
+    if d.action != ECS_STEPPING_ACTION_RUN_ALL {
+        d.action = ECS_STEPPING_ACTION_WAITING;
+        d.previous_schedule = -1;
+        if d.cursor_schedule >= len(d.schedule_order) as i32 {
+            d = ecs_stepping_deep_reset_cursor(d);
+        };
+    };
+    d.initialized = true;
+    if len(d.updates) as i32 == 0 {
+        return d;
+    };
+    let mut_reset_cursor: bool = false;
+    let ui: i32 = 0;
+    let un: i32 = len(d.updates) as i32;
+    while ui < un {
+        let u = d.updates[ui];
+        if u.variant == ECS_STEPPING_UPDATE_SET_ACTION {
+            let target = u.action_or_label;
+            if target == ECS_STEPPING_ACTION_RUN_ALL {
+                d.action = ECS_STEPPING_ACTION_RUN_ALL;
+                mut_reset_cursor = true;
+            } else {
+                // Apply Bevy action-transition filtering
+                let cur = d.action;
+                let skip: bool = false;
+                // (RunAll, RunAll), (Waiting, Waiting), (Continue, Continue), (Step, Step)
+                if cur == ECS_STEPPING_ACTION_RUN_ALL && target == ECS_STEPPING_ACTION_RUN_ALL {
+                    skip = true;
+                };
+                if cur == ECS_STEPPING_ACTION_WAITING && target == ECS_STEPPING_ACTION_WAITING {
+                    skip = true;
+                };
+                if cur == ECS_STEPPING_ACTION_CONTINUE && target == ECS_STEPPING_ACTION_CONTINUE {
+                    skip = true;
+                };
+                if cur == ECS_STEPPING_ACTION_STEP && target == ECS_STEPPING_ACTION_STEP {
+                    skip = true;
+                };
+                // (Continue, Waiting), (Step, Waiting): skip
+                if cur == ECS_STEPPING_ACTION_CONTINUE && target == ECS_STEPPING_ACTION_WAITING {
+                    skip = true;
+                };
+                if cur == ECS_STEPPING_ACTION_STEP && target == ECS_STEPPING_ACTION_WAITING {
+                    skip = true;
+                };
+                // (RunAll, _) where target != RunAll but !enable-equivalent: if cur=RunAll and target != Waiting -> skip
+                if cur == ECS_STEPPING_ACTION_RUN_ALL && target != ECS_STEPPING_ACTION_WAITING {
+                    skip = true;
+                };
+                // (Continue, Step): skip
+                if cur == ECS_STEPPING_ACTION_CONTINUE && target == ECS_STEPPING_ACTION_STEP {
+                    skip = true;
+                };
+                // (Step, Continue): skip
+                if cur == ECS_STEPPING_ACTION_STEP && target == ECS_STEPPING_ACTION_CONTINUE {
+                    skip = true;
+                };
+                if skip != true {
+                    d.action = target;
+                };
+            };
+        };
+        if u.variant == ECS_STEPPING_UPDATE_ADD_SCHEDULE {
+            let lbl = u.action_or_label;
+            // create state with 0 nodes; resize later when skipped_systems is called
+            let st = ecs_stepping_deep_state_new(lbl, 0);
+            d.states.push(st);
+        };
+        if u.variant == ECS_STEPPING_UPDATE_REMOVE_SCHEDULE {
+            let lbl = u.action_or_label;
+            // remove from states
+            let new_states = Vec::new();
+            let si: i32 = 0;
+            let sn: i32 = len(d.states) as i32;
+            while si < sn {
+                if d.states[si].label != lbl {
+                    new_states.push(d.states[si]);
+                };
+                si = si + 1;
+            }
+            d.states = new_states;
+            // remove from schedule_order
+            let new_order = Vec::new();
+            let oi: i32 = 0;
+            let on: i32 = len(d.schedule_order) as i32;
+            while oi < on {
+                if d.schedule_order[oi] != lbl {
+                    new_order.push(d.schedule_order[oi]);
+                };
+                oi = oi + 1;
+            }
+            d.schedule_order = new_order;
+            mut_reset_cursor = true;
+        };
+        if u.variant == ECS_STEPPING_UPDATE_CLEAR_SCHEDULE {
+            let lbl = u.action_or_label;
+            let si = ecs_stepping_deep_state_index(d, lbl);
+            if si >= 0 {
+                d.states[si] = ecs_stepping_deep_state_clear_all(d.states[si]);
+            };
+        };
+        if u.variant == ECS_STEPPING_UPDATE_SET_BEHAVIOR {
+            let lbl = u.action_or_label;
+            let si = ecs_stepping_deep_state_index(d, lbl);
+            if si >= 0 {
+                if u.sid.kind == ECS_SID_NODE {
+                    d.states[si] = ecs_stepping_deep_state_set_behavior(d.states[si], u.sid.id, u.behavior_val);
+                };
+            };
+        };
+        if u.variant == ECS_STEPPING_UPDATE_CLEAR_BEHAVIOR {
+            let lbl = u.action_or_label;
+            let si = ecs_stepping_deep_state_index(d, lbl);
+            if si >= 0 {
+                if u.sid.kind == ECS_SID_NODE {
+                    d.states[si] = ecs_stepping_deep_state_clear_behavior(d.states[si], u.sid.id);
+                };
+            };
+        };
+        ui = ui + 1;
+    }
+    // clear updates queue
+    d.updates = Vec::new();
+    if mut_reset_cursor == true {
+        d = ecs_stepping_deep_reset_cursor(d);
+    };
+    return d;
+}
+
+// begin_frame = next_frame in this model (Bevy uses begin_frame system -> next_frame method)
+fn ecs_stepping_deep_begin_frame(d: EcsSteppingDeep) -> EcsSteppingDeep {
+    return ecs_stepping_deep_next_frame(d);
+}
+
+// schedules(): returns (ready, order) — ready when schedule_order.len == states.len
+fn ecs_stepping_deep_schedules(d: EcsSteppingDeep) -> (bool, Vec<i32>) {
+    if d.initialized != true {
+        return (false, Vec::new());
+    };
+    if len(d.schedule_order) as i32 != len(d.states) as i32 {
+        return (false, Vec::new());
+    };
+    return (true, d.schedule_order);
+}
+
+// cursor(): returns (found, label, system_index)
+fn ecs_stepping_deep_cursor(d: EcsSteppingDeep) -> (bool, i32, i32) {
+    if d.action == ECS_STEPPING_ACTION_RUN_ALL {
+        return (false, 0, 0);
+    };
+    let n: i32 = len(d.schedule_order) as i32;
+    if d.cursor_schedule >= n {
+        return (false, 0, 0);
+    };
+    let lbl = d.schedule_order[d.cursor_schedule];
+    let si = ecs_stepping_deep_state_index(d, lbl);
+    if si < 0 {
+        return (false, 0, 0);
+    };
+    let st = d.states[si];
+    if d.cursor_system >= st.node_count {
+        return (false, 0, 0);
+    };
+    return (true, lbl, d.cursor_system);
+}
+
+// resize_state_to: grow state behaviors/node_count to match system_count
+fn ecs_stepping_deep_state_resize(st: EcsSteppingScheduleStateDeep, system_count: i32) -> EcsSteppingScheduleStateDeep {
+    if st.node_count >= system_count {
+        st.node_count = system_count;
+        return st;
+    };
+    let idx: i32 = st.node_count;
+    while idx < system_count {
+        st.behaviors.push(ECS_SB_CONTINUE);
+        st.behavior_updates.push(-1);
+        idx = idx + 1;
+    }
+    st.node_count = system_count;
+    return st;
+}
+
+// insert at index helper: builds a new Vec<i32> with value inserted at position
+fn ecs_stepping_vec_insert_i32(v: Vec<i32>, pos: i32, val: i32) -> Vec<i32> {
+    let out = Vec::new();
+    let idx: i32 = 0;
+    let n: i32 = len(v) as i32;
+    while idx < n {
+        if idx == pos {
+            out.push(val);
+        };
+        out.push(v[idx]);
+        idx = idx + 1;
+    }
+    if pos >= n {
+        out.push(val);
+    };
+    return out;
+}
+
+// Full Bevy ScheduleState::skipped_systems cursor traversal (lines 654-790).
+// Returns (found, skip_set_as_vec, next_system) where next_system is -1 if None.
+// skip_set[i] = true means system i should be skipped.
+fn ecs_stepping_deep_skipped_systems(d: EcsSteppingDeep, label: i32, system_count: i32) -> (bool, Vec<bool>, i32) {
+    if d.action == ECS_STEPPING_ACTION_RUN_ALL {
+        return (false, Vec::new(), -1);
+    };
+    // find or create order entry for this label
+    let order_idx: i32 = -1;
+    let oi: i32 = 0;
+    let on: i32 = len(d.schedule_order) as i32;
+    while oi < on {
+        if d.schedule_order[oi] == label {
+            order_idx = oi;
+        };
+        oi = oi + 1;
+    }
+    if order_idx < 0 {
+        // not in order; insert after previous_schedule or at 0
+        if d.previous_schedule < 0 {
+            d.schedule_order = ecs_stepping_vec_insert_i32(d.schedule_order, 0, label);
+            order_idx = 0;
+        } else {
+            let insert_at = d.previous_schedule + 1;
+            d.schedule_order = ecs_stepping_vec_insert_i32(d.schedule_order, insert_at, label);
+            order_idx = insert_at;
+        }
+    };
+    d.previous_schedule = order_idx;
+
+    // find state
+    let si = ecs_stepping_deep_state_index(d, label);
+    if si < 0 {
+        return (false, Vec::new(), -1);
+    };
+    // resize state to system_count
+    d.states[si] = ecs_stepping_deep_state_resize(d.states[si], system_count);
+    let st = d.states[si];
+    if st.node_count != system_count {
+        return (false, Vec::new(), -1);
+    };
+
+    // apply pending behavior updates (Bevy: apply_behavior_updates)
+    st = ecs_stepping_deep_state_apply_updates(st);
+
+    // compute first steppable if not set
+    if st.first < 0 {
+        st.first = ecs_stepping_deep_compute_first(st);
+        if st.first < 0 {
+            st.first = 0;
+        };
+    };
+
+    let cursor_schedule_idx: i32 = d.cursor_schedule;
+    let cursor_system_idx: i32 = d.cursor_system;
+    let is_cursor_schedule: bool = order_idx == cursor_schedule_idx;
+    let action_for_scan: i32 = d.action;
+    let start_pos: i32 = -1;
+    let skip = Vec::new();
+    let idx: i32 = 0;
+    while idx < system_count {
+        skip.push(false);
+        idx = idx + 1;
+    }
+    let pos: i32 = -1;
+    let next_sys: i32 = -1;
+
+    if is_cursor_schedule {
+        start_pos = cursor_system_idx;
+        pos = cursor_system_idx;
+        let local_action = action_for_scan;
+        let i: i32 = 0;
+        while i < system_count {
+            let beh = st.behaviors[i];
+            // (NeverRun, _): skip, advance cursor if at pos
+            if beh == ECS_SB_NEVER_RUN {
+                skip[i] = true;
+                if i == pos {
+                    pos = pos + 1;
+                };
+            } else {
+                if beh == ECS_SB_ALWAYS_RUN {
+                    if i == pos {
+                        pos = pos + 1;
+                    };
+                } else {
+                    if local_action == ECS_STEPPING_ACTION_WAITING {
+                        skip[i] = true;
+                    } else {
+                        if local_action == ECS_STEPPING_ACTION_STEP {
+                            if i < pos {
+                                skip[i] = true;
+                            } else {
+                                if i == pos {
+                                    // run this system, advance, set action to Waiting
+                                    pos = pos + 1;
+                                    local_action = ECS_STEPPING_ACTION_WAITING;
+                                } else {
+                                    // i > pos: unreachable in Bevy, but mark skip for safety
+                                    skip[i] = true;
+                                };
+                            };
+                        } else {
+                            if local_action == ECS_STEPPING_ACTION_CONTINUE {
+                                if beh == ECS_SB_CONTINUE {
+                                    if i < start_pos {
+                                        skip[i] = true;
+                                    };
+                                } else {
+                                    // Break behavior
+                                    if i != start_pos {
+                                        skip[i] = true;
+                                        if i > start_pos {
+                                            local_action = ECS_STEPPING_ACTION_WAITING;
+                                        };
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+            // If at cursor pos and not waiting, advance
+            if i == pos && local_action != ECS_STEPPING_ACTION_WAITING {
+                pos = pos + 1;
+            };
+            i = i + 1;
+        }
+        // after Step, action -> Waiting
+        if action_for_scan == ECS_STEPPING_ACTION_STEP {
+            d.action = ECS_STEPPING_ACTION_WAITING;
+        };
+        if pos >= system_count {
+            next_sys = -1;
+        } else {
+            next_sys = pos;
+        };
+    } else {
+        // not cursor schedule: skip all systems in Waiting
+        start_pos = 0;
+        pos = 0;
+        let local_action = ECS_STEPPING_ACTION_WAITING;
+        let i: i32 = 0;
+        while i < system_count {
+            let beh = st.behaviors[i];
+            if beh == ECS_SB_NEVER_RUN {
+                skip[i] = true;
+                if i == pos {
+                    pos = pos + 1;
+                };
+            } else {
+                if beh == ECS_SB_ALWAYS_RUN {
+                    if i == pos {
+                        pos = pos + 1;
+                    };
+                } else {
+                    skip[i] = true;
+                };
+            };
+            // advance if at pos
+            if i == pos && local_action != ECS_STEPPING_ACTION_WAITING {
+                pos = pos + 1;
+            };
+            i = i + 1;
+        }
+        next_sys = cursor_system_idx;
+    };
+
+    // store state with updated first
+    d.states[si] = st;
+
+    // update cursor
+    if next_sys >= 0 {
+        d.cursor_system = next_sys;
+    } else {
+        let next_schedule = cursor_schedule_idx + 1;
+        d.cursor_schedule = next_schedule;
+        d.cursor_system = ecs_stepping_deep_first_system(d, next_schedule);
+    };
+
+    return (true, skip, next_sys);
+}
+
+// Convenience: count of skipped in a skip vec
+fn ecs_stepping_deep_skip_count(skip: Vec<bool>) -> i32 {
+    let c: i32 = 0;
+    let idx: i32 = 0;
+    let n: i32 = len(skip) as i32;
+    while idx < n {
+        if skip[idx] == true {
+            c = c + 1;
+        };
+        idx = idx + 1;
+    }
+    return c;
+}
+
+// Convenience: whether system index is in skip set
+fn ecs_stepping_deep_is_skipped(skip: Vec<bool>, idx: i32) -> bool {
+    if idx < 0 || idx >= len(skip) as i32 {
+        return false;
+    };
+    return skip[idx];
+}
+
+fn ecs_stepping_deep_behavior_for(d: EcsSteppingDeep, label: i32, system_index: i32) -> i32 {
+    let si = ecs_stepping_deep_state_index(d, label);
+    if si < 0 {
+        return ECS_SB_CONTINUE;
+    };
+    let st = d.states[si];
+    if system_index < 0 || system_index >= st.node_count {
+        return ECS_SB_CONTINUE;
+    };
+    return st.behaviors[system_index];
+}
+
+fn ecs_stepping_deep_has_schedule(d: EcsSteppingDeep, label: i32) -> bool {
+    return ecs_stepping_deep_state_exists(d, label);
+}
+
+fn ecs_stepping_deep_action(d: EcsSteppingDeep) -> i32 {
+    return d.action;
+}

@@ -1,0 +1,185 @@
+// Deferred command queue for RegistryErasedWorld<R, M>.
+// Component commands carry erased boxed payloads, so one queue can defer
+// insertions for heterogeneous registered component columns.
+@import "world_registry_erased.sla"
+
+const REGISTRY_ERASED_COMMAND_INSERT_COMPONENT: i32 = 1;
+const REGISTRY_ERASED_COMMAND_DESPAWN: i32 = 2;
+const REGISTRY_ERASED_COMMAND_INSERT_RESOURCE: i32 = 3;
+const REGISTRY_ERASED_COMMAND_WRITE_MESSAGE: i32 = 4;
+
+struct RegistryErasedCommand {
+    kind: i32,
+    entity: Entity,
+    component_id: i32,
+    value_index: i64,
+}
+
+struct RegistryErasedCommands<R, M> {
+    items: Vec<RegistryErasedCommand>,
+    component_values: Vec<ErasedComponentValue>,
+    resource_values: Vec<R>,
+    message_values: Vec<M>,
+}
+
+fn registry_erased_commands_new<R, M>() -> RegistryErasedCommands<R, M> {
+    let items: Vec<RegistryErasedCommand> = Vec::new();
+    let component_values: Vec<ErasedComponentValue> = Vec::new();
+    let resource_values: Vec<R> = Vec::new();
+    let message_values: Vec<M> = Vec::new();
+    return RegistryErasedCommands<R, M> {
+        items: items,
+        component_values: component_values,
+        resource_values: resource_values,
+        message_values: message_values,
+    };
+}
+
+fn registry_erased_command(kind: i32, entity: Entity, component_id: i32, value_index: i64) -> RegistryErasedCommand {
+    return RegistryErasedCommand { kind: kind, entity: entity, component_id: component_id, value_index: value_index };
+}
+
+fn registry_erased_commands_len<R, M>(commands: RegistryErasedCommands<R, M>) -> i64 {
+    return len(commands.items) as i64;
+}
+
+fn registry_erased_commands_reserve_entity<R, M>(world: RegistryErasedWorld<R, M>, commands: RegistryErasedCommands<R, M>) -> (RegistryErasedWorld<R, M>, RegistryErasedCommands<R, M>, Entity) {
+    let (next_world, entity) = registry_erased_world_spawn<R, M>(world);
+    return (next_world, commands, entity);
+}
+
+fn registry_erased_commands_insert<T, R, M>(commands: RegistryErasedCommands<R, M>, entity: Entity, component_id: i32, type_id: i32, value: T) -> RegistryErasedCommands<R, M> {
+    commands.component_values.push(registry_erased_value_new<T>(type_id, value));
+    let idx = (len(commands.component_values) as i64) - 1;
+    commands.items.push(registry_erased_command(REGISTRY_ERASED_COMMAND_INSERT_COMPONENT, entity, component_id, idx));
+    return commands;
+}
+
+fn registry_erased_commands_despawn<R, M>(commands: RegistryErasedCommands<R, M>, entity: Entity) -> RegistryErasedCommands<R, M> {
+    commands.items.push(registry_erased_command(REGISTRY_ERASED_COMMAND_DESPAWN, entity, 0, -1));
+    return commands;
+}
+
+fn registry_erased_commands_insert_resource<R, M>(commands: RegistryErasedCommands<R, M>, value: R) -> RegistryErasedCommands<R, M> {
+    commands.resource_values.push(value);
+    let idx = (len(commands.resource_values) as i64) - 1;
+    commands.items.push(registry_erased_command(REGISTRY_ERASED_COMMAND_INSERT_RESOURCE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn registry_erased_commands_write_message<R, M>(commands: RegistryErasedCommands<R, M>, value: M) -> RegistryErasedCommands<R, M> {
+    commands.message_values.push(value);
+    let idx = (len(commands.message_values) as i64) - 1;
+    commands.items.push(registry_erased_command(REGISTRY_ERASED_COMMAND_WRITE_MESSAGE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn registry_erased_commands_apply_insert<R, M>(world: RegistryErasedWorld<R, M>, commands: RegistryErasedCommands<R, M>, command: RegistryErasedCommand) -> RegistryErasedWorld<R, M> {
+    if command.kind == REGISTRY_ERASED_COMMAND_INSERT_COMPONENT {
+        let value = commands.component_values[command.value_index];
+        if registry_erased_world_has<R, M>(world, command.entity, command.component_id) {
+            return registry_erased_world_replace_erased<R, M>(world, command.entity, command.component_id, value);
+        };
+        return registry_erased_world_insert_erased_new<R, M>(world, command.entity, command.component_id, value);
+    };
+    return world;
+}
+
+fn registry_erased_commands_apply_despawn<R, M>(world: RegistryErasedWorld<R, M>, command: RegistryErasedCommand) -> RegistryErasedWorld<R, M> {
+    if command.kind == REGISTRY_ERASED_COMMAND_DESPAWN {
+        return registry_erased_world_despawn<R, M>(world, command.entity);
+    };
+    return world;
+}
+
+fn registry_erased_commands_apply_resource<R, M>(world: RegistryErasedWorld<R, M>, commands: RegistryErasedCommands<R, M>, command: RegistryErasedCommand) -> RegistryErasedWorld<R, M> {
+    if command.kind == REGISTRY_ERASED_COMMAND_INSERT_RESOURCE {
+        return registry_erased_world_insert_resource<R, M>(world, commands.resource_values[command.value_index]);
+    };
+    return world;
+}
+
+fn registry_erased_commands_apply_message<R, M>(world: RegistryErasedWorld<R, M>, commands: RegistryErasedCommands<R, M>, command: RegistryErasedCommand) -> RegistryErasedWorld<R, M> {
+    if command.kind == REGISTRY_ERASED_COMMAND_WRITE_MESSAGE {
+        return registry_erased_world_write_message<R, M>(world, commands.message_values[command.value_index]);
+    };
+    return world;
+}
+
+fn registry_erased_commands_apply<R, M>(world: RegistryErasedWorld<R, M>, commands: RegistryErasedCommands<R, M>) -> (RegistryErasedWorld<R, M>, RegistryErasedCommands<R, M>) {
+    let i: i64 = 0;
+    let cnt = registry_erased_commands_len<R, M>(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = registry_erased_commands_apply_insert<R, M>(world, commands, command);
+        world = registry_erased_commands_apply_despawn<R, M>(world, command);
+        world = registry_erased_commands_apply_resource<R, M>(world, commands, command);
+        world = registry_erased_commands_apply_message<R, M>(world, commands, command);
+        i = i + 1;
+    }
+    let cleared = registry_erased_commands_new<R, M>();
+    return (world, cleared);
+}
+
+const ERASED_CMD_POS_TYPE: i32 = 111;
+const ERASED_CMD_VEL_TYPE: i32 = 112;
+const ERASED_CMD_MARKER_TYPE: i32 = 113;
+
+struct ErasedCmdPos { x: i32, y: i32 }
+struct ErasedCmdVel { x: i32, y: i32 }
+struct ErasedCmdMarker { value: i32 }
+struct ErasedCmdTime { tick: i32 }
+struct ErasedCmdEvent { amount: i32 }
+
+fn erased_cmd_time_default() -> ErasedCmdTime { return ErasedCmdTime { tick: 0 }; }
+fn erased_cmd_event_default() -> ErasedCmdEvent { return ErasedCmdEvent { amount: 0 }; }
+
+fn erased_cmd_world_new() -> RegistryErasedWorld<ErasedCmdTime, ErasedCmdEvent> {
+    return registry_erased_world_new<ErasedCmdTime, ErasedCmdEvent>(erased_cmd_time_default(), erased_cmd_event_default());
+}
+
+fn erased_cmd_commands_new() -> RegistryErasedCommands<ErasedCmdTime, ErasedCmdEvent> {
+    return registry_erased_commands_new<ErasedCmdTime, ErasedCmdEvent>();
+}
+
+@test "registry erased commands defer heterogeneous insertions until apply"() {
+    let w0 = erased_cmd_world_new();
+    let (w1, position) = registry_erased_world_register_table<ErasedCmdTime, ErasedCmdEvent>(w0, ERASED_CMD_POS_TYPE, ecs_box_drop<ErasedCmdPos>);
+    let (w2, velocity) = registry_erased_world_register_table<ErasedCmdTime, ErasedCmdEvent>(w1, ERASED_CMD_VEL_TYPE, ecs_box_drop<ErasedCmdVel>);
+    let c0 = erased_cmd_commands_new();
+    let (w3, c1, entity) = registry_erased_commands_reserve_entity<ErasedCmdTime, ErasedCmdEvent>(w2, c0);
+    let c2 = registry_erased_commands_insert<ErasedCmdPos, ErasedCmdTime, ErasedCmdEvent>(c1, entity, position.id, ERASED_CMD_POS_TYPE, ErasedCmdPos { x: 3, y: 0 });
+    let c3 = registry_erased_commands_insert<ErasedCmdVel, ErasedCmdTime, ErasedCmdEvent>(c2, entity, velocity.id, ERASED_CMD_VEL_TYPE, ErasedCmdVel { x: 4, y: 0 });
+    if registry_erased_world_has<ErasedCmdTime, ErasedCmdEvent>(w3, entity, position.id) != false { panic(9500); };
+    if registry_erased_commands_len<ErasedCmdTime, ErasedCmdEvent>(c3) != 2 { panic(9501); };
+    let (w4, c4) = registry_erased_commands_apply<ErasedCmdTime, ErasedCmdEvent>(w3, c3);
+    if registry_erased_world_has<ErasedCmdTime, ErasedCmdEvent>(w4, entity, position.id) != true { panic(9502); };
+    if registry_erased_world_has<ErasedCmdTime, ErasedCmdEvent>(w4, entity, velocity.id) != true { panic(9503); };
+    if registry_erased_commands_len<ErasedCmdTime, ErasedCmdEvent>(c4) != 0 { panic(9504); };
+    let pairs = registry_erased_world_query_pair<ErasedCmdPos, ErasedCmdVel, ErasedCmdTime, ErasedCmdEvent>(w4, position.id, ERASED_CMD_POS_TYPE, velocity.id, ERASED_CMD_VEL_TYPE);
+    if len(pairs.items) != 1 { panic(9505); };
+    if pairs.items[0].first.x + pairs.items[0].second.x != 7 { panic(9506); };
+}
+
+@test "registry erased commands replace resource message and despawn in order"() {
+    let w0 = erased_cmd_world_new();
+    let (w1, position) = registry_erased_world_register_table<ErasedCmdTime, ErasedCmdEvent>(w0, ERASED_CMD_POS_TYPE, ecs_box_drop<ErasedCmdPos>);
+    let (w2, marker) = registry_erased_world_register_sparse_set<ErasedCmdTime, ErasedCmdEvent>(w1, ERASED_CMD_MARKER_TYPE, ecs_box_drop<ErasedCmdMarker>);
+    let c0 = erased_cmd_commands_new();
+    let (w3, c1, entity) = registry_erased_commands_reserve_entity<ErasedCmdTime, ErasedCmdEvent>(w2, c0);
+    let c2 = registry_erased_commands_insert<ErasedCmdPos, ErasedCmdTime, ErasedCmdEvent>(c1, entity, position.id, ERASED_CMD_POS_TYPE, ErasedCmdPos { x: 5, y: 0 });
+    let (w4, c3) = registry_erased_commands_apply<ErasedCmdTime, ErasedCmdEvent>(w3, c2);
+    let c4 = registry_erased_commands_insert<ErasedCmdPos, ErasedCmdTime, ErasedCmdEvent>(c3, entity, position.id, ERASED_CMD_POS_TYPE, ErasedCmdPos { x: 9, y: 0 });
+    let c5 = registry_erased_commands_insert<ErasedCmdMarker, ErasedCmdTime, ErasedCmdEvent>(c4, entity, marker.id, ERASED_CMD_MARKER_TYPE, ErasedCmdMarker { value: 1 });
+    let c6 = registry_erased_commands_insert_resource<ErasedCmdTime, ErasedCmdEvent>(c5, ErasedCmdTime { tick: 8 });
+    let c7 = registry_erased_commands_write_message<ErasedCmdTime, ErasedCmdEvent>(c6, ErasedCmdEvent { amount: 6 });
+    let c8 = registry_erased_commands_despawn<ErasedCmdTime, ErasedCmdEvent>(c7, entity);
+    let (w5, c9) = registry_erased_commands_apply<ErasedCmdTime, ErasedCmdEvent>(w4, c8);
+    if registry_erased_world_is_alive<ErasedCmdTime, ErasedCmdEvent>(w5, entity) != false { panic(9510); };
+    if registry_erased_world_has<ErasedCmdTime, ErasedCmdEvent>(w5, entity, position.id) != false { panic(9511); };
+    let time = registry_erased_world_get_resource<ErasedCmdTime, ErasedCmdEvent>(w5);
+    let read = registry_erased_world_read_message<ErasedCmdTime, ErasedCmdEvent>(w5, message_reader_new(), erased_cmd_event_default());
+    if time.tick != 8 { panic(9512); };
+    if read.value.amount != 6 { panic(9513); };
+    if registry_erased_commands_len<ErasedCmdTime, ErasedCmdEvent>(c9) != 0 { panic(9514); };
+}

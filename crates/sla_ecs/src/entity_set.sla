@@ -1,0 +1,1032 @@
+// Entity-keyed collections with Bevy-style value-key semantics.
+// This intentionally avoids sa_std HashMap/HashSet until those containers use
+// derived hash/eq for struct keys instead of pointer identity.
+@import "sa_std/vec.sa"
+@import "entity.sla"
+
+struct EntitySet {
+    values: Vec<Entity>,
+}
+
+struct EntityMap<T> {
+    keys: Vec<Entity>,
+    values: Vec<T>,
+}
+
+struct EntityMapGet<T> {
+    found: bool,
+    value: T,
+}
+
+struct UniqueEntityVec {
+    values: Vec<Entity>,
+}
+
+struct EntityHashSet {
+    keys: Vec<Entity>,
+    states: Vec<i32>,
+    len_value: i64,
+    tombstones: i64,
+}
+
+struct EntityHashMap<T> {
+    keys: Vec<Entity>,
+    states: Vec<i32>,
+    value_slots: Vec<i64>,
+    values: Vec<T>,
+    len_value: i64,
+    tombstones: i64,
+}
+
+struct EntityHashProbe {
+    slot: i64,
+    found: bool,
+}
+
+struct EntityHashMapGet<T> {
+    found: bool,
+    value: T,
+}
+
+impl EntitySet {
+    fn iter_len(&self) -> i64 { return len(self.values) as i64; }
+    fn iter_at(&self, index: i64) -> Entity { return self.values[index]; }
+}
+
+impl UniqueEntityVec {
+    fn iter_len(&self) -> i64 { return len(self.values) as i64; }
+    fn iter_at(&self, index: i64) -> Entity { return self.values[index]; }
+}
+
+impl EntityHashSet {
+    fn iter_len(&self) -> i64 { return self.len_value; }
+    fn iter_at(&self, index: i64) -> Entity {
+        let seen: i64 = 0;
+        let i: i64 = 0;
+        let count = len(self.states) as i64;
+        while i < count {
+            if self.states[i] == 1 {
+                if seen == index { return self.keys[i]; };
+                seen = seen + 1;
+            };
+            i = i + 1;
+        }
+        return entity_placeholder();
+    }
+}
+
+fn entity_hash_state_empty() -> i32 { return 0; }
+fn entity_hash_state_filled() -> i32 { return 1; }
+fn entity_hash_state_tombstone() -> i32 { return 2; }
+
+fn entity_hash_next_capacity(requested: i64) -> i64 {
+    let cap: i64 = 16;
+    while cap < requested {
+        cap = cap * 2;
+    }
+    return cap;
+}
+
+fn entity_hash_slot_index(entity: Entity, capacity: i64) -> i64 {
+    if capacity <= 0 { return 0; };
+    let value = hash(entity) as i64;
+    if value < 0 { value = 0 - value; };
+    return value % capacity;
+}
+
+fn entity_hash_set_with_capacity(requested: i64) -> EntityHashSet {
+    let cap = entity_hash_next_capacity(requested);
+    let keys: Vec<Entity> = Vec::new();
+    let states: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < cap {
+        keys.push(entity_placeholder());
+        states.push(entity_hash_state_empty());
+        i = i + 1;
+    }
+    return EntityHashSet { keys: keys, states: states, len_value: 0, tombstones: 0 };
+}
+
+fn entity_hash_set_new() -> EntityHashSet {
+    return entity_hash_set_with_capacity(16);
+}
+
+fn entity_hash_set_len(set: EntityHashSet) -> i64 { return set.len_value; }
+
+fn entity_hash_set_capacity(set: EntityHashSet) -> i64 { return len(set.states) as i64; }
+
+fn entity_hash_set_is_empty(set: EntityHashSet) -> bool { return set.len_value == 0; }
+
+fn entity_hash_set_probe(set: EntityHashSet, key: Entity) -> EntityHashProbe {
+    let cap = len(set.states) as i64;
+    if cap <= 0 { return EntityHashProbe { slot: -1, found: false }; };
+    let index = entity_hash_slot_index(key, cap);
+    let steps: i64 = 0;
+    let first_tombstone: i64 = -1;
+    while steps < cap {
+        let state = set.states[index];
+        if state == entity_hash_state_empty() {
+            if first_tombstone >= 0 { return EntityHashProbe { slot: first_tombstone, found: false }; };
+            return EntityHashProbe { slot: index, found: false };
+        };
+        if state == entity_hash_state_tombstone() {
+            if first_tombstone < 0 { first_tombstone = index; };
+        };
+        if state == entity_hash_state_filled() {
+            if set.keys[index] == key { return EntityHashProbe { slot: index, found: true }; };
+        };
+        index = index + 1;
+        if index >= cap { index = 0; };
+        steps = steps + 1;
+    }
+    if first_tombstone >= 0 { return EntityHashProbe { slot: first_tombstone, found: false }; };
+    return EntityHashProbe { slot: -1, found: false };
+}
+
+fn entity_hash_set_insert_raw(set: EntityHashSet, key: Entity) -> EntityHashSet {
+    let probe = entity_hash_set_probe(set, key);
+    if probe.found { return set; };
+    if probe.slot < 0 { return set; };
+    let previous_state = set.states[probe.slot];
+    if previous_state == entity_hash_state_tombstone() { set.tombstones = set.tombstones - 1; };
+    set.keys[probe.slot] = key;
+    set.states[probe.slot] = entity_hash_state_filled();
+    set.len_value = set.len_value + 1;
+    return set;
+}
+
+fn entity_hash_set_rehash(set: EntityHashSet, requested: i64) -> EntityHashSet {
+    let out = entity_hash_set_with_capacity(requested);
+    let i: i64 = 0;
+    let count = len(set.states) as i64;
+    while i < count {
+        if set.states[i] == entity_hash_state_filled() { out = entity_hash_set_insert_raw(out, set.keys[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_hash_set_insert(set: EntityHashSet, key: Entity) -> EntityHashSet {
+    let cap = len(set.states) as i64;
+    if ((set.len_value + set.tombstones + 1) * 4) >= (cap * 3) {
+        set = entity_hash_set_rehash(set, cap * 2);
+    };
+    return entity_hash_set_insert_raw(set, key);
+}
+
+fn entity_hash_set_insert_result(set: EntityHashSet, key: Entity) -> (EntityHashSet, bool) {
+    if entity_hash_set_contains(set, key) { return (set, false); };
+    return (entity_hash_set_insert(set, key), true);
+}
+
+fn entity_hash_set_contains(set: EntityHashSet, key: Entity) -> bool {
+    let probe = entity_hash_set_probe(set, key);
+    return probe.found;
+}
+
+fn entity_hash_set_remove(set: EntityHashSet, key: Entity) -> EntityHashSet {
+    let probe = entity_hash_set_probe(set, key);
+    if probe.found != true { return set; };
+    set.keys[probe.slot] = entity_placeholder();
+    set.states[probe.slot] = entity_hash_state_tombstone();
+    set.len_value = set.len_value - 1;
+    set.tombstones = set.tombstones + 1;
+    return set;
+}
+
+fn entity_hash_set_to_entity_set(set: EntityHashSet) -> EntitySet {
+    let out = entity_set_new();
+    let i: i64 = 0;
+    let count = len(set.states) as i64;
+    while i < count {
+        if set.states[i] == entity_hash_state_filled() { out = entity_set_insert(out, set.keys[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_hash_map_new<T>() -> EntityHashMap<T> {
+    return entity_hash_map_with_capacity<T>(16);
+}
+
+fn entity_hash_map_with_capacity<T>(requested: i64) -> EntityHashMap<T> {
+    let cap = entity_hash_next_capacity(requested);
+    let keys: Vec<Entity> = Vec::new();
+    let states: Vec<i32> = Vec::new();
+    let value_slots: Vec<i64> = Vec::new();
+    let values: Vec<T> = Vec::new();
+    let i: i64 = 0;
+    while i < cap {
+        keys.push(entity_placeholder());
+        states.push(entity_hash_state_empty());
+        value_slots.push(-1);
+        i = i + 1;
+    }
+    return EntityHashMap<T> { keys: keys, states: states, value_slots: value_slots, values: values, len_value: 0, tombstones: 0 };
+}
+
+fn entity_hash_map_len<T>(map: EntityHashMap<T>) -> i64 { return map.len_value; }
+
+fn entity_hash_map_capacity<T>(map: EntityHashMap<T>) -> i64 { return len(map.states) as i64; }
+
+fn entity_hash_map_is_empty<T>(map: EntityHashMap<T>) -> bool { return map.len_value == 0; }
+
+fn entity_hash_map_probe<T>(map: EntityHashMap<T>, key: Entity) -> EntityHashProbe {
+    let cap = len(map.states) as i64;
+    if cap <= 0 { return EntityHashProbe { slot: -1, found: false }; };
+    let index = entity_hash_slot_index(key, cap);
+    let steps: i64 = 0;
+    let first_tombstone: i64 = -1;
+    while steps < cap {
+        let state = map.states[index];
+        if state == entity_hash_state_empty() {
+            if first_tombstone >= 0 { return EntityHashProbe { slot: first_tombstone, found: false }; };
+            return EntityHashProbe { slot: index, found: false };
+        };
+        if state == entity_hash_state_tombstone() {
+            if first_tombstone < 0 { first_tombstone = index; };
+        };
+        if state == entity_hash_state_filled() {
+            if map.keys[index] == key { return EntityHashProbe { slot: index, found: true }; };
+        };
+        index = index + 1;
+        if index >= cap { index = 0; };
+        steps = steps + 1;
+    }
+    if first_tombstone >= 0 { return EntityHashProbe { slot: first_tombstone, found: false }; };
+    return EntityHashProbe { slot: -1, found: false };
+}
+
+fn entity_hash_map_insert_raw<T>(map: EntityHashMap<T>, key: Entity, value: T) -> EntityHashMap<T> {
+    let probe = entity_hash_map_probe<T>(map, key);
+    if probe.found {
+        let value_slot = map.value_slots[probe.slot];
+        map.values[value_slot] = value;
+        return map;
+    };
+    if probe.slot < 0 { return map; };
+    let previous_state = map.states[probe.slot];
+    if previous_state == entity_hash_state_tombstone() { map.tombstones = map.tombstones - 1; };
+    let value_slot = len(map.values) as i64;
+    map.values.push(value);
+    map.keys[probe.slot] = key;
+    map.value_slots[probe.slot] = value_slot;
+    map.states[probe.slot] = entity_hash_state_filled();
+    map.len_value = map.len_value + 1;
+    return map;
+}
+
+fn entity_hash_map_rehash<T>(map: EntityHashMap<T>, requested: i64) -> EntityHashMap<T> {
+    let out = entity_hash_map_with_capacity<T>(requested);
+    let i: i64 = 0;
+    let count = len(map.states) as i64;
+    while i < count {
+        if map.states[i] == entity_hash_state_filled() {
+            let value_slot = map.value_slots[i];
+            out = entity_hash_map_insert_raw<T>(out, map.keys[i], map.values[value_slot]);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_hash_map_insert<T>(map: EntityHashMap<T>, key: Entity, value: T) -> EntityHashMap<T> {
+    let cap = len(map.states) as i64;
+    if ((map.len_value + map.tombstones + 1) * 4) >= (cap * 3) {
+        map = entity_hash_map_rehash<T>(map, cap * 2);
+    };
+    return entity_hash_map_insert_raw<T>(map, key, value);
+}
+
+fn entity_hash_map_contains_key<T>(map: EntityHashMap<T>, key: Entity) -> bool {
+    let probe = entity_hash_map_probe<T>(map, key);
+    return probe.found;
+}
+
+fn entity_hash_map_get_or<T>(map: EntityHashMap<T>, key: Entity, default_value: T) -> EntityHashMapGet<T> {
+    let probe = entity_hash_map_probe<T>(map, key);
+    if probe.found != true { return EntityHashMapGet<T> { found: false, value: default_value }; };
+    let value_slot = map.value_slots[probe.slot];
+    return EntityHashMapGet<T> { found: true, value: map.values[value_slot] };
+}
+
+fn entity_hash_map_get_unchecked<T>(map: EntityHashMap<T>, key: Entity) -> T {
+    let probe = entity_hash_map_probe<T>(map, key);
+    if probe.found != true { panic(21680); };
+    let value_slot = map.value_slots[probe.slot];
+    return map.values[value_slot];
+}
+
+fn entity_hash_map_remove<T>(map: EntityHashMap<T>, key: Entity) -> EntityHashMap<T> {
+    let probe = entity_hash_map_probe<T>(map, key);
+    if probe.found != true { return map; };
+    map.keys[probe.slot] = entity_placeholder();
+    map.value_slots[probe.slot] = -1;
+    map.states[probe.slot] = entity_hash_state_tombstone();
+    map.len_value = map.len_value - 1;
+    map.tombstones = map.tombstones + 1;
+    return map;
+}
+
+fn entity_hash_map_keys<T>(map: EntityHashMap<T>) -> EntityHashSet {
+    let out = entity_hash_set_with_capacity(len(map.states) as i64);
+    let i: i64 = 0;
+    let count = len(map.states) as i64;
+    while i < count {
+        if map.states[i] == entity_hash_state_filled() { out = entity_hash_set_insert(out, map.keys[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_set_new() -> EntitySet {
+    let values: Vec<Entity> = Vec::new();
+    return EntitySet { values: values };
+}
+
+fn entity_set_from_vec(values: Vec<Entity>) -> EntitySet {
+    let set = entity_set_new();
+    let i: i64 = 0;
+    let count = len(values) as i64;
+    while i < count {
+        set = entity_set_insert(set, values[i]);
+        i = i + 1;
+    }
+    return set;
+}
+
+fn entity_set_len(set: EntitySet) -> i64 {
+    return len(set.values) as i64;
+}
+
+fn entity_set_is_empty(set: EntitySet) -> bool {
+    return len(set.values) == 0;
+}
+
+fn entity_set_slot(set: EntitySet, entity: Entity) -> i64 {
+    let i: i64 = 0;
+    let count = len(set.values) as i64;
+    while i < count {
+        if set.values[i] == entity { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn entity_set_contains(set: EntitySet, entity: Entity) -> bool {
+    return entity_set_slot(set, entity) >= 0;
+}
+
+fn entity_set_insert(set: EntitySet, entity: Entity) -> EntitySet {
+    if entity_set_contains(set, entity) { return set; };
+    set.values.push(entity);
+    return set;
+}
+
+fn entity_set_insert_result(set: EntitySet, entity: Entity) -> (EntitySet, bool) {
+    if entity_set_contains(set, entity) { return (set, false); };
+    set.values.push(entity);
+    return (set, true);
+}
+
+fn entity_set_remove(set: EntitySet, entity: Entity) -> EntitySet {
+    let slot = entity_set_slot(set, entity);
+    if slot < 0 { return set; };
+    let count = len(set.values) as i64;
+    let last = count - 1;
+    let i = slot + 0;
+    while i < last {
+        set.values[i] = set.values[i + 1];
+        i = i + 1;
+    }
+    let removed = set.values.remove(last);
+    return set;
+}
+
+fn entity_set_remove_result(set: EntitySet, entity: Entity) -> (EntitySet, bool) {
+    if entity_set_contains(set, entity) != true { return (set, false); };
+    return (entity_set_remove(set, entity), true);
+}
+
+fn entity_set_clear(set: EntitySet) -> EntitySet {
+    while len(set.values) > 0 {
+        let last = (len(set.values) as i64) - 1;
+        let removed = set.values.remove(last);
+    }
+    return set;
+}
+
+fn entity_set_to_vec(set: EntitySet) -> Vec<Entity> {
+    let out: Vec<Entity> = Vec::new();
+    let i: i64 = 0;
+    let count = len(set.values) as i64;
+    while i < count {
+        out.push(set.values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_set_has_duplicates(set: EntitySet) -> bool {
+    let i: i64 = 0;
+    let count = len(set.values) as i64;
+    while i < count {
+        let j = i + 1;
+        while j < count {
+            if set.values[i] == set.values[j] { return true; };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn entity_set_is_subset(left: EntitySet, right: EntitySet) -> bool {
+    let i: i64 = 0;
+    let count = len(left.values) as i64;
+    while i < count {
+        if entity_set_contains(right, left.values[i]) != true { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn entity_set_is_superset(left: EntitySet, right: EntitySet) -> bool {
+    return entity_set_is_subset(right, left);
+}
+
+fn entity_set_is_disjoint(left: EntitySet, right: EntitySet) -> bool {
+    let i: i64 = 0;
+    let count = len(left.values) as i64;
+    while i < count {
+        if entity_set_contains(right, left.values[i]) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn entity_set_union(left: EntitySet, right: EntitySet) -> EntitySet {
+    let out = entity_set_new();
+    let i: i64 = 0;
+    let left_count = len(left.values) as i64;
+    while i < left_count {
+        out = entity_set_insert(out, left.values[i]);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let right_count = len(right.values) as i64;
+    while j < right_count {
+        out = entity_set_insert(out, right.values[j]);
+        j = j + 1;
+    }
+    return out;
+}
+
+fn entity_set_intersection(left: EntitySet, right: EntitySet) -> EntitySet {
+    let out = entity_set_new();
+    let i: i64 = 0;
+    let count = len(left.values) as i64;
+    while i < count {
+        if entity_set_contains(right, left.values[i]) { out = entity_set_insert(out, left.values[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_set_difference(left: EntitySet, right: EntitySet) -> EntitySet {
+    let out = entity_set_new();
+    let i: i64 = 0;
+    let count = len(left.values) as i64;
+    while i < count {
+        if entity_set_contains(right, left.values[i]) != true { out = entity_set_insert(out, left.values[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn entity_set_symmetric_difference(left: EntitySet, right: EntitySet) -> EntitySet {
+    return entity_set_union(entity_set_difference(left, right), entity_set_difference(right, left));
+}
+
+fn unique_entity_vec_new() -> UniqueEntityVec {
+    let values: Vec<Entity> = Vec::new();
+    return UniqueEntityVec { values: values };
+}
+
+fn unique_entity_vec_from_vec(values: Vec<Entity>) -> UniqueEntityVec {
+    let out = unique_entity_vec_new();
+    let i: i64 = 0;
+    let count = len(values) as i64;
+    while i < count {
+        out = unique_entity_vec_push(out, values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn unique_entity_vec_len(values: UniqueEntityVec) -> i64 {
+    return len(values.values) as i64;
+}
+
+fn unique_entity_vec_is_empty(values: UniqueEntityVec) -> bool {
+    return len(values.values) == 0;
+}
+
+fn unique_entity_vec_slot(values: UniqueEntityVec, entity: Entity) -> i64 {
+    let i: i64 = 0;
+    let count = len(values.values) as i64;
+    while i < count {
+        if values.values[i] == entity { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn unique_entity_vec_contains(values: UniqueEntityVec, entity: Entity) -> bool {
+    return unique_entity_vec_slot(values, entity) >= 0;
+}
+
+fn unique_entity_vec_get(values: UniqueEntityVec, index: i64) -> Entity {
+    if index < 0 { return entity_placeholder(); };
+    if index >= (len(values.values) as i64) { return entity_placeholder(); };
+    return values.values[index];
+}
+
+fn unique_entity_vec_push(values: UniqueEntityVec, entity: Entity) -> UniqueEntityVec {
+    if unique_entity_vec_contains(values, entity) { return values; };
+    values.values.push(entity);
+    return values;
+}
+
+fn unique_entity_vec_push_result(values: UniqueEntityVec, entity: Entity) -> (UniqueEntityVec, bool) {
+    if unique_entity_vec_contains(values, entity) { return (values, false); };
+    values.values.push(entity);
+    return (values, true);
+}
+
+fn unique_entity_vec_insert(values: UniqueEntityVec, index: i64, entity: Entity) -> UniqueEntityVec {
+    if unique_entity_vec_contains(values, entity) { return values; };
+    let target = index + 0;
+    if target < 0 { target = 0; };
+    if target > len(values.values) { target = len(values.values); };
+    values.values.push(entity);
+    let i = (len(values.values) as i64) - 1;
+    while i > target {
+        values.values[i] = values.values[i - 1];
+        i = i - 1;
+    }
+    values.values[target] = entity;
+    return values;
+}
+
+fn unique_entity_vec_remove(values: UniqueEntityVec, entity: Entity) -> UniqueEntityVec {
+    let slot = unique_entity_vec_slot(values, entity);
+    if slot < 0 { return values; };
+    return unique_entity_vec_remove_at(values, slot);
+}
+
+fn unique_entity_vec_remove_at(values: UniqueEntityVec, index: i64) -> UniqueEntityVec {
+    let count = len(values.values) as i64;
+    if index < 0 { return values; };
+    if index >= count { return values; };
+    let last = count - 1;
+    let i = index + 0;
+    while i < last {
+        values.values[i] = values.values[i + 1];
+        i = i + 1;
+    }
+    let removed = values.values.remove(last);
+    return values;
+}
+
+fn unique_entity_vec_swap_remove_at(values: UniqueEntityVec, index: i64) -> UniqueEntityVec {
+    let count = len(values.values) as i64;
+    if index < 0 { return values; };
+    if index >= count { return values; };
+    let last = count - 1;
+    if index != last { values.values[index] = values.values[last]; };
+    let removed = values.values.remove(last);
+    return values;
+}
+
+fn unique_entity_vec_swap(values: UniqueEntityVec, left: i64, right: i64) -> UniqueEntityVec {
+    let count = len(values.values) as i64;
+    if left < 0 { return values; };
+    if right < 0 { return values; };
+    if left >= count { return values; };
+    if right >= count { return values; };
+    if left == right { return values; };
+    let tmp = values.values[left];
+    values.values[left] = values.values[right];
+    values.values[right] = tmp;
+    return values;
+}
+
+fn unique_entity_vec_truncate(values: UniqueEntityVec, new_len: i64) -> UniqueEntityVec {
+    let target = new_len + 0;
+    if target < 0 { target = 0; };
+    while (len(values.values) as i64) > target {
+        let last = (len(values.values) as i64) - 1;
+        let removed = values.values.remove(last);
+    }
+    return values;
+}
+
+fn unique_entity_vec_to_vec(values: UniqueEntityVec) -> Vec<Entity> {
+    let out: Vec<Entity> = Vec::new();
+    let i: i64 = 0;
+    let count = len(values.values) as i64;
+    while i < count {
+        out.push(values.values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn unique_entity_vec_into_set(values: UniqueEntityVec) -> EntitySet {
+    return entity_set_from_vec(values.values);
+}
+
+fn unique_entity_vec_has_duplicates(values: UniqueEntityVec) -> bool {
+    return entity_set_has_duplicates(EntitySet { values: values.values });
+}
+
+fn entity_map_new<T>() -> EntityMap<T> {
+    let keys: Vec<Entity> = Vec::new();
+    let values: Vec<T> = Vec::new();
+    return EntityMap<T> { keys: keys, values: values };
+}
+
+fn entity_map_len<T>(map: EntityMap<T>) -> i64 {
+    return len(map.keys) as i64;
+}
+
+fn entity_map_is_empty<T>(map: EntityMap<T>) -> bool {
+    return len(map.keys) == 0;
+}
+
+fn entity_map_slot<T>(map: EntityMap<T>, key: Entity) -> i64 {
+    let i: i64 = 0;
+    let count = len(map.keys) as i64;
+    while i < count {
+        if map.keys[i] == key { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn entity_map_contains_key<T>(map: EntityMap<T>, key: Entity) -> bool {
+    return entity_map_slot<T>(map, key) >= 0;
+}
+
+fn entity_map_insert<T>(map: EntityMap<T>, key: Entity, value: T) -> EntityMap<T> {
+    let slot = entity_map_slot<T>(map, key);
+    if slot >= 0 {
+        map.values[slot] = value;
+        return map;
+    };
+    map.keys.push(key);
+    map.values.push(value);
+    return map;
+}
+
+fn entity_map_get_or<T>(map: EntityMap<T>, key: Entity, default_value: T) -> EntityMapGet<T> {
+    let slot = entity_map_slot<T>(map, key);
+    if slot < 0 { return EntityMapGet<T> { found: false, value: default_value }; };
+    return EntityMapGet<T> { found: true, value: map.values[slot] };
+}
+
+fn entity_map_get_unchecked<T>(map: EntityMap<T>, key: Entity) -> T {
+    let slot = entity_map_slot<T>(map, key);
+    if slot < 0 { panic(21480); };
+    return map.values[slot];
+}
+
+fn entity_map_remove<T>(map: EntityMap<T>, key: Entity) -> EntityMap<T> {
+    let slot = entity_map_slot<T>(map, key);
+    if slot < 0 { return map; };
+    let count = len(map.keys) as i64;
+    let last = count - 1;
+    let i = slot + 0;
+    while i < last {
+        map.keys[i] = map.keys[i + 1];
+        map.values[i] = map.values[i + 1];
+        i = i + 1;
+    }
+    let removed_key = map.keys.remove(last);
+    let removed_value = map.values.remove(last);
+    return map;
+}
+
+fn entity_map_keys<T>(map: EntityMap<T>) -> EntitySet {
+    return entity_set_from_vec(map.keys);
+}
+
+fn entity_map_clear<T>(map: EntityMap<T>) -> EntityMap<T> {
+    while len(map.keys) > 0 {
+        let last = (len(map.keys) as i64) - 1;
+        let removed_key = map.keys.remove(last);
+        let removed_value = map.values.remove(last);
+    }
+    return map;
+}
+
+@test "entity set uses Entity value semantics"() {
+    let a = entity_new(7, 1);
+    let same = entity_new(7, 1);
+    let stale = entity_new(7, 2);
+
+    let set0 = entity_set_new();
+    let (set1, inserted1) = entity_set_insert_result(set0, a);
+    let (set2, inserted2) = entity_set_insert_result(set1, same);
+    let set3 = entity_set_insert(set2, stale);
+
+    if inserted1 != true { panic(21400); };
+    if inserted2 != false { panic(21401); };
+    if entity_set_len(set3) != 2 { panic(21402); };
+    if entity_set_contains(set3, same) != true { panic(21403); };
+    if entity_set_contains(set3, entity_new(8, 1)) { panic(21404); };
+    if entity_set_has_duplicates(set3) { panic(21405); };
+}
+
+@test "entity set supports stable removal and set algebra"() {
+    let e1 = entity_new(1, 0);
+    let e2 = entity_new(2, 0);
+    let e3 = entity_new(3, 0);
+    let e4 = entity_new(4, 0);
+
+    let left0 = entity_set_new();
+    let left1 = entity_set_insert(entity_set_insert(entity_set_insert(left0, e1), e2), e3);
+    let right0 = entity_set_new();
+    let right1 = entity_set_insert(entity_set_insert(right0, e3), e4);
+
+    let removed = entity_set_remove(left1, entity_new(2, 0));
+    if entity_set_len(removed) != 2 { panic(21420); };
+    if entity_set_contains(removed, e2) { panic(21421); };
+    if removed.values[0] != e1 { panic(21422); };
+    if removed.values[1] != e3 { panic(21423); };
+
+    let algebra_left0 = entity_set_new();
+    let algebra_left = entity_set_insert(entity_set_insert(entity_set_insert(algebra_left0, e1), e2), e3);
+
+    let union_set = entity_set_union(algebra_left, right1);
+    if entity_set_len(union_set) != 4 { panic(21424); };
+    if entity_set_contains(union_set, e4) != true { panic(21425); };
+
+    let algebra_left2 = entity_set_insert(entity_set_insert(entity_set_insert(entity_set_new(), e1), e2), e3);
+    let intersection = entity_set_intersection(algebra_left2, right1);
+    if entity_set_len(intersection) != 1 { panic(21426); };
+    if entity_set_contains(intersection, e3) != true { panic(21427); };
+
+    let algebra_left3 = entity_set_insert(entity_set_insert(entity_set_insert(entity_set_new(), e1), e2), e3);
+    let difference = entity_set_difference(algebra_left3, right1);
+    if entity_set_len(difference) != 2 { panic(21428); };
+    if entity_set_contains(difference, e1) != true { panic(21429); };
+    if entity_set_contains(difference, e2) != true { panic(21430); };
+
+    let algebra_left4 = entity_set_insert(entity_set_insert(entity_set_insert(entity_set_new(), e1), e2), e3);
+    let symmetric = entity_set_symmetric_difference(algebra_left4, right1);
+    if entity_set_len(symmetric) != 3 { panic(21431); };
+    if entity_set_contains(symmetric, e3) { panic(21432); };
+    if entity_set_is_disjoint(difference, intersection) != true { panic(21433); };
+    if entity_set_is_subset(intersection, union_set) != true { panic(21434); };
+    if entity_set_is_superset(union_set, intersection) != true { panic(21435); };
+}
+
+@test "entity map replaces by Entity value key"() {
+    let a = entity_new(10, 0);
+    let same = entity_new(10, 0);
+    let stale = entity_new(10, 1);
+
+    let map0 = entity_map_new<i32>();
+    let map1 = entity_map_insert<i32>(map0, a, 11);
+    let map2 = entity_map_insert<i32>(map1, same, 22);
+    let map3 = entity_map_insert<i32>(map2, stale, 33);
+
+    if entity_map_len<i32>(map3) != 2 { panic(21450); };
+    if entity_map_get_unchecked<i32>(map3, a) != 22 { panic(21451); };
+    if entity_map_get_unchecked<i32>(map3, same) != 22 { panic(21452); };
+    if entity_map_get_unchecked<i32>(map3, stale) != 33 { panic(21453); };
+
+    let missing = entity_map_get_or<i32>(map3, entity_new(99, 0), -5);
+    if missing.found { panic(21454); };
+    if missing.value != -5 { panic(21455); };
+
+    let found = entity_map_get_or<i32>(map3, same, -1);
+    if found.found != true { panic(21456); };
+    if found.value != 22 { panic(21457); };
+}
+
+@test "entity map removes keys and exposes key set"() {
+    let e1 = entity_new(1, 0);
+    let e2 = entity_new(2, 0);
+    let e3 = entity_new(3, 0);
+    let map0 = entity_map_new<i32>();
+    let map1 = entity_map_insert<i32>(entity_map_insert<i32>(entity_map_insert<i32>(map0, e1, 1), e2, 2), e3, 3);
+    let map2 = entity_map_remove<i32>(map1, entity_new(2, 0));
+
+    if entity_map_len<i32>(map2) != 2 { panic(21470); };
+    if entity_map_contains_key<i32>(map2, e2) { panic(21471); };
+    if entity_map_get_unchecked<i32>(map2, e1) != 1 { panic(21472); };
+    if entity_map_get_unchecked<i32>(map2, e3) != 3 { panic(21473); };
+
+    let keys = entity_map_keys<i32>(map2);
+    if entity_set_len(keys) != 2 { panic(21474); };
+    if entity_set_contains(keys, e1) != true { panic(21475); };
+    if entity_set_contains(keys, e3) != true { panic(21476); };
+
+    let empty = entity_map_clear<i32>(map2);
+    if entity_map_is_empty<i32>(empty) != true { panic(21477); };
+}
+
+@test "unique entity vec preserves insertion order and rejects duplicates"() {
+    let e1 = entity_new(1, 0);
+    let e2 = entity_new(2, 0);
+    let same_e1 = entity_new(1, 0);
+    let stale_e1 = entity_new(1, 1);
+
+    let values0 = unique_entity_vec_new();
+    let (values1, inserted1) = unique_entity_vec_push_result(values0, e1);
+    let (values2, inserted2) = unique_entity_vec_push_result(values1, e2);
+    let (values3, inserted3) = unique_entity_vec_push_result(values2, same_e1);
+    let values4 = unique_entity_vec_push(values3, stale_e1);
+
+    if inserted1 != true { panic(21500); };
+    if inserted2 != true { panic(21501); };
+    if inserted3 != false { panic(21502); };
+    if unique_entity_vec_len(values4) != 3 { panic(21503); };
+    if unique_entity_vec_get(values4, 0) != e1 { panic(21504); };
+    if unique_entity_vec_get(values4, 1) != e2 { panic(21505); };
+    if unique_entity_vec_get(values4, 2) != stale_e1 { panic(21506); };
+    if unique_entity_vec_has_duplicates(values4) { panic(21507); };
+}
+
+@test "unique entity vec insert remove swap and truncate"() {
+    let e1 = entity_new(1, 0);
+    let e2 = entity_new(2, 0);
+    let e3 = entity_new(3, 0);
+    let e4 = entity_new(4, 0);
+    let e5 = entity_new(5, 0);
+
+    let values0 = unique_entity_vec_new();
+    let values1 = unique_entity_vec_push(unique_entity_vec_push(unique_entity_vec_push(values0, e1), e3), e4);
+    let values2 = unique_entity_vec_insert(values1, 1, e2);
+    let values3 = unique_entity_vec_insert(values2, 1, entity_new(3, 0));
+
+    if unique_entity_vec_len(values3) != 4 { panic(21520); };
+    if unique_entity_vec_get(values3, 0) != e1 { panic(21521); };
+    if unique_entity_vec_get(values3, 1) != e2 { panic(21522); };
+    if unique_entity_vec_get(values3, 2) != e3 { panic(21523); };
+    if unique_entity_vec_get(values3, 3) != e4 { panic(21524); };
+
+    let values4 = unique_entity_vec_remove(values3, entity_new(2, 0));
+    if unique_entity_vec_len(values4) != 3 { panic(21525); };
+    if unique_entity_vec_get(values4, 0) != e1 { panic(21526); };
+    if unique_entity_vec_get(values4, 1) != e3 { panic(21527); };
+    if unique_entity_vec_get(values4, 2) != e4 { panic(21528); };
+
+    let values5 = unique_entity_vec_insert(values4, 99, e5);
+    if unique_entity_vec_get(values5, 3) != e5 { panic(21529); };
+
+    let values6 = unique_entity_vec_swap(values5, 0, 2);
+    if unique_entity_vec_get(values6, 0) != e4 { panic(21530); };
+    if unique_entity_vec_get(values6, 2) != e1 { panic(21531); };
+
+    let values7 = unique_entity_vec_swap_remove_at(values6, 1);
+    if unique_entity_vec_len(values7) != 3 { panic(21532); };
+    if unique_entity_vec_contains(values7, e3) { panic(21533); };
+    if unique_entity_vec_has_duplicates(values7) { panic(21534); };
+
+    let values8 = unique_entity_vec_truncate(values7, 2);
+    if unique_entity_vec_len(values8) != 2 { panic(21535); };
+}
+
+@test "unique entity vec from vec and set conversion"() {
+    let e1 = entity_new(11, 0);
+    let e2 = entity_new(12, 0);
+    let e3 = entity_new(13, 0);
+    let raw: Vec<Entity> = Vec::new();
+    raw.push(e1);
+    raw.push(e2);
+    raw.push(entity_new(11, 0));
+    raw.push(e3);
+    raw.push(entity_new(12, 0));
+
+    let values = unique_entity_vec_from_vec(raw);
+    if unique_entity_vec_len(values) != 3 { panic(21550); };
+    if unique_entity_vec_get(values, 0) != e1 { panic(21551); };
+    if unique_entity_vec_get(values, 1) != e2 { panic(21552); };
+    if unique_entity_vec_get(values, 2) != e3 { panic(21553); };
+
+    let out = unique_entity_vec_to_vec(values);
+    if len(out) != 3 { panic(21554); };
+    if out[0] != e1 { panic(21555); };
+    if out[1] != e2 { panic(21556); };
+    if out[2] != e3 { panic(21557); };
+
+    let values_again = unique_entity_vec_from_vec(out);
+    let set = unique_entity_vec_into_set(values_again);
+    if entity_set_len(set) != 3 { panic(21558); };
+    if entity_set_contains(set, e1) != true { panic(21559); };
+    if entity_set_contains(set, e2) != true { panic(21560); };
+    if entity_set_contains(set, e3) != true { panic(21561); };
+}
+
+@test "entity hash set uses derived hash and value equality"() {
+    let e1 = entity_new(1, 0);
+    let e1_same = entity_new(1, 0);
+    let e1_stale = entity_new(1, 1);
+    let e2 = entity_new(2, 0);
+
+    let set0 = entity_hash_set_new();
+    let (set1, inserted1) = entity_hash_set_insert_result(set0, e1);
+    let (set2, inserted2) = entity_hash_set_insert_result(set1, e1_same);
+    let set3 = entity_hash_set_insert(entity_hash_set_insert(set2, e1_stale), e2);
+
+    if inserted1 != true { panic(21600); };
+    if inserted2 != false { panic(21601); };
+    if entity_hash_set_len(set3) != 3 { panic(21602); };
+    if entity_hash_set_contains(set3, e1_same) != true { panic(21603); };
+    if entity_hash_set_contains(set3, e1_stale) != true { panic(21604); };
+    if entity_hash_set_contains(set3, entity_new(99, 0)) { panic(21605); };
+
+    let plain = entity_hash_set_to_entity_set(set3);
+    if entity_set_len(plain) != 3 { panic(21606); };
+    if entity_set_contains(plain, e2) != true { panic(21607); };
+}
+
+@test "entity hash set grows and reuses tombstones"() {
+    let set = entity_hash_set_with_capacity(2);
+    let i: i32 = 0;
+    while i < 40 {
+        set = entity_hash_set_insert(set, entity_new(i + 1, i % 3));
+        i = i + 1;
+    }
+    if entity_hash_set_len(set) != 40 { panic(21620); };
+    if entity_hash_set_capacity(set) < 64 { panic(21621); };
+
+    let j: i32 = 0;
+    while j < 40 {
+        if entity_hash_set_contains(set, entity_new(j + 1, j % 3)) != true { panic(21622); };
+        j = j + 1;
+    }
+
+    let removed = entity_hash_set_remove(entity_hash_set_remove(set, entity_new(5, 1)), entity_new(12, 2));
+    if entity_hash_set_len(removed) != 38 { panic(21623); };
+    if entity_hash_set_contains(removed, entity_new(5, 1)) { panic(21624); };
+
+    let reused = entity_hash_set_insert(entity_hash_set_insert(removed, entity_new(5, 1)), entity_new(88, 0));
+    if entity_hash_set_len(reused) != 40 { panic(21625); };
+    if entity_hash_set_contains(reused, entity_new(5, 1)) != true { panic(21626); };
+    if entity_hash_set_contains(reused, entity_new(88, 0)) != true { panic(21627); };
+}
+
+@test "entity hash map replaces by value key and keeps stale generations distinct"() {
+    let e1 = entity_new(3, 0);
+    let e1_same = entity_new(3, 0);
+    let e1_stale = entity_new(3, 1);
+    let e2 = entity_new(4, 0);
+
+    let map0 = entity_hash_map_new<i32>();
+    let map1 = entity_hash_map_insert<i32>(map0, e1, 10);
+    let map2 = entity_hash_map_insert<i32>(map1, e1_same, 20);
+    let map3 = entity_hash_map_insert<i32>(entity_hash_map_insert<i32>(map2, e1_stale, 30), e2, 40);
+
+    if entity_hash_map_len<i32>(map3) != 3 { panic(21640); };
+    if entity_hash_map_get_unchecked<i32>(map3, e1) != 20 { panic(21641); };
+    if entity_hash_map_get_unchecked<i32>(map3, e1_same) != 20 { panic(21642); };
+    if entity_hash_map_get_unchecked<i32>(map3, e1_stale) != 30 { panic(21643); };
+
+    let missing = entity_hash_map_get_or<i32>(map3, entity_new(99, 0), -9);
+    if missing.found { panic(21644); };
+    if missing.value != -9 { panic(21645); };
+
+    let found = entity_hash_map_get_or<i32>(map3, e2, -1);
+    if found.found != true { panic(21646); };
+    if found.value != 40 { panic(21647); };
+}
+
+@test "entity hash map grows removes and exposes hash key set"() {
+    let map = entity_hash_map_with_capacity<i32>(2);
+    let i: i32 = 0;
+    while i < 36 {
+        map = entity_hash_map_insert<i32>(map, entity_new(i + 10, i % 4), i * 10);
+        i = i + 1;
+    }
+    if entity_hash_map_len<i32>(map) != 36 { panic(21660); };
+    if entity_hash_map_capacity<i32>(map) < 64 { panic(21661); };
+    if entity_hash_map_get_unchecked<i32>(map, entity_new(20, 2)) != 100 { panic(21662); };
+
+    let removed = entity_hash_map_remove<i32>(entity_hash_map_remove<i32>(map, entity_new(20, 2)), entity_new(30, 0));
+    if entity_hash_map_len<i32>(removed) != 34 { panic(21663); };
+    if entity_hash_map_contains_key<i32>(removed, entity_new(20, 2)) { panic(21664); };
+
+    let reinserted = entity_hash_map_insert<i32>(removed, entity_new(20, 2), 777);
+    if entity_hash_map_len<i32>(reinserted) != 35 { panic(21665); };
+    if entity_hash_map_get_unchecked<i32>(reinserted, entity_new(20, 2)) != 777 { panic(21666); };
+
+    let keys = entity_hash_map_keys<i32>(reinserted);
+    if entity_hash_set_len(keys) != 35 { panic(21667); };
+    if entity_hash_set_contains(keys, entity_new(20, 2)) != true { panic(21668); };
+    if entity_hash_set_contains(keys, entity_new(30, 0)) { panic(21669); };
+}

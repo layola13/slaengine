@@ -1,0 +1,349 @@
+// Deepened Bevy ECS schedule::set surface.
+// Mirrors src/schedule/set.rs: SystemSet trait, InternedSystemSet/InternedScheduleLabel,
+// SystemTypeSet<T>, AnonymousSet, IntoSystemSet<Marker>, ScheduleLabel interning.
+// The shallow lib/schedule_set.sla stays as the SystemSet struct value model; this file
+// models trait-observable behavior (system_type/is_anonymous/base), Debug names, and the
+// intern/into dispatch contracts.
+
+// === SetKind / SetIdentity ===
+// Bevy's SystemSet is a `dyn` trait object; concrete impls are SystemTypeSet<T> and
+// AnonymousSet. We model the two observable kind bits plus a stable identity tuple
+// (kind, type_id, anon_id, label_id) used for Hash/Eq after interning.
+const ECS_SET_KIND_SYSTEM_TYPE: i32 = 0;
+const ECS_SET_KIND_ANONYMOUS: i32 = 1;
+const ECS_SET_KIND_BASE: i32 = 2;
+
+struct EcsSystemSetIdentity {
+    kind: i32,
+    type_id: i64,   // 0 if not system-type
+    anon_id: i64,   // 0 if not anonymous
+    label_id: i64,  // ScheduleLabel intern key for base sets, else 0
+}
+
+fn ecs_system_set_identity_system_type(type_id: i64) -> EcsSystemSetIdentity {
+    return EcsSystemSetIdentity {
+        kind: ECS_SET_KIND_SYSTEM_TYPE,
+        type_id: type_id,
+        anon_id: 0,
+        label_id: 0,
+    };
+}
+
+fn ecs_system_set_identity_anonymous(anon_id: i64) -> EcsSystemSetIdentity {
+    return EcsSystemSetIdentity {
+        kind: ECS_SET_KIND_ANONYMOUS,
+        type_id: 0,
+        anon_id: anon_id,
+        label_id: 0,
+    };
+}
+
+fn ecs_system_set_identity_base(label_id: i64) -> EcsSystemSetIdentity {
+    return EcsSystemSetIdentity {
+        kind: ECS_SET_KIND_BASE,
+        type_id: 0,
+        anon_id: 0,
+        label_id: label_id,
+    };
+}
+
+fn ecs_system_set_identity_is_system_type(s: EcsSystemSetIdentity) -> bool {
+    return s.kind == ECS_SET_KIND_SYSTEM_TYPE;
+}
+
+fn ecs_system_set_identity_is_anonymous(s: EcsSystemSetIdentity) -> bool {
+    return s.kind == ECS_SET_KIND_ANONYMOUS;
+}
+
+fn ecs_system_set_identity_is_base(s: EcsSystemSetIdentity) -> bool {
+    return s.kind == ECS_SET_KIND_BASE;
+}
+
+fn ecs_system_set_identity_kind(s: EcsSystemSetIdentity) -> i32 { return s.kind; }
+fn ecs_system_set_identity_type_id(s: EcsSystemSetIdentity) -> i64 { return s.type_id; }
+fn ecs_system_set_identity_anon_id(s: EcsSystemSetIdentity) -> i64 { return s.anon_id; }
+fn ecs_system_set_identity_label_id(s: EcsSystemSetIdentity) -> i64 { return s.label_id; }
+
+// Bevy trait method `system_type(&self) -> Option<TypeId>`: Some for SystemTypeSet.
+fn ecs_system_set_trait_system_type(s: EcsSystemSetIdentity) -> EcsOptionTypeId {
+    if s.kind == ECS_SET_KIND_SYSTEM_TYPE {
+        return ecs_option_type_id_some(s.type_id);
+    };
+    return ecs_option_type_id_none();
+}
+
+// === Option<TypeId> helper (nullable type id) ===
+struct EcsOptionTypeId {
+    has: bool,
+    value: i64,
+}
+
+fn ecs_option_type_id_some(value: i64) -> EcsOptionTypeId {
+    return EcsOptionTypeId { has: true, value: value };
+}
+
+fn ecs_option_type_id_none() -> EcsOptionTypeId {
+    return EcsOptionTypeId { has: false, value: 0 };
+}
+
+fn ecs_option_type_id_is_some(o: EcsOptionTypeId) -> bool { return o.has; }
+fn ecs_option_type_id_is_none(o: EcsOptionTypeId) -> bool { return o.has == false; }
+fn ecs_option_type_id_value(o: EcsOptionTypeId) -> i64 { return o.value; }
+
+// === AnonymousSet ===
+// Bevy `AnonymousSet(usize)`: Clone/Copy/Debug/Hash/PartialEq/Eq, `is_anonymous == true`.
+// Its identity is the unique allocator id; two AnonymousSet are equal iff same id.
+fn ecs_anon_set_is_anonymous(_id: i64) -> bool { return true; }
+
+fn ecs_anon_set_eq(a: i64, b: i64) -> bool { return a == b; }
+
+// stable hash proxy for AnonymousSet (id itself)
+fn ecs_anon_set_hash(a: i64) -> i64 { return a; }
+
+// debug name proxy: "AnonymousSet({id})"
+fn ecs_anon_set_debug(a: i64) -> i64 { return 1000000 + a; }
+
+// === SystemTypeSet<T> ===
+// Bevy `SystemTypeSet<T>(PhantomData<fn() -> T>)`: all instances of the same T compare
+// equal; Hash ignores the state (single value); system_type returns Some(TypeId::of::<T>()).
+// Identity is just the TypeId; there is exactly one per T.
+fn ecs_system_type_set_new(type_id: i64) -> EcsSystemSetIdentity {
+    return ecs_system_set_identity_system_type(type_id);
+}
+
+// SystemTypeSet.eq is always true between same-T (TestSet.eq on the identity):
+//   (kind, type_id, anon_id, label_id) are identical for the same T -> eq == true
+fn ecs_system_type_set_eq_self(_s: EcsSystemSetIdentity) -> bool { return true; }
+
+// Two SystemTypeSets with different type IDs are never equal.
+fn ecs_system_type_set_eq_distinct(a_type: i64, b_type: i64) -> bool { return a_type == b_type; }
+
+// SystemTypeSet.hash: constant; model as the type_id so interned entries still collide/dedup.
+fn ecs_system_type_set_hash(_s: EcsSystemSetIdentity, type_id: i64) -> i64 { return type_id; }
+
+// SystemSet impl returns Some(TypeId::of::<T>())
+fn ecs_system_type_set_system_type(type_id: i64) -> EcsOptionTypeId {
+    return ecs_option_type_id_some(type_id);
+}
+
+fn ecs_system_type_set_is_anonymous(_s: EcsSystemSetIdentity) -> bool { return false; }
+
+// === SystemSet trait proxy ===
+// Bevy trait `SystemSet`: `system_type -> Option<TypeId>` (None unless overridden),
+// `is_anonymous -> bool` (false unless overridden). `base` is None for these built-ins.
+// (ecs_system_set_trait_system_type is defined above as the identity->Option mapper.)
+fn ecs_system_set_trait_is_anonymous(s: EcsSystemSetIdentity) -> bool {
+    return s.kind == ECS_SET_KIND_ANONYMOUS;
+}
+
+// === InternedSystemSet / InternedScheduleLabel ===
+// Bevy `Interned<dyn SystemSet>` / `Interned<dyn ScheduleLabel>`: a shared pointer to an
+// interned trait object, compared by pointer. We model the intern table as an id-based
+// registry: interning a ScheduleLabel/SystemSet produces a stable intern id used for
+// Hash/Eq. Calling intern twice for the same identity returns the same intern id.
+fn ecs_interned_system_set_intern(reg: EcsInternRegistry, identity: EcsSystemSetIdentity) -> EcsInternResult {
+    return ecs_intern_registry_intern(reg, identity);
+}
+
+fn ecs_interned_schedule_label_intern(reg: EcsInternRegistry, label: EcsScheduleLabelIdentity) -> EcsInternResult {
+    return ecs_intern_registry_intern_label(reg, label);
+}
+
+// === InternRegistry: a stable id -> identity table, with a linear probe lookup. ===
+// This models Bevy's interner in `bevy_utils::intern`: same shape => same interned id.
+struct EcsInternRegistry {
+    next_id: i64,
+    ids: Vec<i64>,        // intern ids assigned
+    kinds: Vec<i32>,      // identity.kind at the same index
+    type_ids: Vec<i64>,
+    anon_ids: Vec<i64>,
+    label_ids: Vec<i64>,
+}
+
+fn ecs_intern_registry_new() -> EcsInternRegistry {
+    let r = EcsInternRegistry {
+        next_id: 1,
+        ids: Vec::new(),
+        kinds: Vec::new(),
+        type_ids: Vec::new(),
+        anon_ids: Vec::new(),
+        label_ids: Vec::new(),
+    };
+    return r;
+}
+
+// Returns the existing intern id for an identity, or 0 if not found.
+fn ecs_intern_registry_find(reg: EcsInternRegistry, identity: EcsSystemSetIdentity) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(reg.ids) as i64;
+    while i < n {
+        if reg.kinds[i] == identity.kind
+            && reg.type_ids[i] == identity.type_id
+            && reg.anon_ids[i] == identity.anon_id
+            && reg.label_ids[i] == identity.label_id {
+            return reg.ids[i];
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ecs_intern_registry_intern(reg: EcsInternRegistry, identity: EcsSystemSetIdentity) -> EcsInternResult {
+    let existing = ecs_intern_registry_find(reg, identity);
+    if existing != 0 { return ecs_intern_result_found(existing); };
+    let id = reg.next_id;
+    reg.ids.push(id);
+    reg.kinds.push(identity.kind);
+    reg.type_ids.push(identity.type_id);
+    reg.anon_ids.push(identity.anon_id);
+    reg.label_ids.push(identity.label_id);
+    reg.next_id = reg.next_id + 1;
+    return ecs_intern_result_created(id);
+}
+
+// === ScheduleLabelIdentity ===
+// Bevy `ScheduleLabel` is also interned via `define_label!`. Identity is the concrete
+// derived label's own Hash/Eq, which we carry as a single integer key (label_id).
+struct EcsScheduleLabelIdentity {
+    label_id: i64,
+}
+
+fn ecs_schedule_label_identity_new(label_id: i64) -> EcsScheduleLabelIdentity {
+    return EcsScheduleLabelIdentity { label_id: label_id };
+}
+
+fn ecs_schedule_label_identity_eq(a: EcsScheduleLabelIdentity, b: EcsScheduleLabelIdentity) -> bool {
+    return a.label_id == b.label_id;
+}
+
+fn ecs_schedule_label_identity_hash(a: EcsScheduleLabelIdentity) -> i64 { return a.label_id; }
+
+// Reuses the SystemSet registry but stores an InternEntry with kind=SCHEDULE_LABEL_KIND.
+const ECS_INTERN_KIND_SCHEDULE_LABEL: i32 = 100;
+
+fn ecs_intern_registry_find_label(reg: EcsInternRegistry, label: EcsScheduleLabelIdentity) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(reg.ids) as i64;
+    while i < n {
+        if reg.kinds[i] == ECS_INTERN_KIND_SCHEDULE_LABEL
+            && reg.label_ids[i] == label.label_id {
+            return reg.ids[i];
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ecs_intern_registry_intern_label(reg: EcsInternRegistry, label: EcsScheduleLabelIdentity) -> EcsInternResult {
+    let existing = ecs_intern_registry_find_label(reg, label);
+    if existing != 0 { return ecs_intern_result_found(existing); };
+    let id = reg.next_id;
+    reg.ids.push(id);
+    reg.kinds.push(ECS_INTERN_KIND_SCHEDULE_LABEL);
+    reg.type_ids.push(0);
+    reg.anon_ids.push(0);
+    reg.label_ids.push(label.label_id);
+    reg.next_id = reg.next_id + 1;
+    return ecs_intern_result_created(id);
+}
+
+// === InternResult: created vs found intern id ===
+struct EcsInternResult {
+    intern_id: i64,
+    created: bool,
+}
+
+fn ecs_intern_result_created(id: i64) -> EcsInternResult {
+    return EcsInternResult { intern_id: id, created: true };
+}
+
+fn ecs_intern_result_found(id: i64) -> EcsInternResult {
+    return EcsInternResult { intern_id: id, created: false };
+}
+
+fn ecs_intern_result_id(r: EcsInternResult) -> i64 { return r.intern_id; }
+fn ecs_intern_result_created_flag(r: EcsInternResult) -> bool { return r.created; }
+fn ecs_intern_result_found_flag(r: EcsInternResult) -> bool { return r.created == false; }
+
+// Two InternedSystemSet compare equal iff their intern ids match.
+fn ecs_interned_system_set_eq(a: i64, b: i64) -> bool { return a == b; }
+
+fn ecs_interned_system_set_hash(a: i64) -> i64 { return a; }
+
+// === IntoSystemSet<Marker> dispatch ===
+// Bevy impls:
+//   S: SystemSet  => into_system_set(self) = self
+//   F (fn system) => into_system_set(_) = SystemTypeSet::<F>::new()
+//   F (exclusive) => into_system_set(_) = SystemTypeSet::<F>::new()
+// We model this with a marker enum (0=systemset, 1=fn system, 2=exclusive system) plus
+// the resulting EcsSystemSetIdentity.
+const ECS_INTO_MARKER_SYSTEM_SET: i32 = 0;
+const ECS_INTO_MARKER_FUNCTION_SYSTEM: i32 = 1;
+const ECS_INTO_MARKER_EXCLUSIVE_SYSTEM: i32 = 2;
+
+struct EcsIntoSystemSetInput {
+    marker: i32,
+    // For marker == SYSTEM_SET: identity of an existing SystemSet
+    system_set_identity: EcsSystemSetIdentity,
+    // For marker == FUNCTION_SYSTEM / EXCLUSIVE_SYSTEM: the function-type id
+    function_type_id: i64,
+}
+
+fn ecs_into_system_set_input_from_system_set(identity: EcsSystemSetIdentity) -> EcsIntoSystemSetInput {
+    return EcsIntoSystemSetInput {
+        marker: ECS_INTO_MARKER_SYSTEM_SET,
+        system_set_identity: identity,
+        function_type_id: 0,
+    };
+}
+
+fn ecs_into_system_set_input_from_function_system(type_id: i64) -> EcsIntoSystemSetInput {
+    return EcsIntoSystemSetInput {
+        marker: ECS_INTO_MARKER_FUNCTION_SYSTEM,
+        system_set_identity: ecs_system_set_identity_system_type(0),
+        function_type_id: type_id,
+    };
+}
+
+fn ecs_into_system_set_input_from_exclusive_system(type_id: i64) -> EcsIntoSystemSetInput {
+    return EcsIntoSystemSetInput {
+        marker: ECS_INTO_MARKER_EXCLUSIVE_SYSTEM,
+        system_set_identity: ecs_system_set_identity_system_type(0),
+        function_type_id: type_id,
+    };
+}
+
+// `into_system_set` dispatch. SystemSet path returns the identity unchanged (matching
+// `impl<S: SystemSet> IntoSystemSet<()> for S { type Set = Self }`). Both function-system
+// paths return `SystemTypeSet::<F>::new()` (the same TypeId).
+fn ecs_into_system_set(input: EcsIntoSystemSetInput) -> EcsSystemSetIdentity {
+    if input.marker == ECS_INTO_MARKER_SYSTEM_SET {
+        return input.system_set_identity;
+    };
+    if input.marker == ECS_INTO_MARKER_FUNCTION_SYSTEM {
+        return ecs_system_type_set_new(input.function_type_id);
+    };
+    if input.marker == ECS_INTO_MARKER_EXCLUSIVE_SYSTEM {
+        return ecs_system_type_set_new(input.function_type_id);
+    };
+    // unreachable marker; return an anonymous zero identity
+    return ecs_system_set_identity_anonymous(0);
+}
+
+// === `SystemSet::base` trait proxy ===
+// Bevy's define_label extra method on SystemSet has `fn base(&self) -> Option<Box<dyn SystemSet>>`
+// defaulting to None. Built-in SystemTypeSet/AnonymousSet do not override it, so the result
+// is always `None` for these. We expose a predicate to keep parity with the trait surface.
+fn ecs_system_set_trait_base_is_some(s: EcsSystemSetIdentity) -> bool {
+    return false;
+}
+
+fn ecs_system_set_trait_base_is_none(s: EcsSystemSetIdentity) -> bool {
+    return true;
+}
+
+// === `dyn_clone` proxy ===
+// Bevy's SystemSet requires `dyn_clone(&self) -> Box<dyn SystemSet>`. For the value model
+// the clone result is a bit-for-bit equal identity (Copy-like semantics, since identities
+// have no interior mutability).
+fn ecs_system_set_trait_dyn_clone(s: EcsSystemSetIdentity) -> EcsSystemSetIdentity { return s; }

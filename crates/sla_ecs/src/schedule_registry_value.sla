@@ -1,0 +1,209 @@
+// Sequential schedule for RegistryValueWorld<T, R, M>.
+// Access metadata is keyed by registry component id, so conflict tracking no
+// longer depends on the old A/B component shape.
+@import "commands_registry_value.sla"
+
+struct RegistryValueSystemAccess {
+    read_components: Vec<i32>,
+    write_components: Vec<i32>,
+    reads_resource: bool,
+    writes_resource: bool,
+    reads_messages: bool,
+    writes_messages: bool,
+}
+
+struct RegistryValueSystem<T, R, M> {
+    run: fn(RegistryValueWorld<T, R, M>) -> RegistryValueWorld<T, R, M>,
+    access: RegistryValueSystemAccess,
+}
+
+struct RegistryValueSchedule<T, R, M> {
+    systems: Vec<RegistryValueSystem<T, R, M>>,
+    conflict_count: i32,
+}
+
+fn registry_value_system_access_none() -> RegistryValueSystemAccess {
+    let read_components: Vec<i32> = Vec::new();
+    let write_components: Vec<i32> = Vec::new();
+    return RegistryValueSystemAccess {
+        read_components: read_components,
+        write_components: write_components,
+        reads_resource: false,
+        writes_resource: false,
+        reads_messages: false,
+        writes_messages: false,
+    };
+}
+
+fn registry_value_access_read_component(access: RegistryValueSystemAccess, component_id: i32) -> RegistryValueSystemAccess {
+    access.read_components.push(component_id);
+    return access;
+}
+
+fn registry_value_access_write_component(access: RegistryValueSystemAccess, component_id: i32) -> RegistryValueSystemAccess {
+    access.write_components.push(component_id);
+    return access;
+}
+
+fn registry_value_access_read_resource(access: RegistryValueSystemAccess) -> RegistryValueSystemAccess {
+    access.reads_resource = true;
+    return access;
+}
+
+fn registry_value_access_write_resource(access: RegistryValueSystemAccess) -> RegistryValueSystemAccess {
+    access.writes_resource = true;
+    return access;
+}
+
+fn registry_value_access_read_messages(access: RegistryValueSystemAccess) -> RegistryValueSystemAccess {
+    access.reads_messages = true;
+    return access;
+}
+
+fn registry_value_access_write_messages(access: RegistryValueSystemAccess) -> RegistryValueSystemAccess {
+    access.writes_messages = true;
+    return access;
+}
+
+fn registry_value_component_list_has(values: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(values) as i64;
+    while i < cnt {
+        if values[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn registry_value_access_component_conflicts(left: RegistryValueSystemAccess, right: RegistryValueSystemAccess) -> bool {
+    let i: i64 = 0;
+    let left_writes = len(left.write_components) as i64;
+    while i < left_writes {
+        let component_id = left.write_components[i];
+        if registry_value_component_list_has(right.read_components, component_id) { return true; };
+        if registry_value_component_list_has(right.write_components, component_id) { return true; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let right_writes = len(right.write_components) as i64;
+    while j < right_writes {
+        let component_id = right.write_components[j];
+        if registry_value_component_list_has(left.read_components, component_id) { return true; };
+        if registry_value_component_list_has(left.write_components, component_id) { return true; };
+        j = j + 1;
+    }
+    return false;
+}
+
+fn registry_value_access_conflicts(left: RegistryValueSystemAccess, right: RegistryValueSystemAccess) -> bool {
+    if registry_value_access_component_conflicts(left, right) { return true; };
+    if left.writes_resource { if right.reads_resource { return true; }; if right.writes_resource { return true; }; };
+    if right.writes_resource { if left.reads_resource { return true; }; if left.writes_resource { return true; }; };
+    if left.writes_messages { if right.reads_messages { return true; }; if right.writes_messages { return true; }; };
+    if right.writes_messages { if left.reads_messages { return true; }; if left.writes_messages { return true; }; };
+    return false;
+}
+
+fn registry_value_system_new<T, R, M>(run: fn(RegistryValueWorld<T, R, M>) -> RegistryValueWorld<T, R, M>, access: RegistryValueSystemAccess) -> RegistryValueSystem<T, R, M> {
+    return RegistryValueSystem<T, R, M> { run: run, access: access };
+}
+
+fn registry_value_schedule_default<T, R, M>() -> RegistryValueSchedule<T, R, M> {
+    let systems: Vec<RegistryValueSystem<T, R, M>> = Vec::new();
+    return RegistryValueSchedule<T, R, M> { systems: systems, conflict_count: 0 };
+}
+
+fn registry_value_schedule_add_systems<T, R, M>(schedule: RegistryValueSchedule<T, R, M>, system: RegistryValueSystem<T, R, M>) -> RegistryValueSchedule<T, R, M> {
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        if registry_value_access_conflicts(schedule.systems[i].access, system.access) {
+            schedule.conflict_count = schedule.conflict_count + 1;
+        };
+        i = i + 1;
+    }
+    schedule.systems.push(system);
+    return schedule;
+}
+
+fn registry_value_schedule_conflict_count<T, R, M>(schedule: RegistryValueSchedule<T, R, M>) -> i32 {
+    return schedule.conflict_count;
+}
+
+fn registry_value_schedule_run<T, R, M>(schedule: RegistryValueSchedule<T, R, M>, world: RegistryValueWorld<T, R, M>) -> RegistryValueWorld<T, R, M> {
+    world = registry_value_world_increment_tick<T, R, M>(world);
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        let system = schedule.systems[i];
+        let run = system.run;
+        world = run(world);
+        i = i + 1;
+    }
+    return world;
+}
+
+struct RegValueScheduleData { amount: i32 }
+struct RegValueScheduleTime { tick: i32 }
+struct RegValueScheduleEvent { amount: i32 }
+
+fn reg_value_schedule_time_default() -> RegValueScheduleTime { return RegValueScheduleTime { tick: 0 }; }
+fn reg_value_schedule_event_default() -> RegValueScheduleEvent { return RegValueScheduleEvent { amount: 0 }; }
+
+fn reg_value_schedule_world_new() -> RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent> {
+    return registry_value_world_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_time_default(), reg_value_schedule_event_default());
+}
+
+fn reg_value_schedule_move_system(world: RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>) -> RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent> {
+    let q = registry_value_world_query_pair_mut_first<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(world, 1, 2);
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        let item = q.items[i];
+        world = registry_value_world_pair_write_first<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(world, item, RegValueScheduleData { amount: item.first.value.amount + item.second.amount });
+        i = i + 1;
+    }
+    return world;
+}
+
+fn reg_value_schedule_resource_system(world: RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>) -> RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent> {
+    return registry_value_world_insert_resource<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(world, RegValueScheduleTime { tick: world.registry.change_tick });
+}
+
+fn reg_value_schedule_message_system(world: RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>) -> RegistryValueWorld<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent> {
+    return registry_value_world_write_message<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(world, RegValueScheduleEvent { amount: 9 });
+}
+
+@test "registry value schedule runs systems in order"() {
+    let w0 = reg_value_schedule_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w0);
+    let (w2, mana) = registry_value_world_register_table<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w1);
+    let (w3, entity) = registry_value_world_spawn<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w2);
+    let w4 = registry_value_world_insert<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w3, entity, health.id, RegValueScheduleData { amount: 3 });
+    let w5 = registry_value_world_insert<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w4, entity, mana.id, RegValueScheduleData { amount: 4 });
+    let move_access = registry_value_access_read_component(registry_value_access_write_component(registry_value_system_access_none(), health.id), mana.id);
+    let resource_access = registry_value_access_write_resource(registry_value_system_access_none());
+    let message_access = registry_value_access_write_messages(registry_value_system_access_none());
+    let s0 = registry_value_schedule_default<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>();
+    let s1 = registry_value_schedule_add_systems<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s0, registry_value_system_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_move_system, move_access));
+    let s2 = registry_value_schedule_add_systems<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s1, registry_value_system_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_resource_system, resource_access));
+    let s3 = registry_value_schedule_add_systems<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s2, registry_value_system_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_message_system, message_access));
+    let w6 = registry_value_schedule_run<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s3, w5);
+    let health_out = registry_value_world_get<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w6, entity, health.id);
+    let time = registry_value_world_get_resource<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w6);
+    let read = registry_value_world_read_message<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(w6, message_reader_new(), reg_value_schedule_event_default());
+    if health_out.amount != 7 { panic(9200); };
+    if time.tick != 2 { panic(9201); };
+    if read.value.amount != 9 { panic(9202); };
+}
+
+@test "registry value schedule records component id conflicts"() {
+    let write_health = registry_value_access_write_component(registry_value_system_access_none(), 1);
+    let read_health = registry_value_access_read_component(registry_value_system_access_none(), 1);
+    let write_message = registry_value_access_write_messages(registry_value_system_access_none());
+    let s0 = registry_value_schedule_default<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>();
+    let s1 = registry_value_schedule_add_systems<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s0, registry_value_system_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_move_system, write_health));
+    let s2 = registry_value_schedule_add_systems<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s1, registry_value_system_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_move_system, read_health));
+    let s3 = registry_value_schedule_add_systems<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s2, registry_value_system_new<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(reg_value_schedule_message_system, write_message));
+    if registry_value_schedule_conflict_count<RegValueScheduleData, RegValueScheduleTime, RegValueScheduleEvent>(s3) != 1 { panic(9210); };
+}

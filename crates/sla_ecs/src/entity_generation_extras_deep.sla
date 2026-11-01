@@ -1,0 +1,151 @@
+// Deepened Bevy ECS EntityGeneration extras.
+// Mirrors src/entity/mod.rs EntityGeneration:
+//   FIRST / to_bits / from_bits
+//   after_versions (wrapping_add mod 2^32)
+//   after_versions_and_could_alias (overflowing_add)
+//   cmp_approx (DIFF_MAX = 1<<31)
+//   Entity try_from_bits validity
+// Shallow lib/entity_generation_extras.sla retained.
+
+const ECS_EG_FIRST: i64 = 0;
+const ECS_EG_MOD: i64 = 4294967296;
+const ECS_EG_HALF: i64 = 2147483648;
+const ECS_EG_ORD_LESS: i32 = 0;
+const ECS_EG_ORD_EQUAL: i32 = 1;
+const ECS_EG_ORD_GREATER: i32 = 2;
+
+struct EcsEgDeep {
+    bits: i64,
+}
+
+fn ecs_eg_wrap(x: i64) -> i64 {
+    let r = x % ECS_EG_MOD;
+    if r < 0 { return r + ECS_EG_MOD; };
+    return r;
+}
+
+fn ecs_eg_first() -> EcsEgDeep {
+    return EcsEgDeep { bits: ECS_EG_FIRST };
+}
+
+fn ecs_eg_from_bits(bits: i64) -> EcsEgDeep {
+    return EcsEgDeep { bits: ecs_eg_wrap(bits) };
+}
+
+fn ecs_eg_to_bits(g: EcsEgDeep) -> i64 { return g.bits; }
+
+fn ecs_eg_eq(a: EcsEgDeep, b: EcsEgDeep) -> bool {
+    return a.bits == b.bits;
+}
+
+fn ecs_eg_after_versions(g: EcsEgDeep, versions: i64) -> EcsEgDeep {
+    return EcsEgDeep { bits: ecs_eg_wrap(g.bits + versions) };
+}
+
+struct EcsEgAliasDeep {
+    bits: i64,
+    could_alias: bool,
+}
+
+fn ecs_eg_alias_bits(r: EcsEgAliasDeep) -> i64 { return r.bits; }
+fn ecs_eg_alias_could(r: EcsEgAliasDeep) -> bool { return r.could_alias; }
+
+fn ecs_eg_after_versions_and_could_alias(g: EcsEgDeep, versions: i64) -> EcsEgAliasDeep {
+    let total = g.bits + versions;
+    if total < 0 {
+        return EcsEgAliasDeep { bits: ecs_eg_wrap(total), could_alias: true };
+    };
+    if total >= ECS_EG_MOD {
+        return EcsEgAliasDeep { bits: ecs_eg_wrap(total), could_alias: true };
+    };
+    return EcsEgAliasDeep { bits: total, could_alias: false };
+}
+
+fn ecs_eg_cmp_approx(g: EcsEgDeep, other: EcsEgDeep) -> i32 {
+    let diff = ecs_eg_wrap(g.bits - other.bits);
+    if diff == 0 { return ECS_EG_ORD_EQUAL; };
+    if diff >= 1 {
+        if diff < ECS_EG_HALF { return ECS_EG_ORD_GREATER; };
+    };
+    return ECS_EG_ORD_LESS;
+}
+
+fn ecs_eg_ord_less() -> i32 { return ECS_EG_ORD_LESS; }
+fn ecs_eg_ord_equal() -> i32 { return ECS_EG_ORD_EQUAL; }
+fn ecs_eg_ord_greater() -> i32 { return ECS_EG_ORD_GREATER; }
+
+// Entity packed bits: low 32 index, high 32 generation (modeled as i64 pack)
+struct EcsEgEntityDeep {
+    index: i64,
+    generation: i64,
+}
+
+fn ecs_eg_entity_new(index: i64, generation: i64) -> EcsEgEntityDeep {
+    return EcsEgEntityDeep { index: index, generation: ecs_eg_wrap(generation) };
+}
+
+fn ecs_eg_entity_index(e: EcsEgEntityDeep) -> i64 { return e.index; }
+fn ecs_eg_entity_generation(e: EcsEgEntityDeep) -> i64 { return e.generation; }
+
+fn ecs_eg_entity_to_bits(e: EcsEgEntityDeep) -> i64 {
+    // pack: generation * 2^32 + index  (both in u32 range)
+    return ecs_eg_wrap(e.generation) * ECS_EG_MOD + ecs_eg_wrap(e.index);
+}
+
+struct EcsEgTryDeep {
+    ok: bool,
+    index: i64,
+    generation: i64,
+    bits: i64,
+}
+
+fn ecs_eg_try_ok(t: EcsEgTryDeep) -> bool { return t.ok; }
+fn ecs_eg_try_index(t: EcsEgTryDeep) -> i64 { return t.index; }
+fn ecs_eg_try_generation(t: EcsEgTryDeep) -> i64 { return t.generation; }
+fn ecs_eg_try_bits(t: EcsEgTryDeep) -> i64 { return t.bits; }
+
+fn ecs_eg_entity_try_from_bits(bits: i64) -> EcsEgTryDeep {
+    if bits < 0 {
+        return EcsEgTryDeep { ok: false, index: 0, generation: 0, bits: bits };
+    };
+    // max packed: (2^32-1)*2^32 + (2^32-1) = 2^64-1; we accept any non-neg and split
+    let index = bits % ECS_EG_MOD;
+    let generation = bits / ECS_EG_MOD;
+    // if generation exceeds u32, invalid
+    if generation >= ECS_EG_MOD {
+        return EcsEgTryDeep { ok: false, index: 0, generation: 0, bits: bits };
+    };
+    return EcsEgTryDeep { ok: true, index: index, generation: generation, bits: bits };
+}
+
+// generation-only try_from_bits (legacy shallow surface)
+fn ecs_eg_try_from_bits(bits: i64) -> EcsEgTryDeep {
+    if bits < 0 {
+        return EcsEgTryDeep { ok: false, index: 0, generation: 0, bits: bits };
+    };
+    if bits >= ECS_EG_MOD {
+        return EcsEgTryDeep { ok: false, index: 0, generation: 0, bits: bits };
+    };
+    return EcsEgTryDeep { ok: true, index: 0, generation: bits, bits: bits };
+}
+
+// distance helpers
+fn ecs_eg_versions_between(from_g: EcsEgDeep, to_g: EcsEgDeep) -> i64 {
+    return ecs_eg_wrap(to_g.bits - from_g.bits);
+}
+
+fn ecs_eg_could_alias_after(g: EcsEgDeep, versions: i64) -> bool {
+    let r = ecs_eg_after_versions_and_could_alias(g, versions);
+    return r.could_alias;
+}
+
+fn ecs_eg_is_first(g: EcsEgDeep) -> bool {
+    return g.bits == ECS_EG_FIRST;
+}
+
+fn ecs_eg_next(g: EcsEgDeep) -> EcsEgDeep {
+    return ecs_eg_after_versions(g, 1);
+}
+
+fn ecs_eg_mod() -> i64 { return ECS_EG_MOD; }
+fn ecs_eg_half() -> i64 { return ECS_EG_HALF; }

@@ -1,0 +1,254 @@
+// Bevy ECS required-components dynamic registration gaps — register_by_id + register_dynamic_with +
+// RequiredComponentsRegistrator::register_required_by_id + register_required_dynamic_with +
+// components_registrator accessor. Mirrors src/component/required.rs gaps not in lib/component_required.sla.
+//
+// Bevy semantics:
+//   - register_dynamic_with(component_id, constructor) panics ("already directly required") if the id is
+//     already in self.direct; otherwise inserts into `direct` and propagates the inherited required
+//     components into `all` (depth-first order, components appearing after the ones they require).
+//   - register_by_id(component_id, components, constructor) = wrap-to-RCC and call register_dynamic_with.
+//   - RequiredComponentsRegistrator::register_required_by_id<C>(component_id, fn) =
+//       required_components.register_by_id::<C>(component_id, components, constructor).
+//   - RequiredComponentsRegistrator::register_required_dynamic_with(component_id, constructor) =
+//       required_components.register_dynamic_with(component_id, components, constructor).
+//   - components_registrator() -> &mut ComponentsRegistrator.
+//
+// We model the panic by returning ok=0 with the
+// RequiredComponentsError::DuplicateRegistration kind. The Fn-over-types closures reduce to constructor-id ints.
+
+// Result struct for the dynamic_fn entry points (single-field accessors).
+struct ReqDynResult {
+    ok: i32,
+    err_kind: i32,
+    direct_len: i32,
+    all_len: i32,
+}
+
+fn ecs_req_dyn_ok(r: ReqDynResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_req_dyn_err_kind(r: ReqDynResult) -> i32 {
+    return r.err_kind;
+}
+
+fn ecs_req_dyn_direct_len(r: ReqDynResult) -> i32 {
+    return r.direct_len;
+}
+
+fn ecs_req_dyn_all_len(r: ReqDynResult) -> i32 {
+    return r.all_len;
+}
+
+// === Model: RequiredComponents with direct + all ===
+struct EcsRequiredComponentsDyn {
+    // explicit "direct" requirement ids in registration order
+    direct_ids: Vec<i32>,
+    // "all" ids including inherited, appended in depth-first order
+    all_ids: Vec<i32>,
+}
+
+fn ecs_required_components_dyn_new() -> EcsRequiredComponentsDyn {
+    let r = EcsRequiredComponentsDyn { direct_ids: Vec::new(), all_ids: Vec::new() };
+    return r;
+}
+
+fn ecs_required_components_dyn_direct_count(r: EcsRequiredComponentsDyn) -> i32 {
+    return len(r.direct_ids) as i32;
+}
+
+fn ecs_required_components_dyn_all_count(r: EcsRequiredComponentsDyn) -> i32 {
+    return len(r.all_ids) as i32;
+}
+
+fn ecs_required_components_dyn_direct_at(r: EcsRequiredComponentsDyn, idx: i32) -> i32 {
+    let n: i32 = len(r.direct_ids) as i32;
+    if idx < 0 || idx >= n { return -1; };
+    return r.direct_ids[idx];
+}
+
+fn ecs_required_components_dyn_all_at(r: EcsRequiredComponentsDyn, idx: i32) -> i32 {
+    let n: i32 = len(r.all_ids) as i32;
+    if idx < 0 || idx >= n { return -1; };
+    return r.all_ids[idx];
+}
+
+// internal direct-contains check
+fn _ecs_rcd_direct_contains(r: EcsRequiredComponentsDyn, component_id: i32) -> bool {
+    let n: i32 = len(r.direct_ids) as i32;
+    let i: i32 = 0;
+    while i < n { if r.direct_ids[i] == component_id { return true; }; i = i + 1; }
+    return false;
+}
+
+// internal all-contains check
+fn _ecs_rcd_all_contains(r: EcsRequiredComponentsDyn, component_id: i32) -> bool {
+    let n: i32 = len(r.all_ids) as i32;
+    let i: i32 = 0;
+    while i < n { if r.all_ids[i] == component_id { return true; }; i = i + 1; }
+    return false;
+}
+
+// RequiredComponentsError::DuplicateRegistration kind = 0 (matches lib/component_required.sla).
+fn ecs_rcd_err_dup_kind() -> i32 {
+    return 0;
+}
+
+// register_dynamic_with(component_id, constructor_id): the unsafe inner fn.
+// Returns ReqDynResult. Panic-by-DuplicateRegistration modelled as ok=0 + err_kind=0.
+// In "all" we propagate the inherited requirements — since this model lacks the list of inherited
+// requirements of the new component (those live in a separate Components store), we model `register_inherited_required_components_unchecked`
+// as: append the new component_id at the head of `all` (depth-first, the new required id appears before the components it requires),
+// followed by any pre-inherited ids recorded previously for this id in the model.
+//
+// We expose the `direct` panic semantics directly so the test surface for the by-id/dynamic-with entry
+// points matches Bevy's behaviour: ok=1 + direct_len + all_len on success, ok=0 + err_kind=DuplicateRegistration on conflict.
+fn ecs_required_components_dyn_register_dynamic_with(r: EcsRequiredComponentsDyn, component_id: i32, constructor_id: i32) -> ReqDynResult {
+    if _ecs_rcd_direct_contains(r, component_id) {
+        let res = ReqDynResult { ok: 0, err_kind: ecs_rcd_err_dup_kind(), direct_len: len(r.direct_ids) as i32, all_len: len(r.all_ids) as i32 };
+        return res;
+    };
+    r.direct_ids.push(component_id);
+    // Model: append the new id at the HEAD of `all` (new requirement appears before the components requiring it).
+    let mut_new_all = Vec::new();
+    mut_new_all.push(component_id);
+    let n: i32 = len(r.all_ids) as i32;
+    let i: i32 = 0;
+    while i < n { mut_new_all.push(r.all_ids[i]); i = i + 1; }
+    r.all_ids = mut_new_all;
+    let _ = constructor_id;
+    let res = ReqDynResult { ok: 1, err_kind: -1, direct_len: len(r.direct_ids) as i32, all_len: len(r.all_ids) as i32 };
+    return res;
+}
+
+// register_by_id: equivalent to register_dynamic_with (Bevy wraps the Fn into a RCC).
+fn ecs_required_components_dyn_register_by_id(r: EcsRequiredComponentsDyn, component_id: i32, constructor_id: i32) -> ReqDynResult {
+    return ecs_required_components_dyn_register_dynamic_with(r, component_id, constructor_id);
+}
+
+// register_dynamic_with_mut: builder-style mutator that returns the MUTATED model so tests can
+// thread accumulation through new bindings (matching the registrator facade + query_filtered_set pattern).
+fn ecs_required_components_dyn_register_dynamic_with_mut(r: EcsRequiredComponentsDyn, component_id: i32, constructor_id: i32) -> EcsRequiredComponentsDyn {
+    if _ecs_rcd_direct_contains(r, component_id) {
+        let _ = constructor_id;
+        return r;
+    };
+    r.direct_ids.push(component_id);
+    let mut_new_all = Vec::new();
+    mut_new_all.push(component_id);
+    let n: i32 = len(r.all_ids) as i32;
+    let i: i32 = 0;
+    while i < n { mut_new_all.push(r.all_ids[i]); i = i + 1; }
+    r.all_ids = mut_new_all;
+    let _ = constructor_id;
+    return r;
+}
+
+// register_by_id_mut: builder-style mutator mirroring register_by_id.
+fn ecs_required_components_dyn_register_by_id_mut(r: EcsRequiredComponentsDyn, component_id: i32, constructor_id: i32) -> EcsRequiredComponentsDyn {
+    return ecs_required_components_dyn_register_dynamic_with_mut(r, component_id, constructor_id);
+}
+
+
+// iter_ids: returns count + nth-id via the `all` list (Bevy iterates `all.keys()`.
+fn ecs_required_components_dyn_iter_count(r: EcsRequiredComponentsDyn) -> i32 {
+    return len(r.all_ids) as i32;
+}
+
+fn ecs_required_components_dyn_iter_nth(r: EcsRequiredComponentsDyn, n: i32) -> i32 {
+    return ecs_required_components_dyn_all_at(r, n);
+}
+
+// === Registrator facade (builder-style mutators following lib/query_filtered_set.sla pattern) ===
+// RequiredComponentsRegistrator wraps a target_component_id, an owned RequiredComponents model,
+// a register-counter modelling the ComponentsRegistrator returned by `components_registrator()`,
+// and a last_err field recording the most recent register result so tests can post-check success
+// vs DuplicateRegistration without needing a tuple return (tuples risk the SA-backend .1 corruption).
+// Facade entry points return the MUTATED registrator (builder semantics), matching how
+// ecs_fas_add / ecs_fr_builder_add_* threads mutations through new bindings.
+struct EcsRequiredComponentsRegistratorDyn {
+    target_component_id: i32,
+    required: EcsRequiredComponentsDyn,
+    // models the ComponentsRegistrator register-counter returned by `components_registrator()`.
+    components_next_id: i32,
+    // last register result: 1 = success, 0 = DuplicateRegistration panic-equivalent.
+    last_ok: i32,
+    // err_kind for last register: -1 = none, 0 = DuplicateRegistration kind (matches ecs_rcd_err_dup_kind).
+    last_err_kind: i32,
+}
+
+fn ecs_required_components_registrator_dyn_new(target_component_id: i32) -> EcsRequiredComponentsRegistratorDyn {
+    let r = EcsRequiredComponentsRegistratorDyn { target_component_id: target_component_id, required: ecs_required_components_dyn_new(), components_next_id: 100, last_ok: 1, last_err_kind: -1 };
+    return r;
+}
+
+fn ecs_required_components_registrator_dyn_target(r: EcsRequiredComponentsRegistratorDyn) -> i32 {
+    return r.target_component_id;
+}
+
+// components_registrator() accessor: Bevy returns &mut ComponentsRegistrator; we model it as the
+// next component id the underlying registrator would allocate (the register-counter head).
+fn ecs_required_components_registrator_dyn_components_next_id(r: EcsRequiredComponentsRegistratorDyn) -> i32 {
+    return r.components_next_id;
+}
+
+// internal: directly mutate r.required and record the ok/err_kind onto the registrator's last_* slots.
+fn _ecs_reg_dyn_apply(r: EcsRequiredComponentsRegistratorDyn, component_id: i32, constructor_id: i32) -> EcsRequiredComponentsRegistratorDyn {
+    if _ecs_rcd_direct_contains(r.required, component_id) {
+        r.last_ok = 0;
+        r.last_err_kind = ecs_rcd_err_dup_kind();
+        let _ = constructor_id;
+        return r;
+    };
+    r.required.direct_ids.push(component_id);
+    // Model: append the new id at the HEAD of `all` (depth-first, new requirement appears first).
+    let mut_new_all = Vec::new();
+    mut_new_all.push(component_id);
+    let n: i32 = len(r.required.all_ids) as i32;
+    let i: i32 = 0;
+    while i < n { mut_new_all.push(r.required.all_ids[i]); i = i + 1; }
+    r.required.all_ids = mut_new_all;
+    r.last_ok = 1;
+    r.last_err_kind = -1;
+    let _ = constructor_id;
+    return r;
+}
+
+// register_required_by_id<C>(component_id, fn): delegates to required.register_by_id::<C>(...) and
+// returns the mutated registrator (builder semantics). Bevy's panic is modelled via last_ok=0 + last_err_kind.
+fn ecs_required_components_registrator_dyn_register_required_by_id(r: EcsRequiredComponentsRegistratorDyn, component_id: i32, constructor_id: i32) -> EcsRequiredComponentsRegistratorDyn {
+    let r2 = _ecs_reg_dyn_apply(r, component_id, constructor_id);
+    return r2;
+}
+
+// register_required_dynamic_with(component_id, constructor): delegates to required.register_dynamic_with(...)
+// and returns the mutated registrator.
+fn ecs_required_components_registrator_dyn_register_required_dynamic_with(r: EcsRequiredComponentsRegistratorDyn, component_id: i32, constructor_id: i32) -> EcsRequiredComponentsRegistratorDyn {
+    let r2 = _ecs_reg_dyn_apply(r, component_id, constructor_id);
+    return r2;
+}
+
+// === Post-call registrator state accessors (return ints; safe to assert post-call) ===
+fn ecs_required_components_registrator_dyn_last_ok(r: EcsRequiredComponentsRegistratorDyn) -> i32 {
+    return r.last_ok;
+}
+
+fn ecs_required_components_registrator_dyn_last_err_kind(r: EcsRequiredComponentsRegistratorDyn) -> i32 {
+    return r.last_err_kind;
+}
+
+fn ecs_required_components_registrator_dyn_required_direct_count(r: EcsRequiredComponentsRegistratorDyn) -> i32 {
+    return ecs_required_components_dyn_direct_count(r.required);
+}
+
+fn ecs_required_components_registrator_dyn_required_all_count(r: EcsRequiredComponentsRegistratorDyn) -> i32 {
+    return ecs_required_components_dyn_all_count(r.required);
+}
+
+fn ecs_required_components_registrator_dyn_required_direct_at(r: EcsRequiredComponentsRegistratorDyn, idx: i32) -> i32 {
+    return ecs_required_components_dyn_direct_at(r.required, idx);
+}
+
+fn ecs_required_components_registrator_dyn_required_all_at(r: EcsRequiredComponentsRegistratorDyn, idx: i32) -> i32 {
+    return ecs_required_components_dyn_all_at(r.required, idx);
+}

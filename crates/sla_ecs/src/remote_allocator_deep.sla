@@ -1,0 +1,499 @@
+// Deepened Bevy ECS RemoteAllocator surface.
+// Mirrors src/entity/remote_allocator.rs public/safe surface:
+//   Allocator (world-owned): alloc / free / alloc_many / free_many
+//   RemoteAllocator (shared Arc-like handle): alloc / alloc_many / is_closed / close
+//   close is diagnostic-only: is_closed=true but remote alloc may still succeed
+//     until underlying free-list/fresh supply is exhausted (Bevy docs)
+//   free list LIFO reuse with generation bump on free
+//   never reuse an entity still live; freed entities get new generation
+// SharedAllocator concurrent details are sequentialized.
+// Shallow lib/remote_allocator.sla retained.
+
+const ECS_RA_CAP: i32 = 32;
+// PLACEHOLDER stand-in
+const ECS_RA_PLACEHOLDER: i64 = 2147483647;
+
+// Entity packing: index in low 32 bits of model, generation in high-ish separate field
+struct EcsRaEntityDeep {
+    index: i64,
+    generation: i64,
+}
+
+fn ecs_ra_entity(index: i64, generation: i64) -> EcsRaEntityDeep {
+    return EcsRaEntityDeep { index: index, generation: generation };
+}
+
+fn ecs_ra_entity_index(e: EcsRaEntityDeep) -> i64 { return e.index; }
+fn ecs_ra_entity_generation(e: EcsRaEntityDeep) -> i64 { return e.generation; }
+
+fn ecs_ra_entity_eq(a: EcsRaEntityDeep, b: EcsRaEntityDeep) -> bool {
+    if a.index != b.index { return false; };
+    return a.generation == b.generation;
+}
+
+fn ecs_ra_entity_is_placeholder(e: EcsRaEntityDeep) -> bool {
+    return e.index == ECS_RA_PLACEHOLDER;
+}
+
+fn ecs_ra_placeholder() -> EcsRaEntityDeep {
+    return ecs_ra_entity(ECS_RA_PLACEHOLDER, 0);
+}
+
+// Encode entity as i64 for free-list storage: generation * 1000000 + index
+// index assumed < 1000000
+fn ecs_ra_pack(e: EcsRaEntityDeep) -> i64 {
+    return e.generation * 1000000 + e.index;
+}
+
+fn ecs_ra_unpack(v: i64) -> EcsRaEntityDeep {
+    let gen = v / 1000000;
+    let idx = v - gen * 1000000;
+    return ecs_ra_entity(idx, gen);
+}
+
+// === SharedAllocator core ===
+struct EcsSharedAllocatorDeep {
+    // free list stack (packed entities), top at free_len-1
+    f0: i64, f1: i64, f2: i64, f3: i64,
+    f4: i64, f5: i64, f6: i64, f7: i64,
+    f8: i64, f9: i64, f10: i64, f11: i64,
+    f12: i64, f13: i64, f14: i64, f15: i64,
+    free_len: i32,
+    // next fresh index (never used)
+    next_fresh: i64,
+    // generations per index (current live generation; free bumps)
+    // store only for allocated indices 0..15 for tests
+    g0: i64, g1: i64, g2: i64, g3: i64,
+    g4: i64, g5: i64, g6: i64, g7: i64,
+    g8: i64, g9: i64, g10: i64, g11: i64,
+    g12: i64, g13: i64, g14: i64, g15: i64,
+    // live mask bits via array of bools
+    live0: bool, live1: bool, live2: bool, live3: bool,
+    live4: bool, live5: bool, live6: bool, live7: bool,
+    live8: bool, live9: bool, live10: bool, live11: bool,
+    live12: bool, live13: bool, live14: bool, live15: bool,
+    closed: bool,
+    // stats
+    alloc_count: i64,
+    free_count: i64,
+    remote_alloc_count: i64,
+    free_list_hits: i64,
+    fresh_hits: i64,
+}
+
+fn ecs_ra_shared_new() -> EcsSharedAllocatorDeep {
+    return EcsSharedAllocatorDeep {
+        f0: 0, f1: 0, f2: 0, f3: 0,
+        f4: 0, f5: 0, f6: 0, f7: 0,
+        f8: 0, f9: 0, f10: 0, f11: 0,
+        f12: 0, f13: 0, f14: 0, f15: 0,
+        free_len: 0,
+        next_fresh: 0,
+        g0: 0, g1: 0, g2: 0, g3: 0,
+        g4: 0, g5: 0, g6: 0, g7: 0,
+        g8: 0, g9: 0, g10: 0, g11: 0,
+        g12: 0, g13: 0, g14: 0, g15: 0,
+        live0: false, live1: false, live2: false, live3: false,
+        live4: false, live5: false, live6: false, live7: false,
+        live8: false, live9: false, live10: false, live11: false,
+        live12: false, live13: false, live14: false, live15: false,
+        closed: false,
+        alloc_count: 0,
+        free_count: 0,
+        remote_alloc_count: 0,
+        free_list_hits: 0,
+        fresh_hits: 0,
+    };
+}
+
+fn ecs_ra_shared_closed(a: EcsSharedAllocatorDeep) -> bool { return a.closed; }
+fn ecs_ra_shared_free_len(a: EcsSharedAllocatorDeep) -> i32 { return a.free_len; }
+fn ecs_ra_shared_next_fresh(a: EcsSharedAllocatorDeep) -> i64 { return a.next_fresh; }
+fn ecs_ra_shared_alloc_count(a: EcsSharedAllocatorDeep) -> i64 { return a.alloc_count; }
+fn ecs_ra_shared_free_count(a: EcsSharedAllocatorDeep) -> i64 { return a.free_count; }
+fn ecs_ra_shared_remote_alloc_count(a: EcsSharedAllocatorDeep) -> i64 { return a.remote_alloc_count; }
+fn ecs_ra_shared_free_list_hits(a: EcsSharedAllocatorDeep) -> i64 { return a.free_list_hits; }
+fn ecs_ra_shared_fresh_hits(a: EcsSharedAllocatorDeep) -> i64 { return a.fresh_hits; }
+
+fn ecs_ra_get_gen(a: EcsSharedAllocatorDeep, idx: i64) -> i64 {
+    if idx == 0 { return a.g0; };
+    if idx == 1 { return a.g1; };
+    if idx == 2 { return a.g2; };
+    if idx == 3 { return a.g3; };
+    if idx == 4 { return a.g4; };
+    if idx == 5 { return a.g5; };
+    if idx == 6 { return a.g6; };
+    if idx == 7 { return a.g7; };
+    if idx == 8 { return a.g8; };
+    if idx == 9 { return a.g9; };
+    if idx == 10 { return a.g10; };
+    if idx == 11 { return a.g11; };
+    if idx == 12 { return a.g12; };
+    if idx == 13 { return a.g13; };
+    if idx == 14 { return a.g14; };
+    if idx == 15 { return a.g15; };
+    return 0;
+}
+
+fn ecs_ra_set_gen(a: EcsSharedAllocatorDeep, idx: i64, gen: i64) -> EcsSharedAllocatorDeep {
+    if idx == 0 { a.g0 = gen; return a; };
+    if idx == 1 { a.g1 = gen; return a; };
+    if idx == 2 { a.g2 = gen; return a; };
+    if idx == 3 { a.g3 = gen; return a; };
+    if idx == 4 { a.g4 = gen; return a; };
+    if idx == 5 { a.g5 = gen; return a; };
+    if idx == 6 { a.g6 = gen; return a; };
+    if idx == 7 { a.g7 = gen; return a; };
+    if idx == 8 { a.g8 = gen; return a; };
+    if idx == 9 { a.g9 = gen; return a; };
+    if idx == 10 { a.g10 = gen; return a; };
+    if idx == 11 { a.g11 = gen; return a; };
+    if idx == 12 { a.g12 = gen; return a; };
+    if idx == 13 { a.g13 = gen; return a; };
+    if idx == 14 { a.g14 = gen; return a; };
+    if idx == 15 { a.g15 = gen; return a; };
+    return a;
+}
+
+fn ecs_ra_get_live(a: EcsSharedAllocatorDeep, idx: i64) -> bool {
+    if idx == 0 { return a.live0; };
+    if idx == 1 { return a.live1; };
+    if idx == 2 { return a.live2; };
+    if idx == 3 { return a.live3; };
+    if idx == 4 { return a.live4; };
+    if idx == 5 { return a.live5; };
+    if idx == 6 { return a.live6; };
+    if idx == 7 { return a.live7; };
+    if idx == 8 { return a.live8; };
+    if idx == 9 { return a.live9; };
+    if idx == 10 { return a.live10; };
+    if idx == 11 { return a.live11; };
+    if idx == 12 { return a.live12; };
+    if idx == 13 { return a.live13; };
+    if idx == 14 { return a.live14; };
+    if idx == 15 { return a.live15; };
+    return false;
+}
+
+fn ecs_ra_set_live(a: EcsSharedAllocatorDeep, idx: i64, live: bool) -> EcsSharedAllocatorDeep {
+    if idx == 0 { a.live0 = live; return a; };
+    if idx == 1 { a.live1 = live; return a; };
+    if idx == 2 { a.live2 = live; return a; };
+    if idx == 3 { a.live3 = live; return a; };
+    if idx == 4 { a.live4 = live; return a; };
+    if idx == 5 { a.live5 = live; return a; };
+    if idx == 6 { a.live6 = live; return a; };
+    if idx == 7 { a.live7 = live; return a; };
+    if idx == 8 { a.live8 = live; return a; };
+    if idx == 9 { a.live9 = live; return a; };
+    if idx == 10 { a.live10 = live; return a; };
+    if idx == 11 { a.live11 = live; return a; };
+    if idx == 12 { a.live12 = live; return a; };
+    if idx == 13 { a.live13 = live; return a; };
+    if idx == 14 { a.live14 = live; return a; };
+    if idx == 15 { a.live15 = live; return a; };
+    return a;
+}
+
+fn ecs_ra_free_get(a: EcsSharedAllocatorDeep, idx: i32) -> i64 {
+    if idx == 0 { return a.f0; };
+    if idx == 1 { return a.f1; };
+    if idx == 2 { return a.f2; };
+    if idx == 3 { return a.f3; };
+    if idx == 4 { return a.f4; };
+    if idx == 5 { return a.f5; };
+    if idx == 6 { return a.f6; };
+    if idx == 7 { return a.f7; };
+    if idx == 8 { return a.f8; };
+    if idx == 9 { return a.f9; };
+    if idx == 10 { return a.f10; };
+    if idx == 11 { return a.f11; };
+    if idx == 12 { return a.f12; };
+    if idx == 13 { return a.f13; };
+    if idx == 14 { return a.f14; };
+    if idx == 15 { return a.f15; };
+    return 0;
+}
+
+fn ecs_ra_free_set(a: EcsSharedAllocatorDeep, idx: i32, v: i64) -> EcsSharedAllocatorDeep {
+    if idx == 0 { a.f0 = v; return a; };
+    if idx == 1 { a.f1 = v; return a; };
+    if idx == 2 { a.f2 = v; return a; };
+    if idx == 3 { a.f3 = v; return a; };
+    if idx == 4 { a.f4 = v; return a; };
+    if idx == 5 { a.f5 = v; return a; };
+    if idx == 6 { a.f6 = v; return a; };
+    if idx == 7 { a.f7 = v; return a; };
+    if idx == 8 { a.f8 = v; return a; };
+    if idx == 9 { a.f9 = v; return a; };
+    if idx == 10 { a.f10 = v; return a; };
+    if idx == 11 { a.f11 = v; return a; };
+    if idx == 12 { a.f12 = v; return a; };
+    if idx == 13 { a.f13 = v; return a; };
+    if idx == 14 { a.f14 = v; return a; };
+    if idx == 15 { a.f15 = v; return a; };
+    return a;
+}
+
+fn ecs_ra_free_push(a: EcsSharedAllocatorDeep, packed: i64) -> EcsSharedAllocatorDeep {
+    if a.free_len >= 16 { return a; };
+    a = ecs_ra_free_set(a, a.free_len, packed);
+    a.free_len = a.free_len + 1;
+    return a;
+}
+
+fn ecs_ra_free_pop(a: EcsSharedAllocatorDeep) -> (EcsSharedAllocatorDeep, bool, i64) {
+    if a.free_len <= 0 {
+        return (a, false, 0);
+    };
+    let idx = a.free_len - 1;
+    let v = ecs_ra_free_get(a, idx);
+    a.free_len = idx;
+    return (a, true, v);
+}
+
+// mark live entity from index+gen
+fn ecs_ra_mark_live(a: EcsSharedAllocatorDeep, e: EcsRaEntityDeep) -> EcsSharedAllocatorDeep {
+    a = ecs_ra_set_gen(a, e.index, e.generation);
+    a = ecs_ra_set_live(a, e.index, true);
+    return a;
+}
+
+// core alloc: free list first else fresh
+fn ecs_ra_core_alloc(a: EcsSharedAllocatorDeep) -> (EcsSharedAllocatorDeep, EcsRaEntityDeep) {
+    let pop = ecs_ra_free_pop(a);
+    a = pop.0;
+    if pop.1 {
+        let e = ecs_ra_unpack(pop.2);
+        a.free_list_hits = a.free_list_hits + 1;
+        a.alloc_count = a.alloc_count + 1;
+        a = ecs_ra_mark_live(a, e);
+        return (a, e);
+    };
+    // fresh
+    if a.next_fresh >= 16 {
+        // exhausted model capacity
+        return (a, ecs_ra_placeholder());
+    };
+    let idx = a.next_fresh;
+    a.next_fresh = idx + 1;
+    let e = ecs_ra_entity(idx, 0);
+    a.fresh_hits = a.fresh_hits + 1;
+    a.alloc_count = a.alloc_count + 1;
+    a = ecs_ra_mark_live(a, e);
+    return (a, e);
+}
+
+// free: if generation matches live, push with generation+1 for reuse
+fn ecs_ra_core_free(a: EcsSharedAllocatorDeep, e: EcsRaEntityDeep) -> EcsSharedAllocatorDeep {
+    if e.index < 0 { return a; };
+    if e.index >= 16 { return a; };
+    if ecs_ra_get_live(a, e.index) != true { return a; };
+    if ecs_ra_get_gen(a, e.index) != e.generation { return a; };
+    a = ecs_ra_set_live(a, e.index, false);
+    let next_gen = e.generation + 1;
+    let recycled = ecs_ra_entity(e.index, next_gen);
+    a = ecs_ra_free_push(a, ecs_ra_pack(recycled));
+    a.free_count = a.free_count + 1;
+    return a;
+}
+
+// === Allocator (world) safe API ===
+struct EcsAllocatorDeep {
+    shared: EcsSharedAllocatorDeep,
+}
+
+fn ecs_ra_allocator_new() -> EcsAllocatorDeep {
+    return EcsAllocatorDeep { shared: ecs_ra_shared_new() };
+}
+
+fn ecs_ra_allocator_alloc(a: EcsAllocatorDeep) -> (EcsAllocatorDeep, EcsRaEntityDeep) {
+    let r = ecs_ra_core_alloc(a.shared);
+    a.shared = r.0;
+    return (a, r.1);
+}
+
+fn ecs_ra_allocator_free(a: EcsAllocatorDeep, e: EcsRaEntityDeep) -> EcsAllocatorDeep {
+    a.shared = ecs_ra_core_free(a.shared, e);
+    return a;
+}
+
+// alloc_many: returns count of entities packed into result struct
+struct EcsRaAllocManyDeep {
+    e0: EcsRaEntityDeep, e1: EcsRaEntityDeep, e2: EcsRaEntityDeep, e3: EcsRaEntityDeep,
+    e4: EcsRaEntityDeep, e5: EcsRaEntityDeep, e6: EcsRaEntityDeep, e7: EcsRaEntityDeep,
+    count: i32,
+    // iterator cursor
+    pos: i32,
+}
+
+fn ecs_ra_many_empty() -> EcsRaAllocManyDeep {
+    let z = ecs_ra_entity(0, 0);
+    return EcsRaAllocManyDeep {
+        e0: z, e1: z, e2: z, e3: z,
+        e4: z, e5: z, e6: z, e7: z,
+        count: 0,
+        pos: 0,
+    };
+}
+
+fn ecs_ra_many_set(m: EcsRaAllocManyDeep, idx: i32, e: EcsRaEntityDeep) -> EcsRaAllocManyDeep {
+    if idx == 0 { m.e0 = e; return m; };
+    if idx == 1 { m.e1 = e; return m; };
+    if idx == 2 { m.e2 = e; return m; };
+    if idx == 3 { m.e3 = e; return m; };
+    if idx == 4 { m.e4 = e; return m; };
+    if idx == 5 { m.e5 = e; return m; };
+    if idx == 6 { m.e6 = e; return m; };
+    if idx == 7 { m.e7 = e; return m; };
+    return m;
+}
+
+fn ecs_ra_many_get(m: EcsRaAllocManyDeep, idx: i32) -> EcsRaEntityDeep {
+    if idx == 0 { return m.e0; };
+    if idx == 1 { return m.e1; };
+    if idx == 2 { return m.e2; };
+    if idx == 3 { return m.e3; };
+    if idx == 4 { return m.e4; };
+    if idx == 5 { return m.e5; };
+    if idx == 6 { return m.e6; };
+    if idx == 7 { return m.e7; };
+    return ecs_ra_placeholder();
+}
+
+fn ecs_ra_many_count(m: EcsRaAllocManyDeep) -> i32 { return m.count; }
+
+fn ecs_ra_many_next(m: EcsRaAllocManyDeep) -> (EcsRaAllocManyDeep, bool, EcsRaEntityDeep) {
+    if m.pos >= m.count {
+        return (m, false, ecs_ra_placeholder());
+    };
+    let e = ecs_ra_many_get(m, m.pos);
+    m.pos = m.pos + 1;
+    return (m, true, e);
+}
+
+fn ecs_ra_allocator_alloc_many(a: EcsAllocatorDeep, count: i32) -> (EcsAllocatorDeep, EcsRaAllocManyDeep) {
+    let m = ecs_ra_many_empty();
+    if count < 0 { count = 0; };
+    if count > 8 { count = 8; };
+    let i: i32 = 0;
+    while i < count {
+        let r = ecs_ra_allocator_alloc(a);
+        a = r.0;
+        if ecs_ra_entity_is_placeholder(r.1) {
+            // stop early
+            i = count;
+        };
+        if ecs_ra_entity_is_placeholder(r.1) != true {
+            m = ecs_ra_many_set(m, m.count, r.1);
+            m.count = m.count + 1;
+        };
+        i = i + 1;
+    }
+    return (a, m);
+}
+
+fn ecs_ra_allocator_free_many(a: EcsAllocatorDeep, m: EcsRaAllocManyDeep) -> EcsAllocatorDeep {
+    let i: i32 = 0;
+    while i < m.count {
+        a = ecs_ra_allocator_free(a, ecs_ra_many_get(m, i));
+        i = i + 1;
+    }
+    return a;
+}
+
+// build RemoteAllocator handle from world allocator (clone Arc stand-in: shared state copy)
+// In this model, remote holds its own copy; sync via return values in tests.
+struct EcsRemoteAllocatorDeep {
+    shared: EcsSharedAllocatorDeep,
+}
+
+fn ecs_ra_remote_from_allocator(a: EcsAllocatorDeep) -> EcsRemoteAllocatorDeep {
+    return EcsRemoteAllocatorDeep { shared: a.shared };
+}
+
+// sync remote state back into allocator (test helper for sequential model)
+fn ecs_ra_allocator_sync_from_remote(a: EcsAllocatorDeep, r: EcsRemoteAllocatorDeep) -> EcsAllocatorDeep {
+    a.shared = r.shared;
+    return a;
+}
+
+fn ecs_ra_remote_sync_from_allocator(r: EcsRemoteAllocatorDeep, a: EcsAllocatorDeep) -> EcsRemoteAllocatorDeep {
+    r.shared = a.shared;
+    return r;
+}
+
+fn ecs_ra_remote_alloc(r: EcsRemoteAllocatorDeep) -> (EcsRemoteAllocatorDeep, EcsRaEntityDeep) {
+    // Bevy: close is diagnostic; still allocate if supply remains
+    let out = ecs_ra_core_alloc(r.shared);
+    r.shared = out.0;
+    r.shared.remote_alloc_count = r.shared.remote_alloc_count + 1;
+    // core_alloc already bumped alloc_count; remote_alloc_count extra
+    return (r, out.1);
+}
+
+fn ecs_ra_remote_alloc_many(r: EcsRemoteAllocatorDeep, count: i32) -> (EcsRemoteAllocatorDeep, EcsRaAllocManyDeep) {
+    let m = ecs_ra_many_empty();
+    if count < 0 { count = 0; };
+    if count > 8 { count = 8; };
+    let i: i32 = 0;
+    while i < count {
+        let a = ecs_ra_remote_alloc(r);
+        r = a.0;
+        if ecs_ra_entity_is_placeholder(a.1) {
+            i = count;
+        };
+        if ecs_ra_entity_is_placeholder(a.1) != true {
+            m = ecs_ra_many_set(m, m.count, a.1);
+            m.count = m.count + 1;
+        };
+        i = i + 1;
+    }
+    return (r, m);
+}
+
+fn ecs_ra_remote_close(r: EcsRemoteAllocatorDeep) -> EcsRemoteAllocatorDeep {
+    r.shared.closed = true;
+    return r;
+}
+
+fn ecs_ra_remote_is_closed(r: EcsRemoteAllocatorDeep) -> bool {
+    return r.shared.closed;
+}
+
+// uniqueness check for a batch of entities
+fn ecs_ra_entities_unique(m: EcsRaAllocManyDeep) -> bool {
+    let i: i32 = 0;
+    while i < m.count {
+        let j: i32 = 0;
+        while j < i {
+            if ecs_ra_entity_eq(ecs_ra_many_get(m, i), ecs_ra_many_get(m, j)) {
+                return false;
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// free then realloc same index with bumped generation
+fn ecs_ra_recycle_generation(a: EcsAllocatorDeep, e: EcsRaEntityDeep) -> (EcsAllocatorDeep, EcsRaEntityDeep) {
+    a = ecs_ra_allocator_free(a, e);
+    let r = ecs_ra_allocator_alloc(a);
+    return (r.0, r.1);
+}
+
+fn ecs_ra_is_live(a: EcsAllocatorDeep, e: EcsRaEntityDeep) -> bool {
+    if e.index < 0 { return false; };
+    if e.index >= 16 { return false; };
+    if ecs_ra_get_live(a.shared, e.index) != true { return false; };
+    return ecs_ra_get_gen(a.shared, e.index) == e.generation;
+}
+
+fn ecs_ra_allocator_free_len(a: EcsAllocatorDeep) -> i32 { return a.shared.free_len; }
+fn ecs_ra_allocator_fresh(a: EcsAllocatorDeep) -> i64 { return a.shared.next_fresh; }
+fn ecs_ra_allocator_stats_alloc(a: EcsAllocatorDeep) -> i64 { return a.shared.alloc_count; }
+fn ecs_ra_allocator_stats_free(a: EcsAllocatorDeep) -> i64 { return a.shared.free_count; }
+fn ecs_ra_allocator_stats_free_hits(a: EcsAllocatorDeep) -> i64 { return a.shared.free_list_hits; }
+fn ecs_ra_allocator_stats_fresh_hits(a: EcsAllocatorDeep) -> i64 { return a.shared.fresh_hits; }

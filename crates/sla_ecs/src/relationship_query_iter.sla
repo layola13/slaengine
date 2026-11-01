@@ -1,0 +1,165 @@
+// Bevy ECS relationship::relationship_query (src/relationship/relationship_query.rs):
+// Related query methods + DescendantIter + DescendantDepthFirstIter + AncestorIter.
+
+// === Related query surface ===
+// related<R>(entity) -> Option<Entity>
+// relationship_sources<S>(entity) -> iter
+// root_ancestor<R>(entity) -> Entity
+// iter_leaves / iter_siblings / iter_descendants / iter_ancestors
+
+struct EcsRelationshipQuery {
+    // adjacency: parent -> children (flat parallel arrays)
+    parents: Vec<i64>,
+    children_lists: Vec<Vec<i64>>,
+}
+
+fn ecs_relationship_query_new() -> EcsRelationshipQuery {
+    return EcsRelationshipQuery { parents: Vec::new(), children_lists: Vec::new() };
+}
+
+fn ecs_relationship_query_find(r: EcsRelationshipQuery, parent: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(r.parents) as i64;
+    while i < n {
+        if r.parents[i] == parent { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// add_child: register parent->child edge
+fn ecs_relationship_query_add_child(r: EcsRelationshipQuery, parent: i64, child: i64) -> EcsRelationshipQuery {
+    let idx = ecs_relationship_query_find(r, parent);
+    if idx >= 0 {
+        r.children_lists[idx].push(child);
+        return r;
+    };
+    r.parents.push(parent);
+    let list: Vec<i64> = Vec::new();
+    list.push(child);
+    r.children_lists.push(list);
+    return r;
+}
+
+// related: the single related entity (first child) — mirrors related<R>
+fn ecs_relationship_query_related(r: EcsRelationshipQuery, entity: i64) -> (bool, i64) {
+    let idx = ecs_relationship_query_find(r, entity);
+    if idx < 0 { return (false, 0); };
+    if len(r.children_lists[idx]) as i64 == 0 { return (false, 0); };
+    return (true, r.children_lists[idx][0]);
+}
+
+// relationship_sources: all children of a parent
+fn ecs_relationship_query_sources(r: EcsRelationshipQuery, parent: i64) -> Vec<i64> {
+    let idx = ecs_relationship_query_find(r, parent);
+    if idx < 0 {
+        let empty: Vec<i64> = Vec::new();
+        return empty;
+    };
+    return r.children_lists[idx];
+}
+
+// root_ancestor: walk parents up to the root. We need a parent->child reverse map.
+// For simplicity, we model root_ancestor by walking a separate parent_of map.
+struct EcsAncestorWalker {
+    child_to_parent: Vec<i64>,  // child -> parent (flat)
+    parents: Vec<i64>,
+}
+
+fn ecs_ancestor_walker_new() -> EcsAncestorWalker {
+    return EcsAncestorWalker { child_to_parent: Vec::new(), parents: Vec::new() };
+}
+
+fn ecs_ancestor_walker_set_parent(w: EcsAncestorWalker, child: i64, parent: i64) -> EcsAncestorWalker {
+    w.child_to_parent.push(child);
+    w.parents.push(parent);
+    return w;
+}
+
+fn ecs_ancestor_walker_parent_of(w: EcsAncestorWalker, child: i64) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(w.child_to_parent) as i64;
+    while i < n {
+        if w.child_to_parent[i] == child { return (true, w.parents[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+// root_ancestor: walk up until no parent
+fn ecs_ancestor_walker_root_ancestor(w: EcsAncestorWalker, entity: i64) -> i64 {
+    let current = entity;
+    let p = ecs_ancestor_walker_parent_of(w, current);
+    if p.0 != true { return current; };
+    return ecs_ancestor_walker_root_ancestor(w, p.1);
+}
+
+
+// parent_of_or: returns parent id, or -1 if no parent (avoids tuple allocation in loops)
+fn ecs_ancestor_walker_parent_of_or(w: EcsAncestorWalker, child: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(w.child_to_parent) as i64;
+    while i < n {
+        if w.child_to_parent[i] == child { return w.parents[i]; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// iter_ancestors helper (recursive): collects ancestors into acc
+fn ecs_ancestor_walker_iter_ancestors_rec(w: EcsAncestorWalker, current: i64, acc: Vec<i64>) -> Vec<i64> {
+    let p = ecs_ancestor_walker_parent_of_or(w, current);
+    if p < 0 { return acc; };
+    acc.push(p);
+    return ecs_ancestor_walker_iter_ancestors_rec(w, p, acc);
+}
+
+
+// iter_ancestors_count: count ancestors without allocating a Vec (avoids Vec leak)
+fn ecs_ancestor_walker_iter_ancestors_count(w: EcsAncestorWalker, entity: i64) -> i64 {
+    let p = ecs_ancestor_walker_parent_of_or(w, entity);
+    if p < 0 { return 0; };
+    let rest = ecs_ancestor_walker_iter_ancestors_count(w, p);
+    return rest + 1;
+}
+
+// iter_ancestors_first: return the first ancestor (parent) only
+fn ecs_ancestor_walker_iter_ancestors_first(w: EcsAncestorWalker, entity: i64) -> i64 {
+    return ecs_ancestor_walker_parent_of_or(w, entity);
+}
+// iter_ancestors: collect all ancestors up to root (recursive to avoid loop Vec leak)
+fn ecs_ancestor_walker_iter_ancestors(w: EcsAncestorWalker, entity: i64) -> Vec<i64> {
+    let acc: Vec<i64> = Vec::new();
+    return ecs_ancestor_walker_iter_ancestors_rec(w, entity, acc);
+}
+
+// DescendantIter helper (recursive DFS): visits a node then recurses into its children
+fn ecs_relationship_query_iter_descendants_rec(r: EcsRelationshipQuery, entity: i64, acc: Vec<i64>) -> Vec<i64> {
+    let children = ecs_relationship_query_sources(r, entity);
+    let i: i64 = 0;
+    let n: i64 = len(children) as i64;
+    while i < n {
+        acc.push(children[i]);
+        acc = ecs_relationship_query_iter_descendants_rec(r, children[i], acc);
+        i = i + 1;
+    }
+    return acc;
+}
+
+// === DescendantIter: depth-first descendants (recursive to avoid loop Vec leak) ===
+fn ecs_relationship_query_iter_descendants(r: EcsRelationshipQuery, entity: i64) -> Vec<i64> {
+    let acc: Vec<i64> = Vec::new();
+    return ecs_relationship_query_iter_descendants_rec(r, entity, acc);
+}
+
+// iter_siblings: children of the same parent (excluding self). Needs parent map.
+fn ecs_relationship_query_iter_siblings(r: EcsRelationshipQuery, parent: i64, self_entity: i64) -> Vec<i64> {
+    let siblings = ecs_relationship_query_sources(r, parent);
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    while i < len(siblings) as i64 {
+        if siblings[i] != self_entity { out.push(siblings[i]); };
+        i = i + 1;
+    }
+    return out;
+}

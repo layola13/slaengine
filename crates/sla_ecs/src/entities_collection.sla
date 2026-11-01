@@ -1,0 +1,196 @@
+// Bevy ECS entity (src/entity/mod.rs):
+// Entities — the central collection tracking all entity states, locations, and metadata.
+// Separate from EntityAllocator: tracks EntityLocation, spawn/despawn ticks, and entity validity.
+
+struct EcsEntityLocation {
+    archetype_id: i32,
+    table_id: i32,
+    table_row: i32,
+}
+
+fn ecs_entity_location_new(archetype_id: i32, table_id: i32, table_row: i32) -> EcsEntityLocation {
+    return EcsEntityLocation { archetype_id: archetype_id, table_id: table_id, table_row: table_row };
+}
+
+fn ecs_entity_location_archetype(l: EcsEntityLocation) -> i32 { return l.archetype_id; }
+fn ecs_entity_location_table(l: EcsEntityLocation) -> i32 { return l.table_id; }
+fn ecs_entity_location_table_row(l: EcsEntityLocation) -> i32 { return l.table_row; }
+
+fn ecs_entity_location_eq(a: EcsEntityLocation, b: EcsEntityLocation) -> bool {
+    if a.archetype_id != b.archetype_id { return false; };
+    if a.table_id != b.table_id { return false; };
+    if a.table_row != b.table_row { return false; };
+    return true;
+}
+
+// === Entities collection ===
+struct EcsEntities {
+    // Per-entity metadata, indexed by entity index
+    entity_indices: Vec<i32>,
+    entity_generations: Vec<i32>,
+    entity_spawned: Vec<bool>,
+    entity_locations: Vec<EcsEntityLocation>,
+    entity_spawn_ticks: Vec<i64>,
+    entity_despawn_ticks: Vec<i64>,
+    // free list
+    free_indices: Vec<i32>,
+    next_index: i32,
+    current_tick: i64,
+    spawned_count: i32,
+}
+
+fn ecs_entities_new() -> EcsEntities {
+    return EcsEntities {
+        entity_indices: Vec::new(), entity_generations: Vec::new(),
+        entity_spawned: Vec::new(), entity_locations: Vec::new(),
+        entity_spawn_ticks: Vec::new(), entity_despawn_ticks: Vec::new(),
+        free_indices: Vec::new(), next_index: 0, current_tick: 0, spawned_count: 0
+    };
+}
+
+fn ecs_entities_tick(e: EcsEntities) -> EcsEntities {
+    e.current_tick = e.current_tick + 1;
+    return e;
+}
+
+fn ecs_entities_current_tick(e: EcsEntities) -> i64 { return e.current_tick; }
+
+// alloc: allocate a new entity
+fn ecs_entities_alloc(e: EcsEntities) -> (EcsEntities, i32, i32) {
+    // Returns (entities, index, generation)
+    if len(e.free_indices) as i64 > 0 {
+        // Reuse a freed slot
+        let idx = e.free_indices[0];
+        let gen = e.entity_generations[idx] + 1;
+        e.entity_generations[idx] = gen;
+        e.entity_spawned[idx] = true;
+        e.entity_spawn_ticks[idx] = e.current_tick;
+        e.entity_despawn_ticks[idx] = 0;
+        // Remove from free list (swap remove)
+        let last = (len(e.free_indices) as i64) - 1;
+        if 0 != last {
+            e.free_indices[0] = e.free_indices[last];
+        };
+        e.free_indices.pop();
+        e.spawned_count = e.spawned_count + 1;
+        return (e, idx, gen);
+    };
+    // Allocate new slot
+    let idx = e.next_index;
+    e.next_index = e.next_index + 1;
+    e.entity_indices.push(idx);
+    e.entity_generations.push(0);
+    e.entity_spawned.push(true);
+    e.entity_locations.push(ecs_entity_location_new(0, 0, 0));
+    e.entity_spawn_ticks.push(e.current_tick);
+    e.entity_despawn_ticks.push(0);
+    e.spawned_count = e.spawned_count + 1;
+    return (e, idx, 0);
+}
+
+// contains: check if entity (index, gen) exists (spawned or not)
+fn ecs_entities_contains(e: EcsEntities, index: i32, generation: i32) -> bool {
+    if index < 0 { return false; };
+    if index >= e.next_index { return false; };
+    return e.entity_generations[index] == generation;
+}
+
+// contains_spawned: check if entity is spawned
+fn ecs_entities_contains_spawned(e: EcsEntities, index: i32, generation: i32) -> bool {
+    if ecs_entities_contains(e, index, generation) != true { return false; };
+    return e.entity_spawned[index];
+}
+
+// is_index_spawned
+fn ecs_entities_is_index_spawned(e: EcsEntities, index: i32) -> bool {
+    if index < 0 { return false; };
+    if index >= e.next_index { return false; };
+    return e.entity_spawned[index];
+}
+
+// free: despawn an entity (mark as not spawned, add to free list)
+fn ecs_entities_free(e: EcsEntities, index: i32, generation: i32) -> EcsEntities {
+    if ecs_entities_contains_spawned(e, index, generation) != true { return e; };
+    e.entity_spawned[index] = false;
+    e.entity_despawn_ticks[index] = e.current_tick;
+    e.free_indices.push(index);
+    e.spawned_count = e.spawned_count - 1;
+    return e;
+}
+
+// free_many: free multiple entities
+fn ecs_entities_free_many(e: EcsEntities, indices: Vec<i32>, generations: Vec<i32>) -> EcsEntities {
+    let i: i64 = 0;
+    let n: i64 = len(indices) as i64;
+    while i < n {
+        e = ecs_entities_free(e, indices[i], generations[i]);
+        i = i + 1;
+    }
+    return e;
+}
+
+// get_spawned: get location for a spawned entity
+fn ecs_entities_get_spawned(e: EcsEntities, index: i32, generation: i32) -> (bool, EcsEntityLocation) {
+    if ecs_entities_contains_spawned(e, index, generation) != true { return (false, ecs_entity_location_new(0, 0, 0)); };
+    return (true, e.entity_locations[index]);
+}
+
+// get: get location or None for despawned
+fn ecs_entities_get(e: EcsEntities, index: i32, generation: i32) -> (bool, bool, EcsEntityLocation) {
+    // (valid, spawned, location)
+    if ecs_entities_contains(e, index, generation) != true { return (false, false, ecs_entity_location_new(0, 0, 0)); };
+    if e.entity_spawned[index] { return (true, true, e.entity_locations[index]); };
+    return (true, false, ecs_entity_location_new(0, 0, 0));
+}
+
+// set_location: update location for a spawned entity
+fn ecs_entities_set_location(e: EcsEntities, index: i32, generation: i32, loc: EcsEntityLocation) -> EcsEntities {
+    if ecs_entities_contains_spawned(e, index, generation) != true { return e; };
+    e.entity_locations[index] = loc;
+    return e;
+}
+
+// resolve_from_index: get the current entity at an index (uses current generation)
+fn ecs_entities_resolve_from_index(e: EcsEntities, index: i32) -> (i32, i32) {
+    if index < 0 { return (-1, 0); };
+    if index >= e.next_index { return (-1, 0); };
+    return (index, e.entity_generations[index]);
+}
+
+// get_spawn_tick
+fn ecs_entities_get_spawn_tick(e: EcsEntities, index: i32, generation: i32) -> (bool, i64) {
+    if ecs_entities_contains(e, index, generation) != true { return (false, 0); };
+    return (true, e.entity_spawn_ticks[index]);
+}
+
+// get_despawn_tick
+fn ecs_entities_get_despawn_tick(e: EcsEntities, index: i32, generation: i32) -> (bool, i64) {
+    if ecs_entities_contains(e, index, generation) != true { return (false, 0); };
+    return (true, e.entity_despawn_ticks[index]);
+}
+
+// len: total entity count (spawned + despawned)
+fn ecs_entities_len(e: EcsEntities) -> i32 { return e.next_index; }
+
+// is_empty
+fn ecs_entities_is_empty(e: EcsEntities) -> bool { return e.next_index == 0; }
+
+// count_spawned
+fn ecs_entities_count_spawned(e: EcsEntities) -> i32 { return e.spawned_count; }
+
+// any_spawned
+fn ecs_entities_any_spawned(e: EcsEntities) -> bool { return e.spawned_count > 0; }
+
+// clear
+fn ecs_entities_clear(e: EcsEntities) -> EcsEntities {
+    e.entity_indices = Vec::new();
+    e.entity_generations = Vec::new();
+    e.entity_spawned = Vec::new();
+    e.entity_locations = Vec::new();
+    e.entity_spawn_ticks = Vec::new();
+    e.entity_despawn_ticks = Vec::new();
+    e.free_indices = Vec::new();
+    e.next_index = 0;
+    e.spawned_count = 0;
+    return e;
+}

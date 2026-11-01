@@ -1,0 +1,174 @@
+// Deferred command queue for ArchetypeValueWorld<T, R, M>.
+// Commands mutate real value columns and route component membership changes
+// through RegistryArchetypeWorld so entity locations migrate with signatures.
+@import "world_archetype_value.sla"
+
+const ARCHETYPE_VALUE_COMMAND_INSERT_COMPONENT: i32 = 1;
+const ARCHETYPE_VALUE_COMMAND_DESPAWN: i32 = 2;
+const ARCHETYPE_VALUE_COMMAND_INSERT_RESOURCE: i32 = 3;
+const ARCHETYPE_VALUE_COMMAND_WRITE_MESSAGE: i32 = 4;
+
+struct ArchetypeValueCommand {
+    kind: i32,
+    entity: Entity,
+    component_id: i32,
+    value_index: i64,
+}
+
+struct ArchetypeValueCommands<T, R, M> {
+    items: Vec<ArchetypeValueCommand>,
+    component_values: Vec<T>,
+    resource_values: Vec<R>,
+    message_values: Vec<M>,
+}
+
+fn archetype_value_commands_new<T, R, M>() -> ArchetypeValueCommands<T, R, M> {
+    let items: Vec<ArchetypeValueCommand> = Vec::new();
+    let component_values: Vec<T> = Vec::new();
+    let resource_values: Vec<R> = Vec::new();
+    let message_values: Vec<M> = Vec::new();
+    return ArchetypeValueCommands<T, R, M> { items: items, component_values: component_values, resource_values: resource_values, message_values: message_values };
+}
+
+fn archetype_value_command(kind: i32, entity: Entity, component_id: i32, value_index: i64) -> ArchetypeValueCommand {
+    return ArchetypeValueCommand { kind: kind, entity: entity, component_id: component_id, value_index: value_index };
+}
+
+fn archetype_value_commands_len<T, R, M>(commands: ArchetypeValueCommands<T, R, M>) -> i64 {
+    return len(commands.items) as i64;
+}
+
+fn archetype_value_commands_reserve_entity<T, R, M>(world: ArchetypeValueWorld<T, R, M>, commands: ArchetypeValueCommands<T, R, M>) -> (ArchetypeValueWorld<T, R, M>, ArchetypeValueCommands<T, R, M>, Entity) {
+    let (next_world, entity) = archetype_value_world_spawn<T, R, M>(world);
+    return (next_world, commands, entity);
+}
+
+fn archetype_value_commands_insert<T, R, M>(commands: ArchetypeValueCommands<T, R, M>, entity: Entity, component_id: i32, value: T) -> ArchetypeValueCommands<T, R, M> {
+    commands.component_values.push(value);
+    let idx = (len(commands.component_values) as i64) - 1;
+    commands.items.push(archetype_value_command(ARCHETYPE_VALUE_COMMAND_INSERT_COMPONENT, entity, component_id, idx));
+    return commands;
+}
+
+fn archetype_value_commands_despawn<T, R, M>(commands: ArchetypeValueCommands<T, R, M>, entity: Entity) -> ArchetypeValueCommands<T, R, M> {
+    commands.items.push(archetype_value_command(ARCHETYPE_VALUE_COMMAND_DESPAWN, entity, 0, -1));
+    return commands;
+}
+
+fn archetype_value_commands_insert_resource<T, R, M>(commands: ArchetypeValueCommands<T, R, M>, value: R) -> ArchetypeValueCommands<T, R, M> {
+    commands.resource_values.push(value);
+    let idx = (len(commands.resource_values) as i64) - 1;
+    commands.items.push(archetype_value_command(ARCHETYPE_VALUE_COMMAND_INSERT_RESOURCE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn archetype_value_commands_write_message<T, R, M>(commands: ArchetypeValueCommands<T, R, M>, value: M) -> ArchetypeValueCommands<T, R, M> {
+    commands.message_values.push(value);
+    let idx = (len(commands.message_values) as i64) - 1;
+    commands.items.push(archetype_value_command(ARCHETYPE_VALUE_COMMAND_WRITE_MESSAGE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn archetype_value_commands_apply_insert<T, R, M>(world: ArchetypeValueWorld<T, R, M>, commands: ArchetypeValueCommands<T, R, M>, command: ArchetypeValueCommand) -> ArchetypeValueWorld<T, R, M> {
+    if command.kind == ARCHETYPE_VALUE_COMMAND_INSERT_COMPONENT {
+        return archetype_value_world_insert<T, R, M>(world, command.entity, command.component_id, commands.component_values[command.value_index]);
+    };
+    return world;
+}
+
+fn archetype_value_commands_apply_despawn<T, R, M>(world: ArchetypeValueWorld<T, R, M>, command: ArchetypeValueCommand) -> ArchetypeValueWorld<T, R, M> {
+    if command.kind == ARCHETYPE_VALUE_COMMAND_DESPAWN {
+        return archetype_value_world_despawn<T, R, M>(world, command.entity);
+    };
+    return world;
+}
+
+fn archetype_value_commands_apply_resource<T, R, M>(world: ArchetypeValueWorld<T, R, M>, commands: ArchetypeValueCommands<T, R, M>, command: ArchetypeValueCommand) -> ArchetypeValueWorld<T, R, M> {
+    if command.kind == ARCHETYPE_VALUE_COMMAND_INSERT_RESOURCE {
+        return archetype_value_world_insert_resource<T, R, M>(world, commands.resource_values[command.value_index]);
+    };
+    return world;
+}
+
+fn archetype_value_commands_apply_message<T, R, M>(world: ArchetypeValueWorld<T, R, M>, commands: ArchetypeValueCommands<T, R, M>, command: ArchetypeValueCommand) -> ArchetypeValueWorld<T, R, M> {
+    if command.kind == ARCHETYPE_VALUE_COMMAND_WRITE_MESSAGE {
+        return archetype_value_world_write_message<T, R, M>(world, commands.message_values[command.value_index]);
+    };
+    return world;
+}
+
+fn archetype_value_commands_apply<T, R, M>(world: ArchetypeValueWorld<T, R, M>, commands: ArchetypeValueCommands<T, R, M>) -> (ArchetypeValueWorld<T, R, M>, ArchetypeValueCommands<T, R, M>) {
+    let i: i64 = 0;
+    let cnt = archetype_value_commands_len<T, R, M>(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = archetype_value_commands_apply_insert<T, R, M>(world, commands, command);
+        world = archetype_value_commands_apply_despawn<T, R, M>(world, command);
+        world = archetype_value_commands_apply_resource<T, R, M>(world, commands, command);
+        world = archetype_value_commands_apply_message<T, R, M>(world, commands, command);
+        i = i + 1;
+    }
+    let cleared = archetype_value_commands_new<T, R, M>();
+    return (world, cleared);
+}
+
+struct ArchetypeCmdData { amount: i32 }
+struct ArchetypeCmdTime { tick: i32 }
+struct ArchetypeCmdEvent { amount: i32 }
+
+fn archetype_cmd_time_default() -> ArchetypeCmdTime { return ArchetypeCmdTime { tick: 0 }; }
+fn archetype_cmd_event_default() -> ArchetypeCmdEvent { return ArchetypeCmdEvent { amount: 0 }; }
+
+fn archetype_cmd_world_new() -> ArchetypeValueWorld<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent> {
+    return archetype_value_world_new<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(archetype_cmd_time_default(), archetype_cmd_event_default());
+}
+
+fn archetype_cmd_commands_new() -> ArchetypeValueCommands<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent> {
+    return archetype_value_commands_new<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>();
+}
+
+@test "archetype value commands defer insertions and migrate archetype"() {
+    let w0 = archetype_cmd_world_new();
+    let (w1, health) = archetype_value_world_register_table<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w0);
+    let (w2, mana) = archetype_value_world_register_table<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w1);
+    let c0 = archetype_cmd_commands_new();
+    let (w3, c1, entity) = archetype_value_commands_reserve_entity<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w2, c0);
+    let empty_group = archetype_value_world_entity_archetype_id<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w3, entity);
+    let c2 = archetype_value_commands_insert<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c1, entity, health.id, ArchetypeCmdData { amount: 10 });
+    let c3 = archetype_value_commands_insert<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c2, entity, mana.id, ArchetypeCmdData { amount: 4 });
+    if archetype_value_world_has<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w3, entity, health.id) != false { panic(9960); };
+    let (w4, c4) = archetype_value_commands_apply<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w3, c3);
+    if archetype_value_world_has<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, entity, health.id) != true { panic(9961); };
+    if archetype_value_world_entity_archetype_id<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, entity) == empty_group { panic(9962); };
+    if archetype_value_commands_len<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c4) != 0 { panic(9963); };
+    let pairs = archetype_value_world_query_pair<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, health.id, mana.id);
+    if len(pairs.items) != 1 { panic(9964); };
+    if pairs.items[0].first.amount + pairs.items[0].second.amount != 14 { panic(9965); };
+}
+
+@test "archetype value commands replace resource message and despawn"() {
+    let w0 = archetype_cmd_world_new();
+    let (w1, health) = archetype_value_world_register_table<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w0);
+    let c0 = archetype_cmd_commands_new();
+    let (w2, c1, entity) = archetype_value_commands_reserve_entity<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w1, c0);
+    let c2 = archetype_value_commands_insert<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c1, entity, health.id, ArchetypeCmdData { amount: 5 });
+    let (w3, c3) = archetype_value_commands_apply<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w2, c2);
+    let group_before = archetype_value_world_entity_archetype_id<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w3, entity);
+    let row_before = archetype_value_world_entity_row<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w3, entity);
+    let c4 = archetype_value_commands_insert<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c3, entity, health.id, ArchetypeCmdData { amount: 9 });
+    let c5 = archetype_value_commands_insert_resource<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c4, ArchetypeCmdTime { tick: 8 });
+    let c6 = archetype_value_commands_write_message<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c5, ArchetypeCmdEvent { amount: 6 });
+    let (w4, c7) = archetype_value_commands_apply<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w3, c6);
+    if archetype_value_world_entity_archetype_id<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, entity) != group_before { panic(9970); };
+    if archetype_value_world_entity_row<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, entity) != row_before { panic(9971); };
+    if archetype_value_world_get<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, entity, health.id).amount != 9 { panic(9972); };
+    let c8 = archetype_value_commands_despawn<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c7, entity);
+    let (w5, c9) = archetype_value_commands_apply<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w4, c8);
+    if archetype_value_world_is_alive<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w5, entity) != false { panic(9973); };
+    if archetype_value_world_entity_archetype_id<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w5, entity) != -1 { panic(9974); };
+    let time = archetype_value_world_get_resource<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w5);
+    let event = archetype_value_world_read_message<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(w5, message_reader_new(), archetype_cmd_event_default());
+    if time.tick != 8 { panic(9975); };
+    if event.value.amount != 6 { panic(9976); };
+    if archetype_value_commands_len<ArchetypeCmdData, ArchetypeCmdTime, ArchetypeCmdEvent>(c9) != 0 { panic(9977); };
+}

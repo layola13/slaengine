@@ -1,0 +1,277 @@
+// DynamicWorld query surface.
+// This is the Bevy-shaped query layer over the current two-component
+// DynamicWorld<A, B, R, M> runtime. It provides real query items and writeback
+// over world storage while Sla keeps mutation explicit through Mut<T>.
+@import "world_dynamic.sla"
+
+struct Query<T> {
+    items: Vec<T>,
+}
+
+impl Query<T> {
+    fn iter_len(&self) -> i64 {
+        return len(self.items) as i64;
+    }
+
+    fn iter_at(&self, index: i64) -> T {
+        return self.items[index];
+    }
+}
+
+struct Mut<T> {
+    entity: Entity,
+    slot: i64,
+    value: T,
+}
+
+struct EntityItem<T> {
+    entity: Entity,
+    value: T,
+}
+
+struct PairMutItem<A, B> {
+    a: Mut<A>,
+    b: B,
+}
+
+struct With<T> { marker: i32 }
+struct Without<T> { marker: i32 }
+struct Added<T> { since_tick: i32 }
+struct Changed<T> { since_tick: i32 }
+
+fn query_new<T>() -> Query<T> {
+    let items: Vec<T> = Vec::new();
+    return Query<T> { items: items };
+}
+
+fn with_filter<T>() -> With<T> { return With<T> { marker: 1 }; }
+fn without_filter<T>() -> Without<T> { return Without<T> { marker: 1 }; }
+fn added_filter<T>(since_tick: i32) -> Added<T> { return Added<T> { since_tick: since_tick }; }
+fn changed_filter<T>(since_tick: i32) -> Changed<T> { return Changed<T> { since_tick: since_tick }; }
+
+fn query_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> Query<A> {
+    let query = query_new<A>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            query.items.push(world.a_components.values[i]);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_mut_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> Query<Mut<A>> {
+    let query = query_new<Mut<A>>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            query.items.push(Mut<A> { entity: entity, slot: i, value: world.a_components.values[i] });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_entity_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> Query<EntityItem<A>> {
+    let query = query_new<EntityItem<A>>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            query.items.push(EntityItem<A> { entity: entity, value: world.a_components.values[i] });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_mut_a_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> Query<PairMutItem<A, B>> {
+    let query = query_new<PairMutItem<A, B>>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let b_slot = dyn_store_slot_of<B>(world.b_components, eid);
+        if b_slot >= 0 {
+            let entity = entity_new(eid, world.entities.generations[eid]);
+            if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+                query.items.push(PairMutItem<A, B> {
+                    a: Mut<A> { entity: entity, slot: i, value: world.a_components.values[i] },
+                    b: world.b_components.values[b_slot],
+                });
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_a_with_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, filter: With<B>) -> Query<A> {
+    let query = query_new<A>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            if dyn_store_has<B>(world.b_components, eid) {
+                query.items.push(world.a_components.values[i]);
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_a_without_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, filter: Without<B>) -> Query<A> {
+    let query = query_new<A>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            if dyn_store_has<B>(world.b_components, eid) != true {
+                query.items.push(world.a_components.values[i]);
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_a_added<A, B, R, M>(world: DynamicWorld<A, B, R, M>, filter: Added<A>) -> Query<A> {
+    let query = query_new<A>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            if dynamic_world_a_added_since<A, B, R, M>(world, entity, filter.since_tick) {
+                query.items.push(world.a_components.values[i]);
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_a_changed<A, B, R, M>(world: DynamicWorld<A, B, R, M>, filter: Changed<A>) -> Query<A> {
+    let query = query_new<A>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let entity = entity_new(eid, world.entities.generations[eid]);
+        if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+            if dynamic_world_a_changed_since<A, B, R, M>(world, entity, filter.since_tick) {
+                query.items.push(world.a_components.values[i]);
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn query_mut_a_write<A, B, R, M>(world: DynamicWorld<A, B, R, M>, item: Mut<A>, value: A) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_is_alive<A, B, R, M>(world, item.entity) != true { return world; };
+    world.a_components = dyn_store_write<A>(world.a_components, item.slot, value);
+    world.a_changed_ticks = dyn_store_write<i32>(world.a_changed_ticks, item.slot, world.change_tick);
+    return world;
+}
+
+fn query_pair_mut_a_write<A, B, R, M>(world: DynamicWorld<A, B, R, M>, item: PairMutItem<A, B>, value: A) -> DynamicWorld<A, B, R, M> {
+    return query_mut_a_write<A, B, R, M>(world, item.a, value);
+}
+
+struct QueryDynPos { x: i32, y: i32 }
+struct QueryDynVel { x: i32, y: i32 }
+struct QueryDynTime { tick: i32 }
+struct QueryDynEvent { amount: i32 }
+
+fn query_dyn_time_default() -> QueryDynTime { return QueryDynTime { tick: 0 }; }
+fn query_dyn_event_default() -> QueryDynEvent { return QueryDynEvent { amount: 0 }; }
+
+fn query_test_world_new() -> DynamicWorld<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent> {
+    return dynamic_world_new<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(query_dyn_time_default(), query_dyn_event_default());
+}
+
+fn query_spawn_a(world: DynamicWorld<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>, x: i32) -> (DynamicWorld<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>, Entity) {
+    let (w1, entity) = dynamic_world_spawn<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(world);
+    let w2 = dynamic_world_insert_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w1, entity, QueryDynPos { x: x, y: 0 });
+    return (w2, entity);
+}
+
+@test "dynamic query read entity and for in"() {
+    let w0 = query_test_world_new();
+    let (w1, e1) = query_spawn_a(w0, 10);
+    let (w2, e2) = query_spawn_a(w1, 20);
+    let q = query_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2);
+    let total: i32 = 0;
+    for item in q {
+        total = total + item.x;
+    }
+    if total != 30 { panic(7800); };
+    let entity_q = query_entity_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2);
+    if len(entity_q.items) != 2 { panic(7801); };
+    if entity_q.items[0].entity.id != e1.id { panic(7802); };
+    if entity_q.items[1].entity.id != e2.id { panic(7803); };
+}
+
+@test "dynamic query mut writeback"() {
+    let w0 = query_test_world_new();
+    let (w1, e1) = query_spawn_a(w0, 1);
+    let w2 = dynamic_world_increment_tick<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w1);
+    let q = query_mut_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2);
+    let item = q.items[0];
+    let next = QueryDynPos { x: item.value.x + 9, y: item.value.y };
+    let w3 = query_mut_a_write<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2, item, next);
+    let out = dynamic_world_get_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w3, e1);
+    if out.x != 10 { panic(7810); };
+    if dynamic_world_a_changed_since<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w3, e1, 1) != true { panic(7811); };
+}
+
+@test "dynamic query pair mut and with without filters"() {
+    let w0 = query_test_world_new();
+    let (w1, e1) = query_spawn_a(w0, 1);
+    let (w2, e2) = query_spawn_a(w1, 2);
+    let w3 = dynamic_world_insert_b<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2, e1, QueryDynVel { x: 5, y: 0 });
+    let pairs = query_mut_a_b<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w3);
+    if len(pairs.items) != 1 { panic(7820); };
+    let pair = pairs.items[0];
+    let moved = QueryDynPos { x: pair.a.value.x + pair.b.x, y: 0 };
+    let w4 = query_pair_mut_a_write<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w3, pair, moved);
+    let out = dynamic_world_get_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w4, e1);
+    if out.x != 6 { panic(7821); };
+    let with_q = query_a_with_b<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w4, with_filter<QueryDynVel>());
+    let without_q = query_a_without_b<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w4, without_filter<QueryDynVel>());
+    if len(with_q.items) != 1 { panic(7822); };
+    if len(without_q.items) != 1 { panic(7823); };
+    if without_q.items[0].x != 2 { panic(7824); };
+}
+
+@test "dynamic query added changed filters"() {
+    let w0 = query_test_world_new();
+    let (w1, e1) = query_spawn_a(w0, 1);
+    let (w2, e2) = query_spawn_a(w1, 2);
+    let added = query_a_added<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2, added_filter<QueryDynPos>(0));
+    if len(added.items) != 2 { panic(7830); };
+    let w3 = dynamic_world_increment_tick<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w2);
+    let item = query_mut_a<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w3).items[0];
+    let w4 = query_mut_a_write<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w3, item, QueryDynPos { x: 9, y: 0 });
+    let changed = query_a_changed<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w4, changed_filter<QueryDynPos>(1));
+    if len(changed.items) != 1 { panic(7831); };
+    if changed.items[0].x != 9 { panic(7832); };
+    let added_late = query_a_added<QueryDynPos, QueryDynVel, QueryDynTime, QueryDynEvent>(w4, added_filter<QueryDynPos>(1));
+    if len(added_late.items) != 0 { panic(7833); };
+}

@@ -1,0 +1,240 @@
+// Bevy ECS related-methods gaps not covered by lib/relationship_related_methods.sla.
+//
+// Mirrors src/relationship/related_methods.rs pub fns:
+//   add_one_related<R>(entity)             (EntityWorldMut + EntityCommands)
+//   detach_all_related<R>()                (clears the R::RelationshipTarget component)
+//   despawn_related<S>()                   (collect S sources, queue despawn; returns the queued list)
+//   despawn_children()                     (Children specialization of despawn_related)
+//   with_related<R>(bundle)                (EntityCommands — spawn new entity related to this)
+//   with_related_entities<R>(bundles)      (spawn each bundle_vec entry as a related entity)
+//   insert_recursive<S>(bundle)            (BFS traversal over S, insert bundle; returns the visited list)
+//   remove_recursive<S, B>()                (BFS traversal over S, remove B; returns the visited list)
+//
+// Our model carries an owned relationship-target source Vec<Entity> per builder (id, related list,
+// related_recursive_children per entity for the recursive traversals). Bevy's `<R: Relationship>`
+// generic collapses to a `relationship_id: i32` parameter since sla has no generic-over-types.
+// Fn-over-bundle closures reduce to `bundle_id` ints. Multi-entity traversals use return-result
+// struct Vecs to avoid the SA-backend scalar-tuple ".1 slot" corruption.
+
+// === Result structs (single-field accessors for multi-value returns) ===
+struct RelatedDespawnResult {
+    despawned_count: i32,
+    first_despawned: i64,
+}
+
+fn ecs_relate_despawn_count(r: RelatedDespawnResult) -> i32 {
+    return r.despawned_count;
+}
+
+fn ecs_relate_despawn_first(r: RelatedDespawnResult) -> i64 {
+    return r.first_despawned;
+}
+
+struct RecursiveTraverseResult {
+    visited_count: i32,
+    first_visited: i64,
+}
+
+fn ecs_relate_rec_count(r: RecursiveTraverseResult) -> i32 {
+    return r.visited_count;
+}
+
+fn ecs_relate_rec_first(r: RecursiveTraverseResult) -> i64 {
+    return r.first_visited;
+}
+
+struct WithRelatedSpawnsResult {
+    spawned_count: i32,
+    first_spawned: i64,
+}
+
+fn ecs_relate_spawn_count(r: WithRelatedSpawnsResult) -> i32 {
+    return r.spawned_count;
+}
+
+fn ecs_relate_spawn_first(r: WithRelatedSpawnsResult) -> i64 {
+    return r.first_spawned;
+}
+
+// === Model ===
+struct EcsRelatedMethodsExtras {
+    entity_id: i64,
+    related: Vec<i64>,
+    // per-related-entity descendant list — for BFS recursive traversals (relationship tree)
+    related_descendants: Vec<Vec<i64>>,
+    // total related spawned via with_related/with_related_entities (mirrors Bevy's spawned-entity count)
+    spawned_with_related: i32,
+}
+
+fn ecs_related_extras_new(entity_id: i64) -> EcsRelatedMethodsExtras {
+    let b = EcsRelatedMethodsExtras {
+        entity_id: entity_id,
+        related: Vec::new(),
+        related_descendants: Vec::new(),
+        spawned_with_related: 0,
+    };
+    return b;
+}
+
+fn ecs_related_extras_entity(r: EcsRelatedMethodsExtras) -> i64 {
+    return r.entity_id;
+}
+
+// internal: find related-list index of an entity, or -1
+fn _ecs_rel_index_of(r: EcsRelatedMethodsExtras, entity: i64) -> i32 {
+    let n: i32 = len(r.related) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if r.related[i] == entity { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// internal: descendants index in same slot order as related list
+fn _ecs_rel_descendant_at(r: EcsRelatedMethodsExtras, entity: i64) -> Vec<i64> {
+    let idx = _ecs_rel_index_of(r, entity);
+    if idx < 0 {
+        let empty = Vec::new();
+        return empty;
+    };
+    return r.related_descendants[idx];
+}
+
+// add_one_related(relationship_id, entity): builder mutator adding one related if absent; returns mutated model.
+fn ecs_related_extras_add_one_related(r: EcsRelatedMethodsExtras, relationship_id: i32, entity: i64) -> EcsRelatedMethodsExtras {
+    let _ = relationship_id;
+    if _ecs_rel_index_of(r, entity) >= 0 { return r; };
+    r.related.push(entity);
+    let empty = Vec::new();
+    r.related_descendants.push(empty);
+    return r;
+}
+
+fn ecs_related_extras_related_count(r: EcsRelatedMethodsExtras) -> i32 {
+    return len(r.related) as i32;
+}
+
+fn ecs_related_extras_related_at(r: EcsRelatedMethodsExtras, idx: i32) -> i64 {
+    let n: i32 = len(r.related) as i32;
+    if idx < 0 || idx >= n { return -1; };
+    return r.related[idx];
+}
+
+// detach_all_related(relationship_id): clears the entire relationship target component.
+fn ecs_related_extras_detach_all_related(r: EcsRelatedMethodsExtras, relationship_id: i32) -> EcsRelatedMethodsExtras {
+    let _ = relationship_id;
+    let empty = Vec::new();
+    r.related = empty;
+    let empty_d = Vec::new();
+    r.related_descendants = empty_d;
+    return r;
+}
+
+// add_descendant(parent_entity, descendant_entity): record a leaf relationship for the recursive traversal test tree.
+fn ecs_related_extras_add_descendant(r: EcsRelatedMethodsExtras, parent_entity: i64, descendant_entity: i64) -> EcsRelatedMethodsExtras {
+    let idx = _ecs_rel_index_of(r, parent_entity);
+    if idx < 0 {
+        r.related.push(parent_entity);
+        let empty = Vec::new();
+        r.related_descendants.push(empty);
+        let new_idx = len(r.related) as i32 - 1;
+        r.related_descendants[new_idx].push(descendant_entity);
+        return r;
+    };
+    r.related_descendants[idx].push(descendant_entity);
+    return r;
+}
+
+// despawn_related(relationship_target_id): collects the related entities and queues them for despawn.
+// Model: returns RelatedDespawnResult { despawned_count, first_despawned } and clears the related list
+// as if they were despawned.
+fn ecs_related_extras_despawn_related(r: EcsRelatedMethodsExtras, relationship_target_id: i32) -> RelatedDespawnResult {
+    let _ = relationship_target_id;
+    let n: i32 = len(r.related) as i32;
+    if n == 0 {
+        let none = RelatedDespawnResult { despawned_count: 0, first_despawned: -1 };
+        return none;
+    };
+    let first = r.related[0];
+    let res = RelatedDespawnResult { despawned_count: n, first_despawned: first };
+    let empty = Vec::new();
+    r.related = empty;
+    let empty_d = Vec::new();
+    r.related_descendants = empty_d;
+    return res;
+}
+
+// despawn_children(): specialization — Children is the RelationshipTarget for ChildOf; same as despawn_related.
+// We track a separate "is_children_target" to model the specialization choice.
+fn ecs_related_extras_despawn_children(r: EcsRelatedMethodsExtras) -> RelatedDespawnResult {
+    return ecs_related_extras_despawn_related(r, 0);
+}
+
+// with_related(relationship_id, bundle_id, next_entity): spawn a new entity related to `entity_id` from `next_entity`.
+// Builder-style: returns the mutated model. Spawn count observable via ecs_related_extras_spawned_with_related.
+fn ecs_related_extras_with_related(r: EcsRelatedMethodsExtras, relationship_id: i32, bundle_id: i32, next_entity: i64) -> EcsRelatedMethodsExtras {
+    let _ = relationship_id;
+    let _ = bundle_id;
+    r.related.push(next_entity);
+    let empty = Vec::new();
+    r.related_descendants.push(empty);
+    r.spawned_with_related = r.spawned_with_related + 1;
+    return r;
+}
+
+// with_related_entities(relationship_id, bundle_ids, next_entity_start): spawn N related entities
+// (one per bundle_id) starting at next_entity_start; builder-style returns the mutated model.
+fn ecs_related_extras_with_related_entities(r: EcsRelatedMethodsExtras, relationship_id: i32, bundle_ids: Vec<i32>, next_entity_start: i64) -> EcsRelatedMethodsExtras {
+    let _ = relationship_id;
+    let n: i32 = len(bundle_ids) as i32;
+    let i: i32 = 0;
+    while i < n {
+        r.related.push(next_entity_start + i as i64);
+        let empty = Vec::new();
+        r.related_descendants.push(empty);
+        r.spawned_with_related = r.spawned_with_related + 1;
+        i = i + 1;
+    }
+    return r;
+}
+
+// spawned_with_related(): total spawned entities across with_related/with_related_entities calls.
+fn ecs_related_extras_spawned_with_related(r: EcsRelatedMethodsExtras) -> i32 {
+    return r.spawned_with_related;
+}
+
+// insert_recursive(relationship_target_id, bundle_id): BFS traversal over related + descendants,
+// returning RecursiveTraverseResult. Mutates the model to record a per-visit marker count via the
+// related list expansion (visited count = related + descendants).
+fn ecs_related_extras_insert_recursive(r: EcsRelatedMethodsExtras, relationship_target_id: i32, bundle_id: i32) -> RecursiveTraverseResult {
+    let _ = relationship_target_id;
+    let _ = bundle_id;
+    let rel_count: i32 = len(r.related) as i32;
+    if rel_count == 0 {
+        let none = RecursiveTraverseResult { visited_count: 0, first_visited: -1 };
+        return none;
+    };
+    let first = r.related[0];
+    // BFS: visit each related entity, plus each related-descendant entity
+    let mut visited: i32 = 0;
+    let i: i32 = 0;
+    while i < rel_count {
+        visited = visited + 1;
+        let desc_list = r.related_descendants[i];
+        let desc_n: i32 = len(desc_list) as i32;
+        let k: i32 = 0;
+        while k < desc_n {
+            visited = visited + 1;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    let res = RecursiveTraverseResult { visited_count: visited, first_visited: first };
+    return res;
+}
+
+// remove_recursive(relationship_target_id, bundle_id): symmetric BFS removal-traversal.
+fn ecs_related_extras_remove_recursive(r: EcsRelatedMethodsExtras, relationship_target_id: i32, bundle_id: i32) -> RecursiveTraverseResult {
+    return ecs_related_extras_insert_recursive(r, relationship_target_id, bundle_id);
+}

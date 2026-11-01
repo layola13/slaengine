@@ -1,0 +1,189 @@
+// Explicit metadata identity helpers for derive-like ECS declarations.
+//
+// SLA currently has no compiler macro/derive facility that can turn source type
+// paths into runtime TypeId values. This module provides a library-owned,
+// explicit substitute: callers pass numeric namespace/local/type-path digests,
+// receive a stable id, and can register those ids while detecting duplicate
+// declarations and hash collisions.
+@import "sa_std/vec.sa"
+
+const ECS_METADATA_ID_COMPONENT: i32 = 1;
+const ECS_METADATA_ID_RESOURCE: i32 = 2;
+const ECS_METADATA_ID_MESSAGE: i32 = 3;
+const ECS_METADATA_ID_EVENT: i32 = 4;
+const ECS_METADATA_ID_RELATIONSHIP: i32 = 5;
+
+struct EcsMetadataIdentity {
+    kind: i32,
+    namespace_digest: i64,
+    local_digest: i64,
+    type_path_digest: i64,
+    stable_type_id: i64,
+}
+
+struct EcsMetadataIdentityRegistry {
+    identities: Vec<EcsMetadataIdentity>,
+}
+
+struct EcsMetadataIdentityRegisterResult {
+    registry: EcsMetadataIdentityRegistry,
+    inserted: bool,
+    duplicate: bool,
+    collision: bool,
+    existing_index: i64,
+}
+
+fn ecs_metadata_identity_abs(value: i64) -> i64 {
+    if value < 0 { return 0 - value; };
+    return value;
+}
+
+fn ecs_metadata_identity_normalize_digest(value: i64) -> i64 {
+    let v = ecs_metadata_identity_abs(value);
+    if v == 0 { return 1; };
+    return v;
+}
+
+fn ecs_metadata_identity_mix(seed: i64, value: i64) -> i64 {
+    let mixed = (seed * 1103515245) + (ecs_metadata_identity_normalize_digest(value) * 12345) + 97;
+    let bounded = mixed % 2147480000;
+    if bounded < 0 { return 0 - bounded; };
+    if bounded == 0 { return 1; };
+    return bounded;
+}
+
+fn ecs_metadata_identity_kind_seed(kind: i32) -> i64 {
+    if kind == ECS_METADATA_ID_COMPONENT { return 1009; };
+    if kind == ECS_METADATA_ID_RESOURCE { return 2003; };
+    if kind == ECS_METADATA_ID_MESSAGE { return 3001; };
+    if kind == ECS_METADATA_ID_EVENT { return 4001; };
+    if kind == ECS_METADATA_ID_RELATIONSHIP { return 5003; };
+    panic(32800);
+}
+
+fn ecs_metadata_identity_new(kind: i32, namespace_digest: i64, local_digest: i64, type_path_digest: i64) -> EcsMetadataIdentity {
+    let ns = ecs_metadata_identity_normalize_digest(namespace_digest);
+    let local = ecs_metadata_identity_normalize_digest(local_digest);
+    let path = ecs_metadata_identity_normalize_digest(type_path_digest);
+    let h0 = ecs_metadata_identity_kind_seed(kind);
+    let h1 = ecs_metadata_identity_mix(h0, ns);
+    let h2 = ecs_metadata_identity_mix(h1, local);
+    let h3 = ecs_metadata_identity_mix(h2, path);
+    let type_id = (kind as i64 * 2147480000) + h3;
+    return EcsMetadataIdentity { kind: kind, namespace_digest: ns, local_digest: local, type_path_digest: path, stable_type_id: type_id };
+}
+
+fn ecs_metadata_identity_component(namespace_digest: i64, local_digest: i64, type_path_digest: i64) -> EcsMetadataIdentity {
+    return ecs_metadata_identity_new(ECS_METADATA_ID_COMPONENT, namespace_digest, local_digest, type_path_digest);
+}
+
+fn ecs_metadata_identity_resource(namespace_digest: i64, local_digest: i64, type_path_digest: i64) -> EcsMetadataIdentity {
+    return ecs_metadata_identity_new(ECS_METADATA_ID_RESOURCE, namespace_digest, local_digest, type_path_digest);
+}
+
+fn ecs_metadata_identity_i32_type_id(identity: EcsMetadataIdentity) -> i32 {
+    let bounded = identity.stable_type_id % 2147480000;
+    if bounded <= 0 { return 1; };
+    return bounded as i32;
+}
+
+fn ecs_metadata_identity_same_source(left: EcsMetadataIdentity, right: EcsMetadataIdentity) -> bool {
+    if left.kind != right.kind { return false; };
+    if left.namespace_digest != right.namespace_digest { return false; };
+    if left.local_digest != right.local_digest { return false; };
+    if left.type_path_digest != right.type_path_digest { return false; };
+    return true;
+}
+
+fn ecs_metadata_identity_registry_new() -> EcsMetadataIdentityRegistry {
+    let identities: Vec<EcsMetadataIdentity> = Vec::new();
+    return EcsMetadataIdentityRegistry { identities: identities };
+}
+
+fn ecs_metadata_identity_registry_len(registry: EcsMetadataIdentityRegistry) -> i64 {
+    return len(registry.identities) as i64;
+}
+
+fn ecs_metadata_identity_registry_find_type_id(registry: EcsMetadataIdentityRegistry, stable_type_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(registry.identities) as i64;
+    while i < n {
+        if registry.identities[i].stable_type_id == stable_type_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_metadata_identity_register_result(registry: EcsMetadataIdentityRegistry, inserted: bool, duplicate: bool, collision: bool, existing_index: i64) -> EcsMetadataIdentityRegisterResult {
+    return EcsMetadataIdentityRegisterResult { registry: registry, inserted: inserted, duplicate: duplicate, collision: collision, existing_index: existing_index };
+}
+
+fn ecs_metadata_identity_registry_register(registry: EcsMetadataIdentityRegistry, identity: EcsMetadataIdentity) -> EcsMetadataIdentityRegisterResult {
+    let existing_index = ecs_metadata_identity_registry_find_type_id(registry, identity.stable_type_id);
+    if existing_index >= 0 {
+        let existing = registry.identities[existing_index];
+        if ecs_metadata_identity_same_source(existing, identity) {
+            return ecs_metadata_identity_register_result(registry, false, true, false, existing_index);
+        };
+        return ecs_metadata_identity_register_result(registry, false, false, true, existing_index);
+    };
+    registry.identities.push(identity);
+    return ecs_metadata_identity_register_result(registry, true, false, false, -1);
+}
+
+@test "metadata identity is stable for same explicit source digests"() {
+    let first = ecs_metadata_identity_component(17, 23, 31);
+    let second = ecs_metadata_identity_component(17, 23, 31);
+    if first.stable_type_id != second.stable_type_id { panic(32810); };
+    if ecs_metadata_identity_i32_type_id(first) <= 0 { panic(32811); };
+}
+
+@test "metadata identity kind separates equal type path digests"() {
+    let component = ecs_metadata_identity_component(17, 23, 31);
+    let resource = ecs_metadata_identity_resource(17, 23, 31);
+    if component.stable_type_id == resource.stable_type_id { panic(32820); };
+    if component.kind != ECS_METADATA_ID_COMPONENT { panic(32821); };
+    if resource.kind != ECS_METADATA_ID_RESOURCE { panic(32822); };
+}
+
+@test "metadata identity normalizes zero and negative digests"() {
+    let identity = ecs_metadata_identity_component(0, -5, 0);
+    if identity.namespace_digest != 1 { panic(32830); };
+    if identity.local_digest != 5 { panic(32831); };
+    if identity.type_path_digest != 1 { panic(32832); };
+}
+
+@test "metadata identity registry inserts unique identities"() {
+    let registry = ecs_metadata_identity_registry_new();
+    let identity = ecs_metadata_identity_component(1, 2, 3);
+    let result = ecs_metadata_identity_registry_register(registry, identity);
+    if result.inserted != true { panic(32840); };
+    if result.duplicate { panic(32841); };
+    if result.collision { panic(32842); };
+    if ecs_metadata_identity_registry_len(result.registry) != 1 { panic(32843); };
+}
+
+@test "metadata identity registry reports duplicate source"() {
+    let registry = ecs_metadata_identity_registry_new();
+    let identity = ecs_metadata_identity_component(4, 5, 6);
+    let first = ecs_metadata_identity_registry_register(registry, identity);
+    let second_identity = ecs_metadata_identity_component(4, 5, 6);
+    let second = ecs_metadata_identity_registry_register(first.registry, second_identity);
+    if second.inserted { panic(32850); };
+    if second.duplicate != true { panic(32851); };
+    if second.collision { panic(32852); };
+    if second.existing_index != 0 { panic(32853); };
+}
+
+@test "metadata identity registry reports id collision"() {
+    let registry = ecs_metadata_identity_registry_new();
+    let first = ecs_metadata_identity_component(7, 8, 9);
+    let second = ecs_metadata_identity_component(7, 8, 10);
+    second.stable_type_id = first.stable_type_id;
+    let inserted = ecs_metadata_identity_registry_register(registry, first);
+    let collision = ecs_metadata_identity_registry_register(inserted.registry, second);
+    if collision.inserted { panic(32860); };
+    if collision.duplicate { panic(32861); };
+    if collision.collision != true { panic(32862); };
+    if ecs_metadata_identity_registry_len(collision.registry) != 1 { panic(32863); };
+}

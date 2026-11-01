@@ -1,0 +1,178 @@
+// Bevy TaskPool::scope_with_executor_inner executor-driving model.
+//
+// Bevy selects one of four async drive loops depending on whether the scope
+// should tick the global task-pool executor and whether a distinct external
+// ThreadExecutor ticker exists. This module models that branch selection and
+// the observable tick accounting over explicit task counts, without pretending
+// to implement Rust Future/Waker scheduling.
+
+const ECS_SCOPE_EXECUTE_SCOPE: i32 = 0;
+const ECS_SCOPE_EXECUTE_GLOBAL_SCOPE: i32 = 1;
+const ECS_SCOPE_EXECUTE_EXTERNAL_SCOPE: i32 = 2;
+const ECS_SCOPE_EXECUTE_GLOBAL_EXTERNAL_SCOPE: i32 = 3;
+
+struct EcsScopeExecutorDriveInput {
+    worker_count: i64,
+    tick_task_pool_executor: bool,
+    use_external_executor: bool,
+    external_executor_is_scope: bool,
+    pool_scope_tasks: i64,
+    scope_executor_tasks: i64,
+    external_executor_tasks: i64,
+    unrelated_global_tasks: i64,
+    executor_panic_count: i64,
+}
+
+struct EcsScopeExecutorDriveResult {
+    branch: i32,
+    forced_pool_tick: bool,
+    external_ticker_available: bool,
+    ticked_pool_executor: bool,
+    ticked_scope_executor: bool,
+    ticked_external_executor: bool,
+    pool_scope_completed_by_scope_ticks: i64,
+    pool_scope_completed_by_workers: i64,
+    scope_tick_count: i64,
+    external_tick_count: i64,
+    global_scope_tick_count: i64,
+    unrelated_global_tick_count: i64,
+    worker_completion_count: i64,
+    executor_restart_count: i64,
+    latency_tick_count: i64,
+    completed_scope_tasks: i64,
+}
+
+fn ecs_scope_executor_drive_input(worker_count: i64, tick_task_pool_executor: bool, use_external_executor: bool, external_executor_is_scope: bool, pool_scope_tasks: i64, scope_executor_tasks: i64, external_executor_tasks: i64, unrelated_global_tasks: i64, executor_panic_count: i64) -> EcsScopeExecutorDriveInput {
+    let workers = worker_count;
+    if workers < 0 { workers = 0; };
+    let pool_tasks = pool_scope_tasks;
+    if pool_tasks < 0 { pool_tasks = 0; };
+    let scope_tasks = scope_executor_tasks;
+    if scope_tasks < 0 { scope_tasks = 0; };
+    let external_tasks = external_executor_tasks;
+    if external_tasks < 0 { external_tasks = 0; };
+    let unrelated_tasks = unrelated_global_tasks;
+    if unrelated_tasks < 0 { unrelated_tasks = 0; };
+    let panics = executor_panic_count;
+    if panics < 0 { panics = 0; };
+    return EcsScopeExecutorDriveInput { worker_count: workers, tick_task_pool_executor: tick_task_pool_executor, use_external_executor: use_external_executor, external_executor_is_scope: external_executor_is_scope, pool_scope_tasks: pool_tasks, scope_executor_tasks: scope_tasks, external_executor_tasks: external_tasks, unrelated_global_tasks: unrelated_tasks, executor_panic_count: panics };
+}
+
+fn ecs_scope_executor_drive_result(branch: i32, forced_pool_tick: bool, external_ticker_available: bool, ticked_pool_executor: bool, ticked_scope_executor: bool, ticked_external_executor: bool, pool_scope_completed_by_scope_ticks: i64, pool_scope_completed_by_workers: i64, scope_tick_count: i64, external_tick_count: i64, global_scope_tick_count: i64, unrelated_global_tick_count: i64, worker_completion_count: i64, executor_restart_count: i64, latency_tick_count: i64, completed_scope_tasks: i64) -> EcsScopeExecutorDriveResult {
+    return EcsScopeExecutorDriveResult { branch: branch, forced_pool_tick: forced_pool_tick, external_ticker_available: external_ticker_available, ticked_pool_executor: ticked_pool_executor, ticked_scope_executor: ticked_scope_executor, ticked_external_executor: ticked_external_executor, pool_scope_completed_by_scope_ticks: pool_scope_completed_by_scope_ticks, pool_scope_completed_by_workers: pool_scope_completed_by_workers, scope_tick_count: scope_tick_count, external_tick_count: external_tick_count, global_scope_tick_count: global_scope_tick_count, unrelated_global_tick_count: unrelated_global_tick_count, worker_completion_count: worker_completion_count, executor_restart_count: executor_restart_count, latency_tick_count: latency_tick_count, completed_scope_tasks: completed_scope_tasks };
+}
+
+fn ecs_scope_executor_drive_select_branch(external_ticker_available: bool, tick_pool_executor: bool) -> i32 {
+    if external_ticker_available {
+        if tick_pool_executor { return ECS_SCOPE_EXECUTE_GLOBAL_EXTERNAL_SCOPE; };
+        return ECS_SCOPE_EXECUTE_EXTERNAL_SCOPE;
+    };
+    if tick_pool_executor { return ECS_SCOPE_EXECUTE_GLOBAL_SCOPE; };
+    return ECS_SCOPE_EXECUTE_SCOPE;
+}
+
+fn ecs_scope_executor_drive(input: EcsScopeExecutorDriveInput) -> EcsScopeExecutorDriveResult {
+    let forced_pool_tick = input.worker_count == 0 && input.pool_scope_tasks > 0 && input.tick_task_pool_executor != true;
+    let tick_pool_executor = input.tick_task_pool_executor || forced_pool_tick;
+    let external_ticker_available = input.use_external_executor && input.external_executor_is_scope != true;
+    let branch = ecs_scope_executor_drive_select_branch(external_ticker_available, tick_pool_executor);
+
+    let scope_tick_count = input.scope_executor_tasks;
+    if external_ticker_available != true {
+        scope_tick_count = scope_tick_count + input.external_executor_tasks;
+    };
+    let external_tick_count: i64 = 0;
+    if external_ticker_available {
+        external_tick_count = input.external_executor_tasks;
+    };
+
+    let global_scope_tick_count: i64 = 0;
+    let unrelated_global_tick_count: i64 = 0;
+    let pool_scope_completed_by_scope_ticks: i64 = 0;
+    let pool_scope_completed_by_workers: i64 = 0;
+    let worker_completion_count: i64 = 0;
+    if tick_pool_executor {
+        global_scope_tick_count = input.pool_scope_tasks;
+        unrelated_global_tick_count = input.unrelated_global_tasks;
+        pool_scope_completed_by_scope_ticks = input.pool_scope_tasks;
+    } else {
+        pool_scope_completed_by_workers = input.pool_scope_tasks;
+        worker_completion_count = input.pool_scope_tasks;
+    };
+
+    let ticked_pool_executor = global_scope_tick_count > 0 || unrelated_global_tick_count > 0;
+    let ticked_scope_executor = scope_tick_count > 0;
+    let ticked_external_executor = external_tick_count > 0;
+    let executor_restart_count = input.executor_panic_count;
+    let latency_tick_count = scope_tick_count + external_tick_count + global_scope_tick_count + unrelated_global_tick_count;
+    let completed_scope_tasks = input.pool_scope_tasks + input.scope_executor_tasks + input.external_executor_tasks;
+
+    return ecs_scope_executor_drive_result(branch, forced_pool_tick, external_ticker_available, ticked_pool_executor, ticked_scope_executor, ticked_external_executor, pool_scope_completed_by_scope_ticks, pool_scope_completed_by_workers, scope_tick_count, external_tick_count, global_scope_tick_count, unrelated_global_tick_count, worker_completion_count, executor_restart_count, latency_tick_count, completed_scope_tasks);
+}
+
+@test "scope executor drive selects execute scope without external or global ticking"() {
+    let input = ecs_scope_executor_drive_input(4, false, false, true, 2, 1, 0, 5, 0);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.branch != ECS_SCOPE_EXECUTE_SCOPE { panic(32210); };
+    if drive.ticked_pool_executor { panic(32211); };
+    if drive.worker_completion_count != 2 { panic(32212); };
+    if drive.scope_tick_count != 1 { panic(32213); };
+    if drive.unrelated_global_tick_count != 0 { panic(32214); };
+}
+
+@test "scope executor drive selects global scope and records unrelated delay"() {
+    let input = ecs_scope_executor_drive_input(4, true, false, true, 2, 1, 0, 3, 0);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.branch != ECS_SCOPE_EXECUTE_GLOBAL_SCOPE { panic(32220); };
+    if drive.ticked_pool_executor != true { panic(32221); };
+    if drive.global_scope_tick_count != 2 { panic(32222); };
+    if drive.unrelated_global_tick_count != 3 { panic(32223); };
+    if drive.latency_tick_count != 6 { panic(32224); };
+}
+
+@test "scope executor drive selects external scope when global ticking is disabled"() {
+    let input = ecs_scope_executor_drive_input(4, false, true, false, 2, 1, 3, 7, 0);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.branch != ECS_SCOPE_EXECUTE_EXTERNAL_SCOPE { panic(32230); };
+    if drive.external_ticker_available != true { panic(32231); };
+    if drive.external_tick_count != 3 { panic(32232); };
+    if drive.scope_tick_count != 1 { panic(32233); };
+    if drive.worker_completion_count != 2 { panic(32234); };
+    if drive.unrelated_global_tick_count != 0 { panic(32235); };
+}
+
+@test "scope executor drive selects global external scope"() {
+    let input = ecs_scope_executor_drive_input(4, true, true, false, 2, 1, 3, 4, 0);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.branch != ECS_SCOPE_EXECUTE_GLOBAL_EXTERNAL_SCOPE { panic(32240); };
+    if drive.ticked_pool_executor != true { panic(32241); };
+    if drive.ticked_external_executor != true { panic(32242); };
+    if drive.global_scope_tick_count != 2 { panic(32243); };
+    if drive.external_tick_count != 3 { panic(32244); };
+    if drive.latency_tick_count != 10 { panic(32245); };
+}
+
+@test "scope executor drive forces pool tick when worker pool is empty"() {
+    let input = ecs_scope_executor_drive_input(0, false, false, true, 2, 1, 0, 1, 0);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.forced_pool_tick != true { panic(32250); };
+    if drive.branch != ECS_SCOPE_EXECUTE_GLOBAL_SCOPE { panic(32251); };
+    if drive.pool_scope_completed_by_scope_ticks != 2 { panic(32252); };
+    if drive.pool_scope_completed_by_workers != 0 { panic(32253); };
+}
+
+@test "scope executor drive does not double tick identical external executor"() {
+    let input = ecs_scope_executor_drive_input(4, false, true, true, 0, 1, 2, 0, 0);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.branch != ECS_SCOPE_EXECUTE_SCOPE { panic(32260); };
+    if drive.external_ticker_available { panic(32261); };
+    if drive.ticked_external_executor { panic(32262); };
+    if drive.scope_tick_count != 3 { panic(32263); };
+}
+
+@test "scope executor drive records executor panic restarts"() {
+    let input = ecs_scope_executor_drive_input(4, true, true, false, 1, 1, 1, 0, 2);
+    let drive = ecs_scope_executor_drive(input);
+    if drive.executor_restart_count != 2 { panic(32270); };
+    if drive.completed_scope_tasks != 3 { panic(32271); };
+}

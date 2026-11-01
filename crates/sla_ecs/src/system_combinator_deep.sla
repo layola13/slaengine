@@ -1,0 +1,621 @@
+// Deepened Bevy ECS system::combinator surface.
+// Mirrors src/system/combinator.rs CombinatorSystem + PipeSystem System impls:
+// flags OR, access merge (+ FallbackErrorHandler read), Failed vs Skipped handling,
+// apply_deferred/queue_deferred both, default_system_sets merge, last_run from A,
+// PipeSystem A->B value piping, clone requires re-initialize.
+// Shallow lib/system_combinator.sla keeps simple marker-id combine helpers.
+
+// === RunSystemError (combinator-relevant variants) ===
+// Bevy: Ok(T) | Err(Failed(_)) | Err(Skipped(_))
+// Failed is intercepted by CombinatorSystem and handed to the world error handler,
+// then replaced with a new Failed message. Skipped and Ok pass through.
+const ECS_RUN_OK: i32 = 0;
+const ECS_RUN_FAILED: i32 = 1;
+const ECS_RUN_SKIPPED: i32 = 2;
+
+struct EcsRunResult {
+    kind: i32,
+    value: i64,
+    // Failed payload (error code) when kind == FAILED
+    fail_code: i64,
+}
+
+fn ecs_run_ok(value: i64) -> EcsRunResult {
+    return EcsRunResult { kind: ECS_RUN_OK, value: value, fail_code: 0 };
+}
+
+fn ecs_run_failed(fail_code: i64) -> EcsRunResult {
+    return EcsRunResult { kind: ECS_RUN_FAILED, value: 0, fail_code: fail_code };
+}
+
+fn ecs_run_skipped() -> EcsRunResult {
+    return EcsRunResult { kind: ECS_RUN_SKIPPED, value: 0, fail_code: 0 };
+}
+
+fn ecs_run_is_ok(r: EcsRunResult) -> bool { return r.kind == ECS_RUN_OK; }
+fn ecs_run_is_failed(r: EcsRunResult) -> bool { return r.kind == ECS_RUN_FAILED; }
+fn ecs_run_is_skipped(r: EcsRunResult) -> bool { return r.kind == ECS_RUN_SKIPPED; }
+fn ecs_run_value(r: EcsRunResult) -> i64 { return r.value; }
+fn ecs_run_fail_code(r: EcsRunResult) -> i64 { return r.fail_code; }
+
+// === SystemStateFlags bits (subset used by combinators) ===
+const ECS_SYS_FLAG_NONE: i32 = 0;
+const ECS_SYS_FLAG_EXCLUSIVE: i32 = 1;
+const ECS_SYS_FLAG_DEFERRED: i32 = 2;
+const ECS_SYS_FLAG_SEND: i32 = 4;
+
+fn ecs_sys_flags_or(a: i32, b: i32) -> i32 {
+    return a | b;
+}
+
+fn ecs_sys_flags_has_exclusive(f: i32) -> bool {
+    return (f & ECS_SYS_FLAG_EXCLUSIVE) != 0;
+}
+
+// === Inner system stub ===
+struct EcsInnerSystem {
+    id: i64,
+    name_id: i64,
+    flags: i32,
+    // access components/resources read/write as id lists
+    access_reads: Vec<i64>,
+    access_writes: Vec<i64>,
+    // default system set ids
+    default_sets: Vec<i64>,
+    last_run: i64,
+    // deferred buffer count (apply clears)
+    deferred_count: i64,
+    // initialized access flag
+    access_initialized: bool,
+    // is_read_only
+    read_only: bool,
+}
+
+fn ecs_inner_system_new(id: i64, name_id: i64, flags: i32, read_only: bool) -> EcsInnerSystem {
+    return EcsInnerSystem {
+        id: id,
+        name_id: name_id,
+        flags: flags,
+        access_reads: Vec::new(),
+        access_writes: Vec::new(),
+        default_sets: Vec::new(),
+        last_run: 0,
+        deferred_count: 0,
+        access_initialized: false,
+        read_only: read_only,
+    };
+}
+
+fn ecs_inner_system_add_read(s: EcsInnerSystem, id: i64) -> EcsInnerSystem {
+    s.access_reads.push(id);
+    return s;
+}
+
+fn ecs_inner_system_add_write(s: EcsInnerSystem, id: i64) -> EcsInnerSystem {
+    s.access_writes.push(id);
+    return s;
+}
+
+fn ecs_inner_system_add_default_set(s: EcsInnerSystem, set_id: i64) -> EcsInnerSystem {
+    s.default_sets.push(set_id);
+    return s;
+}
+
+fn ecs_inner_system_queue_deferred(s: EcsInnerSystem, n: i64) -> EcsInnerSystem {
+    s.deferred_count = s.deferred_count + n;
+    return s;
+}
+
+fn ecs_inner_system_apply_deferred(s: EcsInnerSystem) -> EcsInnerSystem {
+    s.deferred_count = 0;
+    return s;
+}
+
+fn ecs_inner_system_initialize(s: EcsInnerSystem) -> EcsInnerSystem {
+    s.access_initialized = true;
+    return s;
+}
+
+fn ecs_inner_system_set_last_run(s: EcsInnerSystem, tick: i64) -> EcsInnerSystem {
+    s.last_run = tick;
+    return s;
+}
+
+fn ecs_inner_system_flags(s: EcsInnerSystem) -> i32 { return s.flags; }
+fn ecs_inner_system_last_run(s: EcsInnerSystem) -> i64 { return s.last_run; }
+fn ecs_inner_system_deferred_count(s: EcsInnerSystem) -> i64 { return s.deferred_count; }
+fn ecs_inner_system_access_initialized(s: EcsInnerSystem) -> bool { return s.access_initialized; }
+fn ecs_inner_system_is_read_only(s: EcsInnerSystem) -> bool { return s.read_only; }
+fn ecs_inner_system_name_id(s: EcsInnerSystem) -> i64 { return s.name_id; }
+
+// === Access set merge (FilteredAccessSet::extend) ===
+struct EcsAccessSetDeep {
+    reads: Vec<i64>,
+    writes: Vec<i64>,
+    // Bevy combinator also adds FallbackErrorHandler resource read
+    has_fallback_handler_read: bool,
+}
+
+fn ecs_access_set_deep_new() -> EcsAccessSetDeep {
+    return EcsAccessSetDeep {
+        reads: Vec::new(),
+        writes: Vec::new(),
+        has_fallback_handler_read: false,
+    };
+}
+
+fn ecs_access_set_deep_from_inner(s: EcsInnerSystem) -> EcsAccessSetDeep {
+    return EcsAccessSetDeep {
+        reads: s.access_reads,
+        writes: s.access_writes,
+        has_fallback_handler_read: false,
+    };
+}
+
+fn ecs_vec_contains_i64(v: Vec<i64>, x: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_access_set_deep_extend(a: EcsAccessSetDeep, b: EcsAccessSetDeep) -> EcsAccessSetDeep {
+    let i: i64 = 0;
+    let nr: i64 = len(b.reads) as i64;
+    while i < nr {
+        if ecs_vec_contains_i64(a.reads, b.reads[i]) != true {
+            a.reads.push(b.reads[i]);
+        };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let nw: i64 = len(b.writes) as i64;
+    while j < nw {
+        if ecs_vec_contains_i64(a.writes, b.writes[j]) != true {
+            a.writes.push(b.writes[j]);
+        };
+        j = j + 1;
+    }
+    if b.has_fallback_handler_read {
+        a.has_fallback_handler_read = true;
+    };
+    return a;
+}
+
+fn ecs_access_set_deep_add_fallback_handler_read(a: EcsAccessSetDeep) -> EcsAccessSetDeep {
+    a.has_fallback_handler_read = true;
+    return a;
+}
+
+fn ecs_access_set_deep_read_count(a: EcsAccessSetDeep) -> i64 { return len(a.reads) as i64; }
+fn ecs_access_set_deep_write_count(a: EcsAccessSetDeep) -> i64 { return len(a.writes) as i64; }
+fn ecs_access_set_deep_has_fallback_handler_read(a: EcsAccessSetDeep) -> bool {
+    return a.has_fallback_handler_read;
+}
+
+// === Error handler counter (FallbackErrorHandler call) ===
+struct EcsErrorHandlerState {
+    handled_count: i64,
+    last_system_name: i64,
+    last_fail_code: i64,
+}
+
+fn ecs_error_handler_new() -> EcsErrorHandlerState {
+    return EcsErrorHandlerState {
+        handled_count: 0,
+        last_system_name: -1,
+        last_fail_code: 0,
+    };
+}
+
+fn ecs_error_handler_handle(h: EcsErrorHandlerState, system_name: i64, fail_code: i64) -> EcsErrorHandlerState {
+    h.handled_count = h.handled_count + 1;
+    h.last_system_name = system_name;
+    h.last_fail_code = fail_code;
+    return h;
+}
+
+fn ecs_error_handler_count(h: EcsErrorHandlerState) -> i64 { return h.handled_count; }
+fn ecs_error_handler_last_name(h: EcsErrorHandlerState) -> i64 { return h.last_system_name; }
+
+// CombinatorSystem intercepts Failed: handler runs, result becomes Failed with new code.
+// Skipped and Ok pass through.
+// Returns (handled_result, updated_handler)
+fn ecs_combinator_intercept_run(
+    result: EcsRunResult,
+    system_name: i64,
+    handler: EcsErrorHandlerState
+) -> (EcsRunResult, EcsErrorHandlerState) {
+    if ecs_run_is_failed(result) {
+        handler = ecs_error_handler_handle(handler, system_name, result.fail_code);
+        // original error consumed; new Failed message (fail_code = -1 sentinel "already handled")
+        return (ecs_run_failed(-1), handler);
+    };
+    return (result, handler);
+}
+
+// === Combine markers ===
+// 0 = Pipe-like (out = b if a ok... actually combine decides invocation)
+// For CombinatorSystem.combine we model:
+//   AND_THEN: run a; if ok(true/nonzero) run b; else return a (or false)
+//   OR_ELSE: run a; if ok(false/zero) or failed-as-false run b
+//   MAP_SUM: always run both, sum ok values (failed -> 0)
+//   XOR: always run both, xor nonzero
+const ECS_COMBINE_AND_THEN: i32 = 1;
+const ECS_COMBINE_OR_ELSE: i32 = 2;
+const ECS_COMBINE_MAP_SUM: i32 = 3;
+const ECS_COMBINE_XOR: i32 = 4;
+
+// Evaluation with invocation tracking
+struct EcsCombineEval {
+    result: EcsRunResult,
+    a_ran: bool,
+    b_ran: bool,
+    handler: EcsErrorHandlerState,
+}
+
+fn ecs_combine_eval_result(e: EcsCombineEval) -> EcsRunResult { return e.result; }
+fn ecs_combine_eval_a_ran(e: EcsCombineEval) -> bool { return e.a_ran; }
+fn ecs_combine_eval_b_ran(e: EcsCombineEval) -> bool { return e.b_ran; }
+fn ecs_combine_eval_handler(e: EcsCombineEval) -> EcsErrorHandlerState { return e.handler; }
+
+// Run A then maybe B under combinator semantics. Each arm goes through intercept.
+fn ecs_combinator_combine(
+    marker: i32,
+    a_name: i64,
+    b_name: i64,
+    a_raw: EcsRunResult,
+    b_raw: EcsRunResult,
+    handler: EcsErrorHandlerState
+) -> EcsCombineEval {
+    let a_int = ecs_combinator_intercept_run(a_raw, a_name, handler);
+    let a_res = a_int.0;
+    let handler2 = a_int.1;
+
+    if marker == ECS_COMBINE_AND_THEN {
+        // short-circuit: only run B if A is Ok and truthy (nonzero)
+        if ecs_run_is_ok(a_res) && a_res.value != 0 {
+            let b_int = ecs_combinator_intercept_run(b_raw, b_name, handler2);
+            return EcsCombineEval {
+                result: b_int.0,
+                a_ran: true,
+                b_ran: true,
+                handler: b_int.1,
+            };
+        };
+        // A failed/skipped/false: return A (after intercept)
+        return EcsCombineEval { result: a_res, a_ran: true, b_ran: false, handler: handler2 };
+    };
+
+    if marker == ECS_COMBINE_OR_ELSE {
+        // run B if A is not Ok-truthy
+        if ecs_run_is_ok(a_res) && a_res.value != 0 {
+            return EcsCombineEval { result: a_res, a_ran: true, b_ran: false, handler: handler2 };
+        };
+        let b_int = ecs_combinator_intercept_run(b_raw, b_name, handler2);
+        return EcsCombineEval {
+            result: b_int.0,
+            a_ran: true,
+            b_ran: true,
+            handler: b_int.1,
+        };
+    };
+
+    // MAP_SUM / XOR: always run both
+    let b_int = ecs_combinator_intercept_run(b_raw, b_name, handler2);
+    let b_res = b_int.0;
+    let handler3 = b_int.1;
+
+    if marker == ECS_COMBINE_MAP_SUM {
+        let av = 0;
+        let bv = 0;
+        if ecs_run_is_ok(a_res) { av = a_res.value; };
+        if ecs_run_is_ok(b_res) { bv = b_res.value; };
+        return EcsCombineEval {
+            result: ecs_run_ok(av + bv),
+            a_ran: true,
+            b_ran: true,
+            handler: handler3,
+        };
+    };
+
+    if marker == ECS_COMBINE_XOR {
+        let at = false;
+        let bt = false;
+        if ecs_run_is_ok(a_res) && a_res.value != 0 { at = true; };
+        if ecs_run_is_ok(b_res) && b_res.value != 0 { bt = true; };
+        let out = 0;
+        if at != bt { out = 1; };
+        return EcsCombineEval {
+            result: ecs_run_ok(out),
+            a_ran: true,
+            b_ran: true,
+            handler: handler3,
+        };
+    };
+
+    return EcsCombineEval { result: a_res, a_ran: true, b_ran: false, handler: handler3 };
+}
+
+// === CombinatorSystem deep ===
+struct EcsCombinatorSystemDeep {
+    marker: i32,
+    a: EcsInnerSystem,
+    b: EcsInnerSystem,
+    name_id: i64,
+    access: EcsAccessSetDeep,
+    access_initialized: bool,
+}
+
+fn ecs_combinator_system_deep_new(
+    marker: i32,
+    a: EcsInnerSystem,
+    b: EcsInnerSystem,
+    name_id: i64
+) -> EcsCombinatorSystemDeep {
+    return EcsCombinatorSystemDeep {
+        marker: marker,
+        a: a,
+        b: b,
+        name_id: name_id,
+        access: ecs_access_set_deep_new(),
+        access_initialized: false,
+    };
+}
+
+fn ecs_combinator_system_deep_name(c: EcsCombinatorSystemDeep) -> i64 { return c.name_id; }
+fn ecs_combinator_system_deep_marker(c: EcsCombinatorSystemDeep) -> i32 { return c.marker; }
+
+// flags = a.flags | b.flags
+fn ecs_combinator_system_deep_flags(c: EcsCombinatorSystemDeep) -> i32 {
+    return ecs_sys_flags_or(c.a.flags, c.b.flags);
+}
+
+// initialize: init both, extend access, add FallbackErrorHandler read
+fn ecs_combinator_system_deep_initialize(c: EcsCombinatorSystemDeep) -> EcsCombinatorSystemDeep {
+    c.a = ecs_inner_system_initialize(c.a);
+    c.b = ecs_inner_system_initialize(c.b);
+    let acc = ecs_access_set_deep_from_inner(c.a);
+    acc = ecs_access_set_deep_extend(acc, ecs_access_set_deep_from_inner(c.b));
+    acc = ecs_access_set_deep_add_fallback_handler_read(acc);
+    c.access = acc;
+    c.access_initialized = true;
+    return c;
+}
+
+fn ecs_combinator_system_deep_access_initialized(c: EcsCombinatorSystemDeep) -> bool {
+    return c.access_initialized;
+}
+
+fn ecs_combinator_system_deep_access(c: EcsCombinatorSystemDeep) -> EcsAccessSetDeep {
+    return c.access;
+}
+
+// apply_deferred both
+fn ecs_combinator_system_deep_apply_deferred(c: EcsCombinatorSystemDeep) -> EcsCombinatorSystemDeep {
+    c.a = ecs_inner_system_apply_deferred(c.a);
+    c.b = ecs_inner_system_apply_deferred(c.b);
+    return c;
+}
+
+// queue_deferred both
+fn ecs_combinator_system_deep_queue_deferred(c: EcsCombinatorSystemDeep, a_n: i64, b_n: i64) -> EcsCombinatorSystemDeep {
+    c.a = ecs_inner_system_queue_deferred(c.a, a_n);
+    c.b = ecs_inner_system_queue_deferred(c.b, b_n);
+    return c;
+}
+
+// default_system_sets: a then append b
+fn ecs_combinator_system_deep_default_system_sets(c: EcsCombinatorSystemDeep) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let na: i64 = len(c.a.default_sets) as i64;
+    while i < na {
+        out.push(c.a.default_sets[i]);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let nb: i64 = len(c.b.default_sets) as i64;
+    while j < nb {
+        out.push(c.b.default_sets[j]);
+        j = j + 1;
+    }
+    return out;
+}
+
+// get_last_run from A only
+fn ecs_combinator_system_deep_get_last_run(c: EcsCombinatorSystemDeep) -> i64 {
+    return c.a.last_run;
+}
+
+// set_last_run both
+fn ecs_combinator_system_deep_set_last_run(c: EcsCombinatorSystemDeep, tick: i64) -> EcsCombinatorSystemDeep {
+    c.a = ecs_inner_system_set_last_run(c.a, tick);
+    c.b = ecs_inner_system_set_last_run(c.b, tick);
+    return c;
+}
+
+// check_change_tick both (model as touch last_run check counter via flags no-op; just returns c)
+fn ecs_combinator_system_deep_check_change_tick(c: EcsCombinatorSystemDeep) -> EcsCombinatorSystemDeep {
+    return c;
+}
+
+// is_read_only: both read_only
+fn ecs_combinator_system_deep_is_read_only(c: EcsCombinatorSystemDeep) -> bool {
+    return c.a.read_only && c.b.read_only;
+}
+
+// clone: copy, access_initialized = false (must re-initialize)
+fn ecs_combinator_system_deep_clone(c: EcsCombinatorSystemDeep) -> EcsCombinatorSystemDeep {
+    let out = c;
+    out.access_initialized = false;
+    out.access = ecs_access_set_deep_new();
+    out.a.access_initialized = false;
+    out.b.access_initialized = false;
+    return out;
+}
+
+// run: combine with intercept
+fn ecs_combinator_system_deep_run(
+    c: EcsCombinatorSystemDeep,
+    a_raw: EcsRunResult,
+    b_raw: EcsRunResult,
+    handler: EcsErrorHandlerState
+) -> (EcsCombinatorSystemDeep, EcsCombineEval) {
+    let eval = ecs_combinator_combine(
+        c.marker,
+        c.a.name_id,
+        c.b.name_id,
+        a_raw,
+        b_raw,
+        handler
+    );
+    return (c, eval);
+}
+
+// === PipeSystem deep ===
+// A runs first; on Ok, value feeds B; on Failed/Skipped, short-circuit (no B)
+struct EcsPipeSystemDeep {
+    a: EcsInnerSystem,
+    b: EcsInnerSystem,
+    name_id: i64,
+    access: EcsAccessSetDeep,
+    access_initialized: bool,
+}
+
+fn ecs_pipe_system_deep_new(a: EcsInnerSystem, b: EcsInnerSystem, name_id: i64) -> EcsPipeSystemDeep {
+    return EcsPipeSystemDeep {
+        a: a,
+        b: b,
+        name_id: name_id,
+        access: ecs_access_set_deep_new(),
+        access_initialized: false,
+    };
+}
+
+// IntoPipeSystem name format proxy: "Pipe(A, B)" as name_id composite
+fn ecs_into_pipe_system_deep_name(a_name: i64, b_name: i64) -> i64 {
+    // stable hash-like combine for tests
+    return a_name * 100000 + b_name;
+}
+
+fn ecs_pipe_system_deep_flags(p: EcsPipeSystemDeep) -> i32 {
+    return ecs_sys_flags_or(p.a.flags, p.b.flags);
+}
+
+fn ecs_pipe_system_deep_initialize(p: EcsPipeSystemDeep) -> EcsPipeSystemDeep {
+    p.a = ecs_inner_system_initialize(p.a);
+    p.b = ecs_inner_system_initialize(p.b);
+    let acc = ecs_access_set_deep_from_inner(p.a);
+    acc = ecs_access_set_deep_extend(acc, ecs_access_set_deep_from_inner(p.b));
+    // PipeSystem does NOT add FallbackErrorHandler read (only CombinatorSystem does)
+    p.access = acc;
+    p.access_initialized = true;
+    return p;
+}
+
+fn ecs_pipe_system_deep_access_initialized(p: EcsPipeSystemDeep) -> bool {
+    return p.access_initialized;
+}
+
+fn ecs_pipe_system_deep_access(p: EcsPipeSystemDeep) -> EcsAccessSetDeep {
+    return p.access;
+}
+
+fn ecs_pipe_system_deep_apply_deferred(p: EcsPipeSystemDeep) -> EcsPipeSystemDeep {
+    p.a = ecs_inner_system_apply_deferred(p.a);
+    p.b = ecs_inner_system_apply_deferred(p.b);
+    return p;
+}
+
+fn ecs_pipe_system_deep_queue_deferred(p: EcsPipeSystemDeep, a_n: i64, b_n: i64) -> EcsPipeSystemDeep {
+    p.a = ecs_inner_system_queue_deferred(p.a, a_n);
+    p.b = ecs_inner_system_queue_deferred(p.b, b_n);
+    return p;
+}
+
+fn ecs_pipe_system_deep_default_system_sets(p: EcsPipeSystemDeep) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let na: i64 = len(p.a.default_sets) as i64;
+    while i < na {
+        out.push(p.a.default_sets[i]);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let nb: i64 = len(p.b.default_sets) as i64;
+    while j < nb {
+        out.push(p.b.default_sets[j]);
+        j = j + 1;
+    }
+    return out;
+}
+
+fn ecs_pipe_system_deep_get_last_run(p: EcsPipeSystemDeep) -> i64 {
+    return p.a.last_run;
+}
+
+fn ecs_pipe_system_deep_set_last_run(p: EcsPipeSystemDeep, tick: i64) -> EcsPipeSystemDeep {
+    p.a = ecs_inner_system_set_last_run(p.a, tick);
+    p.b = ecs_inner_system_set_last_run(p.b, tick);
+    return p;
+}
+
+fn ecs_pipe_system_deep_is_read_only(p: EcsPipeSystemDeep) -> bool {
+    return p.a.read_only && p.b.read_only;
+}
+
+// Pipe run: A then B with A's Ok value as B input context.
+// Returns (pipe, result, a_ran, b_ran, piped_value)
+struct EcsPipeEval {
+    result: EcsRunResult,
+    a_ran: bool,
+    b_ran: bool,
+    piped_value: i64,
+}
+
+fn ecs_pipe_eval_result(e: EcsPipeEval) -> EcsRunResult { return e.result; }
+fn ecs_pipe_eval_a_ran(e: EcsPipeEval) -> bool { return e.a_ran; }
+fn ecs_pipe_eval_b_ran(e: EcsPipeEval) -> bool { return e.b_ran; }
+fn ecs_pipe_eval_piped_value(e: EcsPipeEval) -> i64 { return e.piped_value; }
+
+// a_raw is A's result; b_raw_for_value is B's result when given piped value (caller supplies).
+// If A is not Ok, B does not run and piped_value is 0.
+fn ecs_pipe_system_deep_run(
+    p: EcsPipeSystemDeep,
+    a_raw: EcsRunResult,
+    b_raw_if_ok: EcsRunResult
+) -> (EcsPipeSystemDeep, EcsPipeEval) {
+    if ecs_run_is_ok(a_raw) != true {
+        return (p, EcsPipeEval {
+            result: a_raw,
+            a_ran: true,
+            b_ran: false,
+            piped_value: 0,
+        });
+    };
+    // pipe value = A.out into B
+    return (p, EcsPipeEval {
+        result: b_raw_if_ok,
+        a_ran: true,
+        b_ran: true,
+        piped_value: a_raw.value,
+    });
+}
+
+// exclusive piping is possible: exclusive flag on A does not block pipe construction
+fn ecs_pipe_system_deep_allows_exclusive(p: EcsPipeSystemDeep) -> bool {
+    // Bevy test exclusive_system_piping_is_possible — always allowed if types match
+    return true;
+}
+
+// assert_system_does_not_conflict proxy for combinator with itself:
+// has_fallback_handler_read must not introduce write conflict with self
+fn ecs_combinator_assert_no_self_conflict(c: EcsCombinatorSystemDeep) -> bool {
+    if c.access_initialized != true { return false; };
+    // read-only fallback handler => no self write conflict
+    return c.access.has_fallback_handler_read;
+}

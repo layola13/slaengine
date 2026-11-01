@@ -1,0 +1,423 @@
+// Deepened Bevy ECS event module surface (src/event/mod.rs).
+// Models:
+//   Event metadata: trigger_kind (Global / Entity / Propagate)
+//   EntityEvent: event_target field + SetEntityEventTarget
+//   EventKey: ComponentId-typed wrapper, new/from ComponentId
+//   World register_event_key / event_key (idempotent ComponentId allocation)
+//   Event type registration table + default trigger selection
+//   EntityEvent derive options: propagate, auto_propagate, traversal kind
+//   World::trigger facade selecting Global vs Entity vs Propagate path
+// Shallow lib/event_mod.sla retained. Pairs with event_trigger_deep for dispatch.
+
+// Trigger kinds used as Event::Trigger stand-ins
+const ECS_EM_TRIG_GLOBAL: i32 = 0;
+const ECS_EM_TRIG_ENTITY: i32 = 1;
+const ECS_EM_TRIG_PROPAGATE: i32 = 2;
+
+// Traversal kinds for propagate
+const ECS_EM_TRAV_CHILD_OF: i32 = 0; // default ChildOf / parent
+const ECS_EM_TRAV_CUSTOM: i32 = 1;
+
+// === EventKey ===
+struct EcsEventKeyDeep {
+    component_id: i32,
+}
+
+fn ecs_em_key_new(component_id: i32) -> EcsEventKeyDeep {
+    return EcsEventKeyDeep { component_id: component_id };
+}
+
+fn ecs_em_key_component_id(k: EcsEventKeyDeep) -> i32 { return k.component_id; }
+
+fn ecs_em_key_eq(a: EcsEventKeyDeep, b: EcsEventKeyDeep) -> bool {
+    return a.component_id == b.component_id;
+}
+
+// === Event type descriptor (derived Event / EntityEvent options) ===
+struct EcsEventTypeDeep {
+    type_id: i64,
+    name_id: i64,
+    // Event::Trigger kind
+    trigger_kind: i32,
+    // EntityEvent options
+    is_entity_event: bool,
+    // field that holds target: 0 = entity field, 1 = event_target attr, 2 = tuple first
+    target_field_kind: i32,
+    propagate_enabled: bool,
+    auto_propagate: bool,
+    traversal_kind: i32,
+    // mutable target requires SetEntityEventTarget (true when propagate)
+    set_target_enabled: bool,
+}
+
+fn ecs_em_event_global(type_id: i64, name_id: i64) -> EcsEventTypeDeep {
+    return EcsEventTypeDeep {
+        type_id: type_id,
+        name_id: name_id,
+        trigger_kind: ECS_EM_TRIG_GLOBAL,
+        is_entity_event: false,
+        target_field_kind: 0,
+        propagate_enabled: false,
+        auto_propagate: false,
+        traversal_kind: ECS_EM_TRAV_CHILD_OF,
+        set_target_enabled: false,
+    };
+}
+
+fn ecs_em_entity_event(type_id: i64, name_id: i64) -> EcsEventTypeDeep {
+    return EcsEventTypeDeep {
+        type_id: type_id,
+        name_id: name_id,
+        trigger_kind: ECS_EM_TRIG_ENTITY,
+        is_entity_event: true,
+        target_field_kind: 0,
+        propagate_enabled: false,
+        auto_propagate: false,
+        traversal_kind: ECS_EM_TRAV_CHILD_OF,
+        set_target_enabled: false,
+    };
+}
+
+// #[entity_event(propagate)]
+fn ecs_em_entity_event_propagate(type_id: i64, name_id: i64) -> EcsEventTypeDeep {
+    let e = ecs_em_entity_event(type_id, name_id);
+    e.trigger_kind = ECS_EM_TRIG_PROPAGATE;
+    e.propagate_enabled = true;
+    e.set_target_enabled = true;
+    e.auto_propagate = false;
+    return e;
+}
+
+// #[entity_event(propagate, auto_propagate)]
+fn ecs_em_entity_event_auto_propagate(type_id: i64, name_id: i64) -> EcsEventTypeDeep {
+    let e = ecs_em_entity_event_propagate(type_id, name_id);
+    e.auto_propagate = true;
+    return e;
+}
+
+// custom traversal marker
+fn ecs_em_entity_event_propagate_custom(type_id: i64, name_id: i64) -> EcsEventTypeDeep {
+    let e = ecs_em_entity_event_propagate(type_id, name_id);
+    e.traversal_kind = ECS_EM_TRAV_CUSTOM;
+    return e;
+}
+
+fn ecs_em_with_target_field(e: EcsEventTypeDeep, kind: i32) -> EcsEventTypeDeep {
+    e.target_field_kind = kind;
+    return e;
+}
+
+fn ecs_em_type_id(e: EcsEventTypeDeep) -> i64 { return e.type_id; }
+fn ecs_em_name_id(e: EcsEventTypeDeep) -> i64 { return e.name_id; }
+fn ecs_em_trigger_kind(e: EcsEventTypeDeep) -> i32 { return e.trigger_kind; }
+fn ecs_em_is_entity_event(e: EcsEventTypeDeep) -> bool { return e.is_entity_event; }
+fn ecs_em_propagate_enabled(e: EcsEventTypeDeep) -> bool { return e.propagate_enabled; }
+fn ecs_em_auto_propagate(e: EcsEventTypeDeep) -> bool { return e.auto_propagate; }
+fn ecs_em_set_target_enabled(e: EcsEventTypeDeep) -> bool { return e.set_target_enabled; }
+fn ecs_em_traversal_kind(e: EcsEventTypeDeep) -> i32 { return e.traversal_kind; }
+fn ecs_em_target_field_kind(e: EcsEventTypeDeep) -> i32 { return e.target_field_kind; }
+
+// === Event instance ===
+struct EcsEventInstanceDeep {
+    type_id: i64,
+    value: i64,
+    target: i64,
+    // observer can flip propagate via On::propagate
+    propagate_flag: bool,
+}
+
+fn ecs_em_instance_global(type_id: i64, value: i64) -> EcsEventInstanceDeep {
+    return EcsEventInstanceDeep {
+        type_id: type_id,
+        value: value,
+        target: 0,
+        propagate_flag: false,
+    };
+}
+
+fn ecs_em_instance_entity(type_id: i64, value: i64, target: i64) -> EcsEventInstanceDeep {
+    return EcsEventInstanceDeep {
+        type_id: type_id,
+        value: value,
+        target: target,
+        propagate_flag: false,
+    };
+}
+
+fn ecs_em_instance_value(e: EcsEventInstanceDeep) -> i64 { return e.value; }
+fn ecs_em_instance_target(e: EcsEventInstanceDeep) -> i64 { return e.target; }
+fn ecs_em_instance_type(e: EcsEventInstanceDeep) -> i64 { return e.type_id; }
+
+// EntityEvent::event_target
+fn ecs_em_event_target(e: EcsEventInstanceDeep) -> i64 { return e.target; }
+
+// SetEntityEventTarget::set_event_target
+fn ecs_em_set_event_target(e: EcsEventInstanceDeep, target: i64) -> EcsEventInstanceDeep {
+    e.target = target;
+    return e;
+}
+
+// On::propagate(true/false) stand-in on instance
+fn ecs_em_instance_propagate(e: EcsEventInstanceDeep, should: bool) -> EcsEventInstanceDeep {
+    e.propagate_flag = should;
+    return e;
+}
+
+fn ecs_em_instance_get_propagate(e: EcsEventInstanceDeep) -> bool { return e.propagate_flag; }
+
+// === World event registry ===
+struct EcsEventWorldDeep {
+    // type_id slots
+    t0: i64, t1: i64, t2: i64, t3: i64,
+    t4: i64, t5: i64, t6: i64, t7: i64,
+    // component ids
+    c0: i32, c1: i32, c2: i32, c3: i32,
+    c4: i32, c5: i32, c6: i32, c7: i32,
+    // type meta parallel (trigger_kind + flags packed simply as separate arrays)
+    k0: i32, k1: i32, k2: i32, k3: i32,
+    k4: i32, k5: i32, k6: i32, k7: i32,
+    ent0: bool, ent1: bool, ent2: bool, ent3: bool,
+    ent4: bool, ent5: bool, ent6: bool, ent7: bool,
+    prop0: bool, prop1: bool, prop2: bool, prop3: bool,
+    prop4: bool, prop5: bool, prop6: bool, prop7: bool,
+    auto0: bool, auto1: bool, auto2: bool, auto3: bool,
+    auto4: bool, auto5: bool, auto6: bool, auto7: bool,
+    len: i32,
+    next_component_id: i32,
+    // trigger stats
+    last_trigger_kind: i32,
+    last_event_key: i32,
+    last_target: i64,
+    trigger_count: i64,
+}
+
+fn ecs_em_world_new() -> EcsEventWorldDeep {
+    return EcsEventWorldDeep {
+        t0: 0, t1: 0, t2: 0, t3: 0,
+        t4: 0, t5: 0, t6: 0, t7: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        c4: 0, c5: 0, c6: 0, c7: 0,
+        k0: 0, k1: 0, k2: 0, k3: 0,
+        k4: 0, k5: 0, k6: 0, k7: 0,
+        ent0: false, ent1: false, ent2: false, ent3: false,
+        ent4: false, ent5: false, ent6: false, ent7: false,
+        prop0: false, prop1: false, prop2: false, prop3: false,
+        prop4: false, prop5: false, prop6: false, prop7: false,
+        auto0: false, auto1: false, auto2: false, auto3: false,
+        auto4: false, auto5: false, auto6: false, auto7: false,
+        len: 0,
+        next_component_id: 1,
+        last_trigger_kind: 0 - 1,
+        last_event_key: 0,
+        last_target: 0,
+        trigger_count: 0,
+    };
+}
+
+fn ecs_em_world_len(w: EcsEventWorldDeep) -> i32 { return w.len; }
+fn ecs_em_world_next_cid(w: EcsEventWorldDeep) -> i32 { return w.next_component_id; }
+fn ecs_em_world_trigger_count(w: EcsEventWorldDeep) -> i64 { return w.trigger_count; }
+fn ecs_em_world_last_kind(w: EcsEventWorldDeep) -> i32 { return w.last_trigger_kind; }
+fn ecs_em_world_last_key(w: EcsEventWorldDeep) -> i32 { return w.last_event_key; }
+fn ecs_em_world_last_target(w: EcsEventWorldDeep) -> i64 { return w.last_target; }
+
+fn ecs_em_world_type_at(w: EcsEventWorldDeep, idx: i32) -> i64 {
+    if idx == 0 { return w.t0; };
+    if idx == 1 { return w.t1; };
+    if idx == 2 { return w.t2; };
+    if idx == 3 { return w.t3; };
+    if idx == 4 { return w.t4; };
+    if idx == 5 { return w.t5; };
+    if idx == 6 { return w.t6; };
+    if idx == 7 { return w.t7; };
+    return 0;
+}
+
+fn ecs_em_world_cid_at(w: EcsEventWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.c0; };
+    if idx == 1 { return w.c1; };
+    if idx == 2 { return w.c2; };
+    if idx == 3 { return w.c3; };
+    if idx == 4 { return w.c4; };
+    if idx == 5 { return w.c5; };
+    if idx == 6 { return w.c6; };
+    if idx == 7 { return w.c7; };
+    return 0;
+}
+
+fn ecs_em_world_find(w: EcsEventWorldDeep, type_id: i64) -> i32 {
+    let i: i32 = 0;
+    while i < w.len {
+        if ecs_em_world_type_at(w, i) == type_id { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn ecs_em_world_set_slot(
+    w: EcsEventWorldDeep,
+    idx: i32,
+    type_id: i64,
+    cid: i32,
+    kind: i32,
+    is_ent: bool,
+    prop: bool,
+    auto: bool
+) -> EcsEventWorldDeep {
+    if idx == 0 {
+        w.t0 = type_id; w.c0 = cid; w.k0 = kind; w.ent0 = is_ent; w.prop0 = prop; w.auto0 = auto;
+        return w;
+    };
+    if idx == 1 {
+        w.t1 = type_id; w.c1 = cid; w.k1 = kind; w.ent1 = is_ent; w.prop1 = prop; w.auto1 = auto;
+        return w;
+    };
+    if idx == 2 {
+        w.t2 = type_id; w.c2 = cid; w.k2 = kind; w.ent2 = is_ent; w.prop2 = prop; w.auto2 = auto;
+        return w;
+    };
+    if idx == 3 {
+        w.t3 = type_id; w.c3 = cid; w.k3 = kind; w.ent3 = is_ent; w.prop3 = prop; w.auto3 = auto;
+        return w;
+    };
+    if idx == 4 {
+        w.t4 = type_id; w.c4 = cid; w.k4 = kind; w.ent4 = is_ent; w.prop4 = prop; w.auto4 = auto;
+        return w;
+    };
+    if idx == 5 {
+        w.t5 = type_id; w.c5 = cid; w.k5 = kind; w.ent5 = is_ent; w.prop5 = prop; w.auto5 = auto;
+        return w;
+    };
+    if idx == 6 {
+        w.t6 = type_id; w.c6 = cid; w.k6 = kind; w.ent6 = is_ent; w.prop6 = prop; w.auto6 = auto;
+        return w;
+    };
+    if idx == 7 {
+        w.t7 = type_id; w.c7 = cid; w.k7 = kind; w.ent7 = is_ent; w.prop7 = prop; w.auto7 = auto;
+        return w;
+    };
+    return w;
+}
+
+// register_event_key: allocate ComponentId for EventWrapperComponent<E> once
+fn ecs_em_register_event_key(w: EcsEventWorldDeep, ev: EcsEventTypeDeep) -> (EcsEventWorldDeep, EcsEventKeyDeep) {
+    let found = ecs_em_world_find(w, ev.type_id);
+    if found >= 0 {
+        return (w, ecs_em_key_new(ecs_em_world_cid_at(w, found)));
+    };
+    if w.len >= 8 {
+        return (w, ecs_em_key_new(0));
+    };
+    let cid = w.next_component_id;
+    w.next_component_id = cid + 1;
+    let idx = w.len;
+    w = ecs_em_world_set_slot(
+        w,
+        idx,
+        ev.type_id,
+        cid,
+        ev.trigger_kind,
+        ev.is_entity_event,
+        ev.propagate_enabled,
+        ev.auto_propagate
+    );
+    w.len = idx + 1;
+    return (w, ecs_em_key_new(cid));
+}
+
+// event_key: lookup only
+fn ecs_em_event_key(w: EcsEventWorldDeep, type_id: i64) -> (bool, EcsEventKeyDeep) {
+    let found = ecs_em_world_find(w, type_id);
+    if found < 0 {
+        return (false, ecs_em_key_new(0));
+    };
+    return (true, ecs_em_key_new(ecs_em_world_cid_at(w, found)));
+}
+
+fn ecs_em_world_kind_at(w: EcsEventWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.k0; };
+    if idx == 1 { return w.k1; };
+    if idx == 2 { return w.k2; };
+    if idx == 3 { return w.k3; };
+    if idx == 4 { return w.k4; };
+    if idx == 5 { return w.k5; };
+    if idx == 6 { return w.k6; };
+    if idx == 7 { return w.k7; };
+    return 0;
+}
+
+fn ecs_em_world_auto_at(w: EcsEventWorldDeep, idx: i32) -> bool {
+    if idx == 0 { return w.auto0; };
+    if idx == 1 { return w.auto1; };
+    if idx == 2 { return w.auto2; };
+    if idx == 3 { return w.auto3; };
+    if idx == 4 { return w.auto4; };
+    if idx == 5 { return w.auto5; };
+    if idx == 6 { return w.auto6; };
+    if idx == 7 { return w.auto7; };
+    return false;
+}
+
+// World::trigger: records selected trigger path; does not fully reimplement observers
+// (see event_trigger_deep). Returns updated world + instance (target may change only if set enabled).
+fn ecs_em_world_trigger(
+    w: EcsEventWorldDeep,
+    inst: EcsEventInstanceDeep
+) -> (EcsEventWorldDeep, EcsEventInstanceDeep) {
+    let found = ecs_em_world_find(w, inst.type_id);
+    if found < 0 {
+        // auto-register as global if unknown
+        let ev = ecs_em_event_global(inst.type_id, 0);
+        let reg = ecs_em_register_event_key(w, ev);
+        w = reg.0;
+        found = ecs_em_world_find(w, inst.type_id);
+    };
+    let kind = ecs_em_world_kind_at(w, found);
+    let key = ecs_em_world_cid_at(w, found);
+    w.last_trigger_kind = kind;
+    w.last_event_key = key;
+    w.last_target = inst.target;
+    w.trigger_count = w.trigger_count + 1;
+
+    // auto_propagate: set instance propagate_flag true at start of Propagate path
+    if kind == ECS_EM_TRIG_PROPAGATE {
+        if ecs_em_world_auto_at(w, found) {
+            if inst.propagate_flag != true {
+                inst.propagate_flag = true;
+            };
+        };
+    };
+    return (w, inst);
+}
+
+// Convenience: register + trigger
+fn ecs_em_register_and_trigger(
+    w: EcsEventWorldDeep,
+    ev: EcsEventTypeDeep,
+    inst: EcsEventInstanceDeep
+) -> (EcsEventWorldDeep, EcsEventInstanceDeep, EcsEventKeyDeep) {
+    let reg = ecs_em_register_event_key(w, ev);
+    w = reg.0;
+    let key = reg.1;
+    inst.type_id = ev.type_id;
+    let tr = ecs_em_world_trigger(w, inst);
+    return (tr.0, tr.1, key);
+}
+
+// Derive helper: choose trigger kind from flags
+fn ecs_em_select_trigger_kind(is_entity: bool, propagate: bool) -> i32 {
+    if is_entity != true { return ECS_EM_TRIG_GLOBAL; };
+    if propagate { return ECS_EM_TRIG_PROPAGATE; };
+    return ECS_EM_TRIG_ENTITY;
+}
+
+// Dynamic EventKey::new from ComponentId
+fn ecs_em_dynamic_event_key(component_id: i32) -> EcsEventKeyDeep {
+    return ecs_em_key_new(component_id);
+}
+
+// Event wrapper component type_id derivation stand-in: hash type_id with salt
+fn ecs_em_wrapper_type_id(event_type_id: i64) -> i64 {
+    // EventWrapperComponent<E> distinct from E
+    return event_type_id + 1000000;
+}

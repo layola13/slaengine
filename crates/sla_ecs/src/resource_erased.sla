@@ -1,0 +1,202 @@
+// Type-erased multi-resource storage keyed by Sla-generated resource type ids.
+// This is the Bevy-shaped resource owner: a world can hold at most one value
+// for each resource type, while different resource types coexist in one store.
+@import "world_dynamic.sla"
+@import "box_drop.sla"
+@import "sa_std/core/box.sa"
+
+struct ErasedResourceValue {
+    type_id: i32,
+    raw: *u8,
+}
+
+struct ErasedResourceEntry {
+    type_id: i32,
+    drop_fn: fn(*u8) -> void,
+    value: ErasedResourceValue,
+    added_tick: i32,
+    changed_tick: i32,
+}
+
+struct ErasedResources {
+    entries: Vec<ErasedResourceEntry>,
+    change_tick: i32,
+}
+
+fn erased_resource_value_new<T>(type_id: i32, value: T) -> ErasedResourceValue {
+    let boxed = Box::new(value);
+    let raw = Box::into_raw(boxed) as *u8;
+    return ErasedResourceValue { type_id: type_id, raw: raw };
+}
+
+fn erased_resource_value_read<T>(value: ErasedResourceValue, type_id: i32) -> T {
+    if value.type_id != type_id { panic(12300); };
+    let typed = value.raw as *T;
+    return unsafe { *typed };
+}
+
+fn erased_resources_new() -> ErasedResources {
+    let entries: Vec<ErasedResourceEntry> = Vec::new();
+    return ErasedResources { entries: entries, change_tick: 1 };
+}
+
+fn erased_resources_increment_tick(resources: ErasedResources) -> ErasedResources {
+    resources.change_tick = resources.change_tick + 1;
+    return resources;
+}
+
+fn erased_resources_slot(resources: ErasedResources, type_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(resources.entries) as i64;
+    while i < cnt {
+        if resources.entries[i].type_id == type_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn erased_resources_count(resources: ErasedResources) -> i64 {
+    return len(resources.entries) as i64;
+}
+
+fn erased_resources_has(resources: ErasedResources, type_id: i32) -> bool {
+    return erased_resources_slot(resources, type_id) >= 0;
+}
+
+fn erased_resources_insert<T>(resources: ErasedResources, type_id: i32, drop_fn: fn(*u8) -> void, value: T) -> ErasedResources {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot >= 0 {
+        let old_drop = resources.entries[slot].drop_fn;
+        old_drop(resources.entries[slot].value.raw);
+        resources.entries[slot].value = erased_resource_value_new<T>(type_id, value);
+        resources.entries[slot].changed_tick = resources.change_tick;
+        return resources;
+    };
+    resources.entries.push(ErasedResourceEntry {
+        type_id: type_id,
+        drop_fn: drop_fn,
+        value: erased_resource_value_new<T>(type_id, value),
+        added_tick: resources.change_tick,
+        changed_tick: resources.change_tick,
+    });
+    return resources;
+}
+
+fn erased_resources_get<T>(resources: ErasedResources, type_id: i32) -> T {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { panic(12301); };
+    return erased_resource_value_read<T>(resources.entries[slot].value, type_id);
+}
+
+fn erased_resources_res<T>(resources: ErasedResources, type_id: i32) -> Res<T> {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { panic(12302); };
+    return Res<T> {
+        value: erased_resource_value_read<T>(resources.entries[slot].value, type_id),
+        added_tick: resources.entries[slot].added_tick,
+        changed_tick: resources.entries[slot].changed_tick,
+    };
+}
+
+fn erased_resources_res_mut<T>(resources: ErasedResources, type_id: i32) -> ResMut<T> {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { panic(12303); };
+    return ResMut<T> {
+        value: erased_resource_value_read<T>(resources.entries[slot].value, type_id),
+        added_tick: resources.entries[slot].added_tick,
+        changed_tick: resources.entries[slot].changed_tick,
+    };
+}
+
+fn erased_resources_write<T>(resources: ErasedResources, type_id: i32, value: T) -> ErasedResources {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { return resources; };
+    let drop_fn = resources.entries[slot].drop_fn;
+    drop_fn(resources.entries[slot].value.raw);
+    resources.entries[slot].value = erased_resource_value_new<T>(type_id, value);
+    resources.entries[slot].changed_tick = resources.change_tick;
+    return resources;
+}
+
+fn erased_resources_res_mut_write<T>(resources: ErasedResources, type_id: i32, res: ResMut<T>, value: T) -> ErasedResources {
+    return erased_resources_write<T>(resources, type_id, value);
+}
+
+fn erased_resources_added_since(resources: ErasedResources, type_id: i32, tick: i32) -> bool {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { return false; };
+    return resources.entries[slot].added_tick > tick;
+}
+
+fn erased_resources_changed_since(resources: ErasedResources, type_id: i32, tick: i32) -> bool {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { return false; };
+    return resources.entries[slot].changed_tick > tick;
+}
+
+fn erased_resources_remove(resources: ErasedResources, type_id: i32) -> ErasedResources {
+    let slot = erased_resources_slot(resources, type_id);
+    if slot < 0 { return resources; };
+    let drop_fn = resources.entries[slot].drop_fn;
+    drop_fn(resources.entries[slot].value.raw);
+    let last = (len(resources.entries) as i64) - 1;
+    if slot != last {
+        resources.entries[slot] = resources.entries[last];
+    };
+    let removed = resources.entries.remove(last);
+    return resources;
+}
+
+@derive(Resource)
+struct ErasedResourceTime { tick: i32 }
+
+@derive(Resource)
+struct ErasedResourceScore { value: i32 }
+
+impl ErasedResourceTime {
+    fn resource_type_id() -> i32 { return 123101; }
+}
+
+impl ErasedResourceScore {
+    fn resource_type_id() -> i32 { return 123102; }
+}
+
+@test "erased resources store multiple unique resources by type"() {
+    let time_type = ErasedResourceTime::resource_type_id();
+    let score_type = ErasedResourceScore::resource_type_id();
+    if time_type <= 0 { panic(12310); };
+    if score_type <= 0 { panic(12311); };
+    if time_type == score_type { panic(12312); };
+    let r0 = erased_resources_new();
+    let r1 = erased_resources_insert<ErasedResourceTime>(r0, time_type, ecs_box_drop<ErasedResourceTime>, ErasedResourceTime { tick: 1 });
+    let r2 = erased_resources_insert<ErasedResourceScore>(r1, score_type, ecs_box_drop<ErasedResourceScore>, ErasedResourceScore { value: 7 });
+    if erased_resources_count(r2) != 2 { panic(12313); };
+    if erased_resources_has(r2, time_type) != true { panic(12314); };
+    if erased_resources_has(r2, score_type) != true { panic(12315); };
+    if erased_resources_get<ErasedResourceTime>(r2, time_type).tick != 1 { panic(12316); };
+    if erased_resources_get<ErasedResourceScore>(r2, score_type).value != 7 { panic(12317); };
+}
+
+@test "erased resources replace track changes and remove independently"() {
+    let time_type = ErasedResourceTime::resource_type_id();
+    let score_type = ErasedResourceScore::resource_type_id();
+    let r0 = erased_resources_new();
+    let r1 = erased_resources_insert<ErasedResourceTime>(r0, time_type, ecs_box_drop<ErasedResourceTime>, ErasedResourceTime { tick: 1 });
+    let r2 = erased_resources_insert<ErasedResourceScore>(r1, score_type, ecs_box_drop<ErasedResourceScore>, ErasedResourceScore { value: 7 });
+    let before = r2.change_tick;
+    let r3 = erased_resources_increment_tick(r2);
+    let r4 = erased_resources_insert<ErasedResourceTime>(r3, time_type, ecs_box_drop<ErasedResourceTime>, ErasedResourceTime { tick: 3 });
+    if erased_resources_added_since(r4, time_type, before) != false { panic(12320); };
+    if erased_resources_changed_since(r4, time_type, before) != true { panic(12321); };
+    if erased_resources_changed_since(r4, score_type, before) != false { panic(12322); };
+    let score_res = erased_resources_res<ErasedResourceScore>(r4, score_type);
+    if score_res.value.value != 7 { panic(12323); };
+    let score_mut = erased_resources_res_mut<ErasedResourceScore>(r4, score_type);
+    let r5 = erased_resources_res_mut_write<ErasedResourceScore>(r4, score_type, score_mut, ErasedResourceScore { value: 8 });
+    if erased_resources_changed_since(r5, score_type, before) != true { panic(12324); };
+    let r6 = erased_resources_remove(r5, time_type);
+    if erased_resources_has(r6, time_type) != false { panic(12325); };
+    if erased_resources_has(r6, score_type) != true { panic(12326); };
+    if erased_resources_count(r6) != 1 { panic(12327); };
+    if erased_resources_get<ErasedResourceScore>(r6, score_type).value != 8 { panic(12328); };
+}

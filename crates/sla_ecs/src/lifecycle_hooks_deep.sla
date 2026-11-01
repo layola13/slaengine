@@ -1,0 +1,309 @@
+// Deepened Bevy ECS ComponentHooks + lifecycle markers.
+// Mirrors src/lifecycle.rs:
+//   HookContext entity/component_id/caller
+//   ComponentHooks on_add/on_insert/on_replace/on_remove/on_despawn (+ try_)
+//   update_component_hooks apply path
+// Fixed capacity: 4 hook slots per kind. Shallow lib/lifecycle_hooks.sla retained.
+
+const ECS_LH_ADD: i32 = 0;
+const ECS_LH_INSERT: i32 = 1;
+const ECS_LH_REPLACE: i32 = 2;
+const ECS_LH_REMOVE: i32 = 3;
+const ECS_LH_DESPAWN: i32 = 4;
+
+fn ecs_lh_kind_add() -> i32 { return ECS_LH_ADD; }
+fn ecs_lh_kind_insert() -> i32 { return ECS_LH_INSERT; }
+fn ecs_lh_kind_replace() -> i32 { return ECS_LH_REPLACE; }
+fn ecs_lh_kind_remove() -> i32 { return ECS_LH_REMOVE; }
+fn ecs_lh_kind_despawn() -> i32 { return ECS_LH_DESPAWN; }
+
+struct EcsLhCtxDeep {
+    entity: i64,
+    component_id: i32,
+    kind: i32,
+    caller: i64,
+    has_caller: bool,
+}
+
+fn ecs_lh_ctx_new(entity: i64, component_id: i32, kind: i32) -> EcsLhCtxDeep {
+    return EcsLhCtxDeep {
+        entity: entity, component_id: component_id, kind: kind, caller: 0, has_caller: false,
+    };
+}
+
+fn ecs_lh_ctx_with_caller(c: EcsLhCtxDeep, caller: i64) -> EcsLhCtxDeep {
+    return EcsLhCtxDeep {
+        entity: c.entity, component_id: c.component_id, kind: c.kind, caller: caller, has_caller: true,
+    };
+}
+
+fn ecs_lh_ctx_entity(c: EcsLhCtxDeep) -> i64 { return c.entity; }
+fn ecs_lh_ctx_component_id(c: EcsLhCtxDeep) -> i32 { return c.component_id; }
+fn ecs_lh_ctx_kind(c: EcsLhCtxDeep) -> i32 { return c.kind; }
+fn ecs_lh_ctx_caller(c: EcsLhCtxDeep) -> i64 { return c.caller; }
+fn ecs_lh_ctx_has_caller(c: EcsLhCtxDeep) -> bool { return c.has_caller; }
+
+// ComponentHooks: one runner id per kind (-1 none)
+struct EcsLhHooksDeep {
+    on_add: i64,
+    on_insert: i64,
+    on_replace: i64,
+    on_remove: i64,
+    on_despawn: i64,
+    // try_set flags: false if already set (try fails)
+    locked_add: bool,
+    locked_insert: bool,
+    locked_replace: bool,
+    locked_remove: bool,
+    locked_despawn: bool,
+}
+
+fn ecs_lh_hooks_new() -> EcsLhHooksDeep {
+    return EcsLhHooksDeep {
+        on_add: -1, on_insert: -1, on_replace: -1, on_remove: -1, on_despawn: -1,
+        locked_add: false, locked_insert: false, locked_replace: false, locked_remove: false, locked_despawn: false,
+    };
+}
+
+fn ecs_lh_hooks_on_add(h: EcsLhHooksDeep) -> i64 { return h.on_add; }
+fn ecs_lh_hooks_on_insert(h: EcsLhHooksDeep) -> i64 { return h.on_insert; }
+fn ecs_lh_hooks_on_replace(h: EcsLhHooksDeep) -> i64 { return h.on_replace; }
+fn ecs_lh_hooks_on_remove(h: EcsLhHooksDeep) -> i64 { return h.on_remove; }
+fn ecs_lh_hooks_on_despawn(h: EcsLhHooksDeep) -> i64 { return h.on_despawn; }
+
+fn ecs_lh_hooks_has_any(h: EcsLhHooksDeep) -> bool {
+    if h.on_add >= 0 { return true; };
+    if h.on_insert >= 0 { return true; };
+    if h.on_replace >= 0 { return true; };
+    if h.on_remove >= 0 { return true; };
+    if h.on_despawn >= 0 { return true; };
+    return false;
+}
+
+fn ecs_lh_hooks_rebuild(
+    on_add: i64, on_insert: i64, on_replace: i64, on_remove: i64, on_despawn: i64,
+    locked_add: bool, locked_insert: bool, locked_replace: bool, locked_remove: bool, locked_despawn: bool
+) -> EcsLhHooksDeep {
+    return EcsLhHooksDeep {
+        on_add: on_add, on_insert: on_insert, on_replace: on_replace, on_remove: on_remove, on_despawn: on_despawn,
+        locked_add: locked_add, locked_insert: locked_insert, locked_replace: locked_replace,
+        locked_remove: locked_remove, locked_despawn: locked_despawn,
+    };
+}
+
+fn ecs_lh_hooks_set_on_add(h: EcsLhHooksDeep, runner: i64) -> EcsLhHooksDeep {
+    return ecs_lh_hooks_rebuild(
+        runner, h.on_insert, h.on_replace, h.on_remove, h.on_despawn,
+        true, h.locked_insert, h.locked_replace, h.locked_remove, h.locked_despawn
+    );
+}
+
+fn ecs_lh_hooks_set_on_insert(h: EcsLhHooksDeep, runner: i64) -> EcsLhHooksDeep {
+    return ecs_lh_hooks_rebuild(
+        h.on_add, runner, h.on_replace, h.on_remove, h.on_despawn,
+        h.locked_add, true, h.locked_replace, h.locked_remove, h.locked_despawn
+    );
+}
+
+fn ecs_lh_hooks_set_on_replace(h: EcsLhHooksDeep, runner: i64) -> EcsLhHooksDeep {
+    return ecs_lh_hooks_rebuild(
+        h.on_add, h.on_insert, runner, h.on_remove, h.on_despawn,
+        h.locked_add, h.locked_insert, true, h.locked_remove, h.locked_despawn
+    );
+}
+
+fn ecs_lh_hooks_set_on_remove(h: EcsLhHooksDeep, runner: i64) -> EcsLhHooksDeep {
+    return ecs_lh_hooks_rebuild(
+        h.on_add, h.on_insert, h.on_replace, runner, h.on_despawn,
+        h.locked_add, h.locked_insert, h.locked_replace, true, h.locked_despawn
+    );
+}
+
+fn ecs_lh_hooks_set_on_despawn(h: EcsLhHooksDeep, runner: i64) -> EcsLhHooksDeep {
+    return ecs_lh_hooks_rebuild(
+        h.on_add, h.on_insert, h.on_replace, h.on_remove, runner,
+        h.locked_add, h.locked_insert, h.locked_replace, h.locked_remove, true
+    );
+}
+
+struct EcsLhTryDeep {
+    ok: bool,
+    hooks: EcsLhHooksDeep,
+}
+
+fn ecs_lh_try_ok(t: EcsLhTryDeep) -> bool { return t.ok; }
+fn ecs_lh_try_hooks(t: EcsLhTryDeep) -> EcsLhHooksDeep { return t.hooks; }
+
+fn ecs_lh_hooks_try_on_add(h: EcsLhHooksDeep, runner: i64) -> EcsLhTryDeep {
+    if h.locked_add {
+        return EcsLhTryDeep { ok: false, hooks: h };
+    };
+    return EcsLhTryDeep { ok: true, hooks: ecs_lh_hooks_set_on_add(h, runner) };
+}
+
+fn ecs_lh_hooks_try_on_insert(h: EcsLhHooksDeep, runner: i64) -> EcsLhTryDeep {
+    if h.locked_insert {
+        return EcsLhTryDeep { ok: false, hooks: h };
+    };
+    return EcsLhTryDeep { ok: true, hooks: ecs_lh_hooks_set_on_insert(h, runner) };
+}
+
+fn ecs_lh_hooks_try_on_replace(h: EcsLhHooksDeep, runner: i64) -> EcsLhTryDeep {
+    if h.locked_replace {
+        return EcsLhTryDeep { ok: false, hooks: h };
+    };
+    return EcsLhTryDeep { ok: true, hooks: ecs_lh_hooks_set_on_replace(h, runner) };
+}
+
+fn ecs_lh_hooks_try_on_remove(h: EcsLhHooksDeep, runner: i64) -> EcsLhTryDeep {
+    if h.locked_remove {
+        return EcsLhTryDeep { ok: false, hooks: h };
+    };
+    return EcsLhTryDeep { ok: true, hooks: ecs_lh_hooks_set_on_remove(h, runner) };
+}
+
+fn ecs_lh_hooks_try_on_despawn(h: EcsLhHooksDeep, runner: i64) -> EcsLhTryDeep {
+    if h.locked_despawn {
+        return EcsLhTryDeep { ok: false, hooks: h };
+    };
+    return EcsLhTryDeep { ok: true, hooks: ecs_lh_hooks_set_on_despawn(h, runner) };
+}
+
+fn ecs_lh_hooks_runner_for(h: EcsLhHooksDeep, kind: i32) -> i64 {
+    if kind == ECS_LH_ADD { return h.on_add; };
+    if kind == ECS_LH_INSERT { return h.on_insert; };
+    if kind == ECS_LH_REPLACE { return h.on_replace; };
+    if kind == ECS_LH_REMOVE { return h.on_remove; };
+    if kind == ECS_LH_DESPAWN { return h.on_despawn; };
+    return -1;
+}
+
+// Dispatch log: last run kind + runner + entity
+struct EcsLhDispatchDeep {
+    ran: bool,
+    kind: i32,
+    runner: i64,
+    entity: i64,
+    component_id: i32,
+}
+
+fn ecs_lh_dispatch_ran(d: EcsLhDispatchDeep) -> bool { return d.ran; }
+fn ecs_lh_dispatch_kind(d: EcsLhDispatchDeep) -> i32 { return d.kind; }
+fn ecs_lh_dispatch_runner(d: EcsLhDispatchDeep) -> i64 { return d.runner; }
+fn ecs_lh_dispatch_entity(d: EcsLhDispatchDeep) -> i64 { return d.entity; }
+fn ecs_lh_dispatch_component_id(d: EcsLhDispatchDeep) -> i32 { return d.component_id; }
+
+fn ecs_lh_hooks_run(h: EcsLhHooksDeep, ctx: EcsLhCtxDeep) -> EcsLhDispatchDeep {
+    let runner = ecs_lh_hooks_runner_for(h, ctx.kind);
+    if runner < 0 {
+        return EcsLhDispatchDeep {
+            ran: false, kind: ctx.kind, runner: -1, entity: ctx.entity, component_id: ctx.component_id,
+        };
+    };
+    return EcsLhDispatchDeep {
+        ran: true, kind: ctx.kind, runner: runner, entity: ctx.entity, component_id: ctx.component_id,
+    };
+}
+
+// ComponentId -> hooks table (4 components)
+struct EcsLhTableDeep {
+    c0: i32, h0: EcsLhHooksDeep,
+    c1: i32, h1: EcsLhHooksDeep,
+    c2: i32, h2: EcsLhHooksDeep,
+    c3: i32, h3: EcsLhHooksDeep,
+    len: i32,
+}
+
+fn ecs_lh_table_new() -> EcsLhTableDeep {
+    return EcsLhTableDeep {
+        c0: -1, h0: ecs_lh_hooks_new(),
+        c1: -1, h1: ecs_lh_hooks_new(),
+        c2: -1, h2: ecs_lh_hooks_new(),
+        c3: -1, h3: ecs_lh_hooks_new(),
+        len: 0,
+    };
+}
+
+fn ecs_lh_table_len(t: EcsLhTableDeep) -> i32 { return t.len; }
+
+fn ecs_lh_table_rebuild(
+    c0: i32, h0: EcsLhHooksDeep, c1: i32, h1: EcsLhHooksDeep,
+    c2: i32, h2: EcsLhHooksDeep, c3: i32, h3: EcsLhHooksDeep, len: i32
+) -> EcsLhTableDeep {
+    return EcsLhTableDeep {
+        c0: c0, h0: h0, c1: c1, h1: h1, c2: c2, h2: h2, c3: c3, h3: h3, len: len,
+    };
+}
+
+fn ecs_lh_table_set(t: EcsLhTableDeep, component_id: i32, hooks: EcsLhHooksDeep) -> EcsLhTableDeep {
+    if t.len >= 1 {
+        if t.c0 == component_id {
+            return ecs_lh_table_rebuild(t.c0, hooks, t.c1, t.h1, t.c2, t.h2, t.c3, t.h3, t.len);
+        };
+    };
+    if t.len >= 2 {
+        if t.c1 == component_id {
+            return ecs_lh_table_rebuild(t.c0, t.h0, t.c1, hooks, t.c2, t.h2, t.c3, t.h3, t.len);
+        };
+    };
+    if t.len >= 3 {
+        if t.c2 == component_id {
+            return ecs_lh_table_rebuild(t.c0, t.h0, t.c1, t.h1, t.c2, hooks, t.c3, t.h3, t.len);
+        };
+    };
+    if t.len >= 4 {
+        if t.c3 == component_id {
+            return ecs_lh_table_rebuild(t.c0, t.h0, t.c1, t.h1, t.c2, t.h2, t.c3, hooks, t.len);
+        };
+    };
+    if t.len == 0 {
+        return ecs_lh_table_rebuild(component_id, hooks, t.c1, t.h1, t.c2, t.h2, t.c3, t.h3, 1);
+    };
+    if t.len == 1 {
+        return ecs_lh_table_rebuild(t.c0, t.h0, component_id, hooks, t.c2, t.h2, t.c3, t.h3, 2);
+    };
+    if t.len == 2 {
+        return ecs_lh_table_rebuild(t.c0, t.h0, t.c1, t.h1, component_id, hooks, t.c3, t.h3, 3);
+    };
+    if t.len == 3 {
+        return ecs_lh_table_rebuild(t.c0, t.h0, t.c1, t.h1, t.c2, t.h2, component_id, hooks, 4);
+    };
+    return t;
+}
+
+fn ecs_lh_table_get(t: EcsLhTableDeep, component_id: i32) -> EcsLhHooksDeep {
+    if t.len >= 1 {
+        if t.c0 == component_id { return t.h0; };
+    };
+    if t.len >= 2 {
+        if t.c1 == component_id { return t.h1; };
+    };
+    if t.len >= 3 {
+        if t.c2 == component_id { return t.h2; };
+    };
+    if t.len >= 4 {
+        if t.c3 == component_id { return t.h3; };
+    };
+    return ecs_lh_hooks_new();
+}
+
+fn ecs_lh_table_has(t: EcsLhTableDeep, component_id: i32) -> bool {
+    if t.len >= 1 {
+        if t.c0 == component_id { return true; };
+    };
+    if t.len >= 2 {
+        if t.c1 == component_id { return true; };
+    };
+    if t.len >= 3 {
+        if t.c2 == component_id { return true; };
+    };
+    if t.len >= 4 {
+        if t.c3 == component_id { return true; };
+    };
+    return false;
+}
+
+fn ecs_lh_table_run(t: EcsLhTableDeep, ctx: EcsLhCtxDeep) -> EcsLhDispatchDeep {
+    let h = ecs_lh_table_get(t, ctx.component_id);
+    return ecs_lh_hooks_run(h, ctx);
+}

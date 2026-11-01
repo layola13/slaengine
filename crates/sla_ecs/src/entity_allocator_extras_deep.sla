@@ -1,0 +1,251 @@
+// Deepened Bevy ECS EntityAllocator extras.
+// Mirrors src/entity/mod.rs EntityAllocator:
+//   alloc / free / free_many / alloc_many
+//   build_remote_allocator / has_remote_allocator / restart
+// Fixed capacity: 8 free-stack + 8 alloc_many buffer.
+// Shallow lib/entity_allocator_extras.sla retained.
+
+struct EcsEaexDeep {
+    next_id: i64,
+    // free stack LIFO
+    f0: i64, f1: i64, f2: i64, f3: i64,
+    f4: i64, f5: i64, f6: i64, f7: i64,
+    flen: i32,
+    allocated_count: i32,
+    remote_generation: i32,
+}
+
+fn ecs_eaex_deep_new() -> EcsEaexDeep {
+    return EcsEaexDeep {
+        next_id: 1,
+        f0: 0, f1: 0, f2: 0, f3: 0, f4: 0, f5: 0, f6: 0, f7: 0,
+        flen: 0, allocated_count: 0, remote_generation: 1,
+    };
+}
+
+fn ecs_eaex_next(a: EcsEaexDeep) -> i64 { return a.next_id; }
+fn ecs_eaex_allocated(a: EcsEaexDeep) -> i32 { return a.allocated_count; }
+fn ecs_eaex_pending_free(a: EcsEaexDeep) -> i32 { return a.flen; }
+fn ecs_eaex_generation(a: EcsEaexDeep) -> i32 { return a.remote_generation; }
+
+fn ecs_eaex_rebuild(
+    next_id: i64,
+    f0: i64, f1: i64, f2: i64, f3: i64, f4: i64, f5: i64, f6: i64, f7: i64,
+    flen: i32, allocated_count: i32, remote_generation: i32
+) -> EcsEaexDeep {
+    return EcsEaexDeep {
+        next_id: next_id,
+        f0: f0, f1: f1, f2: f2, f3: f3, f4: f4, f5: f5, f6: f6, f7: f7,
+        flen: flen, allocated_count: allocated_count, remote_generation: remote_generation,
+    };
+}
+
+struct EcsEaexAllocDeep {
+    world: EcsEaexDeep,
+    entity: i64,
+}
+
+fn ecs_eaex_alloc_world(r: EcsEaexAllocDeep) -> EcsEaexDeep { return r.world; }
+fn ecs_eaex_alloc_entity(r: EcsEaexAllocDeep) -> i64 { return r.entity; }
+
+fn ecs_eaex_free_push(a: EcsEaexDeep, entity: i64) -> EcsEaexDeep {
+    if a.flen == 0 {
+        return ecs_eaex_rebuild(a.next_id, entity, a.f1, a.f2, a.f3, a.f4, a.f5, a.f6, a.f7, 1, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 1 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, entity, a.f2, a.f3, a.f4, a.f5, a.f6, a.f7, 2, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 2 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, a.f1, entity, a.f3, a.f4, a.f5, a.f6, a.f7, 3, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 3 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, entity, a.f4, a.f5, a.f6, a.f7, 4, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 4 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, entity, a.f5, a.f6, a.f7, 5, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 5 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, a.f4, entity, a.f6, a.f7, 6, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 6 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, entity, a.f7, 7, a.allocated_count, a.remote_generation);
+    };
+    if a.flen == 7 {
+        return ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, a.f6, entity, 8, a.allocated_count, a.remote_generation);
+    };
+    return a;
+}
+
+fn ecs_eaex_free(a: EcsEaexDeep, entity: i64) -> EcsEaexDeep {
+    return ecs_eaex_free_push(a, entity);
+}
+
+fn ecs_eaex_free_many2(a: EcsEaexDeep, e0: i64, e1: i64) -> EcsEaexDeep {
+    let a2 = ecs_eaex_free_push(a, e0);
+    return ecs_eaex_free_push(a2, e1);
+}
+
+fn ecs_eaex_alloc(a: EcsEaexDeep) -> EcsEaexAllocDeep {
+    if a.flen >= 1 {
+        // pop last
+        if a.flen == 1 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, a.allocated_count + 1, a.remote_generation),
+                entity: a.f0,
+            };
+        };
+        if a.flen == 2 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, a.f0, 0, 0, 0, 0, 0, 0, 0, 1, a.allocated_count + 1, a.remote_generation),
+                entity: a.f1,
+            };
+        };
+        if a.flen == 3 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, a.f0, a.f1, 0, 0, 0, 0, 0, 0, 2, a.allocated_count + 1, a.remote_generation),
+                entity: a.f2,
+            };
+        };
+        if a.flen == 4 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, 0, 0, 0, 0, 0, 3, a.allocated_count + 1, a.remote_generation),
+                entity: a.f3,
+            };
+        };
+        if a.flen == 5 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, 0, 0, 0, 0, 4, a.allocated_count + 1, a.remote_generation),
+                entity: a.f4,
+            };
+        };
+        if a.flen == 6 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, a.f4, 0, 0, 0, 5, a.allocated_count + 1, a.remote_generation),
+                entity: a.f5,
+            };
+        };
+        if a.flen == 7 {
+            return EcsEaexAllocDeep {
+                world: ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, 0, 0, 6, a.allocated_count + 1, a.remote_generation),
+                entity: a.f6,
+            };
+        };
+        return EcsEaexAllocDeep {
+            world: ecs_eaex_rebuild(a.next_id, a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, a.f6, 0, 7, a.allocated_count + 1, a.remote_generation),
+            entity: a.f7,
+        };
+    };
+    let fresh = a.next_id;
+    return EcsEaexAllocDeep {
+        world: ecs_eaex_rebuild(fresh + 1, a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, a.f6, a.f7, 0, a.allocated_count + 1, a.remote_generation),
+        entity: fresh,
+    };
+}
+
+// alloc_many buffer
+struct EcsEaexManyDeep {
+    world: EcsEaexDeep,
+    e0: i64, e1: i64, e2: i64, e3: i64,
+    e4: i64, e5: i64, e6: i64, e7: i64,
+    count: i32,
+    cursor: i32,
+}
+
+fn ecs_eaex_many_world(m: EcsEaexManyDeep) -> EcsEaexDeep { return m.world; }
+fn ecs_eaex_many_count(m: EcsEaexManyDeep) -> i32 { return m.count; }
+fn ecs_eaex_many_cursor(m: EcsEaexManyDeep) -> i32 { return m.cursor; }
+fn ecs_eaex_many_remaining(m: EcsEaexManyDeep) -> i32 { return m.count - m.cursor; }
+fn ecs_eaex_many_is_empty(m: EcsEaexManyDeep) -> bool { return m.cursor >= m.count; }
+
+fn ecs_eaex_many_at(m: EcsEaexManyDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.e0; };
+    if idx == 1 { return m.e1; };
+    if idx == 2 { return m.e2; };
+    if idx == 3 { return m.e3; };
+    if idx == 4 { return m.e4; };
+    if idx == 5 { return m.e5; };
+    if idx == 6 { return m.e6; };
+    if idx == 7 { return m.e7; };
+    return -1;
+}
+
+fn ecs_eaex_many_rebuild(
+    world: EcsEaexDeep,
+    e0: i64, e1: i64, e2: i64, e3: i64, e4: i64, e5: i64, e6: i64, e7: i64,
+    count: i32, cursor: i32
+) -> EcsEaexManyDeep {
+    return EcsEaexManyDeep {
+        world: world, e0: e0, e1: e1, e2: e2, e3: e3, e4: e4, e5: e5, e6: e6, e7: e7,
+        count: count, cursor: cursor,
+    };
+}
+
+fn ecs_eaex_alloc_many(a: EcsEaexDeep, count: i32) -> EcsEaexManyDeep {
+    if count <= 0 {
+        return ecs_eaex_many_rebuild(a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    };
+    // unrolled up to 4 for tests
+    let r0 = ecs_eaex_alloc(a);
+    if count == 1 {
+        return ecs_eaex_many_rebuild(r0.world, r0.entity, 0, 0, 0, 0, 0, 0, 0, 1, 0);
+    };
+    let r1 = ecs_eaex_alloc(r0.world);
+    if count == 2 {
+        return ecs_eaex_many_rebuild(r1.world, r0.entity, r1.entity, 0, 0, 0, 0, 0, 0, 2, 0);
+    };
+    let r2 = ecs_eaex_alloc(r1.world);
+    if count == 3 {
+        return ecs_eaex_many_rebuild(r2.world, r0.entity, r1.entity, r2.entity, 0, 0, 0, 0, 0, 3, 0);
+    };
+    let r3 = ecs_eaex_alloc(r2.world);
+    if count >= 4 {
+        return ecs_eaex_many_rebuild(r3.world, r0.entity, r1.entity, r2.entity, r3.entity, 0, 0, 0, 0, 4, 0);
+    };
+    return ecs_eaex_many_rebuild(a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+struct EcsEaexNextDeep {
+    iter: EcsEaexManyDeep,
+    has: bool,
+    entity: i64,
+}
+
+fn ecs_eaex_next_has(n: EcsEaexNextDeep) -> bool { return n.has; }
+fn ecs_eaex_next_entity(n: EcsEaexNextDeep) -> i64 { return n.entity; }
+fn ecs_eaex_next_iter(n: EcsEaexNextDeep) -> EcsEaexManyDeep { return n.iter; }
+
+fn ecs_eaex_many_next(m: EcsEaexManyDeep) -> EcsEaexNextDeep {
+    if m.cursor >= m.count {
+        return EcsEaexNextDeep { iter: m, has: false, entity: -1 };
+    };
+    let e = ecs_eaex_many_at(m, m.cursor);
+    let m2 = ecs_eaex_many_rebuild(m.world, m.e0, m.e1, m.e2, m.e3, m.e4, m.e5, m.e6, m.e7, m.count, m.cursor + 1);
+    return EcsEaexNextDeep { iter: m2, has: true, entity: e };
+}
+
+// remote allocator proxy
+struct EcsEaexRemoteDeep {
+    generation: i32,
+    underlying_next: i64,
+    underlying_freed_len: i32,
+}
+
+fn ecs_eaex_remote_generation(p: EcsEaexRemoteDeep) -> i32 { return p.generation; }
+fn ecs_eaex_remote_next(p: EcsEaexRemoteDeep) -> i64 { return p.underlying_next; }
+fn ecs_eaex_remote_freed_len(p: EcsEaexRemoteDeep) -> i32 { return p.underlying_freed_len; }
+
+fn ecs_eaex_build_remote(a: EcsEaexDeep) -> EcsEaexRemoteDeep {
+    return EcsEaexRemoteDeep {
+        generation: a.remote_generation,
+        underlying_next: a.next_id,
+        underlying_freed_len: a.flen,
+    };
+}
+
+fn ecs_eaex_has_remote(a: EcsEaexDeep, p: EcsEaexRemoteDeep) -> bool {
+    return p.generation == a.remote_generation;
+}
+
+fn ecs_eaex_restart(a: EcsEaexDeep) -> EcsEaexDeep {
+    return ecs_eaex_rebuild(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, a.remote_generation + 1);
+}

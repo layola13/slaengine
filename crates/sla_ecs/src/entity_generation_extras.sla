@@ -1,0 +1,144 @@
+// Bevy ECS EntityGeneration gap surfaces not present in lib/entity.sla.
+//
+// Mirrors src/entity/mod.rs:
+//   EntityGeneration::FIRST = 0
+//   EntityGeneration::to_bits -> u32  (model: i64; SLA has no u32)
+//   EntityGeneration::from_bits(bits) -> Self
+//   EntityGeneration::after_versions(versions) -> Self                  (wrapping_add)
+//   EntityGeneration::after_versions_and_could_alias(versions) -> (Self, bool)
+//     (overflowing_add; bool = true when the wrap-round produced an aliased version)
+//   EntityGeneration::cmp_approx(other) -> Ordering                     (Less=0, Equal=1, Greater=2)
+//     Bevy's DIFF_MAX = 1 << 31 = 2_147_483_648; modelled as i64.
+//
+// Model: EcsEntityGeneration { bits: i64 } carrying the underlying version count (u32 bits as i64).
+// The wrapping-add and overflowing-add semantics are replicated with i64 arithmetic against a
+// full u32 cycle modulo 2^32.
+
+// === Result struct for after_versions_and_could_alias (single-field accessors) ===
+struct GenAliasResult {
+    new_bits: i64,
+    could_alias: i32,
+}
+
+fn ecs_gen_alias_new_bits(r: GenAliasResult) -> i64 {
+    return r.new_bits;
+}
+
+fn ecs_gen_alias_could_alias(r: GenAliasResult) -> i32 {
+    return r.could_alias;
+}
+
+// === Model ===
+struct EcsEntityGeneration {
+    bits: i64,
+}
+
+const ECS_GEN_FIRST: i64 = 0;
+const ECS_GEN_MOD: i64 = 4294967296;
+// Bevy's DIFF_MAX for cmp_approx: 1 << 31; we model the threshold implicitly via the half-cycle.
+const ECS_GEN_HALF: i64 = 2147483648;
+const ECS_ORD_LESS: i32 = 0;
+const ECS_ORD_EQUAL: i32 = 1;
+const ECS_ORD_GREATER: i32 = 2;
+
+// constructor / accessors
+fn ecs_entity_generation_first() -> EcsEntityGeneration {
+    let g = EcsEntityGeneration { bits: ECS_GEN_FIRST };
+    return g;
+}
+
+fn ecs_entity_generation_from_bits(bits: i64) -> EcsEntityGeneration {
+    let g = EcsEntityGeneration { bits: bits };
+    return g;
+}
+
+fn ecs_entity_generation_to_bits(g: EcsEntityGeneration) -> i64 {
+    return g.bits;
+}
+
+fn ecs_entity_generation_new(bits: i64) -> EcsEntityGeneration {
+    return ecs_entity_generation_from_bits(bits);
+}
+
+// === after_versions(versions) -> Self: u32 wrapping_add self.bits + versions (mod 2^32) ===
+// Model: we expand the bits to [0, 2^32) and apply wrapping semantics.
+fn ecs_entity_generation_after_versions(g: EcsEntityGeneration, versions: i64) -> EcsEntityGeneration {
+    let total: i64 = g.bits + versions;
+    let rem: i64 = total % ECS_GEN_MOD;
+    let wrapped: i64 = rem;
+    if rem < 0 { wrapped = rem + ECS_GEN_MOD; };
+    let r = EcsEntityGeneration { bits: wrapped };
+    return r;
+}
+
+// === after_versions_and_could_alias(versions) -> (Self, bool) ===
+// Bevy returns (Self(u32::overflowing_add), bool = the overflow flag).
+fn ecs_entity_generation_after_versions_and_could_alias(g: EcsEntityGeneration, versions: i64) -> GenAliasResult {
+    let total: i64 = g.bits + versions;
+    let overflow: i32 = 0;
+    if total < 0 || total >= ECS_GEN_MOD { overflow = 1; };
+    let rem: i64 = total % ECS_GEN_MOD;
+    let wrapped: i64 = rem;
+    if rem < 0 { wrapped = rem + ECS_GEN_MOD; };
+    let res = GenAliasResult { new_bits: wrapped, could_alias: overflow };
+    return res;
+}
+
+// === cmp_approx(other) -> Ordering ===
+// Bevy: wrapping_sub(self, other); 0 -> Equal, [1 .. DIFF_MAX) -> Greater, else Less.
+// Modelled as: diff = (self.bits - other.bits) mod 2^32 (in [0, 2^32)).
+fn ecs_entity_generation_cmp_approx(g: EcsEntityGeneration, other: EcsEntityGeneration) -> i32 {
+    let diff_signed: i64 = g.bits - other.bits;
+    let rem: i64 = diff_signed % ECS_GEN_MOD;
+    let diff: i64 = rem;
+    if rem < 0 { diff = rem + ECS_GEN_MOD; };
+    if diff == 0 { return ECS_ORD_EQUAL; };
+    if diff >= 1 && diff < ECS_GEN_HALF { return ECS_ORD_GREATER; };
+    return ECS_ORD_LESS;
+}
+
+// === Ordering helpers ===
+fn ecs_entity_ord_less() -> i32 { return ECS_ORD_LESS; }
+fn ecs_entity_ord_equal() -> i32 { return ECS_ORD_EQUAL; }
+fn ecs_entity_ord_greater() -> i32 { return ECS_ORD_GREATER; }
+
+// === Entity::try_from_bits(bits) -> Option<Entity> ===
+// Bevy: bits outside u32::MAX representation returns None (only reserved-stop bit excluded);
+// the real host-programmer-visible mask is u64 where the upper bits must be zero (u32 index + u32 gen = u64).
+// We model the validity by: bits must be in [0, 2^32 - 1] (a 32-bit index + 32-bit gen packing is >= 0
+// combined bits). To keep this tractable in our model where bits is the gen's lower 32-bit value:
+// try_from_bits returns has=1 if bits in [0, 2^32), else has=0.
+struct TryFromBits {
+    has: i32,
+    bits: i64,
+}
+
+fn ecs_entity_try_from_bits_has(r: TryFromBits) -> i32 {
+    return r.has;
+}
+
+fn ecs_entity_try_from_bits_bits(r: TryFromBits) -> i64 {
+    return r.bits;
+}
+
+fn ecs_entity_try_from_bits(bits: i64) -> TryFromBits {
+    if bits < 0 || bits >= ECS_GEN_MOD {
+        let none = TryFromBits { has: 0, bits: -1 };
+        return none;
+    };
+    let some = TryFromBits { has: 1, bits: bits };
+    return some;
+}
+
+// === EntityIndex::from_raw_u32(u32) => Option<EntityIndex> ===
+// Bevy: NonMaxU32 wraps u32 unless equal to u32::MAX (NonMaxU32 disallows MAX). The error sentinel
+// Undefined message semantics: from_raw_u32 returns None when index == u32::MAX.
+fn ecs_entity_index_from_raw_u32(index: i64) -> TryFromBits {
+    if index < 0 || index >= ECS_GEN_MOD - 1 {
+        // NonMaxU32 disallows u32::MAX (which is ECS_GEN_MOD - 1); reject.
+        let none = TryFromBits { has: 0, bits: -1 };
+        return none;
+    };
+    let some = TryFromBits { has: 1, bits: index };
+    return some;
+}

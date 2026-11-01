@@ -1,0 +1,738 @@
+// Deepened Bevy ECS system::system_registry surface.
+// Mirrors src/system/system_registry.rs: SystemId, SystemIdMarker, RegisteredSystem,
+// RemovedSystem, SystemHandle Strong/Weak, RegisteredSystemDespawner queue,
+// CachedSystemId, World register/unregister/run_system_with/run_system_cached,
+// RegisteredSystemError variants. Fixed-slot world for SLA stability.
+// Shallow lib/system_registry.sla + system_registry_template.sla retained.
+
+// === RegisteredSystemError codes ===
+const ECS_RSE_OK: i32 = 0;
+const ECS_RSE_NOT_REGISTERED: i32 = 1;
+const ECS_RSE_NOT_CACHED: i32 = 2;
+const ECS_RSE_MISSING_COMPONENT: i32 = 3;
+const ECS_RSE_SELF_REMOVE: i32 = 4;
+const ECS_RSE_SKIPPED: i32 = 5;
+const ECS_RSE_FAILED: i32 = 6;
+const ECS_RSE_INCORRECT_TYPE: i32 = 7;
+const ECS_RSE_SYSTEM_MISSING: i32 = 8;
+
+// === Handle kinds ===
+const ECS_SR_HANDLE_STRONG: i32 = 0;
+const ECS_SR_HANDLE_WEAK: i32 = 1;
+
+// Max fixed slots in deep world registry
+const ECS_SR_MAX_SLOTS: i32 = 8;
+
+// === SystemId ===
+struct EcsSystemIdDeep {
+    entity: i64,
+    input_type: i64,
+    output_type: i64,
+}
+
+fn ecs_system_id_deep_new(entity: i64, input_type: i64, output_type: i64) -> EcsSystemIdDeep {
+    return EcsSystemIdDeep { entity: entity, input_type: input_type, output_type: output_type };
+}
+
+fn ecs_system_id_deep_from_entity(entity: i64) -> EcsSystemIdDeep {
+    return EcsSystemIdDeep { entity: entity, input_type: 0, output_type: 0 };
+}
+
+fn ecs_system_id_deep_entity(id: EcsSystemIdDeep) -> i64 { return id.entity; }
+fn ecs_system_id_deep_input_type(id: EcsSystemIdDeep) -> i64 { return id.input_type; }
+fn ecs_system_id_deep_output_type(id: EcsSystemIdDeep) -> i64 { return id.output_type; }
+fn ecs_system_id_deep_eq(a: EcsSystemIdDeep, b: EcsSystemIdDeep) -> bool {
+    return a.entity == b.entity;
+}
+
+// === SystemIdMarker (type ids for I/O) ===
+struct EcsSystemIdMarkerDeep {
+    input_type: i64,
+    output_type: i64,
+}
+
+fn ecs_system_id_marker_deep_new(input_type: i64, output_type: i64) -> EcsSystemIdMarkerDeep {
+    return EcsSystemIdMarkerDeep { input_type: input_type, output_type: output_type };
+}
+
+fn ecs_system_id_marker_deep_input(m: EcsSystemIdMarkerDeep) -> i64 { return m.input_type; }
+fn ecs_system_id_marker_deep_output(m: EcsSystemIdMarkerDeep) -> i64 { return m.output_type; }
+fn ecs_system_id_marker_deep_matches(m: EcsSystemIdMarkerDeep, input_type: i64, output_type: i64) -> bool {
+    return m.input_type == input_type && m.output_type == output_type;
+}
+
+// === Slot: one registered system entity ===
+struct EcsRegisteredSlotDeep {
+    occupied: bool,
+    entity: i64,
+    system_fn_id: i64,
+    has_system: bool,       // Option<BoxedSystem> present
+    initialized: bool,
+    has_component: bool,    // RegisteredSystem component present
+    input_type: i64,
+    output_type: i64,
+    run_count: i64,
+    last_output: i64,
+    local_value: i64,       // Local state persistence across runs
+    strong_refs: i64,       // for tracked Strong handles
+}
+
+fn ecs_registered_slot_deep_empty() -> EcsRegisteredSlotDeep {
+    return EcsRegisteredSlotDeep {
+        occupied: false,
+        entity: 0,
+        system_fn_id: 0,
+        has_system: false,
+        initialized: false,
+        has_component: false,
+        input_type: 0,
+        output_type: 0,
+        run_count: 0,
+        last_output: 0,
+        local_value: 0,
+        strong_refs: 0,
+    };
+}
+
+// === RemovedSystem ===
+struct EcsRemovedSystemDeep {
+    system_fn_id: i64,
+    initialized: bool,
+    valid: bool,
+}
+
+fn ecs_removed_system_deep_new(system_fn_id: i64, initialized: bool) -> EcsRemovedSystemDeep {
+    return EcsRemovedSystemDeep { system_fn_id: system_fn_id, initialized: initialized, valid: true };
+}
+
+fn ecs_removed_system_deep_invalid() -> EcsRemovedSystemDeep {
+    return EcsRemovedSystemDeep { system_fn_id: 0, initialized: false, valid: false };
+}
+
+fn ecs_removed_system_deep_initialized(r: EcsRemovedSystemDeep) -> bool { return r.initialized; }
+fn ecs_removed_system_deep_system(r: EcsRemovedSystemDeep) -> i64 { return r.system_fn_id; }
+fn ecs_removed_system_deep_valid(r: EcsRemovedSystemDeep) -> bool { return r.valid; }
+
+// === SystemHandle ===
+struct EcsSystemHandleDeep {
+    kind: i32,
+    entity: i64,
+    input_type: i64,
+    output_type: i64,
+}
+
+fn ecs_system_handle_deep_strong(entity: i64, input_type: i64, output_type: i64) -> EcsSystemHandleDeep {
+    return EcsSystemHandleDeep {
+        kind: ECS_SR_HANDLE_STRONG,
+        entity: entity,
+        input_type: input_type,
+        output_type: output_type,
+    };
+}
+
+fn ecs_system_handle_deep_weak(entity: i64, input_type: i64, output_type: i64) -> EcsSystemHandleDeep {
+    return EcsSystemHandleDeep {
+        kind: ECS_SR_HANDLE_WEAK,
+        entity: entity,
+        input_type: input_type,
+        output_type: output_type,
+    };
+}
+
+fn ecs_system_handle_deep_entity(h: EcsSystemHandleDeep) -> i64 { return h.entity; }
+fn ecs_system_handle_deep_is_strong(h: EcsSystemHandleDeep) -> bool { return h.kind == ECS_SR_HANDLE_STRONG; }
+fn ecs_system_handle_deep_is_weak(h: EcsSystemHandleDeep) -> bool { return h.kind == ECS_SR_HANDLE_WEAK; }
+fn ecs_system_handle_deep_eq(a: EcsSystemHandleDeep, b: EcsSystemHandleDeep) -> bool {
+    return a.entity == b.entity;
+}
+fn ecs_system_handle_deep_eq_id(h: EcsSystemHandleDeep, id: EcsSystemIdDeep) -> bool {
+    return h.entity == id.entity;
+}
+fn ecs_system_handle_deep_to_id(h: EcsSystemHandleDeep) -> EcsSystemIdDeep {
+    return EcsSystemIdDeep { entity: h.entity, input_type: h.input_type, output_type: h.output_type };
+}
+
+// === CachedSystemId (one type-keyed cache entry) ===
+struct EcsCachedSystemIdDeep {
+    has: bool,
+    entity: i64,
+    type_key: i64,
+}
+
+fn ecs_cached_system_id_deep_empty() -> EcsCachedSystemIdDeep {
+    return EcsCachedSystemIdDeep { has: false, entity: 0, type_key: 0 };
+}
+
+fn ecs_cached_system_id_deep_new(entity: i64, type_key: i64) -> EcsCachedSystemIdDeep {
+    return EcsCachedSystemIdDeep { has: true, entity: entity, type_key: type_key };
+}
+
+fn ecs_cached_system_id_deep_has(c: EcsCachedSystemIdDeep) -> bool { return c.has; }
+fn ecs_cached_system_id_deep_entity(c: EcsCachedSystemIdDeep) -> i64 { return c.entity; }
+fn ecs_cached_system_id_deep_type_key(c: EcsCachedSystemIdDeep) -> i64 { return c.type_key; }
+
+// === Despawner queue (fixed 8 pending entities) ===
+struct EcsRegisteredSystemDespawnerDeep {
+    q0: i64,
+    q1: i64,
+    q2: i64,
+    q3: i64,
+    q4: i64,
+    q5: i64,
+    q6: i64,
+    q7: i64,
+    len: i32,
+}
+
+fn ecs_sr_despawner_deep_new() -> EcsRegisteredSystemDespawnerDeep {
+    return EcsRegisteredSystemDespawnerDeep {
+        q0: 0, q1: 0, q2: 0, q3: 0, q4: 0, q5: 0, q6: 0, q7: 0, len: 0,
+    };
+}
+
+fn ecs_sr_despawner_deep_len(d: EcsRegisteredSystemDespawnerDeep) -> i32 { return d.len; }
+
+fn ecs_sr_despawner_deep_push(d: EcsRegisteredSystemDespawnerDeep, entity: i64) -> EcsRegisteredSystemDespawnerDeep {
+    if d.len >= 8 { return d; };
+    if d.len == 0 { d.q0 = entity; };
+    if d.len == 1 { d.q1 = entity; };
+    if d.len == 2 { d.q2 = entity; };
+    if d.len == 3 { d.q3 = entity; };
+    if d.len == 4 { d.q4 = entity; };
+    if d.len == 5 { d.q5 = entity; };
+    if d.len == 6 { d.q6 = entity; };
+    if d.len == 7 { d.q7 = entity; };
+    d.len = d.len + 1;
+    return d;
+}
+
+fn ecs_sr_despawner_deep_at(d: EcsRegisteredSystemDespawnerDeep, i: i32) -> i64 {
+    if i == 0 { return d.q0; };
+    if i == 1 { return d.q1; };
+    if i == 2 { return d.q2; };
+    if i == 3 { return d.q3; };
+    if i == 4 { return d.q4; };
+    if i == 5 { return d.q5; };
+    if i == 6 { return d.q6; };
+    if i == 7 { return d.q7; };
+    return 0;
+}
+
+fn ecs_sr_despawner_deep_clear(d: EcsRegisteredSystemDespawnerDeep) -> EcsRegisteredSystemDespawnerDeep {
+    d.q0 = 0; d.q1 = 0; d.q2 = 0; d.q3 = 0;
+    d.q4 = 0; d.q5 = 0; d.q6 = 0; d.q7 = 0;
+    d.len = 0;
+    return d;
+}
+
+// === Registry World (fixed 8 slots + cache + despawner + last error) ===
+struct EcsSystemRegistryWorldDeep {
+    s0: EcsRegisteredSlotDeep,
+    s1: EcsRegisteredSlotDeep,
+    s2: EcsRegisteredSlotDeep,
+    s3: EcsRegisteredSlotDeep,
+    s4: EcsRegisteredSlotDeep,
+    s5: EcsRegisteredSlotDeep,
+    s6: EcsRegisteredSlotDeep,
+    s7: EcsRegisteredSlotDeep,
+    next_entity: i64,
+    cache: EcsCachedSystemIdDeep,
+    despawner: EcsRegisteredSystemDespawnerDeep,
+    last_error: i32,
+    last_err_code: i64,
+    flush_count: i64,
+    running_entity: i64, // non-zero while run_system holds system temporarily
+}
+
+fn ecs_sr_world_deep_new() -> EcsSystemRegistryWorldDeep {
+    return EcsSystemRegistryWorldDeep {
+        s0: ecs_registered_slot_deep_empty(),
+        s1: ecs_registered_slot_deep_empty(),
+        s2: ecs_registered_slot_deep_empty(),
+        s3: ecs_registered_slot_deep_empty(),
+        s4: ecs_registered_slot_deep_empty(),
+        s5: ecs_registered_slot_deep_empty(),
+        s6: ecs_registered_slot_deep_empty(),
+        s7: ecs_registered_slot_deep_empty(),
+        next_entity: 1,
+        cache: ecs_cached_system_id_deep_empty(),
+        despawner: ecs_sr_despawner_deep_new(),
+        last_error: ECS_RSE_OK,
+        last_err_code: 0,
+        flush_count: 0,
+        running_entity: 0,
+    };
+}
+
+fn ecs_sr_world_deep_last_error(w: EcsSystemRegistryWorldDeep) -> i32 { return w.last_error; }
+fn ecs_sr_world_deep_last_err_code(w: EcsSystemRegistryWorldDeep) -> i64 { return w.last_err_code; }
+fn ecs_sr_world_deep_flush_count(w: EcsSystemRegistryWorldDeep) -> i64 { return w.flush_count; }
+fn ecs_sr_world_deep_next_entity(w: EcsSystemRegistryWorldDeep) -> i64 { return w.next_entity; }
+fn ecs_sr_world_deep_cache_has(w: EcsSystemRegistryWorldDeep) -> bool { return w.cache.has; }
+fn ecs_sr_world_deep_cache_entity(w: EcsSystemRegistryWorldDeep) -> i64 { return w.cache.entity; }
+fn ecs_sr_world_deep_despawner_len(w: EcsSystemRegistryWorldDeep) -> i32 { return w.despawner.len; }
+
+fn ecs_sr_world_deep_get_slot(w: EcsSystemRegistryWorldDeep, idx: i32) -> EcsRegisteredSlotDeep {
+    if idx == 0 { return w.s0; };
+    if idx == 1 { return w.s1; };
+    if idx == 2 { return w.s2; };
+    if idx == 3 { return w.s3; };
+    if idx == 4 { return w.s4; };
+    if idx == 5 { return w.s5; };
+    if idx == 6 { return w.s6; };
+    return w.s7;
+}
+
+fn ecs_sr_world_deep_set_slot(w: EcsSystemRegistryWorldDeep, idx: i32, s: EcsRegisteredSlotDeep) -> EcsSystemRegistryWorldDeep {
+    if idx == 0 {
+        w.s0 = s;
+        return w;
+    };
+    if idx == 1 {
+        w.s1 = s;
+        return w;
+    };
+    if idx == 2 {
+        w.s2 = s;
+        return w;
+    };
+    if idx == 3 {
+        w.s3 = s;
+        return w;
+    };
+    if idx == 4 {
+        w.s4 = s;
+        return w;
+    };
+    if idx == 5 {
+        w.s5 = s;
+        return w;
+    };
+    if idx == 6 {
+        w.s6 = s;
+        return w;
+    };
+    w.s7 = s;
+    return w;
+}
+
+fn ecs_sr_world_deep_find_entity_idx(w: EcsSystemRegistryWorldDeep, entity: i64) -> i32 {
+    let i: i32 = 0;
+    while i < 8 {
+        let s = ecs_sr_world_deep_get_slot(w, i);
+        if s.occupied && s.entity == entity {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_sr_world_deep_find_free_idx(w: EcsSystemRegistryWorldDeep) -> i32 {
+    let i: i32 = 0;
+    while i < 8 {
+        let s = ecs_sr_world_deep_get_slot(w, i);
+        if s.occupied != true {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_sr_world_deep_count(w: EcsSystemRegistryWorldDeep) -> i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while i < 8 {
+        let s = ecs_sr_world_deep_get_slot(w, i);
+        if s.occupied { n = n + 1; };
+        i = i + 1;
+    }
+    return n;
+}
+
+fn ecs_sr_world_deep_slot_run_count(w: EcsSystemRegistryWorldDeep, entity: i64) -> i64 {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx < 0 { return -1; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    return s.run_count;
+}
+
+fn ecs_sr_world_deep_slot_local(w: EcsSystemRegistryWorldDeep, entity: i64) -> i64 {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx < 0 { return -1; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    return s.local_value;
+}
+
+fn ecs_sr_world_deep_slot_initialized(w: EcsSystemRegistryWorldDeep, entity: i64) -> bool {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx < 0 { return false; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    return s.initialized;
+}
+
+fn ecs_sr_world_deep_slot_strong_refs(w: EcsSystemRegistryWorldDeep, entity: i64) -> i64 {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx < 0 { return -1; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    return s.strong_refs;
+}
+
+// register_system / register_boxed_system
+fn ecs_sr_world_deep_register(
+    w: EcsSystemRegistryWorldDeep,
+    system_fn_id: i64,
+    input_type: i64,
+    output_type: i64
+) -> (EcsSystemRegistryWorldDeep, EcsSystemIdDeep) {
+    let idx = ecs_sr_world_deep_find_free_idx(w);
+    if idx < 0 {
+        w.last_error = ECS_RSE_FAILED;
+        w.last_err_code = -1;
+        return (w, ecs_system_id_deep_new(0, input_type, output_type));
+    };
+    let entity = w.next_entity;
+    w.next_entity = w.next_entity + 1;
+    let slot = EcsRegisteredSlotDeep {
+        occupied: true,
+        entity: entity,
+        system_fn_id: system_fn_id,
+        has_system: true,
+        initialized: false,
+        has_component: true,
+        input_type: input_type,
+        output_type: output_type,
+        run_count: 0,
+        last_output: 0,
+        local_value: 0,
+        strong_refs: 0,
+    };
+    w = ecs_sr_world_deep_set_slot(w, idx, slot);
+    w.last_error = ECS_RSE_OK;
+    w.last_err_code = 0;
+    return (w, ecs_system_id_deep_new(entity, input_type, output_type));
+}
+
+// register_tracked_system -> Strong handle, strong_refs = 1
+fn ecs_sr_world_deep_register_tracked(
+    w: EcsSystemRegistryWorldDeep,
+    system_fn_id: i64,
+    input_type: i64,
+    output_type: i64
+) -> (EcsSystemRegistryWorldDeep, EcsSystemHandleDeep) {
+    let pair = ecs_sr_world_deep_register(w, system_fn_id, input_type, output_type);
+    w = pair.0;
+    let id = pair.1;
+    if id.entity == 0 {
+        return (w, ecs_system_handle_deep_weak(0, input_type, output_type));
+    };
+    let idx = ecs_sr_world_deep_find_entity_idx(w, id.entity);
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    s.strong_refs = 1;
+    w = ecs_sr_world_deep_set_slot(w, idx, s);
+    return (w, ecs_system_handle_deep_strong(id.entity, input_type, output_type));
+}
+
+// clone strong handle: bump strong_refs
+fn ecs_sr_world_deep_clone_strong(
+    w: EcsSystemRegistryWorldDeep,
+    h: EcsSystemHandleDeep
+) -> (EcsSystemRegistryWorldDeep, EcsSystemHandleDeep) {
+    if h.kind != ECS_SR_HANDLE_STRONG {
+        return (w, h);
+    };
+    let idx = ecs_sr_world_deep_find_entity_idx(w, h.entity);
+    if idx < 0 { return (w, h); };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    s.strong_refs = s.strong_refs + 1;
+    w = ecs_sr_world_deep_set_slot(w, idx, s);
+    return (w, h);
+}
+
+// drop strong handle: decrement; if zero enqueue despawn
+fn ecs_sr_world_deep_drop_strong(
+    w: EcsSystemRegistryWorldDeep,
+    h: EcsSystemHandleDeep
+) -> EcsSystemRegistryWorldDeep {
+    if h.kind != ECS_SR_HANDLE_STRONG { return w; };
+    let idx = ecs_sr_world_deep_find_entity_idx(w, h.entity);
+    if idx < 0 { return w; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    let refs = s.strong_refs;
+    if refs > 0 {
+        s.strong_refs = refs - 1;
+        refs = refs - 1;
+    };
+    w = ecs_sr_world_deep_set_slot(w, idx, s);
+    if refs == 0 {
+        w.despawner = ecs_sr_despawner_deep_push(w.despawner, h.entity);
+    };
+    return w;
+}
+
+// weak from strong / id
+fn ecs_sr_world_deep_downgrade(h: EcsSystemHandleDeep) -> EcsSystemHandleDeep {
+    return ecs_system_handle_deep_weak(h.entity, h.input_type, h.output_type);
+}
+
+// unregister_system
+fn ecs_sr_world_deep_unregister(
+    w: EcsSystemRegistryWorldDeep,
+    id: EcsSystemIdDeep
+) -> (EcsSystemRegistryWorldDeep, EcsRemovedSystemDeep) {
+    // self-remove while running
+    if w.running_entity != 0 && w.running_entity == id.entity {
+        w.last_error = ECS_RSE_SELF_REMOVE;
+        w.last_err_code = id.entity;
+        return (w, ecs_removed_system_deep_invalid());
+    };
+    let idx = ecs_sr_world_deep_find_entity_idx(w, id.entity);
+    if idx < 0 {
+        w.last_error = ECS_RSE_NOT_REGISTERED;
+        w.last_err_code = id.entity;
+        return (w, ecs_removed_system_deep_invalid());
+    };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    let has_comp = s.has_component;
+    let has_sys = s.has_system;
+    let fn_id = s.system_fn_id;
+    let was_init = s.initialized;
+    if has_comp != true {
+        w.last_error = ECS_RSE_MISSING_COMPONENT;
+        w.last_err_code = id.entity;
+        return (w, ecs_removed_system_deep_invalid());
+    };
+    if has_sys != true {
+        w.last_error = ECS_RSE_SYSTEM_MISSING;
+        w.last_err_code = id.entity;
+        return (w, ecs_removed_system_deep_invalid());
+    };
+    let removed = ecs_removed_system_deep_new(fn_id, was_init);
+    w = ecs_sr_world_deep_set_slot(w, idx, ecs_registered_slot_deep_empty());
+    // clear cache if pointing here
+    if w.cache.has && w.cache.entity == id.entity {
+        w.cache = ecs_cached_system_id_deep_empty();
+    };
+    w.last_error = ECS_RSE_OK;
+    w.last_err_code = 0;
+    return (w, removed);
+}
+
+// run_system_with: take system, init once, run, return, flush
+// mode: 0=plain add local+=1 output=local, 1=with input local+=input output=local,
+//       2=param fail skip, 3=failed error
+fn ecs_sr_world_deep_run_system_with(
+    w: EcsSystemRegistryWorldDeep,
+    id: EcsSystemIdDeep,
+    input: i64,
+    mode: i32
+) -> (EcsSystemRegistryWorldDeep, i64) {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, id.entity);
+    if idx < 0 {
+        w.last_error = ECS_RSE_NOT_REGISTERED;
+        w.last_err_code = id.entity;
+        return (w, 0);
+    };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    let sin = s.input_type;
+    let sout = s.output_type;
+    let has_comp = s.has_component;
+    let has_sys = s.has_system;
+    if sin != id.input_type || sout != id.output_type {
+        w.last_error = ECS_RSE_INCORRECT_TYPE;
+        w.last_err_code = id.entity;
+        return (w, 0);
+    };
+    if has_comp != true {
+        w.last_error = ECS_RSE_MISSING_COMPONENT;
+        w.last_err_code = id.entity;
+        return (w, 0);
+    };
+    if has_sys != true {
+        w.last_error = ECS_RSE_SYSTEM_MISSING;
+        w.last_err_code = id.entity;
+        return (w, 0);
+    };
+    // take system (recursive re-entry protection)
+    s.has_system = false;
+    w.running_entity = id.entity;
+    w = ecs_sr_world_deep_set_slot(w, idx, s);
+
+    if mode == 2 {
+        let s2 = ecs_sr_world_deep_get_slot(w, idx);
+        s2.has_system = true;
+        w = ecs_sr_world_deep_set_slot(w, idx, s2);
+        w.running_entity = 0;
+        w.last_error = ECS_RSE_SKIPPED;
+        w.last_err_code = 0;
+        return (w, 0);
+    };
+    if mode == 3 {
+        let s3 = ecs_sr_world_deep_get_slot(w, idx);
+        s3.has_system = true;
+        w = ecs_sr_world_deep_set_slot(w, idx, s3);
+        w.running_entity = 0;
+        w.last_error = ECS_RSE_FAILED;
+        w.last_err_code = 99;
+        w.flush_count = w.flush_count + 1;
+        return (w, 0);
+    };
+
+    let s4 = ecs_sr_world_deep_get_slot(w, idx);
+    if s4.initialized != true {
+        s4.initialized = true;
+    };
+    if mode == 1 {
+        s4.local_value = s4.local_value + input;
+    } else {
+        s4.local_value = s4.local_value + 1;
+    };
+    s4.run_count = s4.run_count + 1;
+    s4.last_output = s4.local_value;
+    s4.has_system = true;
+    let out = s4.last_output;
+    w = ecs_sr_world_deep_set_slot(w, idx, s4);
+    w.running_entity = 0;
+    w.flush_count = w.flush_count + 1;
+    w.last_error = ECS_RSE_OK;
+    w.last_err_code = 0;
+    return (w, out);
+}
+
+fn ecs_sr_world_deep_run_system(
+    w: EcsSystemRegistryWorldDeep,
+    id: EcsSystemIdDeep
+) -> (EcsSystemRegistryWorldDeep, i64) {
+    return ecs_sr_world_deep_run_system_with(w, id, 0, 0);
+}
+
+// strip component (simulates app code removing RegisteredSystem)
+fn ecs_sr_world_deep_strip_component(w: EcsSystemRegistryWorldDeep, entity: i64) -> EcsSystemRegistryWorldDeep {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx < 0 { return w; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    s.has_component = false;
+    s.has_system = false;
+    w = ecs_sr_world_deep_set_slot(w, idx, s);
+    return w;
+}
+
+// force system missing while entity exists (recursive/panic path)
+fn ecs_sr_world_deep_force_system_missing(w: EcsSystemRegistryWorldDeep, entity: i64) -> EcsSystemRegistryWorldDeep {
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx < 0 { return w; };
+    let s = ecs_sr_world_deep_get_slot(w, idx);
+    s.has_system = false;
+    w = ecs_sr_world_deep_set_slot(w, idx, s);
+    return w;
+}
+
+// register_system_cached (ZST type_key); reuses entity if cache live
+fn ecs_sr_world_deep_register_cached(
+    w: EcsSystemRegistryWorldDeep,
+    type_key: i64,
+    system_fn_id: i64,
+    input_type: i64,
+    output_type: i64
+) -> (EcsSystemRegistryWorldDeep, EcsSystemIdDeep) {
+    if w.cache.has {
+        let idx = ecs_sr_world_deep_find_entity_idx(w, w.cache.entity);
+        if idx >= 0 {
+            let s = ecs_sr_world_deep_get_slot(w, idx);
+            // re-insert component if missing
+            if s.has_component != true {
+                s.has_component = true;
+                s.has_system = true;
+                s.system_fn_id = system_fn_id;
+                s.input_type = input_type;
+                s.output_type = output_type;
+                w = ecs_sr_world_deep_set_slot(w, idx, s);
+            };
+            w.last_error = ECS_RSE_OK;
+            return (w, ecs_system_id_deep_new(w.cache.entity, input_type, output_type));
+        };
+        // entity gone: re-register and update cache
+    };
+    let pair = ecs_sr_world_deep_register(w, system_fn_id, input_type, output_type);
+    w = pair.0;
+    let id = pair.1;
+    if id.entity != 0 {
+        w.cache = ecs_cached_system_id_deep_new(id.entity, type_key);
+    };
+    return (w, id);
+}
+
+// unregister_system_cached
+fn ecs_sr_world_deep_unregister_cached(
+    w: EcsSystemRegistryWorldDeep,
+    type_key: i64
+) -> (EcsSystemRegistryWorldDeep, EcsRemovedSystemDeep) {
+    if w.cache.has != true || w.cache.type_key != type_key {
+        w.last_error = ECS_RSE_NOT_CACHED;
+        w.last_err_code = type_key;
+        return (w, ecs_removed_system_deep_invalid());
+    };
+    let entity = w.cache.entity;
+    w.cache = ecs_cached_system_id_deep_empty();
+    let id = ecs_system_id_deep_from_entity(entity);
+    // need types from slot
+    let idx = ecs_sr_world_deep_find_entity_idx(w, entity);
+    if idx >= 0 {
+        let s = ecs_sr_world_deep_get_slot(w, idx);
+        let it = s.input_type;
+        let ot = s.output_type;
+        id = ecs_system_id_deep_new(entity, it, ot);
+    };
+    return ecs_sr_world_deep_unregister(w, id);
+}
+
+// run_system_cached_with
+fn ecs_sr_world_deep_run_cached_with(
+    w: EcsSystemRegistryWorldDeep,
+    type_key: i64,
+    system_fn_id: i64,
+    input_type: i64,
+    output_type: i64,
+    input: i64,
+    mode: i32
+) -> (EcsSystemRegistryWorldDeep, i64) {
+    let pair = ecs_sr_world_deep_register_cached(w, type_key, system_fn_id, input_type, output_type);
+    w = pair.0;
+    let id = pair.1;
+    return ecs_sr_world_deep_run_system_with(w, id, input, mode);
+}
+
+// despawn_unused_registered_systems: drain queue
+fn ecs_sr_world_deep_despawn_unused(w: EcsSystemRegistryWorldDeep) -> EcsSystemRegistryWorldDeep {
+    let n = w.despawner.len;
+    let i: i32 = 0;
+    while i < n {
+        let e = ecs_sr_despawner_deep_at(w.despawner, i);
+        let idx = ecs_sr_world_deep_find_entity_idx(w, e);
+        if idx >= 0 {
+            let s = ecs_sr_world_deep_get_slot(w, idx);
+            // only despawn if strong_refs still 0
+            if s.strong_refs == 0 {
+                w = ecs_sr_world_deep_set_slot(w, idx, ecs_registered_slot_deep_empty());
+                if w.cache.has && w.cache.entity == e {
+                    w.cache = ecs_cached_system_id_deep_empty();
+                };
+            };
+        };
+        i = i + 1;
+    }
+    w.despawner = ecs_sr_despawner_deep_clear(w.despawner);
+    return w;
+}
+
+// From RunSystemError mapping
+fn ecs_rse_from_run_system_error(is_skipped: bool, err_code: i64) -> i32 {
+    if is_skipped { return ECS_RSE_SKIPPED; };
+    return ECS_RSE_FAILED;
+}
+
+// system_value helper: create unregistered handle-value identity
+fn ecs_system_value_deep(system_fn_id: i64) -> i64 {
+    return system_fn_id;
+}

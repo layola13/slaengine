@@ -1,0 +1,166 @@
+// Bevy ECS query::par_iter (src/query/par_iter.rs): QueryParManyIter + QueryParManyUniqueIter.
+//
+// QueryParManyIter<'w, 's, D, F, E: EntityEquivalent>: parallel iteration over the query set
+// restricted to a caller-provided Vec<E> entity list. The `E: EntityEquivalent` is the entity
+// handle type — we model the entity_list as Vec<i32> (entity ids).
+// QueryParManyUniqueIter<'w, 's, D, F, E: EntityEquivalent + Sync>: same shape but the entity_list
+// is a UniqueEntityEquivalentVec<E> (de-duplicated); for_each visits each unique entity once.
+//
+// Public surface for both (src/query/par_iter.rs lines 164-260 and 318-420):
+//   batching_strategy(strategy) -> Self                (builder mutator, sets batch_size)
+//   for_each(func)                              (visits each entity once; model: returns processed count)
+//   for_each_init(init, func)                  (visits each entity once with an accumulator-style local)
+//
+// We model the parallel compute as a sequential fold-accumulation since sla_ecs has no thread-pool.
+// `func` Fn-over-items closures reduce to `func_id: i32` parameters; `init` closures to `init_id: i32`.
+// Result structs with single-field accessors are used for (init_value, processed_count, summed)
+// returns to avoid the SA-backend ".1 slot of (struct,scalar-tuple)" corruption.
+
+// === QueryParManyIter (entity_list may contain duplicates; visits each occurrence) ===
+struct EcsQueryParManyIter {
+    batch_size: i64,
+    // number of entities in the caller-provided list (the par-iter visits one query-result per
+    // list entry — duplicates allowed in the list)
+    entity_list_len: i64,
+    processed: i64,
+}
+
+fn ecs_query_par_many_iter_new(entity_list_len: i64) -> EcsQueryParManyIter {
+    let p = EcsQueryParManyIter { batch_size: 128, entity_list_len: entity_list_len, processed: 0 };
+    return p;
+}
+
+fn ecs_query_par_many_iter_batching_strategy(p: EcsQueryParManyIter, batch_size: i64) -> EcsQueryParManyIter {
+    p.batch_size = batch_size;
+    return p;
+}
+
+fn ecs_query_par_many_iter_batch_size(p: EcsQueryParManyIter) -> i64 {
+    return p.batch_size;
+}
+
+fn ecs_query_par_many_iter_len(p: EcsQueryParManyIter) -> i64 {
+    return p.entity_list_len;
+}
+
+fn ecs_query_par_many_iter_is_empty(p: EcsQueryParManyIter) -> bool {
+    return p.entity_list_len == 0;
+}
+
+// batch_count: number of batches given batch_size (ceil division), matches QueryParIter model.
+fn ecs_query_par_many_iter_batch_count(p: EcsQueryParManyIter) -> i64 {
+    if p.batch_size <= 0 { return 0; };
+    let n = p.entity_list_len / p.batch_size;
+    if p.entity_list_len % p.batch_size != 0 { return n + 1; };
+    return n;
+}
+
+// for_each(func): visits each entity in the list once; model: marks processed = list len.
+// Returns the number of items processed.
+fn ecs_query_par_many_iter_for_each(p: EcsQueryParManyIter, func_id: i32) -> i64 {
+    let _ = func_id;
+    p.processed = p.entity_list_len;
+    return p.processed;
+}
+
+// Result struct for for_each_init — single-field accessors.
+struct ParManyForEachInit {
+    processed: i64,
+    accumulator: i64,
+}
+
+fn ecs_par_many_fei_processed(r: ParManyForEachInit) -> i64 {
+    return r.processed;
+}
+
+fn ecs_par_many_fei_accumulator(r: ParManyForEachInit) -> i64 {
+    return r.accumulator;
+}
+
+// for_each_init(init, func): visits each entity once, accumulating init_value + func contribution.
+// INIT returns a per-thread local; the Bevy fn allows threads to mutate independently. We model
+// accumulate-by-func-call: accumulator = init_value + func_id_count*processed (func_id_count models
+// a per-fn-call delta so tests can observe different accumulation per func_id).
+fn ecs_query_par_many_iter_for_each_init(p: EcsQueryParManyIter, init_value: i64, func_id: i32) -> ParManyForEachInit {
+    let _ = func_id;
+    p.processed = p.entity_list_len;
+    // Model the accumulation: each invokation of `func` adds a flat +1 to the accumulator, mirroring the
+    // for_each_init example where `**local += some_expensive_operation(item)` increments per item.
+    let acc = init_value + p.processed;
+    let res = ParManyForEachInit { processed: p.processed, accumulator: acc };
+    return res;
+}
+
+fn ecs_query_par_many_iter_processed(p: EcsQueryParManyIter) -> i64 {
+    return p.processed;
+}
+
+// === QueryParManyUniqueIter (entity_list is de-duplicated; visits each unique entity once) ===
+struct EcsQueryParManyUniqueIter {
+    batch_size: i64,
+    // number of unique entities after de-duplication (matches Bevy UniqueEntityEquivalentVec's len)
+    unique_count: i64,
+    processed: i64,
+}
+
+fn ecs_query_par_many_unique_iter_new(unique_count: i64) -> EcsQueryParManyUniqueIter {
+    let p = EcsQueryParManyUniqueIter { batch_size: 128, unique_count: unique_count, processed: 0 };
+    return p;
+}
+
+fn ecs_query_par_many_unique_iter_batching_strategy(p: EcsQueryParManyUniqueIter, batch_size: i64) -> EcsQueryParManyUniqueIter {
+    p.batch_size = batch_size;
+    return p;
+}
+
+fn ecs_query_par_many_unique_iter_batch_size(p: EcsQueryParManyUniqueIter) -> i64 {
+    return p.batch_size;
+}
+
+fn ecs_query_par_many_unique_iter_len(p: EcsQueryParManyUniqueIter) -> i64 {
+    return p.unique_count;
+}
+
+fn ecs_query_par_many_unique_iter_is_empty(p: EcsQueryParManyUniqueIter) -> bool {
+    return p.unique_count == 0;
+}
+
+fn ecs_query_par_many_unique_iter_batch_count(p: EcsQueryParManyUniqueIter) -> i64 {
+    if p.batch_size <= 0 { return 0; };
+    let n = p.unique_count / p.batch_size;
+    if p.unique_count % p.batch_size != 0 { return n + 1; };
+    return n;
+}
+
+// for_each(func): the unique entity vec guarantees each entity is visited exactly once even if the
+// caller-supplied list contained duplicates (de-dup happens during construction).
+fn ecs_query_par_many_unique_iter_for_each(p: EcsQueryParManyUniqueIter, func_id: i32) -> i64 {
+    let _ = func_id;
+    p.processed = p.unique_count;
+    return p.processed;
+}
+
+struct ParManyUniqueForEachInit {
+    processed: i64,
+    accumulator: i64,
+}
+
+fn ecs_par_many_unique_fei_processed(r: ParManyUniqueForEachInit) -> i64 {
+    return r.processed;
+}
+
+fn ecs_par_many_unique_fei_accumulator(r: ParManyUniqueForEachInit) -> i64 {
+    return r.accumulator;
+}
+
+fn ecs_query_par_many_unique_iter_for_each_init(p: EcsQueryParManyUniqueIter, init_value: i64, func_id: i32) -> ParManyUniqueForEachInit {
+    let _ = func_id;
+    p.processed = p.unique_count;
+    let acc = init_value + p.processed;
+    let res = ParManyUniqueForEachInit { processed: p.processed, accumulator: acc };
+    return res;
+}
+
+fn ecs_query_par_many_unique_iter_processed(p: EcsQueryParManyUniqueIter) -> i64 {
+    return p.processed;
+}

@@ -1,0 +1,364 @@
+// Deepened Bevy ECS schedule::auto_insert_apply_deferred surface.
+// Mirrors src/schedule/auto_insert_apply_deferred.rs: AutoInsertApplyDeferredPass with the full
+// distance-tracking topo-scan build(), explicit-sync-point cache, no_sync (IgnoreDeferred)
+// forwarding, and collapse_set forwarding. The shallow lib/schedule_auto_insert_deferred.sla
+// keeps the simpler pass-struct + edge-list builder; this adds the algorithmic Bevy core.
+
+// === NodeKey (SystemKey) ===
+struct EcsAidNodeKey {
+    id: i64,
+}
+
+fn ecs_aid_node_key_new(id: i64) -> EcsAidNodeKey { return EcsAidNodeKey { id: id }; }
+fn ecs_aid_node_key_id(k: EcsAidNodeKey) -> i64 { return k.id; }
+fn ecs_aid_node_key_eq(a: EcsAidNodeKey, b: EcsAidNodeKey) -> bool { return a.id == b.id; }
+
+// === FlatDependencyEdges: directed system->system edge list ===
+struct EcsAidFlatEdges {
+    edges_from: Vec<i64>,
+    edges_to: Vec<i64>,
+}
+
+fn ecs_aid_flat_edges_new() -> EcsAidFlatEdges {
+    return EcsAidFlatEdges { edges_from: Vec::new(), edges_to: Vec::new() };
+}
+
+fn ecs_aid_flat_edges_add(d: EcsAidFlatEdges, a: i64, b: i64) -> EcsAidFlatEdges {
+    d.edges_from.push(a);
+    d.edges_to.push(b);
+    return d;
+}
+
+fn ecs_aid_flat_edges_remove(d: EcsAidFlatEdges, a: i64, b: i64) -> (EcsAidFlatEdges, bool) {
+    let nf: Vec<i64> = Vec::new();
+    let nt: Vec<i64> = Vec::new();
+    let removed = false;
+    let i: i64 = 0;
+    let n: i64 = len(d.edges_from) as i64;
+    while i < n {
+        if d.edges_from[i] == a && d.edges_to[i] == b {
+            removed = true;
+        } else {
+            nf.push(d.edges_from[i]);
+            nt.push(d.edges_to[i]);
+        };
+        i = i + 1;
+    }
+    d.edges_from = nf;
+    d.edges_to = nt;
+    return (d, removed);
+}
+
+fn ecs_aid_flat_edges_outgoing_targets(d: EcsAidFlatEdges, a: i64) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(d.edges_from) as i64;
+    while i < n {
+        if d.edges_from[i] == a { out.push(d.edges_to[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// === Pass model ===
+// no_sync_edges mirrors Bevy BTreeSet<(NodeId, NodeId)>. We store them as flattened (from,to).
+// auto_sync_node_ids mirrors HashMap<u32, SystemKey> — distance -> cached sync SystemKey.
+struct EcsAidPass {
+    no_sync_from: Vec<i64>,
+    no_sync_to: Vec<i64>,
+    sync_distances: Vec<i32>,
+    sync_node_ids: Vec<i64>,
+    next_sync_node: i64,
+}
+
+fn ecs_aid_pass_new() -> EcsAidPass {
+    return EcsAidPass {
+        no_sync_from: Vec::new(),
+        no_sync_to: Vec::new(),
+        sync_distances: Vec::new(),
+        sync_node_ids: Vec::new(),
+        next_sync_node: 100000,
+    };
+}
+
+fn ecs_aid_pass_no_sync_contains(p: EcsAidPass, from: i64, to: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(p.no_sync_from) as i64;
+    while i < n {
+        if p.no_sync_from[i] == from && p.no_sync_to[i] == to { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_aid_pass_no_sync_add(p: EcsAidPass, from: i64, to: i64) -> EcsAidPass {
+    if ecs_aid_pass_no_sync_contains(p, from, to) { return p; };
+    p.no_sync_from.push(from);
+    p.no_sync_to.push(to);
+    return p;
+}
+
+// `add_dependency(from, to, Some(IgnoreDeferred))` — options present records edge as no-sync.
+fn ecs_aid_pass_add_dependency(p: EcsAidPass, from: i64, to: i64, ignore_deferred: bool) -> EcsAidPass {
+    if ignore_deferred {
+        p = ecs_aid_pass_no_sync_add(p, from, to);
+    };
+    return p;
+}
+
+fn ecs_aid_pass_no_sync_count(p: EcsAidPass) -> i64 { return len(p.no_sync_from) as i64; }
+fn ecs_aid_pass_sync_count(p: EcsAidPass) -> i64 { return len(p.sync_node_ids) as i64; }
+
+// `add_auto_sync`: allocate a fresh sync-point SystemKey (the Bevy `graph.systems.insert(...)`),
+// register `ambiguous_with_all` and return the key. We model it as a monotonic allocator.
+fn ecs_aid_pass_add_auto_sync(p: EcsAidPass) -> (EcsAidPass, i64) {
+    let key = p.next_sync_node;
+    p.next_sync_node = p.next_sync_node + 1;
+    return (p, key);
+}
+
+// `get_sync_point(distance)`: return the cached sync node for this distance, else allocate + cache.
+fn ecs_aid_pass_get_sync_point(p: EcsAidPass, distance: i32) -> (EcsAidPass, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(p.sync_distances) as i64;
+    while i < n {
+        if p.sync_distances[i] == distance { return (p, p.sync_node_ids[i]); };
+        i = i + 1;
+    }
+    let alloc = ecs_aid_pass_add_auto_sync(p);
+    p = alloc.0;
+    let key = alloc.1;
+    p.sync_distances.push(distance);
+    p.sync_node_ids.push(key);
+    return (p, key);
+}
+
+// === build() ===
+// Inputs over a topo-sorted slice of system ids with per-system flags:
+//   has_deferred[key]  -> system has Deferred params (Commands etc.)
+//   is_explicit_sync[key] -> is_apply_deferred(&system) (explicit ApplyDeferred node)
+//   has_conditions[key] -> system_has_conditions(key)
+//   is_exclusive[key]   -> system.is_exclusive()
+// The pass produces new flat edges via FlattenedDependencies::add_edge / remove_edge.
+struct EcsAidBuildResult {
+    edges: EcsAidFlatEdges,          // resulting edge list
+    new_sync_point_keys: Vec<i64>,   // distinct sync Nodes created during this build
+    sync_edges: Vec<i64>,            // flattened (from, sync, to) triples where a sync was inserted
+}
+
+fn ecs_aid_build_result_success(edges: EcsAidFlatEdges, new_sync_point_keys: Vec<i64>, sync_edges: Vec<i64>) -> EcsAidBuildResult {
+    return EcsAidBuildResult {
+        edges: edges,
+        new_sync_point_keys: new_sync_point_keys,
+        sync_edges: sync_edges,
+    };
+}
+
+fn ecs_aid_build_result_edge_count(r: EcsAidBuildResult) -> i64 { return len(r.edges.edges_from) as i64; }
+fn ecs_aid_build_result_sync_edges_count(r: EcsAidBuildResult) -> i64 { return (len(r.sync_edges) as i64) / 3; }
+fn ecs_aid_build_result_new_sync_points(r: EcsAidBuildResult) -> i64 { return len(r.new_sync_point_keys) as i64; }
+fn ecs_aid_build_result_sync_edge_triple(r: EcsAidBuildResult, i: i64) -> (i64, i64, i64) {
+    let base = i * 3;
+    return (r.sync_edges[base], r.sync_edges[base + 1], r.sync_edges[base + 2]);
+}
+fn ecs_aid_build_result_edges_from(r: EcsAidBuildResult) -> Vec<i64> { return r.edges.edges_from; }
+fn ecs_aid_build_result_edges_to(r: EcsAidBuildResult) -> Vec<i64> { return r.edges.edges_to; }
+
+// The build itself. Returns (pass, build_result).
+//
+// Phase 1: iterate over `topo` in order. Each node's (distance, node_needs_sync). If the node is an
+// explicit sync point, we clear node_needs_sync and cache distance_to_explicit_sync_node.
+// Otherwise, if not already pending from an earlier IgnoredDeferred edge, we check the node's own
+// has_deferred flag. For each outgoing edge -> target:
+//   - if node_needs_sync AND target not exclusive AND (key,target) is in no_sync_edges, set
+//     target's pending_sync = true and edge_needs_sync = false. Otherwise edge_needs_sync = node_needs_sync.
+//   - weight = 1 if edge_needs_sync or target is an explicit sync point, else 0.
+//   - target_distance = max(current_target_distance, node_distance + weight).
+//
+// Phase 2: for each (key, target) edge, if key distance != target distance and target is not itself
+// an explicit sync, insert (key -> sync_point -> target) and remove (key -> target). Choose
+// sync_point: explicit node for that target_distance if present, else allocate+cache.
+//
+// topo: Vec<i64> in topo order.
+// The inputs are Vecs indexed by system-id-offset (an index into `topo`), so we translate a system
+// id to its index inside `topo` and use the parallel-flag Vecs by index.
+fn ecs_aid_pass_build(p: EcsAidPass, topo: Vec<i64>, flat_from: Vec<i64>, flat_to: Vec<i64>, has_deferred: Vec<bool>, is_explicit_sync: Vec<bool>, has_conditions: Vec<bool>, is_exclusive: Vec<bool>) -> (EcsAidPass, EcsAidBuildResult) {
+    let n: i64 = len(topo) as i64;
+    // per-node dist + pending_sync + distance_to_explicit_sync cache
+    let dists: Vec<i32> = Vec::new();
+    let pendings: Vec<bool> = Vec::new();
+    let i: i64 = 0;
+    while i < n {
+        dists.push(0);
+        pendings.push(false);
+        i = i + 1;
+    }
+    let explicit_distance_keys: Vec<i32> = Vec::new();
+    let explicit_node_keys: Vec<i64> = Vec::new();
+    // new sync nodes allocated during this build (from add_auto_sync via get_sync_point)
+    let new_sync_points: Vec<i64> = Vec::new();
+    let snapshot_next_sync_before = p.next_sync_node;
+
+    // helper: index_of(topo, id)
+    // ----- Phase 1 -----
+    let ti: i64 = 0;
+    while ti < n {
+        let key = topo[ti];
+        let cur_dist = dists[ti];
+        let mut needs_sync = pendings[ti];
+        if is_explicit_sync[ti] {
+            // cache explicit sync for this distance
+            explicit_distance_keys.push(cur_dist);
+            explicit_node_keys.push(key);
+            needs_sync = false;
+        } else {
+            if needs_sync != true {
+                needs_sync = has_deferred[ti];
+            };
+        };
+        // outgoing targets -- look up edges whose from==key
+        let ei: i64 = 0;
+        let ne: i64 = len(flat_from) as i64;
+        while ei < ne {
+            if flat_from[ei] == key {
+                let target = flat_to[ei];
+                let tgt_idx = ecs_aid_index_of(topo, target);
+                let mut edge_needs_sync = needs_sync;
+                if needs_sync && (is_exclusive[tgt_idx] == false) && ecs_aid_pass_no_sync_contains(p, key, target) {
+                    // target delays commands
+                    pendings[tgt_idx] = true;
+                    edge_needs_sync = false;
+                };
+                let mut weight: i32 = 0;
+                if edge_needs_sync || is_explicit_sync[tgt_idx] { weight = 1; };
+                let candidate = cur_dist + weight;
+                if candidate > dists[tgt_idx] { dists[tgt_idx] = candidate; };
+            };
+            ei = ei + 1;
+        }
+        ti = ti + 1;
+    }
+    // ----- Phase 2 -----
+    // build result edge list (start from existing flat edges; we add new edges and remove redundant).
+    let out_edges = ecs_aid_flat_edges_new();
+    let out_sync_triples: Vec<i64> = Vec::new();
+    let ei2: i64 = 0;
+    let ne2: i64 = len(flat_from) as i64;
+    while ei2 < ne2 {
+        let key = flat_from[ei2];
+        let target = flat_to[ei2];
+        let ttl = ecs_aid_index_of(topo, target);
+        let ktl = ecs_aid_index_of(topo, key);
+        let same_distance = dists[ktl] == dists[ttl];
+        let target_is_explicit_sync = is_explicit_sync[ttl];
+        if same_distance || target_is_explicit_sync {
+            // No sync needed; keep the original edge.
+            out_edges = ecs_aid_flat_edges_add(out_edges, key, target);
+        } else {
+            // insert sync point between key and target
+            let target_distance = dists[ttl];
+            // explicit sync node for that distance if cached, else allocate
+            let mut sync_node: i64 = 0;
+            let mut found_explicit = false;
+            let di: i64 = 0;
+            let dn: i64 = len(explicit_distance_keys) as i64;
+            while di < dn {
+                if explicit_distance_keys[di] == target_distance {
+                    sync_node = explicit_node_keys[di];
+                    found_explicit = true;
+                };
+                di = di + 1;
+            }
+            if found_explicit != true {
+                let alloc = ecs_aid_pass_get_sync_point(p, target_distance);
+                p = alloc.0;
+                sync_node = alloc.1;
+            };
+            out_edges = ecs_aid_flat_edges_add(out_edges, key, sync_node);
+            out_edges = ecs_aid_flat_edges_add(out_edges, sync_node, target);
+            out_sync_triples.push(key);
+            out_sync_triples.push(sync_node);
+            out_sync_triples.push(target);
+        };
+        ei2 = ei2 + 1;
+    }
+    // collect newly allocated sync node ids (allocator bumped past the snapshot).
+    let mut nsk: i64 = snapshot_next_sync_before;
+    while nsk < p.next_sync_node {
+        new_sync_points.push(nsk);
+        nsk = nsk + 1;
+    }
+    let res = ecs_aid_build_result_success(out_edges, new_sync_points, out_sync_triples);
+    return (p, res);
+}
+
+// index_of returns the position of `id` in `topo` or -1.
+fn ecs_aid_index_of(topo: Vec<i64>, id: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(topo) as i64;
+    while i < n {
+        if topo[i] == id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// === collapse_set IgnoreDeferred forwarding (auto_insert_apply_deferred.rs lines 216-263) ===
+// Bevy `collapse_set(set, systems, dependency_flattening)`:
+// - if systems is empty, for each incoming a and outgoing b of NodeId::Set(set),
+//   if (a, Set(set)) and (Set(set), b) are both no_sync edges, insert (a, b) as no_sync.
+// - else (non-empty systems):
+//   for each incoming a, for each system sys in systems: if (a, Set(set)) is no_sync,
+//     insert (a, System(sys)).
+//   for each outgoing b, for each system sys in systems: if (Set(set), b) is no_sync,
+//     insert (System(sys), b).
+// We model it against a set-key id and a dependency-flattening edge list (incoming/outgoing).
+fn ecs_aid_pass_collapse_set(p: EcsAidPass, set_id: i64, systems: Vec<i64>, incoming_a: Vec<i64>, outgoing_b: Vec<i64>) -> EcsAidPass {
+    let nsys: i64 = len(systems) as i64;
+    let n_in: i64 = len(incoming_a) as i64;
+    let n_out: i64 = len(outgoing_b) as i64;
+    if nsys == 0 {
+        let ai: i64 = 0;
+        while ai < n_in {
+            let a = incoming_a[ai];
+            if ecs_aid_pass_no_sync_contains(p, a, set_id) {
+                let bi: i64 = 0;
+                while bi < n_out {
+                    if ecs_aid_pass_no_sync_contains(p, set_id, outgoing_b[bi]) {
+                        p = ecs_aid_pass_no_sync_add(p, a, outgoing_b[bi]);
+                    };
+                    bi = bi + 1;
+                }
+            };
+            ai = ai + 1;
+        }
+    } else {
+        // incoming -> (a, System(sys))
+        let ai2: i64 = 0;
+        while ai2 < n_in {
+            let a = incoming_a[ai2];
+            if ecs_aid_pass_no_sync_contains(p, a, set_id) {
+                let si: i64 = 0;
+                while si < nsys {
+                    p = ecs_aid_pass_no_sync_add(p, a, systems[si]);
+                    si = si + 1;
+                }
+            };
+            ai2 = ai2 + 1;
+        }
+        // outgoing -> (System(sys), b)
+        let bi2: i64 = 0;
+        while bi2 < n_out {
+            let b = outgoing_b[bi2];
+            if ecs_aid_pass_no_sync_contains(p, set_id, b) {
+                let si2: i64 = 0;
+                while si2 < nsys {
+                    p = ecs_aid_pass_no_sync_add(p, systems[si2], b);
+                    si2 = si2 + 1;
+                }
+            };
+            bi2 = bi2 + 1;
+        }
+    };
+    return p;
+}

@@ -1,0 +1,789 @@
+// Deepened Bevy ECS event trigger surface.
+// Mirrors src/event/trigger.rs:
+//   GlobalTrigger — run all global observers for the event key
+//   EntityTrigger — global + entity-scoped observers for event_target
+//   PropagateEntityTrigger — EntityTrigger at each hop along Traversal until
+//     propagate=false or traversal ends; original_event_target preserved
+//   EntityComponentsTrigger — EntityTrigger + per-component global/entity observers
+//   trigger_entity_internal shared path
+// Observer runners are modeled as recording (observer_id, target, hop) invocations.
+// Shallow lib/event_trigger.sla retained.
+
+// === Trigger kinds ===
+const ECS_ETR_KIND_GLOBAL: i32 = 0;
+const ECS_ETR_KIND_ENTITY: i32 = 1;
+const ECS_ETR_KIND_PROPAGATE: i32 = 2;
+const ECS_ETR_KIND_ENTITY_COMPONENTS: i32 = 3;
+
+// Entity placeholder (Bevy Entity::PLACEHOLDER stand-in)
+const ECS_ETR_PLACEHOLDER: i64 = 2147483647;
+
+// Fixed capacities
+const ECS_ETR_OBS_CAP: i32 = 16;
+const ECS_ETR_COMP_CAP: i32 = 8;
+const ECS_ETR_PARENT_CAP: i32 = 16;
+const ECS_ETR_LOG_CAP: i32 = 32;
+
+// === Observer invocation log entry ===
+// scope: 0=global, 1=entity, 2=component_global, 3=entity_component
+const ECS_ETR_SCOPE_GLOBAL: i32 = 0;
+const ECS_ETR_SCOPE_ENTITY: i32 = 1;
+const ECS_ETR_SCOPE_COMP_GLOBAL: i32 = 2;
+const ECS_ETR_SCOPE_ENTITY_COMP: i32 = 3;
+
+struct EcsEtrInvokeDeep {
+    observer_id: i64,
+    scope: i32,
+    target_entity: i64,
+    component_id: i32,
+    hop: i32,
+    event_value: i64,
+}
+
+// === CachedObservers model ===
+// Global observers: list of observer entity ids
+// Entity observers: (entity, observer_id) pairs
+// Component global observers: (component_id, observer_id)
+// Entity-component observers: (entity, component_id, observer_id)
+struct EcsCachedObserversDeep {
+    // global
+    g0: i64, g1: i64, g2: i64, g3: i64,
+    g4: i64, g5: i64, g6: i64, g7: i64,
+    g_len: i32,
+    // entity-scoped
+    ee0: i64, eo0: i64,
+    ee1: i64, eo1: i64,
+    ee2: i64, eo2: i64,
+    ee3: i64, eo3: i64,
+    ee4: i64, eo4: i64,
+    ee5: i64, eo5: i64,
+    ee6: i64, eo6: i64,
+    ee7: i64, eo7: i64,
+    e_len: i32,
+    // component global
+    cg0: i32, co0: i64,
+    cg1: i32, co1: i64,
+    cg2: i32, co2: i64,
+    cg3: i32, co3: i64,
+    cg4: i32, co4: i64,
+    cg5: i32, co5: i64,
+    cg6: i32, co6: i64,
+    cg7: i32, co7: i64,
+    cg_len: i32,
+    // entity-component
+    ece0: i64, ecc0: i32, eco0: i64,
+    ece1: i64, ecc1: i32, eco1: i64,
+    ece2: i64, ecc2: i32, eco2: i64,
+    ece3: i64, ecc3: i32, eco3: i64,
+    ece4: i64, ecc4: i32, eco4: i64,
+    ece5: i64, ecc5: i32, eco5: i64,
+    ece6: i64, ecc6: i32, eco6: i64,
+    ece7: i64, ecc7: i32, eco7: i64,
+    ec_len: i32,
+    // trigger id counter (world.increment_trigger_id)
+    trigger_id: i64,
+}
+
+fn ecs_etr_observers_new() -> EcsCachedObserversDeep {
+    return EcsCachedObserversDeep {
+        g0: 0, g1: 0, g2: 0, g3: 0,
+        g4: 0, g5: 0, g6: 0, g7: 0,
+        g_len: 0,
+        ee0: 0, eo0: 0, ee1: 0, eo1: 0,
+        ee2: 0, eo2: 0, ee3: 0, eo3: 0,
+        ee4: 0, eo4: 0, ee5: 0, eo5: 0,
+        ee6: 0, eo6: 0, ee7: 0, eo7: 0,
+        e_len: 0,
+        cg0: 0, co0: 0, cg1: 0, co1: 0,
+        cg2: 0, co2: 0, cg3: 0, co3: 0,
+        cg4: 0, co4: 0, cg5: 0, co5: 0,
+        cg6: 0, co6: 0, cg7: 0, co7: 0,
+        cg_len: 0,
+        ece0: 0, ecc0: 0, eco0: 0,
+        ece1: 0, ecc1: 0, eco1: 0,
+        ece2: 0, ecc2: 0, eco2: 0,
+        ece3: 0, ecc3: 0, eco3: 0,
+        ece4: 0, ecc4: 0, eco4: 0,
+        ece5: 0, ecc5: 0, eco5: 0,
+        ece6: 0, ecc6: 0, eco6: 0,
+        ece7: 0, ecc7: 0, eco7: 0,
+        ec_len: 0,
+        trigger_id: 0,
+    };
+}
+
+fn ecs_etr_add_global(o: EcsCachedObserversDeep, observer_id: i64) -> EcsCachedObserversDeep {
+    if o.g_len >= 8 { return o; };
+    if o.g_len == 0 { o.g0 = observer_id; };
+    if o.g_len == 1 { o.g1 = observer_id; };
+    if o.g_len == 2 { o.g2 = observer_id; };
+    if o.g_len == 3 { o.g3 = observer_id; };
+    if o.g_len == 4 { o.g4 = observer_id; };
+    if o.g_len == 5 { o.g5 = observer_id; };
+    if o.g_len == 6 { o.g6 = observer_id; };
+    if o.g_len == 7 { o.g7 = observer_id; };
+    o.g_len = o.g_len + 1;
+    return o;
+}
+
+fn ecs_etr_global_at(o: EcsCachedObserversDeep, idx: i32) -> i64 {
+    if idx == 0 { return o.g0; };
+    if idx == 1 { return o.g1; };
+    if idx == 2 { return o.g2; };
+    if idx == 3 { return o.g3; };
+    if idx == 4 { return o.g4; };
+    if idx == 5 { return o.g5; };
+    if idx == 6 { return o.g6; };
+    if idx == 7 { return o.g7; };
+    return 0;
+}
+
+fn ecs_etr_add_entity_obs(o: EcsCachedObserversDeep, entity: i64, observer_id: i64) -> EcsCachedObserversDeep {
+    if o.e_len >= 8 { return o; };
+    if o.e_len == 0 { o.ee0 = entity; o.eo0 = observer_id; };
+    if o.e_len == 1 { o.ee1 = entity; o.eo1 = observer_id; };
+    if o.e_len == 2 { o.ee2 = entity; o.eo2 = observer_id; };
+    if o.e_len == 3 { o.ee3 = entity; o.eo3 = observer_id; };
+    if o.e_len == 4 { o.ee4 = entity; o.eo4 = observer_id; };
+    if o.e_len == 5 { o.ee5 = entity; o.eo5 = observer_id; };
+    if o.e_len == 6 { o.ee6 = entity; o.eo6 = observer_id; };
+    if o.e_len == 7 { o.ee7 = entity; o.eo7 = observer_id; };
+    o.e_len = o.e_len + 1;
+    return o;
+}
+
+fn ecs_etr_entity_pair(o: EcsCachedObserversDeep, idx: i32) -> (i64, i64) {
+    if idx == 0 { return (o.ee0, o.eo0); };
+    if idx == 1 { return (o.ee1, o.eo1); };
+    if idx == 2 { return (o.ee2, o.eo2); };
+    if idx == 3 { return (o.ee3, o.eo3); };
+    if idx == 4 { return (o.ee4, o.eo4); };
+    if idx == 5 { return (o.ee5, o.eo5); };
+    if idx == 6 { return (o.ee6, o.eo6); };
+    if idx == 7 { return (o.ee7, o.eo7); };
+    return (0, 0);
+}
+
+fn ecs_etr_add_comp_global(o: EcsCachedObserversDeep, component_id: i32, observer_id: i64) -> EcsCachedObserversDeep {
+    if o.cg_len >= 8 { return o; };
+    if o.cg_len == 0 { o.cg0 = component_id; o.co0 = observer_id; };
+    if o.cg_len == 1 { o.cg1 = component_id; o.co1 = observer_id; };
+    if o.cg_len == 2 { o.cg2 = component_id; o.co2 = observer_id; };
+    if o.cg_len == 3 { o.cg3 = component_id; o.co3 = observer_id; };
+    if o.cg_len == 4 { o.cg4 = component_id; o.co4 = observer_id; };
+    if o.cg_len == 5 { o.cg5 = component_id; o.co5 = observer_id; };
+    if o.cg_len == 6 { o.cg6 = component_id; o.co6 = observer_id; };
+    if o.cg_len == 7 { o.cg7 = component_id; o.co7 = observer_id; };
+    o.cg_len = o.cg_len + 1;
+    return o;
+}
+
+fn ecs_etr_comp_global_pair(o: EcsCachedObserversDeep, idx: i32) -> (i32, i64) {
+    if idx == 0 { return (o.cg0, o.co0); };
+    if idx == 1 { return (o.cg1, o.co1); };
+    if idx == 2 { return (o.cg2, o.co2); };
+    if idx == 3 { return (o.cg3, o.co3); };
+    if idx == 4 { return (o.cg4, o.co4); };
+    if idx == 5 { return (o.cg5, o.co5); };
+    if idx == 6 { return (o.cg6, o.co6); };
+    if idx == 7 { return (o.cg7, o.co7); };
+    return (0, 0);
+}
+
+fn ecs_etr_add_entity_comp(
+    o: EcsCachedObserversDeep,
+    entity: i64,
+    component_id: i32,
+    observer_id: i64
+) -> EcsCachedObserversDeep {
+    if o.ec_len >= 8 { return o; };
+    if o.ec_len == 0 { o.ece0 = entity; o.ecc0 = component_id; o.eco0 = observer_id; };
+    if o.ec_len == 1 { o.ece1 = entity; o.ecc1 = component_id; o.eco1 = observer_id; };
+    if o.ec_len == 2 { o.ece2 = entity; o.ecc2 = component_id; o.eco2 = observer_id; };
+    if o.ec_len == 3 { o.ece3 = entity; o.ecc3 = component_id; o.eco3 = observer_id; };
+    if o.ec_len == 4 { o.ece4 = entity; o.ecc4 = component_id; o.eco4 = observer_id; };
+    if o.ec_len == 5 { o.ece5 = entity; o.ecc5 = component_id; o.eco5 = observer_id; };
+    if o.ec_len == 6 { o.ece6 = entity; o.ecc6 = component_id; o.eco6 = observer_id; };
+    if o.ec_len == 7 { o.ece7 = entity; o.ecc7 = component_id; o.eco7 = observer_id; };
+    o.ec_len = o.ec_len + 1;
+    return o;
+}
+
+fn ecs_etr_entity_comp_triple(o: EcsCachedObserversDeep, idx: i32) -> (i64, i32, i64) {
+    if idx == 0 { return (o.ece0, o.ecc0, o.eco0); };
+    if idx == 1 { return (o.ece1, o.ecc1, o.eco1); };
+    if idx == 2 { return (o.ece2, o.ecc2, o.eco2); };
+    if idx == 3 { return (o.ece3, o.ecc3, o.eco3); };
+    if idx == 4 { return (o.ece4, o.ecc4, o.eco4); };
+    if idx == 5 { return (o.ece5, o.ecc5, o.eco5); };
+    if idx == 6 { return (o.ece6, o.ecc6, o.eco6); };
+    if idx == 7 { return (o.ece7, o.ecc7, o.eco7); };
+    return (0, 0, 0);
+}
+
+fn ecs_etr_global_len(o: EcsCachedObserversDeep) -> i32 { return o.g_len; }
+fn ecs_etr_entity_obs_len(o: EcsCachedObserversDeep) -> i32 { return o.e_len; }
+fn ecs_etr_comp_global_len(o: EcsCachedObserversDeep) -> i32 { return o.cg_len; }
+fn ecs_etr_entity_comp_len(o: EcsCachedObserversDeep) -> i32 { return o.ec_len; }
+fn ecs_etr_trigger_id(o: EcsCachedObserversDeep) -> i64 { return o.trigger_id; }
+
+// === World parent traversal map (Parent relationship stand-in) ===
+// parent_of[entity_index] = parent entity id; 0 means no parent / missing
+// Entities are positive i64 ids; we store sparse pairs.
+struct EcsEtrWorldDeep {
+    // entity existence mask via pairs
+    ent0: i64, ent1: i64, ent2: i64, ent3: i64,
+    ent4: i64, ent5: i64, ent6: i64, ent7: i64,
+    e_len: i32,
+    // parent edges: child -> parent
+    c0: i64, p0: i64,
+    c1: i64, p1: i64,
+    c2: i64, p2: i64,
+    c3: i64, p3: i64,
+    c4: i64, p4: i64,
+    c5: i64, p5: i64,
+    c6: i64, p6: i64,
+    c7: i64, p7: i64,
+    edge_len: i32,
+}
+
+fn ecs_etr_world_new() -> EcsEtrWorldDeep {
+    return EcsEtrWorldDeep {
+        ent0: 0, ent1: 0, ent2: 0, ent3: 0,
+        ent4: 0, ent5: 0, ent6: 0, ent7: 0,
+        e_len: 0,
+        c0: 0, p0: 0, c1: 0, p1: 0,
+        c2: 0, p2: 0, c3: 0, p3: 0,
+        c4: 0, p4: 0, c5: 0, p5: 0,
+        c6: 0, p6: 0, c7: 0, p7: 0,
+        edge_len: 0,
+    };
+}
+
+fn ecs_etr_world_spawn(w: EcsEtrWorldDeep, entity: i64) -> EcsEtrWorldDeep {
+    if w.e_len >= 8 { return w; };
+    if w.e_len == 0 { w.ent0 = entity; };
+    if w.e_len == 1 { w.ent1 = entity; };
+    if w.e_len == 2 { w.ent2 = entity; };
+    if w.e_len == 3 { w.ent3 = entity; };
+    if w.e_len == 4 { w.ent4 = entity; };
+    if w.e_len == 5 { w.ent5 = entity; };
+    if w.e_len == 6 { w.ent6 = entity; };
+    if w.e_len == 7 { w.ent7 = entity; };
+    w.e_len = w.e_len + 1;
+    return w;
+}
+
+fn ecs_etr_world_has(w: EcsEtrWorldDeep, entity: i64) -> bool {
+    if w.e_len > 0 { if w.ent0 == entity { return true; }; };
+    if w.e_len > 1 { if w.ent1 == entity { return true; }; };
+    if w.e_len > 2 { if w.ent2 == entity { return true; }; };
+    if w.e_len > 3 { if w.ent3 == entity { return true; }; };
+    if w.e_len > 4 { if w.ent4 == entity { return true; }; };
+    if w.e_len > 5 { if w.ent5 == entity { return true; }; };
+    if w.e_len > 6 { if w.ent6 == entity { return true; }; };
+    if w.e_len > 7 { if w.ent7 == entity { return true; }; };
+    return false;
+}
+
+fn ecs_etr_world_set_parent(w: EcsEtrWorldDeep, child: i64, parent: i64) -> EcsEtrWorldDeep {
+    if w.edge_len >= 8 { return w; };
+    if w.edge_len == 0 { w.c0 = child; w.p0 = parent; };
+    if w.edge_len == 1 { w.c1 = child; w.p1 = parent; };
+    if w.edge_len == 2 { w.c2 = child; w.p2 = parent; };
+    if w.edge_len == 3 { w.c3 = child; w.p3 = parent; };
+    if w.edge_len == 4 { w.c4 = child; w.p4 = parent; };
+    if w.edge_len == 5 { w.c5 = child; w.p5 = parent; };
+    if w.edge_len == 6 { w.c6 = child; w.p6 = parent; };
+    if w.edge_len == 7 { w.c7 = child; w.p7 = parent; };
+    w.edge_len = w.edge_len + 1;
+    return w;
+}
+
+// Traversal::traverse Parent-like: return Some(parent) if edge exists and parent spawned
+fn ecs_etr_traverse_parent(w: EcsEtrWorldDeep, current: i64) -> (bool, i64) {
+    let i: i32 = 0;
+    while i < w.edge_len {
+        let child: i64 = 0;
+        let parent: i64 = 0;
+        if i == 0 { child = w.c0; parent = w.p0; };
+        if i == 1 { child = w.c1; parent = w.p1; };
+        if i == 2 { child = w.c2; parent = w.p2; };
+        if i == 3 { child = w.c3; parent = w.p3; };
+        if i == 4 { child = w.c4; parent = w.p4; };
+        if i == 5 { child = w.c5; parent = w.p5; };
+        if i == 6 { child = w.c6; parent = w.p6; };
+        if i == 7 { child = w.c7; parent = w.p7; };
+        if child == current {
+            if ecs_etr_world_has(w, parent) {
+                return (true, parent);
+            };
+            return (false, 0);
+        };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+// === TriggerContext ===
+struct EcsEtrTriggerContextDeep {
+    event_key: i64,
+    caller: i64,
+}
+
+fn ecs_etr_ctx_new(event_key: i64, caller: i64) -> EcsEtrTriggerContextDeep {
+    return EcsEtrTriggerContextDeep { event_key: event_key, caller: caller };
+}
+
+fn ecs_etr_ctx_event_key(c: EcsEtrTriggerContextDeep) -> i64 { return c.event_key; }
+
+// === Event payload with mutable target ===
+struct EcsEtrEventDeep {
+    value: i64,
+    target: i64,
+}
+
+fn ecs_etr_event_new(value: i64, target: i64) -> EcsEtrEventDeep {
+    return EcsEtrEventDeep { value: value, target: target };
+}
+
+fn ecs_etr_event_value(e: EcsEtrEventDeep) -> i64 { return e.value; }
+fn ecs_etr_event_target(e: EcsEtrEventDeep) -> i64 { return e.target; }
+fn ecs_etr_event_set_target(e: EcsEtrEventDeep, target: i64) -> EcsEtrEventDeep {
+    e.target = target;
+    return e;
+}
+
+// === Invocation log ===
+struct EcsEtrLogDeep {
+    // packed as parallel arrays
+    o0: i64, s0: i32, t0: i64, c0: i32, h0: i32, v0: i64,
+    o1: i64, s1: i32, t1: i64, c1: i32, h1: i32, v1: i64,
+    o2: i64, s2: i32, t2: i64, c2: i32, h2: i32, v2: i64,
+    o3: i64, s3: i32, t3: i64, c3: i32, h3: i32, v3: i64,
+    o4: i64, s4: i32, t4: i64, c4: i32, h4: i32, v4: i64,
+    o5: i64, s5: i32, t5: i64, c5: i32, h5: i32, v5: i64,
+    o6: i64, s6: i32, t6: i64, c6: i32, h6: i32, v6: i64,
+    o7: i64, s7: i32, t7: i64, c7: i32, h7: i32, v7: i64,
+    o8: i64, s8: i32, t8: i64, c8: i32, h8: i32, v8: i64,
+    o9: i64, s9: i32, t9: i64, c9: i32, h9: i32, v9: i64,
+    o10: i64, s10: i32, t10: i64, c10: i32, h10: i32, v10: i64,
+    o11: i64, s11: i32, t11: i64, c11: i32, h11: i32, v11: i64,
+    o12: i64, s12: i32, t12: i64, c12: i32, h12: i32, v12: i64,
+    o13: i64, s13: i32, t13: i64, c13: i32, h13: i32, v13: i64,
+    o14: i64, s14: i32, t14: i64, c14: i32, h14: i32, v14: i64,
+    o15: i64, s15: i32, t15: i64, c15: i32, h15: i32, v15: i64,
+    len: i32,
+}
+
+fn ecs_etr_log_new() -> EcsEtrLogDeep {
+    return EcsEtrLogDeep {
+        o0: 0, s0: 0, t0: 0, c0: 0, h0: 0, v0: 0,
+        o1: 0, s1: 0, t1: 0, c1: 0, h1: 0, v1: 0,
+        o2: 0, s2: 0, t2: 0, c2: 0, h2: 0, v2: 0,
+        o3: 0, s3: 0, t3: 0, c3: 0, h3: 0, v3: 0,
+        o4: 0, s4: 0, t4: 0, c4: 0, h4: 0, v4: 0,
+        o5: 0, s5: 0, t5: 0, c5: 0, h5: 0, v5: 0,
+        o6: 0, s6: 0, t6: 0, c6: 0, h6: 0, v6: 0,
+        o7: 0, s7: 0, t7: 0, c7: 0, h7: 0, v7: 0,
+        o8: 0, s8: 0, t8: 0, c8: 0, h8: 0, v8: 0,
+        o9: 0, s9: 0, t9: 0, c9: 0, h9: 0, v9: 0,
+        o10: 0, s10: 0, t10: 0, c10: 0, h10: 0, v10: 0,
+        o11: 0, s11: 0, t11: 0, c11: 0, h11: 0, v11: 0,
+        o12: 0, s12: 0, t12: 0, c12: 0, h12: 0, v12: 0,
+        o13: 0, s13: 0, t13: 0, c13: 0, h13: 0, v13: 0,
+        o14: 0, s14: 0, t14: 0, c14: 0, h14: 0, v14: 0,
+        o15: 0, s15: 0, t15: 0, c15: 0, h15: 0, v15: 0,
+        len: 0,
+    };
+}
+
+fn ecs_etr_log_len(l: EcsEtrLogDeep) -> i32 { return l.len; }
+
+fn ecs_etr_log_push(
+    l: EcsEtrLogDeep,
+    observer_id: i64,
+    scope: i32,
+    target: i64,
+    component_id: i32,
+    hop: i32,
+    value: i64
+) -> EcsEtrLogDeep {
+    if l.len >= 16 { return l; };
+    if l.len == 0 { l.o0 = observer_id; l.s0 = scope; l.t0 = target; l.c0 = component_id; l.h0 = hop; l.v0 = value; };
+    if l.len == 1 { l.o1 = observer_id; l.s1 = scope; l.t1 = target; l.c1 = component_id; l.h1 = hop; l.v1 = value; };
+    if l.len == 2 { l.o2 = observer_id; l.s2 = scope; l.t2 = target; l.c2 = component_id; l.h2 = hop; l.v2 = value; };
+    if l.len == 3 { l.o3 = observer_id; l.s3 = scope; l.t3 = target; l.c3 = component_id; l.h3 = hop; l.v3 = value; };
+    if l.len == 4 { l.o4 = observer_id; l.s4 = scope; l.t4 = target; l.c4 = component_id; l.h4 = hop; l.v4 = value; };
+    if l.len == 5 { l.o5 = observer_id; l.s5 = scope; l.t5 = target; l.c5 = component_id; l.h5 = hop; l.v5 = value; };
+    if l.len == 6 { l.o6 = observer_id; l.s6 = scope; l.t6 = target; l.c6 = component_id; l.h6 = hop; l.v6 = value; };
+    if l.len == 7 { l.o7 = observer_id; l.s7 = scope; l.t7 = target; l.c7 = component_id; l.h7 = hop; l.v7 = value; };
+    if l.len == 8 { l.o8 = observer_id; l.s8 = scope; l.t8 = target; l.c8 = component_id; l.h8 = hop; l.v8 = value; };
+    if l.len == 9 { l.o9 = observer_id; l.s9 = scope; l.t9 = target; l.c9 = component_id; l.h9 = hop; l.v9 = value; };
+    if l.len == 10 { l.o10 = observer_id; l.s10 = scope; l.t10 = target; l.c10 = component_id; l.h10 = hop; l.v10 = value; };
+    if l.len == 11 { l.o11 = observer_id; l.s11 = scope; l.t11 = target; l.c11 = component_id; l.h11 = hop; l.v11 = value; };
+    if l.len == 12 { l.o12 = observer_id; l.s12 = scope; l.t12 = target; l.c12 = component_id; l.h12 = hop; l.v12 = value; };
+    if l.len == 13 { l.o13 = observer_id; l.s13 = scope; l.t13 = target; l.c13 = component_id; l.h13 = hop; l.v13 = value; };
+    if l.len == 14 { l.o14 = observer_id; l.s14 = scope; l.t14 = target; l.c14 = component_id; l.h14 = hop; l.v14 = value; };
+    if l.len == 15 { l.o15 = observer_id; l.s15 = scope; l.t15 = target; l.c15 = component_id; l.h15 = hop; l.v15 = value; };
+    l.len = l.len + 1;
+    return l;
+}
+
+fn ecs_etr_log_get(l: EcsEtrLogDeep, idx: i32) -> EcsEtrInvokeDeep {
+    let inv = EcsEtrInvokeDeep {
+        observer_id: 0, scope: 0, target_entity: 0, component_id: 0, hop: 0, event_value: 0,
+    };
+    if idx == 0 { inv.observer_id = l.o0; inv.scope = l.s0; inv.target_entity = l.t0; inv.component_id = l.c0; inv.hop = l.h0; inv.event_value = l.v0; };
+    if idx == 1 { inv.observer_id = l.o1; inv.scope = l.s1; inv.target_entity = l.t1; inv.component_id = l.c1; inv.hop = l.h1; inv.event_value = l.v1; };
+    if idx == 2 { inv.observer_id = l.o2; inv.scope = l.s2; inv.target_entity = l.t2; inv.component_id = l.c2; inv.hop = l.h2; inv.event_value = l.v2; };
+    if idx == 3 { inv.observer_id = l.o3; inv.scope = l.s3; inv.target_entity = l.t3; inv.component_id = l.c3; inv.hop = l.h3; inv.event_value = l.v3; };
+    if idx == 4 { inv.observer_id = l.o4; inv.scope = l.s4; inv.target_entity = l.t4; inv.component_id = l.c4; inv.hop = l.h4; inv.event_value = l.v4; };
+    if idx == 5 { inv.observer_id = l.o5; inv.scope = l.s5; inv.target_entity = l.t5; inv.component_id = l.c5; inv.hop = l.h5; inv.event_value = l.v5; };
+    if idx == 6 { inv.observer_id = l.o6; inv.scope = l.s6; inv.target_entity = l.t6; inv.component_id = l.c6; inv.hop = l.h6; inv.event_value = l.v6; };
+    if idx == 7 { inv.observer_id = l.o7; inv.scope = l.s7; inv.target_entity = l.t7; inv.component_id = l.c7; inv.hop = l.h7; inv.event_value = l.v7; };
+    if idx == 8 { inv.observer_id = l.o8; inv.scope = l.s8; inv.target_entity = l.t8; inv.component_id = l.c8; inv.hop = l.h8; inv.event_value = l.v8; };
+    if idx == 9 { inv.observer_id = l.o9; inv.scope = l.s9; inv.target_entity = l.t9; inv.component_id = l.c9; inv.hop = l.h9; inv.event_value = l.v9; };
+    if idx == 10 { inv.observer_id = l.o10; inv.scope = l.s10; inv.target_entity = l.t10; inv.component_id = l.c10; inv.hop = l.h10; inv.event_value = l.v10; };
+    if idx == 11 { inv.observer_id = l.o11; inv.scope = l.s11; inv.target_entity = l.t11; inv.component_id = l.c11; inv.hop = l.h11; inv.event_value = l.v11; };
+    if idx == 12 { inv.observer_id = l.o12; inv.scope = l.s12; inv.target_entity = l.t12; inv.component_id = l.c12; inv.hop = l.h12; inv.event_value = l.v12; };
+    if idx == 13 { inv.observer_id = l.o13; inv.scope = l.s13; inv.target_entity = l.t13; inv.component_id = l.c13; inv.hop = l.h13; inv.event_value = l.v13; };
+    if idx == 14 { inv.observer_id = l.o14; inv.scope = l.s14; inv.target_entity = l.t14; inv.component_id = l.c14; inv.hop = l.h14; inv.event_value = l.v14; };
+    if idx == 15 { inv.observer_id = l.o15; inv.scope = l.s15; inv.target_entity = l.t15; inv.component_id = l.c15; inv.hop = l.h15; inv.event_value = l.v15; };
+    return inv;
+}
+
+fn ecs_etr_invoke_observer_id(i: EcsEtrInvokeDeep) -> i64 { return i.observer_id; }
+fn ecs_etr_invoke_scope(i: EcsEtrInvokeDeep) -> i32 { return i.scope; }
+fn ecs_etr_invoke_target(i: EcsEtrInvokeDeep) -> i64 { return i.target_entity; }
+fn ecs_etr_invoke_component(i: EcsEtrInvokeDeep) -> i32 { return i.component_id; }
+fn ecs_etr_invoke_hop(i: EcsEtrInvokeDeep) -> i32 { return i.hop; }
+
+// === Trigger result bundle ===
+struct EcsEtrResultDeep {
+    observers: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    log: EcsEtrLogDeep,
+    // PropagateEntityTrigger state
+    original_event_target: i64,
+    propagate: bool,
+    hops: i32,
+    kind: i32,
+}
+
+fn ecs_etr_result_log_len(r: EcsEtrResultDeep) -> i32 { return r.log.len; }
+fn ecs_etr_result_hops(r: EcsEtrResultDeep) -> i32 { return r.hops; }
+fn ecs_etr_result_propagate(r: EcsEtrResultDeep) -> bool { return r.propagate; }
+fn ecs_etr_result_original(r: EcsEtrResultDeep) -> i64 { return r.original_event_target; }
+fn ecs_etr_result_event_target(r: EcsEtrResultDeep) -> i64 { return r.event.target; }
+fn ecs_etr_result_trigger_id(r: EcsEtrResultDeep) -> i64 { return r.observers.trigger_id; }
+fn ecs_etr_result_log_at(r: EcsEtrResultDeep, idx: i32) -> EcsEtrInvokeDeep {
+    return ecs_etr_log_get(r.log, idx);
+}
+
+// count invocations by scope
+fn ecs_etr_result_count_scope(r: EcsEtrResultDeep, scope: i32) -> i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while i < r.log.len {
+        let inv = ecs_etr_log_get(r.log, i);
+        if inv.scope == scope { n = n + 1; };
+        i = i + 1;
+    }
+    return n;
+}
+
+// === trigger_entity_internal ===
+// Runs global observers then entity-scoped for target_entity.
+// Increments trigger_id once (world.increment_trigger_id).
+fn ecs_etr_trigger_entity_internal(
+    obs: EcsCachedObserversDeep,
+    log: EcsEtrLogDeep,
+    event: EcsEtrEventDeep,
+    target_entity: i64,
+    hop: i32
+) -> (EcsCachedObserversDeep, EcsEtrLogDeep) {
+    obs.trigger_id = obs.trigger_id + 1;
+
+    // global observers
+    let gi: i32 = 0;
+    while gi < obs.g_len {
+        let oid = ecs_etr_global_at(obs, gi);
+        log = ecs_etr_log_push(log, oid, ECS_ETR_SCOPE_GLOBAL, target_entity, 0, hop, event.value);
+        gi = gi + 1;
+    }
+
+    // entity-scoped
+    let ei: i32 = 0;
+    while ei < obs.e_len {
+        let pair = ecs_etr_entity_pair(obs, ei);
+        if pair.0 == target_entity {
+            log = ecs_etr_log_push(log, pair.1, ECS_ETR_SCOPE_ENTITY, target_entity, 0, hop, event.value);
+        };
+        ei = ei + 1;
+    }
+    return (obs, log);
+}
+
+// === GlobalTrigger::trigger ===
+fn ecs_etr_global_trigger(
+    obs: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    _ctx: EcsEtrTriggerContextDeep
+) -> EcsEtrResultDeep {
+    let log = ecs_etr_log_new();
+    obs.trigger_id = obs.trigger_id + 1;
+    let gi: i32 = 0;
+    while gi < obs.g_len {
+        let oid = ecs_etr_global_at(obs, gi);
+        log = ecs_etr_log_push(log, oid, ECS_ETR_SCOPE_GLOBAL, event.target, 0, 0, event.value);
+        gi = gi + 1;
+    }
+    return EcsEtrResultDeep {
+        observers: obs,
+        event: event,
+        log: log,
+        original_event_target: event.target,
+        propagate: false,
+        hops: 0,
+        kind: ECS_ETR_KIND_GLOBAL,
+    };
+}
+
+// === EntityTrigger::trigger ===
+fn ecs_etr_entity_trigger(
+    obs: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    _ctx: EcsEtrTriggerContextDeep
+) -> EcsEtrResultDeep {
+    let log = ecs_etr_log_new();
+    let target = event.target;
+    let r = ecs_etr_trigger_entity_internal(obs, log, event, target, 0);
+    return EcsEtrResultDeep {
+        observers: r.0,
+        event: event,
+        log: r.1,
+        original_event_target: target,
+        propagate: false,
+        hops: 0,
+        kind: ECS_ETR_KIND_ENTITY,
+    };
+}
+
+// === PropagateEntityTrigger ===
+// auto_propagate sets initial propagate flag.
+// Observers can call ecs_etr_set_propagate on the result mid-run via explicit API;
+// here we model a fixed policy: stop_after_hop if stop_hop >= 0 forces propagate=false after that hop.
+fn ecs_etr_propagate_trigger(
+    world: EcsEtrWorldDeep,
+    obs: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    _ctx: EcsEtrTriggerContextDeep,
+    auto_propagate: bool,
+    stop_after_hop: i32
+) -> EcsEtrResultDeep {
+    let log = ecs_etr_log_new();
+    let current = event.target;
+    let original = current;
+    let propagate = auto_propagate;
+    let hop: i32 = 0;
+
+    // first hop
+    let r0 = ecs_etr_trigger_entity_internal(obs, log, event, current, hop);
+    obs = r0.0;
+    log = r0.1;
+
+    // optional early stop after hop 0
+    if stop_after_hop == 0 {
+        propagate = false;
+    };
+
+    // propagation loop
+    while propagate {
+        let trav = ecs_etr_traverse_parent(world, current);
+        if trav.0 != true {
+            // no further entity
+            // break without another trigger
+            let _break = true;
+            propagate = false;
+        };
+        if trav.0 == true {
+            current = trav.1;
+            event = ecs_etr_event_set_target(event, current);
+            hop = hop + 1;
+            let r = ecs_etr_trigger_entity_internal(obs, log, event, current, hop);
+            obs = r.0;
+            log = r.1;
+            if stop_after_hop >= 0 {
+                if hop >= stop_after_hop {
+                    propagate = false;
+                };
+            };
+        };
+    }
+
+    return EcsEtrResultDeep {
+        observers: obs,
+        event: event,
+        log: log,
+        original_event_target: original,
+        propagate: propagate,
+        hops: hop,
+        kind: ECS_ETR_KIND_PROPAGATE,
+    };
+}
+
+// Default PropagateEntityTrigger (AUTO_PROPAGATE true)
+fn ecs_etr_propagate_default(
+    world: EcsEtrWorldDeep,
+    obs: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    ctx: EcsEtrTriggerContextDeep
+) -> EcsEtrResultDeep {
+    return ecs_etr_propagate_trigger(world, obs, event, ctx, true, 0 - 1);
+}
+
+// AUTO_PROPAGATE false — only original target unless externally forced (stop unused)
+fn ecs_etr_propagate_manual(
+    world: EcsEtrWorldDeep,
+    obs: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    ctx: EcsEtrTriggerContextDeep
+) -> EcsEtrResultDeep {
+    return ecs_etr_propagate_trigger(world, obs, event, ctx, false, 0 - 1);
+}
+
+// === EntityComponentsTrigger ===
+// components list fixed 8 slots
+struct EcsEtrComponentsDeep {
+    c0: i32, c1: i32, c2: i32, c3: i32,
+    c4: i32, c5: i32, c6: i32, c7: i32,
+    len: i32,
+    // optional new_archetype contains flags: bit i means component i present in new archetype
+    // for Remove/Disable lifecycle examples; 0 = None archetype, -1 = Some empty, else mask
+    new_archetype_mask: i64,
+    has_new_archetype: bool,
+}
+
+fn ecs_etr_components_new() -> EcsEtrComponentsDeep {
+    return EcsEtrComponentsDeep {
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        c4: 0, c5: 0, c6: 0, c7: 0,
+        len: 0,
+        new_archetype_mask: 0,
+        has_new_archetype: false,
+    };
+}
+
+fn ecs_etr_components_push(c: EcsEtrComponentsDeep, component_id: i32) -> EcsEtrComponentsDeep {
+    if c.len >= 8 { return c; };
+    if c.len == 0 { c.c0 = component_id; };
+    if c.len == 1 { c.c1 = component_id; };
+    if c.len == 2 { c.c2 = component_id; };
+    if c.len == 3 { c.c3 = component_id; };
+    if c.len == 4 { c.c4 = component_id; };
+    if c.len == 5 { c.c5 = component_id; };
+    if c.len == 6 { c.c6 = component_id; };
+    if c.len == 7 { c.c7 = component_id; };
+    c.len = c.len + 1;
+    return c;
+}
+
+fn ecs_etr_components_at(c: EcsEtrComponentsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.c0; };
+    if idx == 1 { return c.c1; };
+    if idx == 2 { return c.c2; };
+    if idx == 3 { return c.c3; };
+    if idx == 4 { return c.c4; };
+    if idx == 5 { return c.c5; };
+    if idx == 6 { return c.c6; };
+    if idx == 7 { return c.c7; };
+    return 0;
+}
+
+fn ecs_etr_components_len(c: EcsEtrComponentsDeep) -> i32 { return c.len; }
+
+fn ecs_etr_components_set_new_archetype(c: EcsEtrComponentsDeep, mask: i64) -> EcsEtrComponentsDeep {
+    c.has_new_archetype = true;
+    c.new_archetype_mask = mask;
+    return c;
+}
+
+fn ecs_etr_components_has_new_archetype(c: EcsEtrComponentsDeep) -> bool { return c.has_new_archetype; }
+
+// new_archetype.contains(component_id) stand-in: component_id bit in mask
+fn ecs_etr_new_archetype_contains(c: EcsEtrComponentsDeep, component_id: i32) -> bool {
+    if c.has_new_archetype != true { return false; };
+    // treat component_id as small positive bit index (1-based ids map to bit (id-1))
+    if component_id <= 0 { return false; };
+    let bit: i64 = 1;
+    let i: i32 = 1;
+    while i < component_id {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return (c.new_archetype_mask / bit) % 2 == 1;
+}
+
+fn ecs_etr_entity_components_trigger(
+    obs: EcsCachedObserversDeep,
+    event: EcsEtrEventDeep,
+    _ctx: EcsEtrTriggerContextDeep,
+    components: EcsEtrComponentsDeep
+) -> EcsEtrResultDeep {
+    let log = ecs_etr_log_new();
+    let target = event.target;
+    // first: entity path
+    let r0 = ecs_etr_trigger_entity_internal(obs, log, event, target, 0);
+    obs = r0.0;
+    log = r0.1;
+
+    // then per-component observers
+    let ci: i32 = 0;
+    while ci < components.len {
+        let cid = ecs_etr_components_at(components, ci);
+        // component global
+        let gi: i32 = 0;
+        while gi < obs.cg_len {
+            let pair = ecs_etr_comp_global_pair(obs, gi);
+            if pair.0 == cid {
+                log = ecs_etr_log_push(log, pair.1, ECS_ETR_SCOPE_COMP_GLOBAL, target, cid, 0, event.value);
+            };
+            gi = gi + 1;
+        }
+        // entity-component
+        let ei: i32 = 0;
+        while ei < obs.ec_len {
+            let triple = ecs_etr_entity_comp_triple(obs, ei);
+            if triple.0 == target {
+                if triple.1 == cid {
+                    log = ecs_etr_log_push(log, triple.2, ECS_ETR_SCOPE_ENTITY_COMP, target, cid, 0, event.value);
+                };
+            };
+            ei = ei + 1;
+        }
+        ci = ci + 1;
+    }
+
+    return EcsEtrResultDeep {
+        observers: obs,
+        event: event,
+        log: log,
+        original_event_target: target,
+        propagate: false,
+        hops: 0,
+        kind: ECS_ETR_KIND_ENTITY_COMPONENTS,
+    };
+}
+
+// === On<> propagation control helper (observer can disable further hops) ===
+// Models reading/writing PropagateEntityTrigger.propagate via On::propagate
+fn ecs_etr_on_set_propagate(r: EcsEtrResultDeep, should: bool) -> EcsEtrResultDeep {
+    r.propagate = should;
+    return r;
+}
+
+fn ecs_etr_kind_global() -> i32 { return ECS_ETR_KIND_GLOBAL; }
+fn ecs_etr_kind_entity() -> i32 { return ECS_ETR_KIND_ENTITY; }
+fn ecs_etr_kind_propagate() -> i32 { return ECS_ETR_KIND_PROPAGATE; }
+fn ecs_etr_kind_entity_components() -> i32 { return ECS_ETR_KIND_ENTITY_COMPONENTS; }

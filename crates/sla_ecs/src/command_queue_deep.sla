@@ -1,0 +1,431 @@
+// Deepened Bevy ECS world::command_queue surface.
+// Mirrors src/world/command_queue.rs: dense CommandQueue buffer + cursor,
+// RawCommandQueue apply_or_drop_queued, panic recovery, silent/warn_on_unapplied,
+// SystemBuffer apply/queue, append/is_empty/push, drop warning.
+// Shallow lib/command_queue.sla retained.
+
+// Capacity of dense command slots (models bytes buffer length units)
+const ECS_CQ_CAP: i32 = 8;
+
+// Command kinds stored next to payload (models CommandMeta + body)
+const ECS_CQ_KIND_NORMAL: i32 = 0;
+const ECS_CQ_KIND_PANIC: i32 = 1;
+// When applied: push payload as a new NORMAL command into the same queue (nested queue)
+const ECS_CQ_KIND_NESTED_PUSH: i32 = 2;
+// When applied: run a nested apply on the current queue (models flush_commands recursion)
+const ECS_CQ_KIND_NESTED_FLUSH: i32 = 3;
+
+// last_error codes
+const ECS_CQ_ERR_OK: i32 = 0;
+const ECS_CQ_ERR_FULL: i32 = 1;
+const ECS_CQ_ERR_PANIC: i32 = 2;
+
+struct EcsCommandQueueDeep {
+    // dense queue body (payload + kind), length = end cursor of buffer
+    c0: i64, c1: i64, c2: i64, c3: i64,
+    c4: i64, c5: i64, c6: i64, c7: i64,
+    k0: i32, k1: i32, k2: i32, k3: i32,
+    k4: i32, k5: i32, k6: i32, k7: i32,
+    len: i32,
+    cursor: i32,
+    // panic_recovery buffer
+    r0: i64, r1: i64, r2: i64, r3: i64,
+    r4: i64, r5: i64, r6: i64, r7: i64,
+    rk0: i32, rk1: i32, rk2: i32, rk3: i32,
+    rk4: i32, rk5: i32, rk6: i32, rk7: i32,
+    r_len: i32,
+    // drop warning policy (Bevy warn_on_unapplied; silent => false)
+    warn_on_unapplied: bool,
+    caller_id: i64,
+    // apply bookkeeping
+    apply_depth: i32,
+    world_flush_count: i64,
+    applied_count: i64,
+    drop_warning_count: i64,
+    last_panicked: bool,
+    last_error: i32,
+    // applied order log (first 8 successful NORMAL payloads)
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    a4: i64, a5: i64, a6: i64, a7: i64,
+    a_len: i32,
+    // raw view token (address stand-in for get_raw)
+    raw_token: i64,
+}
+
+fn ecs_cq_deep_new(caller_id: i64) -> EcsCommandQueueDeep {
+    return EcsCommandQueueDeep {
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        c4: 0, c5: 0, c6: 0, c7: 0,
+        k0: 0, k1: 0, k2: 0, k3: 0,
+        k4: 0, k5: 0, k6: 0, k7: 0,
+        len: 0,
+        cursor: 0,
+        r0: 0, r1: 0, r2: 0, r3: 0,
+        r4: 0, r5: 0, r6: 0, r7: 0,
+        rk0: 0, rk1: 0, rk2: 0, rk3: 0,
+        rk4: 0, rk5: 0, rk6: 0, rk7: 0,
+        r_len: 0,
+        warn_on_unapplied: true,
+        caller_id: caller_id,
+        apply_depth: 0,
+        world_flush_count: 0,
+        applied_count: 0,
+        drop_warning_count: 0,
+        last_panicked: false,
+        last_error: ECS_CQ_ERR_OK,
+        a0: 0, a1: 0, a2: 0, a3: 0,
+        a4: 0, a5: 0, a6: 0, a7: 0,
+        a_len: 0,
+        raw_token: caller_id + 1000,
+    };
+}
+
+// CommandQueue::default
+fn ecs_cq_deep_default() -> EcsCommandQueueDeep {
+    return ecs_cq_deep_new(0);
+}
+
+// CommandQueue::silent — no drop warning
+fn ecs_cq_deep_silent(caller_id: i64) -> EcsCommandQueueDeep {
+    let q = ecs_cq_deep_new(caller_id);
+    q.warn_on_unapplied = false;
+    return q;
+}
+
+fn ecs_cq_deep_is_empty(q: EcsCommandQueueDeep) -> bool {
+    return q.cursor >= q.len;
+}
+
+fn ecs_cq_deep_len(q: EcsCommandQueueDeep) -> i32 {
+    if q.cursor >= q.len { return 0; };
+    return q.len - q.cursor;
+}
+
+fn ecs_cq_deep_buffer_len(q: EcsCommandQueueDeep) -> i32 { return q.len; }
+fn ecs_cq_deep_cursor(q: EcsCommandQueueDeep) -> i32 { return q.cursor; }
+fn ecs_cq_deep_recovery_len(q: EcsCommandQueueDeep) -> i32 { return q.r_len; }
+fn ecs_cq_deep_applied_count(q: EcsCommandQueueDeep) -> i64 { return q.applied_count; }
+fn ecs_cq_deep_world_flush_count(q: EcsCommandQueueDeep) -> i64 { return q.world_flush_count; }
+fn ecs_cq_deep_drop_warning_count(q: EcsCommandQueueDeep) -> i64 { return q.drop_warning_count; }
+fn ecs_cq_deep_warn_on_unapplied(q: EcsCommandQueueDeep) -> bool { return q.warn_on_unapplied; }
+fn ecs_cq_deep_last_panicked(q: EcsCommandQueueDeep) -> bool { return q.last_panicked; }
+fn ecs_cq_deep_last_error(q: EcsCommandQueueDeep) -> i32 { return q.last_error; }
+fn ecs_cq_deep_caller_id(q: EcsCommandQueueDeep) -> i64 { return q.caller_id; }
+fn ecs_cq_deep_apply_log_len(q: EcsCommandQueueDeep) -> i32 { return q.a_len; }
+
+fn ecs_cq_deep_silence_drop_warning(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    q.warn_on_unapplied = false;
+    return q;
+}
+
+// get_raw: returns token sharing underlying queue (same struct identity stand-in)
+fn ecs_cq_deep_get_raw(q: EcsCommandQueueDeep) -> (EcsCommandQueueDeep, i64) {
+    return (q, q.raw_token);
+}
+
+fn ecs_cq_deep_raw_is_empty(q: EcsCommandQueueDeep) -> bool {
+    return ecs_cq_deep_is_empty(q);
+}
+
+fn ecs_cq_deep_get_payload(q: EcsCommandQueueDeep, i: i32) -> i64 {
+    if i == 0 { return q.c0; };
+    if i == 1 { return q.c1; };
+    if i == 2 { return q.c2; };
+    if i == 3 { return q.c3; };
+    if i == 4 { return q.c4; };
+    if i == 5 { return q.c5; };
+    if i == 6 { return q.c6; };
+    if i == 7 { return q.c7; };
+    return 0;
+}
+
+fn ecs_cq_deep_get_kind(q: EcsCommandQueueDeep, i: i32) -> i32 {
+    if i == 0 { return q.k0; };
+    if i == 1 { return q.k1; };
+    if i == 2 { return q.k2; };
+    if i == 3 { return q.k3; };
+    if i == 4 { return q.k4; };
+    if i == 5 { return q.k5; };
+    if i == 6 { return q.k6; };
+    if i == 7 { return q.k7; };
+    return 0;
+}
+
+fn ecs_cq_deep_set_slot(q: EcsCommandQueueDeep, i: i32, payload: i64, kind: i32) -> EcsCommandQueueDeep {
+    if i == 0 { q.c0 = payload; q.k0 = kind; };
+    if i == 1 { q.c1 = payload; q.k1 = kind; };
+    if i == 2 { q.c2 = payload; q.k2 = kind; };
+    if i == 3 { q.c3 = payload; q.k3 = kind; };
+    if i == 4 { q.c4 = payload; q.k4 = kind; };
+    if i == 5 { q.c5 = payload; q.k5 = kind; };
+    if i == 6 { q.c6 = payload; q.k6 = kind; };
+    if i == 7 { q.c7 = payload; q.k7 = kind; };
+    return q;
+}
+
+fn ecs_cq_deep_get_recovery_payload(q: EcsCommandQueueDeep, i: i32) -> i64 {
+    if i == 0 { return q.r0; };
+    if i == 1 { return q.r1; };
+    if i == 2 { return q.r2; };
+    if i == 3 { return q.r3; };
+    if i == 4 { return q.r4; };
+    if i == 5 { return q.r5; };
+    if i == 6 { return q.r6; };
+    if i == 7 { return q.r7; };
+    return 0;
+}
+
+fn ecs_cq_deep_get_recovery_kind(q: EcsCommandQueueDeep, i: i32) -> i32 {
+    if i == 0 { return q.rk0; };
+    if i == 1 { return q.rk1; };
+    if i == 2 { return q.rk2; };
+    if i == 3 { return q.rk3; };
+    if i == 4 { return q.rk4; };
+    if i == 5 { return q.rk5; };
+    if i == 6 { return q.rk6; };
+    if i == 7 { return q.rk7; };
+    return 0;
+}
+
+fn ecs_cq_deep_set_recovery_slot(q: EcsCommandQueueDeep, i: i32, payload: i64, kind: i32) -> EcsCommandQueueDeep {
+    if i == 0 { q.r0 = payload; q.rk0 = kind; };
+    if i == 1 { q.r1 = payload; q.rk1 = kind; };
+    if i == 2 { q.r2 = payload; q.rk2 = kind; };
+    if i == 3 { q.r3 = payload; q.rk3 = kind; };
+    if i == 4 { q.r4 = payload; q.rk4 = kind; };
+    if i == 5 { q.r5 = payload; q.rk5 = kind; };
+    if i == 6 { q.r6 = payload; q.rk6 = kind; };
+    if i == 7 { q.r7 = payload; q.rk7 = kind; };
+    return q;
+}
+
+fn ecs_cq_deep_log_applied(q: EcsCommandQueueDeep, payload: i64) -> EcsCommandQueueDeep {
+    if q.a_len >= 8 { return q; };
+    let i = q.a_len;
+    if i == 0 { q.a0 = payload; };
+    if i == 1 { q.a1 = payload; };
+    if i == 2 { q.a2 = payload; };
+    if i == 3 { q.a3 = payload; };
+    if i == 4 { q.a4 = payload; };
+    if i == 5 { q.a5 = payload; };
+    if i == 6 { q.a6 = payload; };
+    if i == 7 { q.a7 = payload; };
+    q.a_len = q.a_len + 1;
+    q.applied_count = q.applied_count + 1;
+    return q;
+}
+
+fn ecs_cq_deep_applied_at(q: EcsCommandQueueDeep, i: i32) -> i64 {
+    if i == 0 { return q.a0; };
+    if i == 1 { return q.a1; };
+    if i == 2 { return q.a2; };
+    if i == 3 { return q.a3; };
+    if i == 4 { return q.a4; };
+    if i == 5 { return q.a5; };
+    if i == 6 { return q.a6; };
+    if i == 7 { return q.a7; };
+    return 0;
+}
+
+// Internal push into dense buffer at end
+fn ecs_cq_deep_push_kind(q: EcsCommandQueueDeep, payload: i64, kind: i32) -> EcsCommandQueueDeep {
+    if q.len >= ECS_CQ_CAP {
+        q.last_error = ECS_CQ_ERR_FULL;
+        return q;
+    };
+    q = ecs_cq_deep_set_slot(q, q.len, payload, kind);
+    q.len = q.len + 1;
+    q.last_error = ECS_CQ_ERR_OK;
+    return q;
+}
+
+fn ecs_cq_deep_push(q: EcsCommandQueueDeep, payload: i64) -> EcsCommandQueueDeep {
+    return ecs_cq_deep_push_kind(q, payload, ECS_CQ_KIND_NORMAL);
+}
+
+fn ecs_cq_deep_push_panic(q: EcsCommandQueueDeep, payload: i64) -> EcsCommandQueueDeep {
+    return ecs_cq_deep_push_kind(q, payload, ECS_CQ_KIND_PANIC);
+}
+
+fn ecs_cq_deep_push_nested(q: EcsCommandQueueDeep, payload: i64) -> EcsCommandQueueDeep {
+    return ecs_cq_deep_push_kind(q, payload, ECS_CQ_KIND_NESTED_PUSH);
+}
+
+fn ecs_cq_deep_push_nested_flush(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    return ecs_cq_deep_push_kind(q, 0, ECS_CQ_KIND_NESTED_FLUSH);
+}
+
+// recovery helpers
+fn ecs_cq_deep_recovery_push(q: EcsCommandQueueDeep, payload: i64, kind: i32) -> EcsCommandQueueDeep {
+    if q.r_len >= ECS_CQ_CAP { return q; };
+    q = ecs_cq_deep_set_recovery_slot(q, q.r_len, payload, kind);
+    q.r_len = q.r_len + 1;
+    return q;
+}
+
+fn ecs_cq_deep_clear_recovery(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    q.r_len = 0;
+    return q;
+}
+
+// Move recovery back onto main buffer (top-of-stack panic restore)
+fn ecs_cq_deep_append_recovery(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    let saved_err = q.last_error;
+    let saved_panic = q.last_panicked;
+    let i: i32 = 0;
+    while i < q.r_len {
+        let p = ecs_cq_deep_get_recovery_payload(q, i);
+        let k = ecs_cq_deep_get_recovery_kind(q, i);
+        q = ecs_cq_deep_push_kind(q, p, k);
+        i = i + 1;
+    }
+    q = ecs_cq_deep_clear_recovery(q);
+    // push_kind clears last_error; restore panic status for the caller
+    q.last_error = saved_err;
+    q.last_panicked = saved_panic;
+    return q;
+}
+
+// Truncate buffer length to `new_len`, keeping prefix [0, new_len)
+fn ecs_cq_deep_truncate(q: EcsCommandQueueDeep, new_len: i32) -> EcsCommandQueueDeep {
+    if new_len < 0 { new_len = 0; };
+    if new_len > q.len { new_len = q.len; };
+    q.len = new_len;
+    if q.cursor > q.len { q.cursor = q.len; };
+    return q;
+}
+
+// append: take all commands from other into self, leave other empty
+fn ecs_cq_deep_append(q: EcsCommandQueueDeep, other: EcsCommandQueueDeep) -> (EcsCommandQueueDeep, EcsCommandQueueDeep) {
+    let i: i32 = other.cursor;
+    while i < other.len {
+        let p = ecs_cq_deep_get_payload(other, i);
+        let k = ecs_cq_deep_get_kind(other, i);
+        q = ecs_cq_deep_push_kind(q, p, k);
+        i = i + 1;
+    }
+    other.cursor = other.len;
+    other.len = other.cursor;
+    return (q, other);
+}
+
+// apply_or_drop_queued: world=true applies NORMAL; world=false drops without side effects
+// Panic path: remaining of this apply window go to recovery; top-level restores them.
+fn ecs_cq_deep_apply_or_drop_queued(q: EcsCommandQueueDeep, with_world: bool) -> EcsCommandQueueDeep {
+    let start = q.cursor;
+    let stop = q.len;
+    // prevent nested re-entry from re-applying the same window (Bevy sets cursor to stop)
+    q.cursor = stop;
+    q.apply_depth = q.apply_depth + 1;
+    q.last_panicked = false;
+    q.last_error = ECS_CQ_ERR_OK;
+
+    let local: i32 = start;
+    while local < stop {
+        let payload = ecs_cq_deep_get_payload(q, local);
+        let kind = ecs_cq_deep_get_kind(q, local);
+        local = local + 1;
+
+        if kind == ECS_CQ_KIND_PANIC {
+            // remaining [local, current_len) -> recovery (includes cmds queued during apply)
+            let current_stop = q.len;
+            let j: i32 = local;
+            while j < current_stop {
+                let rp = ecs_cq_deep_get_payload(q, j);
+                let rk = ecs_cq_deep_get_kind(q, j);
+                q = ecs_cq_deep_recovery_push(q, rp, rk);
+                j = j + 1;
+            }
+            q = ecs_cq_deep_truncate(q, start);
+            q.cursor = start;
+            q.last_panicked = true;
+            q.last_error = ECS_CQ_ERR_PANIC;
+            // top-of-stack restores recovery onto buffer
+            if q.apply_depth == 1 {
+                q = ecs_cq_deep_append_recovery(q);
+            };
+            q.apply_depth = q.apply_depth - 1;
+            return q;
+        };
+
+        if kind == ECS_CQ_KIND_NESTED_PUSH {
+            // models command that queues another command during apply
+            q = ecs_cq_deep_push_kind(q, payload, ECS_CQ_KIND_NORMAL);
+        };
+
+        if kind == ECS_CQ_KIND_NESTED_FLUSH {
+            // recursive apply of commands queued so far beyond original stop
+            // (simplified nested flush_commands)
+            q = ecs_cq_deep_apply_or_drop_queued(q, with_world);
+            if q.last_panicked {
+                // bubble panic; if we are now top after unwind restore already done lower
+                q.apply_depth = q.apply_depth - 1;
+                if q.apply_depth == 0 {
+                    // ensure recovery merged if still pending
+                    if q.r_len > 0 {
+                        q = ecs_cq_deep_append_recovery(q);
+                    };
+                };
+                return q;
+            };
+        };
+
+        if kind == ECS_CQ_KIND_NORMAL {
+            if with_world {
+                q = ecs_cq_deep_log_applied(q, payload);
+            };
+            // drop path (with_world=false): discard without log
+        };
+    }
+
+    // successful window: buffer reset to start (commands consumed)
+    q = ecs_cq_deep_truncate(q, start);
+    q.cursor = start;
+    q.apply_depth = q.apply_depth - 1;
+    return q;
+}
+
+// CommandQueue::apply — flush world queue first, then apply this queue
+fn ecs_cq_deep_apply(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    q.world_flush_count = q.world_flush_count + 1;
+    q = ecs_cq_deep_apply_or_drop_queued(q, true);
+    return q;
+}
+
+// SystemBuffer::apply
+fn ecs_cq_deep_system_buffer_apply(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    return ecs_cq_deep_apply(q);
+}
+
+// SystemBuffer::queue — append this queue into "world commands" then clear self.
+// Modeled by applying through a synthetic world queue counter + move-out.
+fn ecs_cq_deep_system_buffer_queue(q: EcsCommandQueueDeep, world_q: EcsCommandQueueDeep) -> (EcsCommandQueueDeep, EcsCommandQueueDeep) {
+    let pair = ecs_cq_deep_append(world_q, q);
+    world_q = pair.0;
+    q = pair.1;
+    return (q, world_q);
+}
+
+// Drop: warn if unapplied && warn_on_unapplied; then drop remaining commands
+fn ecs_cq_deep_drop(q: EcsCommandQueueDeep) -> EcsCommandQueueDeep {
+    if ecs_cq_deep_is_empty(q) != true {
+        if q.warn_on_unapplied {
+            q.drop_warning_count = q.drop_warning_count + 1;
+        };
+        q = ecs_cq_deep_apply_or_drop_queued(q, false);
+    };
+    return q;
+}
+
+// Unapplied payload at relative index from cursor
+fn ecs_cq_deep_unapplied_at(q: EcsCommandQueueDeep, i: i32) -> i64 {
+    let idx = q.cursor + i;
+    if idx < 0 || idx >= q.len { return 0; };
+    return ecs_cq_deep_get_payload(q, idx);
+}
+
+fn ecs_cq_deep_unapplied_kind_at(q: EcsCommandQueueDeep, i: i32) -> i32 {
+    let idx = q.cursor + i;
+    if idx < 0 || idx >= q.len { return 0; };
+    return ecs_cq_deep_get_kind(q, idx);
+}

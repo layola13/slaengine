@@ -1,0 +1,169 @@
+// Bevy ECS schedule::pass (src/schedule/pass.rs): ScheduleBuildPass + FlattenedDependencies.
+
+// === SystemKey (a node id in the schedule graph) ===
+struct EcsSystemKey {
+    id: i64,
+}
+
+fn ecs_system_key_new(id: i64) -> EcsSystemKey { return EcsSystemKey { id: id }; }
+fn ecs_system_key_id(k: EcsSystemKey) -> i64 { return k.id; }
+fn ecs_system_key_eq(a: EcsSystemKey, b: EcsSystemKey) -> bool { return a.id == b.id; }
+
+// === FlattenedDependencies ===
+// A DAG of system dependencies with add_edge/remove_edge/toposort/analyze.
+struct EcsFlattenedDependencies {
+    edges_from: Vec<i64>,
+    edges_to: Vec<i64>,
+    nodes: Vec<i64>,
+}
+
+fn ecs_flattened_deps_new() -> EcsFlattenedDependencies {
+    return EcsFlattenedDependencies { edges_from: Vec::new(), edges_to: Vec::new(), nodes: Vec::new() };
+}
+
+fn ecs_flattened_deps_add_node(d: EcsFlattenedDependencies, key: i64) -> EcsFlattenedDependencies {
+    d.nodes.push(key);
+    return d;
+}
+
+fn ecs_flattened_deps_add_edge(d: EcsFlattenedDependencies, a: i64, b: i64) -> EcsFlattenedDependencies {
+    d.edges_from.push(a);
+    d.edges_to.push(b);
+    return d;
+}
+
+fn ecs_flattened_deps_remove_edge(d: EcsFlattenedDependencies, a: i64, b: i64) -> (EcsFlattenedDependencies, bool) {
+    let new_from: Vec<i64> = Vec::new();
+    let new_to: Vec<i64> = Vec::new();
+    let removed = false;
+    let i: i64 = 0;
+    let n: i64 = len(d.edges_from) as i64;
+    while i < n {
+        if d.edges_from[i] == a {
+            if d.edges_to[i] == b {
+                if removed != true { removed = true; };
+            } else {
+                new_from.push(d.edges_from[i]);
+                new_to.push(d.edges_to[i]);
+            };
+        } else {
+            new_from.push(d.edges_from[i]);
+            new_to.push(d.edges_to[i]);
+        };
+        i = i + 1;
+    }
+    d.edges_from = new_from;
+    d.edges_to = new_to;
+    return (d, removed);
+}
+
+fn ecs_flattened_deps_edge_count(d: EcsFlattenedDependencies) -> i64 { return len(d.edges_from) as i64; }
+fn ecs_flattened_deps_node_count(d: EcsFlattenedDependencies) -> i64 { return len(d.nodes) as i64; }
+
+// toposort: Kahn's algorithm. Returns (ok, sorted_ids). If cycle, returns (false, empty).
+fn ecs_flattened_deps_toposort(d: EcsFlattenedDependencies) -> (bool, Vec<i64>) {
+    let n: i64 = len(d.nodes) as i64;
+    // compute in-degree per node (by index in nodes)
+    let indeg: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < n {
+        indeg.push(0);
+        i = i + 1;
+    }
+    // map node id -> index
+    let j: i64 = 0;
+    let ne: i64 = len(d.edges_from) as i64;
+    while j < ne {
+        // find target index
+        let t = d.edges_to[j];
+        let k: i64 = 0;
+        while k < n {
+            if d.nodes[k] == t { indeg[k] = indeg[k] + 1; };
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    // collect zero-indegree nodes
+    let queue: Vec<i64> = Vec::new();
+    let q: i64 = 0;
+    while q < n {
+        if indeg[q] == 0 { queue.push(q); };
+        q = q + 1;
+    }
+    let sorted: Vec<i64> = Vec::new();
+    let qi: i64 = 0;
+    while qi < len(queue) as i64 {
+        let idx = queue[qi];
+        sorted.push(d.nodes[idx]);
+        // decrement indegree of neighbors
+        let src = d.nodes[idx];
+        let e: i64 = 0;
+        while e < ne {
+            if d.edges_from[e] == src {
+                let t = d.edges_to[e];
+                let k: i64 = 0;
+                while k < n {
+                    if d.nodes[k] == t {
+                        indeg[k] = indeg[k] - 1;
+                        if indeg[k] == 0 { queue.push(k); };
+                    };
+                    k = k + 1;
+                }
+            };
+            e = e + 1;
+        }
+        qi = qi + 1;
+    }
+    if len(sorted) as i64 != n { return (false, Vec::new()); };
+    return (true, sorted);
+}
+
+// === ScheduleBuildPass trait surface ===
+// trait ScheduleBuildPass { type Config; fn build(...) }
+// Modeled as a builder that takes FlattenedDependencies and produces a sorted order.
+struct EcsScheduleBuildPass {
+    name_id: i64,
+    deps: EcsFlattenedDependencies,
+}
+
+fn ecs_schedule_build_pass_new(name_id: i64) -> EcsScheduleBuildPass {
+    return EcsScheduleBuildPass { name_id: name_id, deps: ecs_flattened_deps_new() };
+}
+
+fn ecs_schedule_build_pass_add_node(p: EcsScheduleBuildPass, key: i64) -> EcsScheduleBuildPass {
+    p.deps = ecs_flattened_deps_add_node(p.deps, key);
+    return p;
+}
+
+fn ecs_schedule_build_pass_add_edge(p: EcsScheduleBuildPass, a: i64, b: i64) -> EcsScheduleBuildPass {
+    p.deps = ecs_flattened_deps_add_edge(p.deps, a, b);
+    return p;
+}
+
+// build: run toposort
+fn ecs_schedule_build_pass_build(p: EcsScheduleBuildPass) -> (bool, Vec<i64>) {
+    return ecs_flattened_deps_toposort(p.deps);
+}
+
+fn ecs_schedule_build_pass_name(p: EcsScheduleBuildPass) -> i64 { return p.name_id; }
+
+// === DagAnalysis (result of analyze) ===
+struct EcsDagAnalysis {
+    is_acyclic: bool,
+    node_count: i64,
+    edge_count: i64,
+}
+
+fn ecs_dag_analysis_new(is_acyclic: bool, nodes: i64, edges: i64) -> EcsDagAnalysis {
+    return EcsDagAnalysis { is_acyclic: is_acyclic, node_count: nodes, edge_count: edges };
+}
+
+fn ecs_dag_analysis_is_acyclic(a: EcsDagAnalysis) -> bool { return a.is_acyclic; }
+fn ecs_dag_analysis_node_count(a: EcsDagAnalysis) -> i64 { return a.node_count; }
+fn ecs_dag_analysis_edge_count(a: EcsDagAnalysis) -> i64 { return a.edge_count; }
+
+// analyze: run toposort and build a DagAnalysis
+fn ecs_schedule_build_pass_analyze(p: EcsScheduleBuildPass) -> EcsDagAnalysis {
+    let r = ecs_flattened_deps_toposort(p.deps);
+    return ecs_dag_analysis_new(r.0, ecs_flattened_deps_node_count(p.deps), ecs_flattened_deps_edge_count(p.deps));
+}

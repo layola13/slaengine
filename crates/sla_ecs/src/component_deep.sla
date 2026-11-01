@@ -1,0 +1,739 @@
+// Deepened Bevy ECS component core surface.
+// Unifies key pieces of src/component/mod.rs + clone.rs + required.rs + register.rs:
+//   StorageType { Table, SparseSet }
+//   ComponentMutability { Mutable, Immutable }
+//   ComponentHooks { on_add, on_insert, on_discard, on_remove, on_despawn }
+//   ComponentCloneBehavior { Default, Ignore, Custom } + resolve
+//   RequiredComponents register (shallowest depth wins) + insert expansion
+//   Components registry: register descriptor, lookup by type_id / ComponentId
+//   ComponentIdFor FromWorld stand-in
+// Existing shallow/specialized modules retained (component.sla, component_info*,
+// component_required, component_clone, component_register).
+
+// === StorageType ===
+const ECS_CD_STORAGE_TABLE: i32 = 0;
+const ECS_CD_STORAGE_SPARSE: i32 = 1;
+
+// === Mutability ===
+const ECS_CD_MUTABLE: i32 = 0;
+const ECS_CD_IMMUTABLE: i32 = 1;
+
+// === Clone behavior kinds ===
+const ECS_CD_CLONE_DEFAULT: i32 = 0;
+const ECS_CD_CLONE_IGNORE: i32 = 1;
+const ECS_CD_CLONE_CUSTOM: i32 = 2;
+
+// Resolved clone fn ids
+const ECS_CD_CLONE_FN_DEFAULT: i32 = 100;
+const ECS_CD_CLONE_FN_IGNORE: i32 = 101;
+// custom uses stored custom_fn_id
+
+// === Hook kinds (bit flags) ===
+const ECS_CD_HOOK_ON_ADD: i32 = 1;
+const ECS_CD_HOOK_ON_INSERT: i32 = 2;
+const ECS_CD_HOOK_ON_DISCARD: i32 = 4;
+const ECS_CD_HOOK_ON_REMOVE: i32 = 8;
+const ECS_CD_HOOK_ON_DESPAWN: i32 = 16;
+
+// Required component error kinds
+const ECS_CD_REQ_OK: i32 = 0;
+const ECS_CD_REQ_ERR_CYCLE: i32 = 1;
+const ECS_CD_REQ_ERR_MISSING: i32 = 2;
+const ECS_CD_REQ_ERR_DUPLICATE_DIRECT: i32 = 3;
+
+// Registry capacity
+const ECS_CD_CAP: i32 = 16;
+const ECS_CD_REQ_CAP: i32 = 8;
+
+// === ComponentHooks ===
+struct EcsComponentHooksDeep {
+    // bitmask of present hooks
+    flags: i32,
+    // hook handler ids (0 = none)
+    on_add: i64,
+    on_insert: i64,
+    on_discard: i64,
+    on_remove: i64,
+    on_despawn: i64,
+}
+
+fn ecs_cd_hooks_none() -> EcsComponentHooksDeep {
+    return EcsComponentHooksDeep {
+        flags: 0,
+        on_add: 0,
+        on_insert: 0,
+        on_discard: 0,
+        on_remove: 0,
+        on_despawn: 0,
+    };
+}
+
+fn ecs_cd_hooks_recompute(h: EcsComponentHooksDeep) -> EcsComponentHooksDeep {
+    let f: i32 = 0;
+    if h.on_add != 0 { f = f + ECS_CD_HOOK_ON_ADD; };
+    if h.on_insert != 0 { f = f + ECS_CD_HOOK_ON_INSERT; };
+    if h.on_discard != 0 { f = f + ECS_CD_HOOK_ON_DISCARD; };
+    if h.on_remove != 0 { f = f + ECS_CD_HOOK_ON_REMOVE; };
+    if h.on_despawn != 0 { f = f + ECS_CD_HOOK_ON_DESPAWN; };
+    h.flags = f;
+    return h;
+}
+
+fn ecs_cd_hooks_set_on_add(h: EcsComponentHooksDeep, id: i64) -> EcsComponentHooksDeep {
+    h.on_add = id;
+    return ecs_cd_hooks_recompute(h);
+}
+
+
+fn ecs_cd_hooks_set_on_insert(h: EcsComponentHooksDeep, id: i64) -> EcsComponentHooksDeep {
+    h.on_insert = id;
+    return ecs_cd_hooks_recompute(h);
+}
+fn ecs_cd_hooks_set_on_discard(h: EcsComponentHooksDeep, id: i64) -> EcsComponentHooksDeep {
+    h.on_discard = id;
+    return ecs_cd_hooks_recompute(h);
+}
+fn ecs_cd_hooks_set_on_remove(h: EcsComponentHooksDeep, id: i64) -> EcsComponentHooksDeep {
+    h.on_remove = id;
+    return ecs_cd_hooks_recompute(h);
+}
+fn ecs_cd_hooks_set_on_despawn(h: EcsComponentHooksDeep, id: i64) -> EcsComponentHooksDeep {
+    h.on_despawn = id;
+    return ecs_cd_hooks_recompute(h);
+}
+
+fn ecs_cd_hooks_flags(h: EcsComponentHooksDeep) -> i32 { return h.flags; }
+fn ecs_cd_hooks_has(h: EcsComponentHooksDeep, bit: i32) -> bool {
+    return (h.flags / bit) % 2 == 1;
+}
+fn ecs_cd_hooks_on_add(h: EcsComponentHooksDeep) -> i64 { return h.on_add; }
+fn ecs_cd_hooks_on_insert(h: EcsComponentHooksDeep) -> i64 { return h.on_insert; }
+fn ecs_cd_hooks_on_remove(h: EcsComponentHooksDeep) -> i64 { return h.on_remove; }
+fn ecs_cd_hooks_on_despawn(h: EcsComponentHooksDeep) -> i64 { return h.on_despawn; }
+fn ecs_cd_hooks_on_discard(h: EcsComponentHooksDeep) -> i64 { return h.on_discard; }
+fn ecs_cd_hooks_is_empty(h: EcsComponentHooksDeep) -> bool { return h.flags == 0; }
+
+// === ComponentCloneBehavior ===
+struct EcsComponentCloneBehaviorDeep {
+    kind: i32,
+    custom_fn_id: i32,
+}
+
+fn ecs_cd_clone_default() -> EcsComponentCloneBehaviorDeep {
+    return EcsComponentCloneBehaviorDeep { kind: ECS_CD_CLONE_DEFAULT, custom_fn_id: 0 };
+}
+fn ecs_cd_clone_ignore() -> EcsComponentCloneBehaviorDeep {
+    return EcsComponentCloneBehaviorDeep { kind: ECS_CD_CLONE_IGNORE, custom_fn_id: 0 };
+}
+fn ecs_cd_clone_custom(fn_id: i32) -> EcsComponentCloneBehaviorDeep {
+    return EcsComponentCloneBehaviorDeep { kind: ECS_CD_CLONE_CUSTOM, custom_fn_id: fn_id };
+}
+
+fn ecs_cd_clone_kind(b: EcsComponentCloneBehaviorDeep) -> i32 { return b.kind; }
+fn ecs_cd_clone_custom_fn(b: EcsComponentCloneBehaviorDeep) -> i32 { return b.custom_fn_id; }
+
+// resolve(behavior, default_fn) -> fn id
+fn ecs_cd_clone_resolve(b: EcsComponentCloneBehaviorDeep, default_fn: i32) -> i32 {
+    if b.kind == ECS_CD_CLONE_DEFAULT { return default_fn; };
+    if b.kind == ECS_CD_CLONE_IGNORE { return ECS_CD_CLONE_FN_IGNORE; };
+    return b.custom_fn_id;
+}
+
+// === RequiredComponents ===
+struct EcsRequiredComponentsDeep {
+    // up to 8 required entries
+    id0: i32, ctor0: i32, depth0: i32,
+    id1: i32, ctor1: i32, depth1: i32,
+    id2: i32, ctor2: i32, depth2: i32,
+    id3: i32, ctor3: i32, depth3: i32,
+    id4: i32, ctor4: i32, depth4: i32,
+    id5: i32, ctor5: i32, depth5: i32,
+    id6: i32, ctor6: i32, depth6: i32,
+    id7: i32, ctor7: i32, depth7: i32,
+    len: i32,
+    last_error: i32,
+}
+
+fn ecs_cd_req_new() -> EcsRequiredComponentsDeep {
+    return EcsRequiredComponentsDeep {
+        id0: 0, ctor0: 0, depth0: 0,
+        id1: 0, ctor1: 0, depth1: 0,
+        id2: 0, ctor2: 0, depth2: 0,
+        id3: 0, ctor3: 0, depth3: 0,
+        id4: 0, ctor4: 0, depth4: 0,
+        id5: 0, ctor5: 0, depth5: 0,
+        id6: 0, ctor6: 0, depth6: 0,
+        id7: 0, ctor7: 0, depth7: 0,
+        len: 0,
+        last_error: ECS_CD_REQ_OK,
+    };
+}
+
+fn ecs_cd_req_len(r: EcsRequiredComponentsDeep) -> i32 { return r.len; }
+fn ecs_cd_req_last_error(r: EcsRequiredComponentsDeep) -> i32 { return r.last_error; }
+
+fn ecs_cd_req_get_id(r: EcsRequiredComponentsDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.id0; };
+    if idx == 1 { return r.id1; };
+    if idx == 2 { return r.id2; };
+    if idx == 3 { return r.id3; };
+    if idx == 4 { return r.id4; };
+    if idx == 5 { return r.id5; };
+    if idx == 6 { return r.id6; };
+    if idx == 7 { return r.id7; };
+    return 0;
+}
+fn ecs_cd_req_get_ctor(r: EcsRequiredComponentsDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.ctor0; };
+    if idx == 1 { return r.ctor1; };
+    if idx == 2 { return r.ctor2; };
+    if idx == 3 { return r.ctor3; };
+    if idx == 4 { return r.ctor4; };
+    if idx == 5 { return r.ctor5; };
+    if idx == 6 { return r.ctor6; };
+    if idx == 7 { return r.ctor7; };
+    return 0;
+}
+fn ecs_cd_req_get_depth(r: EcsRequiredComponentsDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.depth0; };
+    if idx == 1 { return r.depth1; };
+    if idx == 2 { return r.depth2; };
+    if idx == 3 { return r.depth3; };
+    if idx == 4 { return r.depth4; };
+    if idx == 5 { return r.depth5; };
+    if idx == 6 { return r.depth6; };
+    if idx == 7 { return r.depth7; };
+    return 0;
+}
+
+fn ecs_cd_req_set_at(
+    r: EcsRequiredComponentsDeep,
+    idx: i32,
+    id: i32,
+    ctor: i32,
+    depth: i32
+) -> EcsRequiredComponentsDeep {
+    if idx == 0 { r.id0 = id; r.ctor0 = ctor; r.depth0 = depth; };
+    if idx == 1 { r.id1 = id; r.ctor1 = ctor; r.depth1 = depth; };
+    if idx == 2 { r.id2 = id; r.ctor2 = ctor; r.depth2 = depth; };
+    if idx == 3 { r.id3 = id; r.ctor3 = ctor; r.depth3 = depth; };
+    if idx == 4 { r.id4 = id; r.ctor4 = ctor; r.depth4 = depth; };
+    if idx == 5 { r.id5 = id; r.ctor5 = ctor; r.depth5 = depth; };
+    if idx == 6 { r.id6 = id; r.ctor6 = ctor; r.depth6 = depth; };
+    if idx == 7 { r.id7 = id; r.ctor7 = ctor; r.depth7 = depth; };
+    return r;
+}
+
+fn ecs_cd_req_find(r: EcsRequiredComponentsDeep, component_id: i32) -> i32 {
+    let i: i32 = 0;
+    while i < r.len {
+        if ecs_cd_req_get_id(r, i) == component_id { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn ecs_cd_req_contains(r: EcsRequiredComponentsDeep, component_id: i32) -> bool {
+    return ecs_cd_req_find(r, component_id) >= 0;
+}
+
+// register: shallowest depth wins (Bevy RequiredComponents::register_by_id)
+fn ecs_cd_req_register(
+    r: EcsRequiredComponentsDeep,
+    component_id: i32,
+    constructor_id: i32,
+    depth: i32
+) -> EcsRequiredComponentsDeep {
+    r.last_error = ECS_CD_REQ_OK;
+    let found = ecs_cd_req_find(r, component_id);
+    if found >= 0 {
+        let old = ecs_cd_req_get_depth(r, found);
+        if depth < old {
+            r = ecs_cd_req_set_at(r, found, component_id, constructor_id, depth);
+        };
+        return r;
+    };
+    if r.len >= ECS_CD_REQ_CAP {
+        r.last_error = ECS_CD_REQ_ERR_MISSING;
+        return r;
+    };
+    r = ecs_cd_req_set_at(r, r.len, component_id, constructor_id, depth);
+    r.len = r.len + 1;
+    return r;
+}
+
+// direct require at depth 0; duplicate direct same id is ok (idempotent via find)
+fn ecs_cd_req_register_direct(
+    r: EcsRequiredComponentsDeep,
+    component_id: i32,
+    constructor_id: i32
+) -> EcsRequiredComponentsDeep {
+    return ecs_cd_req_register(r, component_id, constructor_id, 0);
+}
+
+// === Component descriptor / info ===
+struct EcsComponentDescDeep {
+    component_id: i32,
+    type_id: i64,
+    name_id: i64,
+    storage: i32,
+    mutability: i32,
+    clone_kind: i32,
+    clone_custom_fn: i32,
+    hooks: EcsComponentHooksDeep,
+    // required components registered for this component
+    required: EcsRequiredComponentsDeep,
+    is_send_and_sync: bool,
+    layout_size: i64,
+    layout_align: i64,
+}
+
+fn ecs_cd_desc_default(type_id: i64, name_id: i64) -> EcsComponentDescDeep {
+    return EcsComponentDescDeep {
+        component_id: 0,
+        type_id: type_id,
+        name_id: name_id,
+        storage: ECS_CD_STORAGE_TABLE,
+        mutability: ECS_CD_MUTABLE,
+        clone_kind: ECS_CD_CLONE_DEFAULT,
+        clone_custom_fn: 0,
+        hooks: ecs_cd_hooks_none(),
+        required: ecs_cd_req_new(),
+        is_send_and_sync: true,
+        layout_size: 0,
+        layout_align: 1,
+    };
+}
+
+fn ecs_cd_desc_storage_sparse(d: EcsComponentDescDeep) -> EcsComponentDescDeep {
+    d.storage = ECS_CD_STORAGE_SPARSE;
+    return d;
+}
+fn ecs_cd_desc_immutable(d: EcsComponentDescDeep) -> EcsComponentDescDeep {
+    d.mutability = ECS_CD_IMMUTABLE;
+    return d;
+}
+fn ecs_cd_desc_clone_behavior(d: EcsComponentDescDeep, b: EcsComponentCloneBehaviorDeep) -> EcsComponentDescDeep {
+    d.clone_kind = b.kind;
+    d.clone_custom_fn = b.custom_fn_id;
+    return d;
+}
+fn ecs_cd_desc_hooks(d: EcsComponentDescDeep, h: EcsComponentHooksDeep) -> EcsComponentDescDeep {
+    d.hooks = h;
+    return d;
+}
+fn ecs_cd_desc_require(
+    d: EcsComponentDescDeep,
+    required_id: i32,
+    ctor: i32,
+    depth: i32
+) -> EcsComponentDescDeep {
+    let req = d.required;
+    req = ecs_cd_req_register(req, required_id, ctor, depth);
+    d.required = req;
+    return d;
+}
+fn ecs_cd_desc_layout(d: EcsComponentDescDeep, size: i64, align: i64) -> EcsComponentDescDeep {
+    d.layout_size = size;
+    d.layout_align = align;
+    return d;
+}
+fn ecs_cd_desc_non_send(d: EcsComponentDescDeep) -> EcsComponentDescDeep {
+    d.is_send_and_sync = false;
+    return d;
+}
+
+fn ecs_cd_desc_id(d: EcsComponentDescDeep) -> i32 { return d.component_id; }
+fn ecs_cd_desc_type_id(d: EcsComponentDescDeep) -> i64 { return d.type_id; }
+fn ecs_cd_desc_storage(d: EcsComponentDescDeep) -> i32 { return d.storage; }
+fn ecs_cd_desc_mutability(d: EcsComponentDescDeep) -> i32 { return d.mutability; }
+fn ecs_cd_desc_is_mutable(d: EcsComponentDescDeep) -> bool { return d.mutability == ECS_CD_MUTABLE; }
+fn ecs_cd_desc_is_table(d: EcsComponentDescDeep) -> bool { return d.storage == ECS_CD_STORAGE_TABLE; }
+fn ecs_cd_desc_is_sparse(d: EcsComponentDescDeep) -> bool { return d.storage == ECS_CD_STORAGE_SPARSE; }
+fn ecs_cd_desc_clone_kind(d: EcsComponentDescDeep) -> i32 { return d.clone_kind; }
+fn ecs_cd_desc_hooks_ref(d: EcsComponentDescDeep) -> EcsComponentHooksDeep { return d.hooks; }
+fn ecs_cd_desc_required_ref(d: EcsComponentDescDeep) -> EcsRequiredComponentsDeep { return d.required; }
+fn ecs_cd_desc_is_send(d: EcsComponentDescDeep) -> bool { return d.is_send_and_sync; }
+
+// resolved clone for this descriptor
+fn ecs_cd_desc_resolve_clone(d: EcsComponentDescDeep, default_fn: i32) -> i32 {
+    let b = EcsComponentCloneBehaviorDeep { kind: d.clone_kind, custom_fn_id: d.clone_custom_fn };
+    return ecs_cd_clone_resolve(b, default_fn);
+}
+
+// === Components registry ===
+struct EcsComponentsDeep {
+    // fixed slots of descriptors (component_id is index+1)
+    d0: EcsComponentDescDeep,
+    d1: EcsComponentDescDeep,
+    d2: EcsComponentDescDeep,
+    d3: EcsComponentDescDeep,
+    d4: EcsComponentDescDeep,
+    d5: EcsComponentDescDeep,
+    d6: EcsComponentDescDeep,
+    d7: EcsComponentDescDeep,
+    d8: EcsComponentDescDeep,
+    d9: EcsComponentDescDeep,
+    d10: EcsComponentDescDeep,
+    d11: EcsComponentDescDeep,
+    d12: EcsComponentDescDeep,
+    d13: EcsComponentDescDeep,
+    d14: EcsComponentDescDeep,
+    d15: EcsComponentDescDeep,
+    len: i32,
+    // hook invocation counters for lifecycle simulation
+    hook_add_count: i64,
+    hook_insert_count: i64,
+    hook_remove_count: i64,
+    hook_despawn_count: i64,
+    hook_discard_count: i64,
+    last_hook_id: i64,
+}
+
+fn ecs_cd_components_new() -> EcsComponentsDeep {
+    return EcsComponentsDeep {
+        d0: ecs_cd_desc_default(0, 0),
+        d1: ecs_cd_desc_default(0, 0),
+        d2: ecs_cd_desc_default(0, 0),
+        d3: ecs_cd_desc_default(0, 0),
+        d4: ecs_cd_desc_default(0, 0),
+        d5: ecs_cd_desc_default(0, 0),
+        d6: ecs_cd_desc_default(0, 0),
+        d7: ecs_cd_desc_default(0, 0),
+        d8: ecs_cd_desc_default(0, 0),
+        d9: ecs_cd_desc_default(0, 0),
+        d10: ecs_cd_desc_default(0, 0),
+        d11: ecs_cd_desc_default(0, 0),
+        d12: ecs_cd_desc_default(0, 0),
+        d13: ecs_cd_desc_default(0, 0),
+        d14: ecs_cd_desc_default(0, 0),
+        d15: ecs_cd_desc_default(0, 0),
+        len: 0,
+        hook_add_count: 0,
+        hook_insert_count: 0,
+        hook_remove_count: 0,
+        hook_despawn_count: 0,
+        hook_discard_count: 0,
+        last_hook_id: 0,
+    };
+}
+
+fn ecs_cd_components_len(c: EcsComponentsDeep) -> i32 { return c.len; }
+
+fn ecs_cd_components_get_at(c: EcsComponentsDeep, idx: i32) -> EcsComponentDescDeep {
+    if idx == 0 { return c.d0; };
+    if idx == 1 { return c.d1; };
+    if idx == 2 { return c.d2; };
+    if idx == 3 { return c.d3; };
+    if idx == 4 { return c.d4; };
+    if idx == 5 { return c.d5; };
+    if idx == 6 { return c.d6; };
+    if idx == 7 { return c.d7; };
+    if idx == 8 { return c.d8; };
+    if idx == 9 { return c.d9; };
+    if idx == 10 { return c.d10; };
+    if idx == 11 { return c.d11; };
+    if idx == 12 { return c.d12; };
+    if idx == 13 { return c.d13; };
+    if idx == 14 { return c.d14; };
+    if idx == 15 { return c.d15; };
+    return ecs_cd_desc_default(0, 0);
+}
+
+fn ecs_cd_components_set_at(
+    c: EcsComponentsDeep,
+    idx: i32,
+    d: EcsComponentDescDeep
+) -> EcsComponentsDeep {
+    if idx == 0 {
+        c.d0 = d;
+        return c;
+    };
+    if idx == 1 {
+        c.d1 = d;
+        return c;
+    };
+    if idx == 2 {
+        c.d2 = d;
+        return c;
+    };
+    if idx == 3 {
+        c.d3 = d;
+        return c;
+    };
+    if idx == 4 {
+        c.d4 = d;
+        return c;
+    };
+    if idx == 5 {
+        c.d5 = d;
+        return c;
+    };
+    if idx == 6 {
+        c.d6 = d;
+        return c;
+    };
+    if idx == 7 {
+        c.d7 = d;
+        return c;
+    };
+    if idx == 8 {
+        c.d8 = d;
+        return c;
+    };
+    if idx == 9 {
+        c.d9 = d;
+        return c;
+    };
+    if idx == 10 {
+        c.d10 = d;
+        return c;
+    };
+    if idx == 11 {
+        c.d11 = d;
+        return c;
+    };
+    if idx == 12 {
+        c.d12 = d;
+        return c;
+    };
+    if idx == 13 {
+        c.d13 = d;
+        return c;
+    };
+    if idx == 14 {
+        c.d14 = d;
+        return c;
+    };
+    if idx == 15 {
+        c.d15 = d;
+        return c;
+    };
+    return c;
+}
+
+// register_component: if type_id already present, return existing id
+fn ecs_cd_register(c: EcsComponentsDeep, d: EcsComponentDescDeep) -> (EcsComponentsDeep, i32) {
+    let type_id = d.type_id;
+    let i: i32 = 0;
+    while i < c.len {
+        let existing = ecs_cd_components_get_at(c, i);
+        if existing.type_id == type_id {
+            let existing_id = existing.component_id;
+            return (c, existing_id);
+        };
+        i = i + 1;
+    }
+    if c.len >= ECS_CD_CAP {
+        return (c, 0);
+    };
+    let idx = c.len;
+    let id = idx + 1; // ComponentId starts at 1
+    d.component_id = id;
+    c = ecs_cd_components_set_at(c, idx, d);
+    c.len = idx + 1;
+    return (c, id);
+}
+
+fn ecs_cd_get_by_id(c: EcsComponentsDeep, component_id: i32) -> (bool, EcsComponentDescDeep) {
+    let i: i32 = 0;
+    while i < c.len {
+        let d = ecs_cd_components_get_at(c, i);
+        if d.component_id == component_id {
+            return (true, d);
+        };
+        i = i + 1;
+    }
+    return (false, ecs_cd_desc_default(0, 0));
+}
+
+fn ecs_cd_get_by_type(c: EcsComponentsDeep, type_id: i64) -> (bool, EcsComponentDescDeep) {
+    let i: i32 = 0;
+    while i < c.len {
+        let d = ecs_cd_components_get_at(c, i);
+        if d.type_id == type_id {
+            return (true, d);
+        };
+        i = i + 1;
+    }
+    return (false, ecs_cd_desc_default(0, 0));
+}
+
+// ComponentIdFor::from_world / get
+fn ecs_cd_id_for(c: EcsComponentsDeep, type_id: i64) -> (bool, i32) {
+    let r = ecs_cd_get_by_type(c, type_id);
+    if r.0 != true { return (false, 0); };
+    return (true, r.1.component_id);
+}
+
+// === Lifecycle hook dispatch simulation ===
+// on insert of component_id: fire on_add (first time) + on_insert
+// is_first_add distinguishes add vs reinsert
+fn ecs_cd_fire_insert(
+    c: EcsComponentsDeep,
+    component_id: i32,
+    is_first_add: bool
+) -> EcsComponentsDeep {
+    let g = ecs_cd_get_by_id(c, component_id);
+    if g.0 != true { return c; };
+    let desc = g.1;
+    let h = desc.hooks;
+    if is_first_add {
+        if h.on_add != 0 {
+            c.hook_add_count = c.hook_add_count + 1;
+            c.last_hook_id = h.on_add;
+        };
+    };
+    if h.on_insert != 0 {
+        c.hook_insert_count = c.hook_insert_count + 1;
+        c.last_hook_id = h.on_insert;
+    };
+    return c;
+}
+
+fn ecs_cd_fire_remove(c: EcsComponentsDeep, component_id: i32) -> EcsComponentsDeep {
+    let g = ecs_cd_get_by_id(c, component_id);
+    if g.0 != true { return c; };
+    let desc = g.1;
+    let h = desc.hooks;
+    if h.on_remove != 0 {
+        c.hook_remove_count = c.hook_remove_count + 1;
+        c.last_hook_id = h.on_remove;
+    };
+    return c;
+}
+
+fn ecs_cd_fire_despawn(c: EcsComponentsDeep, component_id: i32) -> EcsComponentsDeep {
+    let g = ecs_cd_get_by_id(c, component_id);
+    if g.0 != true { return c; };
+    let desc = g.1;
+    let h = desc.hooks;
+    if h.on_despawn != 0 {
+        c.hook_despawn_count = c.hook_despawn_count + 1;
+        c.last_hook_id = h.on_despawn;
+    };
+    return c;
+}
+
+fn ecs_cd_fire_discard(c: EcsComponentsDeep, component_id: i32) -> EcsComponentsDeep {
+    let g = ecs_cd_get_by_id(c, component_id);
+    if g.0 != true { return c; };
+    let desc = g.1;
+    let h = desc.hooks;
+    if h.on_discard != 0 {
+        c.hook_discard_count = c.hook_discard_count + 1;
+        c.last_hook_id = h.on_discard;
+    };
+    return c;
+}
+
+fn ecs_cd_hook_add_count(c: EcsComponentsDeep) -> i64 { return c.hook_add_count; }
+fn ecs_cd_hook_insert_count(c: EcsComponentsDeep) -> i64 { return c.hook_insert_count; }
+fn ecs_cd_hook_remove_count(c: EcsComponentsDeep) -> i64 { return c.hook_remove_count; }
+fn ecs_cd_hook_despawn_count(c: EcsComponentsDeep) -> i64 { return c.hook_despawn_count; }
+fn ecs_cd_hook_discard_count(c: EcsComponentsDeep) -> i64 { return c.hook_discard_count; }
+fn ecs_cd_last_hook_id(c: EcsComponentsDeep) -> i64 { return c.last_hook_id; }
+
+// === Required insert expansion ===
+// When inserting `component_id`, collect required ids not already present on entity.
+// entity_present_mask: bit (component_id-1) set means already present.
+struct EcsCdInsertPlanDeep {
+    // components to construct/insert (including primary first)
+    id0: i32, ctor0: i32,
+    id1: i32, ctor1: i32,
+    id2: i32, ctor2: i32,
+    id3: i32, ctor3: i32,
+    id4: i32, ctor4: i32,
+    id5: i32, ctor5: i32,
+    id6: i32, ctor6: i32,
+    id7: i32, ctor7: i32,
+    len: i32,
+}
+
+fn ecs_cd_plan_new() -> EcsCdInsertPlanDeep {
+    return EcsCdInsertPlanDeep {
+        id0: 0, ctor0: 0, id1: 0, ctor1: 0,
+        id2: 0, ctor2: 0, id3: 0, ctor3: 0,
+        id4: 0, ctor4: 0, id5: 0, ctor5: 0,
+        id6: 0, ctor6: 0, id7: 0, ctor7: 0,
+        len: 0,
+    };
+}
+
+fn ecs_cd_plan_len(p: EcsCdInsertPlanDeep) -> i32 { return p.len; }
+fn ecs_cd_plan_id_at(p: EcsCdInsertPlanDeep, idx: i32) -> i32 {
+    if idx == 0 { return p.id0; };
+    if idx == 1 { return p.id1; };
+    if idx == 2 { return p.id2; };
+    if idx == 3 { return p.id3; };
+    if idx == 4 { return p.id4; };
+    if idx == 5 { return p.id5; };
+    if idx == 6 { return p.id6; };
+    if idx == 7 { return p.id7; };
+    return 0;
+}
+fn ecs_cd_plan_ctor_at(p: EcsCdInsertPlanDeep, idx: i32) -> i32 {
+    if idx == 0 { return p.ctor0; };
+    if idx == 1 { return p.ctor1; };
+    if idx == 2 { return p.ctor2; };
+    if idx == 3 { return p.ctor3; };
+    if idx == 4 { return p.ctor4; };
+    if idx == 5 { return p.ctor5; };
+    if idx == 6 { return p.ctor6; };
+    if idx == 7 { return p.ctor7; };
+    return 0;
+}
+
+fn ecs_cd_plan_push(p: EcsCdInsertPlanDeep, id: i32, ctor: i32) -> EcsCdInsertPlanDeep {
+    if p.len >= 8 { return p; };
+    if p.len == 0 { p.id0 = id; p.ctor0 = ctor; };
+    if p.len == 1 { p.id1 = id; p.ctor1 = ctor; };
+    if p.len == 2 { p.id2 = id; p.ctor2 = ctor; };
+    if p.len == 3 { p.id3 = id; p.ctor3 = ctor; };
+    if p.len == 4 { p.id4 = id; p.ctor4 = ctor; };
+    if p.len == 5 { p.id5 = id; p.ctor5 = ctor; };
+    if p.len == 6 { p.id6 = id; p.ctor6 = ctor; };
+    if p.len == 7 { p.id7 = id; p.ctor7 = ctor; };
+    p.len = p.len + 1;
+    return p;
+}
+
+fn ecs_cd_entity_has(mask: i64, component_id: i32) -> bool {
+    if component_id <= 0 { return false; };
+    let bit: i64 = 1;
+    let i: i32 = 1;
+    while i < component_id {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return (mask / bit) % 2 == 1;
+}
+
+// Build insert plan: primary component (ctor 0) + missing required
+fn ecs_cd_build_insert_plan(
+    c: EcsComponentsDeep,
+    component_id: i32,
+    entity_present_mask: i64
+) -> EcsCdInsertPlanDeep {
+    let plan = ecs_cd_plan_new();
+    // primary always included
+    plan = ecs_cd_plan_push(plan, component_id, 0);
+    let g = ecs_cd_get_by_id(c, component_id);
+    if g.0 != true { return plan; };
+    let desc = g.1;
+    let req = desc.required;
+    let i: i32 = 0;
+    while i < req.len {
+        let rid = ecs_cd_req_get_id(req, i);
+        if ecs_cd_entity_has(entity_present_mask, rid) != true {
+            plan = ecs_cd_plan_push(plan, rid, ecs_cd_req_get_ctor(req, i));
+        };
+        i = i + 1;
+    }
+    return plan;
+}
+
+// Storage type defaults
+fn ecs_cd_storage_default() -> i32 { return ECS_CD_STORAGE_TABLE; }
+fn ecs_cd_storage_is_table(s: i32) -> bool { return s == ECS_CD_STORAGE_TABLE; }
+fn ecs_cd_storage_is_sparse(s: i32) -> bool { return s == ECS_CD_STORAGE_SPARSE; }

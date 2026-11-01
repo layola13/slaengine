@@ -1,0 +1,372 @@
+// Reusable dynamic-capacity World owner.
+// This keeps the current verified two-component shape of lib/world.sla while
+// moving entities, component stores, and change ticks onto dynamic Vec-backed
+// storage.
+@import "entity.sla"
+@import "entity_dynamic.sla"
+@import "dyn_store.sla"
+@import "resource.sla"
+@import "messages.sla"
+
+struct DynamicWorld<A, B, R, M> {
+    entities: DynamicEntityAllocator,
+    a_components: DynamicComponentStore<A>,
+    b_components: DynamicComponentStore<B>,
+    resource: ResourceSlot<R>,
+    messages: Messages<M>,
+    change_tick: i32,
+    a_added_ticks: DynamicComponentStore<i32>,
+    a_changed_ticks: DynamicComponentStore<i32>,
+    b_added_ticks: DynamicComponentStore<i32>,
+    b_changed_ticks: DynamicComponentStore<i32>,
+    resource_added_tick: i32,
+    resource_changed_tick: i32,
+}
+
+struct Res<T> {
+    value: T,
+    added_tick: i32,
+    changed_tick: i32,
+}
+
+struct ResMut<T> {
+    value: T,
+    added_tick: i32,
+    changed_tick: i32,
+}
+
+struct DynamicWorldPairItem<A, B> {
+    entity: Entity,
+    a_slot: i64,
+    b_slot: i64,
+    a: A,
+    b: B,
+}
+
+struct DynamicWorldPairQuery<A, B> {
+    items: Vec<DynamicWorldPairItem<A, B> >,
+}
+
+fn dynamic_world_new<A, B, R, M>(default_r: R, default_m: M) -> DynamicWorld<A, B, R, M> {
+    return DynamicWorld<A, B, R, M> {
+        entities: dyn_allocator_new(),
+        a_components: dyn_store_new<A>(),
+        b_components: dyn_store_new<B>(),
+        resource: resource_slot_new<R>(default_r),
+        messages: messages_new<M>(default_m),
+        change_tick: 1,
+        a_added_ticks: dyn_store_new<i32>(),
+        a_changed_ticks: dyn_store_new<i32>(),
+        b_added_ticks: dyn_store_new<i32>(),
+        b_changed_ticks: dyn_store_new<i32>(),
+        resource_added_tick: 0,
+        resource_changed_tick: 0,
+    };
+}
+
+fn dynamic_world_increment_tick<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> DynamicWorld<A, B, R, M> {
+    world.change_tick = world.change_tick + 1;
+    return world;
+}
+
+fn dynamic_world_spawn<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> (DynamicWorld<A, B, R, M>, Entity) {
+    let (allocator, entity) = dyn_alloc_entity(world.entities);
+    world.entities = allocator;
+    return (world, entity);
+}
+
+fn dynamic_world_is_alive<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> bool {
+    return dyn_is_alive(world.entities, entity);
+}
+
+fn dynamic_world_insert_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity, value: A) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_is_alive<A, B, R, M>(world, entity) != true { panic(7501); };
+    let slot = dyn_store_slot_of<A>(world.a_components, entity.id);
+    if slot >= 0 {
+        world.a_components = dyn_store_write<A>(world.a_components, slot, value);
+        world.a_changed_ticks = dyn_store_write<i32>(world.a_changed_ticks, slot, world.change_tick);
+        return world;
+    };
+    world.a_components = dyn_store_insert<A>(world.a_components, entity.id, value);
+    world.a_added_ticks = dyn_store_insert<i32>(world.a_added_ticks, entity.id, world.change_tick);
+    world.a_changed_ticks = dyn_store_insert<i32>(world.a_changed_ticks, entity.id, world.change_tick);
+    return world;
+}
+
+fn dynamic_world_insert_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity, value: B) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_is_alive<A, B, R, M>(world, entity) != true { panic(7502); };
+    let slot = dyn_store_slot_of<B>(world.b_components, entity.id);
+    if slot >= 0 {
+        world.b_components = dyn_store_write<B>(world.b_components, slot, value);
+        world.b_changed_ticks = dyn_store_write<i32>(world.b_changed_ticks, slot, world.change_tick);
+        return world;
+    };
+    world.b_components = dyn_store_insert<B>(world.b_components, entity.id, value);
+    world.b_added_ticks = dyn_store_insert<i32>(world.b_added_ticks, entity.id, world.change_tick);
+    world.b_changed_ticks = dyn_store_insert<i32>(world.b_changed_ticks, entity.id, world.change_tick);
+    return world;
+}
+
+fn dynamic_world_remove_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> DynamicWorld<A, B, R, M> {
+    world.a_components = dyn_store_remove<A>(world.a_components, entity.id);
+    world.a_added_ticks = dyn_store_remove<i32>(world.a_added_ticks, entity.id);
+    world.a_changed_ticks = dyn_store_remove<i32>(world.a_changed_ticks, entity.id);
+    return world;
+}
+
+fn dynamic_world_remove_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> DynamicWorld<A, B, R, M> {
+    world.b_components = dyn_store_remove<B>(world.b_components, entity.id);
+    world.b_added_ticks = dyn_store_remove<i32>(world.b_added_ticks, entity.id);
+    world.b_changed_ticks = dyn_store_remove<i32>(world.b_changed_ticks, entity.id);
+    return world;
+}
+
+fn dynamic_world_despawn<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_is_alive<A, B, R, M>(world, entity) != true { return world; };
+    world = dynamic_world_remove_a<A, B, R, M>(world, entity);
+    world = dynamic_world_remove_b<A, B, R, M>(world, entity);
+    world.entities = dyn_free_entity(world.entities, entity);
+    return world;
+}
+
+fn dynamic_world_has_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> bool {
+    if dynamic_world_is_alive<A, B, R, M>(world, entity) != true { return false; };
+    return dyn_store_has<A>(world.a_components, entity.id);
+}
+
+fn dynamic_world_has_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> bool {
+    if dynamic_world_is_alive<A, B, R, M>(world, entity) != true { return false; };
+    return dyn_store_has<B>(world.b_components, entity.id);
+}
+
+fn dynamic_world_get_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> A {
+    if dynamic_world_has_a<A, B, R, M>(world, entity) != true { panic(7503); };
+    return dyn_store_get<A>(world.a_components, entity.id);
+}
+
+fn dynamic_world_get_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity) -> B {
+    if dynamic_world_has_b<A, B, R, M>(world, entity) != true { panic(7504); };
+    return dyn_store_get<B>(world.b_components, entity.id);
+}
+
+fn dynamic_world_write_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity, value: A) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_has_a<A, B, R, M>(world, entity) != true { panic(7505); };
+    let slot = dyn_store_slot_of<A>(world.a_components, entity.id);
+    world.a_components = dyn_store_write<A>(world.a_components, slot, value);
+    world.a_changed_ticks = dyn_store_write<i32>(world.a_changed_ticks, slot, world.change_tick);
+    return world;
+}
+
+fn dynamic_world_insert_resource<A, B, R, M>(world: DynamicWorld<A, B, R, M>, value: R) -> DynamicWorld<A, B, R, M> {
+    if resource_has<R>(world.resource) != true {
+        world.resource_added_tick = world.change_tick;
+    };
+    world.resource = resource_insert<R>(world.resource, value);
+    world.resource_changed_tick = world.change_tick;
+    return world;
+}
+
+fn dynamic_world_has_resource<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> bool {
+    return resource_has<R>(world.resource);
+}
+
+fn dynamic_world_get_resource<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> R {
+    return resource_get<R>(world.resource);
+}
+
+fn dynamic_world_res<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> Res<R> {
+    return Res<R> {
+        value: dynamic_world_get_resource<A, B, R, M>(world),
+        added_tick: world.resource_added_tick,
+        changed_tick: world.resource_changed_tick,
+    };
+}
+
+fn dynamic_world_res_mut<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> ResMut<R> {
+    return ResMut<R> {
+        value: dynamic_world_get_resource<A, B, R, M>(world),
+        added_tick: world.resource_added_tick,
+        changed_tick: world.resource_changed_tick,
+    };
+}
+
+fn res_is_added_since<T>(res: Res<T>, tick: i32) -> bool { return res.added_tick > tick; }
+fn res_is_changed_since<T>(res: Res<T>, tick: i32) -> bool { return res.changed_tick > tick; }
+fn res_mut_is_added_since<T>(res: ResMut<T>, tick: i32) -> bool { return res.added_tick > tick; }
+fn res_mut_is_changed_since<T>(res: ResMut<T>, tick: i32) -> bool { return res.changed_tick > tick; }
+
+fn dynamic_world_resource_added_since<A, B, R, M>(world: DynamicWorld<A, B, R, M>, tick: i32) -> bool {
+    if dynamic_world_has_resource<A, B, R, M>(world) != true { return false; };
+    return world.resource_added_tick > tick;
+}
+
+fn dynamic_world_resource_changed_since<A, B, R, M>(world: DynamicWorld<A, B, R, M>, tick: i32) -> bool {
+    if dynamic_world_has_resource<A, B, R, M>(world) != true { return false; };
+    return world.resource_changed_tick > tick;
+}
+
+fn dynamic_world_res_mut_write<A, B, R, M>(world: DynamicWorld<A, B, R, M>, res: ResMut<R>, value: R) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_has_resource<A, B, R, M>(world) != true { return world; };
+    world.resource = resource_insert<R>(world.resource, value);
+    world.resource_changed_tick = world.change_tick;
+    return world;
+}
+
+fn dynamic_world_remove_resource<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> DynamicWorld<A, B, R, M> {
+    world.resource = resource_remove<R>(world.resource);
+    world.resource_added_tick = 0;
+    world.resource_changed_tick = 0;
+    return world;
+}
+
+fn dynamic_world_write_message<A, B, R, M>(world: DynamicWorld<A, B, R, M>, value: M) -> DynamicWorld<A, B, R, M> {
+    world.messages = messages_write<M>(world.messages, value);
+    return world;
+}
+
+fn dynamic_world_read_message<A, B, R, M>(world: DynamicWorld<A, B, R, M>, reader: MessageReader, default_value: M) -> MessageRead<M> {
+    return messages_read_next<M>(world.messages, reader, default_value);
+}
+
+fn dynamic_world_pair_query_new<A, B>() -> DynamicWorldPairQuery<A, B> {
+    let items: Vec<DynamicWorldPairItem<A, B>> = Vec::new();
+    return DynamicWorldPairQuery<A, B> { items: items };
+}
+
+fn dynamic_world_query_a_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>) -> DynamicWorldPairQuery<A, B> {
+    let query = dynamic_world_pair_query_new<A, B>();
+    let i: i64 = 0;
+    let cnt = dyn_store_count<A>(world.a_components);
+    while i < cnt {
+        let eid = world.a_components.entity_ids[i];
+        let b_slot = dyn_store_slot_of<B>(world.b_components, eid);
+        if b_slot >= 0 {
+            let entity = entity_new(eid, world.entities.generations[eid]);
+            if dynamic_world_is_alive<A, B, R, M>(world, entity) {
+                query.items.push(DynamicWorldPairItem<A, B> {
+                    entity: entity,
+                    a_slot: i,
+                    b_slot: b_slot,
+                    a: world.a_components.values[i],
+                    b: world.b_components.values[b_slot],
+                });
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn dynamic_world_pair_write_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, item: DynamicWorldPairItem<A, B>, value: A) -> DynamicWorld<A, B, R, M> {
+    if dynamic_world_is_alive<A, B, R, M>(world, item.entity) != true { return world; };
+    world.a_components = dyn_store_write<A>(world.a_components, item.a_slot, value);
+    world.a_changed_ticks = dyn_store_write<i32>(world.a_changed_ticks, item.a_slot, world.change_tick);
+    return world;
+}
+
+fn dynamic_world_a_added_since<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity, tick: i32) -> bool {
+    let slot = dyn_store_slot_of<i32>(world.a_added_ticks, entity.id);
+    if slot < 0 { return false; };
+    return world.a_added_ticks.values[slot] > tick;
+}
+
+fn dynamic_world_a_changed_since<A, B, R, M>(world: DynamicWorld<A, B, R, M>, entity: Entity, tick: i32) -> bool {
+    let slot = dyn_store_slot_of<i32>(world.a_changed_ticks, entity.id);
+    if slot < 0 { return false; };
+    return world.a_changed_ticks.values[slot] > tick;
+}
+
+struct DynamicWorldPos {
+    x: i32,
+    y: i32,
+}
+
+struct DynamicWorldVel {
+    x: i32,
+    y: i32,
+}
+
+struct DynamicWorldTime {
+    tick: i32,
+}
+
+struct DynamicWorldDamage {
+    amount: i32,
+}
+
+fn dynamic_world_time_default() -> DynamicWorldTime { return DynamicWorldTime { tick: 0 }; }
+fn dynamic_world_damage_default() -> DynamicWorldDamage { return DynamicWorldDamage { amount: 0 }; }
+
+fn test_dynamic_world_new() -> DynamicWorld<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage> {
+    return dynamic_world_new<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(
+        dynamic_world_time_default(),
+        dynamic_world_damage_default(),
+    );
+}
+
+@test "dynamic world spawn exceeds old entity cap"() {
+    let w = test_dynamic_world_new();
+    let i: i32 = 0;
+    while i < 20 {
+        let (next_w, entity) = dynamic_world_spawn<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w);
+        w = next_w;
+        if entity.id != i + 1 { panic(7600); };
+        if dynamic_world_is_alive<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w, entity) != true { panic(7601); };
+        i = i + 1;
+    }
+}
+
+@test "dynamic world insert remove query and writeback"() {
+    let w0 = test_dynamic_world_new();
+    let (w1, e1) = dynamic_world_spawn<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w0);
+    let (w2, e2) = dynamic_world_spawn<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w1);
+    let w3 = dynamic_world_insert_a<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w2, e1, DynamicWorldPos { x: 1, y: 2 });
+    let w4 = dynamic_world_insert_b<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w3, e1, DynamicWorldVel { x: 10, y: 20 });
+    let w5 = dynamic_world_insert_a<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w4, e2, DynamicWorldPos { x: 5, y: 6 });
+    let q = dynamic_world_query_a_b<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w5);
+    if len(q.items) != 1 { panic(7610); };
+    if q.items[0].entity.id != e1.id { panic(7611); };
+    let w6 = dynamic_world_increment_tick<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w5);
+    let moved = DynamicWorldPos { x: q.items[0].a.x + q.items[0].b.x, y: q.items[0].a.y + q.items[0].b.y };
+    let w7 = dynamic_world_pair_write_a<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w6, q.items[0], moved);
+    let p = dynamic_world_get_a<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w7, e1);
+    if p.x != 11 { panic(7612); };
+    if p.y != 22 { panic(7613); };
+    let w8 = dynamic_world_remove_a<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w7, e1);
+    if dynamic_world_has_a<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w8, e1) != false { panic(7614); };
+}
+
+@test "dynamic world stale entity rejection and resource messages"() {
+    let w0 = test_dynamic_world_new();
+    let (w1, e1) = dynamic_world_spawn<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w0);
+    let w2 = dynamic_world_despawn<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w1, e1);
+    if dynamic_world_is_alive<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w2, e1) != false { panic(7620); };
+    let (w3, e2) = dynamic_world_spawn<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w2);
+    if e2.id != e1.id { panic(7621); };
+    if e2.gen != e1.gen + 1 { panic(7622); };
+    let w4 = dynamic_world_insert_resource<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w3, DynamicWorldTime { tick: 9 });
+    let t = dynamic_world_get_resource<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w4);
+    if t.tick != 9 { panic(7623); };
+    let w5 = dynamic_world_write_message<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w4, DynamicWorldDamage { amount: 5 });
+    let read = dynamic_world_read_message<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w5, message_reader_new(), dynamic_world_damage_default());
+    if read.has_value != true { panic(7624); };
+    if read.value.amount != 5 { panic(7625); };
+}
+
+@test "dynamic world resource res and resmut change detection"() {
+    let w0 = test_dynamic_world_new();
+    let w1 = dynamic_world_insert_resource<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w0, DynamicWorldTime { tick: 4 });
+    if dynamic_world_resource_added_since<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w1, 0) != true { panic(7640); };
+    if dynamic_world_resource_changed_since<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w1, 0) != true { panic(7641); };
+    let res = dynamic_world_res<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w1);
+    if res.value.tick != 4 { panic(7642); };
+    if res_is_added_since<DynamicWorldTime>(res, 0) != true { panic(7643); };
+    let w2 = dynamic_world_increment_tick<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w1);
+    let res_mut = dynamic_world_res_mut<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w2);
+    if res_mut_is_changed_since<DynamicWorldTime>(res_mut, 1) != false { panic(7644); };
+    let w3 = dynamic_world_res_mut_write<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w2, res_mut, DynamicWorldTime { tick: 8 });
+    if dynamic_world_resource_added_since<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w3, 1) != false { panic(7645); };
+    if dynamic_world_resource_changed_since<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w3, 1) != true { panic(7646); };
+    let out = dynamic_world_get_resource<DynamicWorldPos, DynamicWorldVel, DynamicWorldTime, DynamicWorldDamage>(w3);
+    if out.tick != 8 { panic(7647); };
+}

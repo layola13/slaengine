@@ -1,0 +1,312 @@
+// Bevy ECS system::system_registry templates: SystemHandleTemplate + SystemHandleValue
+// + CachedSystemId + tracked + cached register/run helpers.
+// Mirrors src/system/system_registry.rs.
+
+// === SystemHandleOrValue: lifts a system into either a handle (registered) or value (unregistered) ===
+const ECS_SYS_HOV_HANDLE: i32 = 0;
+const ECS_SYS_HOV_VALUE: i32 = 1;
+
+struct EcsSystemHandleOrValue {
+    kind: i32,
+    handle: i64,         // entity when already registered; sentinel otherwise
+    has_system_value: bool,
+    system_id: i64,
+}
+
+fn ecs_sys_hov_handle(handle_entity: i64) -> EcsSystemHandleOrValue {
+    return EcsSystemHandleOrValue { kind: ECS_SYS_HOV_HANDLE, handle: handle_entity, has_system_value: false, system_id: 0 };
+}
+
+fn ecs_sys_hov_value(system_id: i64) -> EcsSystemHandleOrValue {
+    return EcsSystemHandleOrValue { kind: ECS_SYS_HOV_VALUE, handle: 0, has_system_value: true, system_id: system_id };
+}
+
+fn ecs_sys_hov_is_handle(v: EcsSystemHandleOrValue) -> bool { return v.kind == ECS_SYS_HOV_HANDLE; }
+fn ecs_sys_hov_is_value(v: EcsSystemHandleOrValue) -> bool { return v.kind == ECS_SYS_HOV_VALUE; }
+fn ecs_sys_hov_handle_entity(v: EcsSystemHandleOrValue) -> i64 { return v.handle; }
+fn ecs_sys_hov_system_id(v: EcsSystemHandleOrValue) -> i64 { return v.system_id; }
+fn ecs_sys_hov_has_value(v: EcsSystemHandleOrValue) -> bool { return v.has_system_value; }
+
+// === SystemHandleValue: Arc<Mutex<...>> analog with cloned ref count ===
+struct EcsSystemHandleValue {
+    ref_count: i64,             // Arc::clone bumps; drop decrements
+    inner: EcsSystemHandleOrValue,
+}
+
+fn ecs_system_handle_value_new(system_id: i64) -> EcsSystemHandleValue {
+    return EcsSystemHandleValue { ref_count: 1, inner: ecs_sys_hov_value(system_id) };
+}
+
+fn ecs_system_handle_value_clone(v: EcsSystemHandleValue) -> EcsSystemHandleValue {
+    v.ref_count = v.ref_count + 1;
+    return v;
+}
+
+fn ecs_system_handle_value_drop_clone(v: EcsSystemHandleValue) -> EcsSystemHandleValue {
+    if v.ref_count > 0 {
+        v.ref_count = v.ref_count - 1;
+    };
+    return v;
+}
+
+fn ecs_system_handle_value_ref_count(v: EcsSystemHandleValue) -> i64 { return v.ref_count; }
+fn ecs_system_handle_value_inner_kind(v: EcsSystemHandleValue) -> i32 { return v.inner.kind; }
+fn ecs_system_handle_value_has_value(v: EcsSystemHandleValue) -> bool { return v.inner.has_system_value; }
+fn ecs_system_handle_value_handle(v: EcsSystemHandleValue) -> i64 { return v.inner.handle; }
+
+// when build_template is called for a Value variant: register the system and convert to Handle in-place
+fn ecs_system_handle_value_build(v: EcsSystemHandleValue, assigned_entity: i64) -> EcsSystemHandleValue {
+    if v.inner.kind == ECS_SYS_HOV_VALUE && v.inner.has_system_value {
+        v.inner.kind = ECS_SYS_HOV_HANDLE;
+        v.inner.handle = assigned_entity;
+        v.inner.has_system_value = false;
+    };
+    return v;
+}
+
+// === SystemHandleTemplate = Handle(variant) | Value(SystemHandleValue) ===
+const ECS_SYS_TEMPLATE_HANDLE: i32 = 0;
+const ECS_SYS_TEMPLATE_VALUE: i32 = 1;
+
+struct EcsSystemHandleTemplate {
+    kind: i32,
+    handle: i64,
+    value: EcsSystemHandleValue,
+}
+
+fn ecs_system_template_handle_weak(entity: i64) -> EcsSystemHandleTemplate {
+    let v = ecs_system_handle_value_new(0);
+    return EcsSystemHandleTemplate { kind: ECS_SYS_TEMPLATE_HANDLE, handle: entity, value: v };
+}
+
+fn ecs_system_template_value(system_id: i64) -> EcsSystemHandleTemplate {
+    let v = ecs_system_handle_value_new(system_id);
+    return EcsSystemHandleTemplate { kind: ECS_SYS_TEMPLATE_VALUE, handle: 0, value: v };
+}
+
+fn ecs_system_template_is_handle(t: EcsSystemHandleTemplate) -> bool { return t.kind == ECS_SYS_TEMPLATE_HANDLE; }
+fn ecs_system_template_is_value(t: EcsSystemHandleTemplate) -> bool { return t.kind == ECS_SYS_TEMPLATE_VALUE; }
+fn ecs_system_template_handle(t: EcsSystemHandleTemplate) -> i64 { return t.handle; }
+fn ecs_system_template_value_ref_count(t: EcsSystemHandleTemplate) -> i64 { return ecs_system_handle_value_ref_count(t.value); }
+fn ecs_system_template_default() -> EcsSystemHandleTemplate {
+    return ecs_system_template_handle_weak(-1);
+}
+
+fn ecs_system_template_clone(t: EcsSystemHandleTemplate) -> EcsSystemHandleTemplate {
+    if t.kind == ECS_SYS_TEMPLATE_HANDLE {
+        return ecs_system_template_handle_weak(t.handle);
+    };
+    let v2 = ecs_system_handle_value_clone(t.value);
+    return EcsSystemHandleTemplate { kind: ECS_SYS_TEMPLATE_VALUE, handle: 0, value: v2 };
+}
+
+fn ecs_system_template_from_handle(handle_entity: i64) -> EcsSystemHandleTemplate {
+    return ecs_system_template_handle_weak(handle_entity);
+}
+
+fn ecs_system_template_from_boxed(system_id: i64) -> EcsSystemHandleTemplate {
+    return ecs_system_template_value(system_id);
+}
+
+fn ecs_system_template_from_id(id_entity: i64) -> EcsSystemHandleTemplate {
+    return ecs_system_template_handle_weak(id_entity);
+}
+
+// build_template: for Value variant, lazily register (consuming the value system), returns the handle entity
+// For Handle variant, returns the held handle directly.
+fn ecs_system_template_build(t: EcsSystemHandleTemplate, assigned_entity: i64) -> (EcsSystemHandleTemplate, i64) {
+    if t.kind == ECS_SYS_TEMPLATE_HANDLE {
+        return (t, t.handle);
+    };
+    let v2 = ecs_system_handle_value_build(t.value, assigned_entity);
+    t.value = v2;
+    t.kind = ECS_SYS_TEMPLATE_HANDLE;
+    t.handle = assigned_entity;
+    return (t, assigned_entity);
+}
+
+// === system_value constructor (free fn) ===
+fn ecs_system_value_new(system_id: i64) -> EcsSystemHandleTemplate {
+    return ecs_system_template_value(system_id);
+}
+
+// === CachedSystemId<S> ===
+// Resolved by type name to a stored entity (handle) — types are not first-class
+// in SLA so we identify by an integer type id (caller-provided).
+struct EcsCachedSystemId {
+    entity: i64,
+    type_id: i32,
+}
+
+fn ecs_cached_system_id_new(entity: i64, type_id: i32) -> EcsCachedSystemId {
+    return EcsCachedSystemId { entity: entity, type_id: type_id };
+}
+
+fn ecs_cached_system_id_entity(c: EcsCachedSystemId) -> i64 { return c.entity; }
+fn ecs_cached_system_id_type_id(c: EcsCachedSystemId) -> i32 { return c.type_id; }
+
+// === Registry holder carrying cached lookups ===
+// Keyed by type_id. Allows register_system_cached / unregister_system_cached / run_system_cached.
+struct EcsCachedSystemRegistry {
+    type_ids: Vec<i32>,        // parallel: each type_id
+    entities: Vec<i64>,        // parallel: cached handle entities
+}
+
+fn ecs_cached_system_registry_new() -> EcsCachedSystemRegistry {
+    return EcsCachedSystemRegistry { type_ids: Vec::new(), entities: Vec::new() };
+}
+
+fn ecs_cached_registry_find(reg: EcsCachedSystemRegistry, type_id: i32) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(reg.type_ids) as i64;
+    while i < n {
+        if reg.type_ids[i as i32] == type_id {
+            return reg.entities[i as i32];
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_cached_registry_contains(reg: EcsCachedSystemRegistry, type_id: i32) -> bool {
+    return ecs_cached_registry_find(reg, type_id) >= 0;
+}
+
+fn ecs_cached_registry_count(reg: EcsCachedSystemRegistry) -> i64 { return len(reg.type_ids) as i64; }
+
+// register_system_cached: if type_id not yet cached, store entity; return (registry, entity)
+fn ecs_cached_registry_register(reg: EcsCachedSystemRegistry, type_id: i32, new_entity: i64) -> (EcsCachedSystemRegistry, i64) {
+    let existing = ecs_cached_registry_find(reg, type_id);
+    if existing >= 0 {
+        return (reg, existing);
+    };
+    reg.type_ids.push(type_id);
+    reg.entities.push(new_entity);
+    return (reg, new_entity);
+}
+
+// unregister_system_cached: remove cached type_id, returns (registry, success)
+fn ecs_cached_registry_unregister(reg: EcsCachedSystemRegistry, type_id: i32) -> (EcsCachedSystemRegistry, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(reg.type_ids) as i64;
+    let found = false;
+    let idx: i64 = -1;
+    while i < n {
+        if reg.type_ids[i as i32] == type_id {
+            found = true;
+            idx = i;
+            i = n;
+        };
+        i = i + 1;
+    }
+    if found {
+        // mark blank
+        reg.type_ids[idx as i32] = -1;
+        reg.entities[idx as i32] = -1;
+        let new_ids = Vec::new();
+        let new_ents = Vec::new();
+        let k: i64 = 0;
+        let m: i64 = len(reg.type_ids) as i64;
+        let kk: i64 = 0;
+        while k < m {
+            if reg.type_ids[k as i32] != -1 {
+                new_ids.push(reg.type_ids[k as i32]);
+                new_ents.push(reg.entities[k as i32]);
+                kk = kk + 1;
+            };
+            k = k + 1;
+        }
+        reg.type_ids = new_ids;
+        reg.entities = new_ents;
+        return (reg, true);
+    };
+    return (reg, false);
+}
+
+// run_system_cached: returns handle entity
+fn ecs_cached_registry_run(reg: EcsCachedSystemRegistry, type_id: i32) -> i64 {
+    let e = ecs_cached_registry_find(reg, type_id);
+    return e;
+}
+
+// run_system_cached_with: same lookup, queue an input marker separately
+fn ecs_cached_registry_run_with(reg: EcsCachedSystemRegistry, type_id: i32, input_value: i64) -> (i64, i64) {
+    let e = ecs_cached_registry_find(reg, type_id);
+    if e < 0 { return (-1, input_value); };
+    return (e, input_value);
+}
+
+// Local self-contained struct definitions (mirrors system_registry.sla).
+struct EcsSystemId { entity: i64 }
+struct EcsRegisteredSystemDespawner { entity: i64 }
+fn ecs_system_id_entity(id: EcsSystemId) -> i64 { return id.entity; }
+fn ecs_registered_system_despawner_entity(d: EcsRegisteredSystemDespawner) -> i64 { return d.entity; }
+
+
+
+// === TrackedSystem wrappers (auto-despawn via despawner entity) ===
+// register_tracked_system: assign an explicit despawner entity and return both id and despawner
+struct EcsTrackedSystem {
+    system_id: EcsSystemId,
+    despawner: EcsRegisteredSystemDespawner,
+}
+
+fn ecs_system_id_mk(entity: i64) -> EcsSystemId { return EcsSystemId { entity: entity }; }
+fn ecs_registered_system_despawner_mk(entity: i64) -> EcsRegisteredSystemDespawner {
+    return EcsRegisteredSystemDespawner { entity: entity };
+}
+
+fn ecs_tracked_system_new(system_entity: i64, despawner_entity: i64) -> EcsTrackedSystem {
+    return EcsTrackedSystem { system_id: ecs_system_id_mk(system_entity), despawner: ecs_registered_system_despawner_mk(despawner_entity) };
+}
+
+fn ecs_tracked_system_id(t: EcsTrackedSystem) -> EcsSystemId { return t.system_id; }
+fn ecs_tracked_system_despawner(t: EcsTrackedSystem) -> EcsRegisteredSystemDespawner { return t.despawner; }
+fn ecs_tracked_system_entity(t: EcsTrackedSystem) -> i64 { return t.system_id.entity; }
+fn ecs_tracked_system_despawner_entity(t: EcsTrackedSystem) -> i64 { return t.despawner.entity; }
+
+// register_tracked_boxed_system: same construction; system Boxing detail omitted
+fn ecs_tracked_boxed_new(system_entity: i64, despawner_entity: i64) -> EcsTrackedSystem {
+    return ecs_tracked_system_new(system_entity, despawner_entity);
+}
+
+// === SystemHandle Handle-strong/weak variants helpers used by templates ===
+struct EcsStrippedSystemHandle {
+    kind: i32,
+    entity: i64,
+}
+
+fn ecs_stripped_handle_strong(entity: i64) -> EcsStrippedSystemHandle {
+    return EcsStrippedSystemHandle { kind: 0, entity: entity };
+}
+
+fn ecs_stripped_handle_weak(entity: i64) -> EcsStrippedSystemHandle {
+    return EcsStrippedSystemHandle { kind: 1, entity: entity };
+}
+
+fn ecs_stripped_handle_is_strong(h: EcsStrippedSystemHandle) -> bool { return h.kind == 0; }
+fn ecs_stripped_handle_is_weak(h: EcsStrippedSystemHandle) -> bool { return h.kind == 1; }
+fn ecs_stripped_handle_entity(h: EcsStrippedSystemHandle) -> i64 { return h.entity; }
+
+// === TemplateContext: provides world access for build_template ===
+struct EcsTemplateContext {
+    world_entity_start: i64,
+    next_entity: i64,
+}
+
+fn ecs_template_context_new(start_entity: i64) -> EcsTemplateContext {
+    return EcsTemplateContext { world_entity_start: start_entity, next_entity: start_entity };
+}
+
+fn ecs_template_context_allocate_entity(c: EcsTemplateContext) -> (EcsTemplateContext, i64) {
+    let e = c.next_entity;
+    c.next_entity = c.next_entity + 1;
+    return (c, e);
+}
+
+fn ecs_template_context_next(c: EcsTemplateContext) -> i64 { return c.next_entity; }
+
+// Template::clone_template entry-point wrapper
+fn ecs_template_clone_template(t: EcsSystemHandleTemplate) -> EcsSystemHandleTemplate {
+    return ecs_system_template_clone(t);
+}

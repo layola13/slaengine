@@ -1,0 +1,353 @@
+// Deepened Bevy ECS RequiredComponentsError + registration guards.
+// Mirrors src/component/required.rs:
+//   RequiredComponentsError::{DuplicateRegistration, CyclicRequirement, ArchetypeExists}
+//   try_register_required path: cycle check, duplicate direct, archetype-exists
+//   display codes; Result helpers
+// Shallow lib/required_components_error.sla retained.
+
+// Error kinds (Bevy order)
+const ECS_RCE_DUPLICATE_REGISTRATION: i32 = 0;
+const ECS_RCE_CYCLIC_REQUIREMENT: i32 = 1;
+const ECS_RCE_ARCHETYPE_EXISTS: i32 = 2;
+
+// Display bases
+const ECS_RCE_DISP_DUP: i64 = 1000000000;
+const ECS_RCE_DISP_CYCLE: i64 = 2000000000;
+const ECS_RCE_DISP_ARCH: i64 = 3000000000;
+
+struct EcsRequiredComponentsErrorDeep {
+    kind: i32,
+    // DuplicateRegistration(requiree, required)
+    // CyclicRequirement(requiree, required)
+    // ArchetypeExists(component)
+    a: i32,
+    b: i32, // -1 unused for ArchetypeExists — use 2147483647 as none? use -1 carefully in tests via helper
+    has_b: bool,
+}
+
+fn ecs_rce_duplicate(requiree: i32, required: i32) -> EcsRequiredComponentsErrorDeep {
+    return EcsRequiredComponentsErrorDeep {
+        kind: ECS_RCE_DUPLICATE_REGISTRATION,
+        a: requiree,
+        b: required,
+        has_b: true,
+    };
+}
+
+fn ecs_rce_cyclic(requiree: i32, required: i32) -> EcsRequiredComponentsErrorDeep {
+    return EcsRequiredComponentsErrorDeep {
+        kind: ECS_RCE_CYCLIC_REQUIREMENT,
+        a: requiree,
+        b: required,
+        has_b: true,
+    };
+}
+
+fn ecs_rce_archetype_exists(component: i32) -> EcsRequiredComponentsErrorDeep {
+    return EcsRequiredComponentsErrorDeep {
+        kind: ECS_RCE_ARCHETYPE_EXISTS,
+        a: component,
+        b: 0,
+        has_b: false,
+    };
+}
+
+fn ecs_rce_kind(e: EcsRequiredComponentsErrorDeep) -> i32 { return e.kind; }
+fn ecs_rce_a(e: EcsRequiredComponentsErrorDeep) -> i32 { return e.a; }
+fn ecs_rce_b(e: EcsRequiredComponentsErrorDeep) -> i32 { return e.b; }
+fn ecs_rce_has_b(e: EcsRequiredComponentsErrorDeep) -> bool { return e.has_b; }
+
+fn ecs_rce_is_duplicate(e: EcsRequiredComponentsErrorDeep) -> bool {
+    return e.kind == ECS_RCE_DUPLICATE_REGISTRATION;
+}
+fn ecs_rce_is_cyclic(e: EcsRequiredComponentsErrorDeep) -> bool {
+    return e.kind == ECS_RCE_CYCLIC_REQUIREMENT;
+}
+fn ecs_rce_is_archetype_exists(e: EcsRequiredComponentsErrorDeep) -> bool {
+    return e.kind == ECS_RCE_ARCHETYPE_EXISTS;
+}
+
+fn ecs_rce_eq(a: EcsRequiredComponentsErrorDeep, b: EcsRequiredComponentsErrorDeep) -> bool {
+    if a.kind != b.kind { return false; };
+    if a.a != b.a { return false; };
+    if a.has_b != b.has_b { return false; };
+    if a.has_b {
+        return a.b == b.b;
+    };
+    return true;
+}
+
+fn ecs_rce_display_code(e: EcsRequiredComponentsErrorDeep) -> i64 {
+    if e.kind == ECS_RCE_DUPLICATE_REGISTRATION {
+        return ECS_RCE_DISP_DUP + (e.a as i64) * 1000 + (e.b as i64);
+    };
+    if e.kind == ECS_RCE_CYCLIC_REQUIREMENT {
+        return ECS_RCE_DISP_CYCLE + (e.a as i64) * 1000 + (e.b as i64);
+    };
+    return ECS_RCE_DISP_ARCH + (e.a as i64);
+}
+
+// === Required graph for try_register ===
+// Components 1..8; each has list of direct required ids (up to 4)
+struct EcsRceGraphDeep {
+    // for component index i (1-based id): required slots
+    // store as flat: node i uses 4 slots starting (i-1)*4 — simplify with parallel arrays per node
+    // node 1..8 direct requirements
+    n1_0: i32, n1_1: i32, n1_2: i32, n1_3: i32, n1_len: i32,
+    n2_0: i32, n2_1: i32, n2_2: i32, n2_3: i32, n2_len: i32,
+    n3_0: i32, n3_1: i32, n3_2: i32, n3_3: i32, n3_len: i32,
+    n4_0: i32, n4_1: i32, n4_2: i32, n4_3: i32, n4_len: i32,
+    n5_0: i32, n5_1: i32, n5_2: i32, n5_3: i32, n5_len: i32,
+    n6_0: i32, n6_1: i32, n6_2: i32, n6_3: i32, n6_len: i32,
+    n7_0: i32, n7_1: i32, n7_2: i32, n7_3: i32, n7_len: i32,
+    n8_0: i32, n8_1: i32, n8_2: i32, n8_3: i32, n8_len: i32,
+    // archetype exists mask: bit (id-1)
+    archetype_mask: i64,
+}
+
+fn ecs_rce_graph_new() -> EcsRceGraphDeep {
+    return EcsRceGraphDeep {
+        n1_0: 0, n1_1: 0, n1_2: 0, n1_3: 0, n1_len: 0,
+        n2_0: 0, n2_1: 0, n2_2: 0, n2_3: 0, n2_len: 0,
+        n3_0: 0, n3_1: 0, n3_2: 0, n3_3: 0, n3_len: 0,
+        n4_0: 0, n4_1: 0, n4_2: 0, n4_3: 0, n4_len: 0,
+        n5_0: 0, n5_1: 0, n5_2: 0, n5_3: 0, n5_len: 0,
+        n6_0: 0, n6_1: 0, n6_2: 0, n6_3: 0, n6_len: 0,
+        n7_0: 0, n7_1: 0, n7_2: 0, n7_3: 0, n7_len: 0,
+        n8_0: 0, n8_1: 0, n8_2: 0, n8_3: 0, n8_len: 0,
+        archetype_mask: 0,
+    };
+}
+
+fn ecs_rce_graph_set_archetype(g: EcsRceGraphDeep, component_id: i32) -> EcsRceGraphDeep {
+    if component_id <= 0 { return g; };
+    let bit: i64 = 1;
+    let i: i32 = 1;
+    while i < component_id {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    // set bit if not set
+    if (g.archetype_mask / bit) % 2 == 0 {
+        g.archetype_mask = g.archetype_mask + bit;
+    };
+    return g;
+}
+
+fn ecs_rce_graph_archetype_exists(g: EcsRceGraphDeep, component_id: i32) -> bool {
+    if component_id <= 0 { return false; };
+    let bit: i64 = 1;
+    let i: i32 = 1;
+    while i < component_id {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return (g.archetype_mask / bit) % 2 == 1;
+}
+
+fn ecs_rce_node_len(g: EcsRceGraphDeep, node: i32) -> i32 {
+    if node == 1 { return g.n1_len; };
+    if node == 2 { return g.n2_len; };
+    if node == 3 { return g.n3_len; };
+    if node == 4 { return g.n4_len; };
+    if node == 5 { return g.n5_len; };
+    if node == 6 { return g.n6_len; };
+    if node == 7 { return g.n7_len; };
+    if node == 8 { return g.n8_len; };
+    return 0;
+}
+
+fn ecs_rce_node_get(g: EcsRceGraphDeep, node: i32, idx: i32) -> i32 {
+    if node == 1 {
+        if idx == 0 { return g.n1_0; };
+        if idx == 1 { return g.n1_1; };
+        if idx == 2 { return g.n1_2; };
+        if idx == 3 { return g.n1_3; };
+    };
+    if node == 2 {
+        if idx == 0 { return g.n2_0; };
+        if idx == 1 { return g.n2_1; };
+        if idx == 2 { return g.n2_2; };
+        if idx == 3 { return g.n2_3; };
+    };
+    if node == 3 {
+        if idx == 0 { return g.n3_0; };
+        if idx == 1 { return g.n3_1; };
+        if idx == 2 { return g.n3_2; };
+        if idx == 3 { return g.n3_3; };
+    };
+    if node == 4 {
+        if idx == 0 { return g.n4_0; };
+        if idx == 1 { return g.n4_1; };
+        if idx == 2 { return g.n4_2; };
+        if idx == 3 { return g.n4_3; };
+    };
+    if node == 5 {
+        if idx == 0 { return g.n5_0; };
+        if idx == 1 { return g.n5_1; };
+        if idx == 2 { return g.n5_2; };
+        if idx == 3 { return g.n5_3; };
+    };
+    if node == 6 {
+        if idx == 0 { return g.n6_0; };
+        if idx == 1 { return g.n6_1; };
+        if idx == 2 { return g.n6_2; };
+        if idx == 3 { return g.n6_3; };
+    };
+    if node == 7 {
+        if idx == 0 { return g.n7_0; };
+        if idx == 1 { return g.n7_1; };
+        if idx == 2 { return g.n7_2; };
+        if idx == 3 { return g.n7_3; };
+    };
+    if node == 8 {
+        if idx == 0 { return g.n8_0; };
+        if idx == 1 { return g.n8_1; };
+        if idx == 2 { return g.n8_2; };
+        if idx == 3 { return g.n8_3; };
+    };
+    return 0;
+}
+
+fn ecs_rce_node_push(g: EcsRceGraphDeep, node: i32, required: i32) -> EcsRceGraphDeep {
+    let len = ecs_rce_node_len(g, node);
+    if len >= 4 { return g; };
+    if node == 1 {
+        if len == 0 { g.n1_0 = required; };
+        if len == 1 { g.n1_1 = required; };
+        if len == 2 { g.n1_2 = required; };
+        if len == 3 { g.n1_3 = required; };
+        g.n1_len = len + 1;
+        return g;
+    };
+    if node == 2 {
+        if len == 0 { g.n2_0 = required; };
+        if len == 1 { g.n2_1 = required; };
+        if len == 2 { g.n2_2 = required; };
+        if len == 3 { g.n2_3 = required; };
+        g.n2_len = len + 1;
+        return g;
+    };
+    if node == 3 {
+        if len == 0 { g.n3_0 = required; };
+        if len == 1 { g.n3_1 = required; };
+        if len == 2 { g.n3_2 = required; };
+        if len == 3 { g.n3_3 = required; };
+        g.n3_len = len + 1;
+        return g;
+    };
+    if node == 4 {
+        if len == 0 { g.n4_0 = required; };
+        if len == 1 { g.n4_1 = required; };
+        if len == 2 { g.n4_2 = required; };
+        if len == 3 { g.n4_3 = required; };
+        g.n4_len = len + 1;
+        return g;
+    };
+    if node == 5 {
+        if len == 0 { g.n5_0 = required; };
+        if len == 1 { g.n5_1 = required; };
+        if len == 2 { g.n5_2 = required; };
+        if len == 3 { g.n5_3 = required; };
+        g.n5_len = len + 1;
+        return g;
+    };
+    if node == 6 {
+        if len == 0 { g.n6_0 = required; };
+        if len == 1 { g.n6_1 = required; };
+        if len == 2 { g.n6_2 = required; };
+        if len == 3 { g.n6_3 = required; };
+        g.n6_len = len + 1;
+        return g;
+    };
+    if node == 7 {
+        if len == 0 { g.n7_0 = required; };
+        if len == 1 { g.n7_1 = required; };
+        if len == 2 { g.n7_2 = required; };
+        if len == 3 { g.n7_3 = required; };
+        g.n7_len = len + 1;
+        return g;
+    };
+    if node == 8 {
+        if len == 0 { g.n8_0 = required; };
+        if len == 1 { g.n8_1 = required; };
+        if len == 2 { g.n8_2 = required; };
+        if len == 3 { g.n8_3 = required; };
+        g.n8_len = len + 1;
+        return g;
+    };
+    return g;
+}
+
+fn ecs_rce_node_contains(g: EcsRceGraphDeep, node: i32, required: i32) -> bool {
+    let i: i32 = 0;
+    let n = ecs_rce_node_len(g, node);
+    while i < n {
+        if ecs_rce_node_get(g, node, i) == required { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// DFS: does `from` require `target` through the graph (including direct)?
+// visited bitmask for nodes 1..8
+fn ecs_rce_reaches(g: EcsRceGraphDeep, from: i32, target: i32, visited: i64) -> bool {
+    if from == target { return true; };
+    if from <= 0 { return false; };
+    if from > 8 { return false; };
+    let bit: i64 = 1;
+    let i: i32 = 1;
+    while i < from {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    if (visited / bit) % 2 == 1 { return false; };
+    visited = visited + bit;
+    let j: i32 = 0;
+    let n = ecs_rce_node_len(g, from);
+    while j < n {
+        let next = ecs_rce_node_get(g, from, j);
+        if ecs_rce_reaches(g, next, target, visited) {
+            return true;
+        };
+        j = j + 1;
+    }
+    return false;
+}
+
+// try_register requiree requires `required`
+// Bevy order roughly: if archetype exists for requiree -> ArchetypeExists
+// if required already requires requiree (cycle) -> CyclicRequirement
+// if already directly registered -> DuplicateRegistration
+// else Ok and add edge
+fn ecs_rce_try_register(
+    g: EcsRceGraphDeep,
+    requiree: i32,
+    required: i32
+) -> (EcsRceGraphDeep, bool, EcsRequiredComponentsErrorDeep) {
+    // archetype exists on requiree blocks new required registration
+    if ecs_rce_graph_archetype_exists(g, requiree) {
+        return (g, false, ecs_rce_archetype_exists(requiree));
+    };
+    // cycle: required already reaches requiree (or required == requiree)
+    if required == requiree {
+        return (g, false, ecs_rce_cyclic(requiree, required));
+    };
+    if ecs_rce_reaches(g, required, requiree, 0) {
+        return (g, false, ecs_rce_cyclic(requiree, required));
+    };
+    // duplicate direct
+    if ecs_rce_node_contains(g, requiree, required) {
+        return (g, false, ecs_rce_duplicate(requiree, required));
+    };
+    g = ecs_rce_node_push(g, requiree, required);
+    return (g, true, ecs_rce_duplicate(0, 0));
+}
+
+// Result helpers
+fn ecs_rce_result_is_ok(ok: bool) -> bool { return ok; }
+
+// Kind constants accessors
+fn ecs_rce_kind_duplicate() -> i32 { return ECS_RCE_DUPLICATE_REGISTRATION; }
+fn ecs_rce_kind_cyclic() -> i32 { return ECS_RCE_CYCLIC_REQUIREMENT; }
+fn ecs_rce_kind_archetype() -> i32 { return ECS_RCE_ARCHETYPE_EXISTS; }

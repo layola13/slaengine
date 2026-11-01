@@ -1,0 +1,213 @@
+// Sequential schedule for RegistryErasedWorld<R, M>.
+// Access metadata is keyed by registry component id and works across
+// heterogeneous erased component columns.
+@import "commands_registry_erased.sla"
+
+struct RegistryErasedSystemAccess {
+    read_components: Vec<i32>,
+    write_components: Vec<i32>,
+    reads_resource: bool,
+    writes_resource: bool,
+    reads_messages: bool,
+    writes_messages: bool,
+}
+
+struct RegistryErasedSystem<R, M> {
+    run: fn(RegistryErasedWorld<R, M>) -> RegistryErasedWorld<R, M>,
+    access: RegistryErasedSystemAccess,
+}
+
+struct RegistryErasedSchedule<R, M> {
+    systems: Vec<RegistryErasedSystem<R, M>>,
+    conflict_count: i32,
+}
+
+fn registry_erased_system_access_none() -> RegistryErasedSystemAccess {
+    let read_components: Vec<i32> = Vec::new();
+    let write_components: Vec<i32> = Vec::new();
+    return RegistryErasedSystemAccess {
+        read_components: read_components,
+        write_components: write_components,
+        reads_resource: false,
+        writes_resource: false,
+        reads_messages: false,
+        writes_messages: false,
+    };
+}
+
+fn registry_erased_access_read_component(access: RegistryErasedSystemAccess, component_id: i32) -> RegistryErasedSystemAccess {
+    access.read_components.push(component_id);
+    return access;
+}
+
+fn registry_erased_access_write_component(access: RegistryErasedSystemAccess, component_id: i32) -> RegistryErasedSystemAccess {
+    access.write_components.push(component_id);
+    return access;
+}
+
+fn registry_erased_access_read_resource(access: RegistryErasedSystemAccess) -> RegistryErasedSystemAccess {
+    access.reads_resource = true;
+    return access;
+}
+
+fn registry_erased_access_write_resource(access: RegistryErasedSystemAccess) -> RegistryErasedSystemAccess {
+    access.writes_resource = true;
+    return access;
+}
+
+fn registry_erased_access_read_messages(access: RegistryErasedSystemAccess) -> RegistryErasedSystemAccess {
+    access.reads_messages = true;
+    return access;
+}
+
+fn registry_erased_access_write_messages(access: RegistryErasedSystemAccess) -> RegistryErasedSystemAccess {
+    access.writes_messages = true;
+    return access;
+}
+
+fn registry_erased_component_list_has(values: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(values) as i64;
+    while i < cnt {
+        if values[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn registry_erased_access_component_conflicts(left: RegistryErasedSystemAccess, right: RegistryErasedSystemAccess) -> bool {
+    let i: i64 = 0;
+    let left_writes = len(left.write_components) as i64;
+    while i < left_writes {
+        let component_id = left.write_components[i];
+        if registry_erased_component_list_has(right.read_components, component_id) { return true; };
+        if registry_erased_component_list_has(right.write_components, component_id) { return true; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let right_writes = len(right.write_components) as i64;
+    while j < right_writes {
+        let component_id = right.write_components[j];
+        if registry_erased_component_list_has(left.read_components, component_id) { return true; };
+        if registry_erased_component_list_has(left.write_components, component_id) { return true; };
+        j = j + 1;
+    }
+    return false;
+}
+
+fn registry_erased_access_conflicts(left: RegistryErasedSystemAccess, right: RegistryErasedSystemAccess) -> bool {
+    if registry_erased_access_component_conflicts(left, right) { return true; };
+    if left.writes_resource { if right.reads_resource { return true; }; if right.writes_resource { return true; }; };
+    if right.writes_resource { if left.reads_resource { return true; }; if left.writes_resource { return true; }; };
+    if left.writes_messages { if right.reads_messages { return true; }; if right.writes_messages { return true; }; };
+    if right.writes_messages { if left.reads_messages { return true; }; if left.writes_messages { return true; }; };
+    return false;
+}
+
+fn registry_erased_system_new<R, M>(run: fn(RegistryErasedWorld<R, M>) -> RegistryErasedWorld<R, M>, access: RegistryErasedSystemAccess) -> RegistryErasedSystem<R, M> {
+    return RegistryErasedSystem<R, M> { run: run, access: access };
+}
+
+fn registry_erased_schedule_default<R, M>() -> RegistryErasedSchedule<R, M> {
+    let systems: Vec<RegistryErasedSystem<R, M>> = Vec::new();
+    return RegistryErasedSchedule<R, M> { systems: systems, conflict_count: 0 };
+}
+
+fn registry_erased_schedule_add_systems<R, M>(schedule: RegistryErasedSchedule<R, M>, system: RegistryErasedSystem<R, M>) -> RegistryErasedSchedule<R, M> {
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        if registry_erased_access_conflicts(schedule.systems[i].access, system.access) {
+            schedule.conflict_count = schedule.conflict_count + 1;
+        };
+        i = i + 1;
+    }
+    schedule.systems.push(system);
+    return schedule;
+}
+
+fn registry_erased_schedule_conflict_count<R, M>(schedule: RegistryErasedSchedule<R, M>) -> i32 {
+    return schedule.conflict_count;
+}
+
+fn registry_erased_schedule_run<R, M>(schedule: RegistryErasedSchedule<R, M>, world: RegistryErasedWorld<R, M>) -> RegistryErasedWorld<R, M> {
+    world = registry_erased_world_increment_tick<R, M>(world);
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        let system = schedule.systems[i];
+        let run = system.run;
+        world = run(world);
+        i = i + 1;
+    }
+    return world;
+}
+
+const ERASED_SCHEDULE_POS_TYPE: i32 = 121;
+const ERASED_SCHEDULE_VEL_TYPE: i32 = 122;
+
+struct ErasedSchedulePos { x: i32, y: i32 }
+struct ErasedScheduleVel { x: i32, y: i32 }
+struct ErasedScheduleTime { tick: i32 }
+struct ErasedScheduleEvent { amount: i32 }
+
+fn erased_schedule_time_default() -> ErasedScheduleTime { return ErasedScheduleTime { tick: 0 }; }
+fn erased_schedule_event_default() -> ErasedScheduleEvent { return ErasedScheduleEvent { amount: 0 }; }
+
+fn erased_schedule_world_new() -> RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent> {
+    return registry_erased_world_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_time_default(), erased_schedule_event_default());
+}
+
+fn erased_schedule_move_system(world: RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent>) -> RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent> {
+    let q = registry_erased_world_query_pair_mut_first<ErasedSchedulePos, ErasedScheduleVel, ErasedScheduleTime, ErasedScheduleEvent>(world, 1, ERASED_SCHEDULE_POS_TYPE, 2, ERASED_SCHEDULE_VEL_TYPE);
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        let item = q.items[i];
+        world = registry_erased_world_pair_write_first<ErasedSchedulePos, ErasedScheduleVel, ErasedScheduleTime, ErasedScheduleEvent>(world, item, ErasedSchedulePos { x: item.first.value.x + item.second.x, y: item.first.value.y + item.second.y });
+        i = i + 1;
+    }
+    return world;
+}
+
+fn erased_schedule_resource_system(world: RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent>) -> RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent> {
+    return registry_erased_world_insert_resource<ErasedScheduleTime, ErasedScheduleEvent>(world, ErasedScheduleTime { tick: world.registry.change_tick });
+}
+
+fn erased_schedule_message_system(world: RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent>) -> RegistryErasedWorld<ErasedScheduleTime, ErasedScheduleEvent> {
+    return registry_erased_world_write_message<ErasedScheduleTime, ErasedScheduleEvent>(world, ErasedScheduleEvent { amount: 9 });
+}
+
+@test "registry erased schedule runs systems in order"() {
+    let w0 = erased_schedule_world_new();
+    let (w1, position) = registry_erased_world_register_table<ErasedScheduleTime, ErasedScheduleEvent>(w0, ERASED_SCHEDULE_POS_TYPE, ecs_box_drop<ErasedSchedulePos>);
+    let (w2, velocity) = registry_erased_world_register_table<ErasedScheduleTime, ErasedScheduleEvent>(w1, ERASED_SCHEDULE_VEL_TYPE, ecs_box_drop<ErasedScheduleVel>);
+    let (w3, entity) = registry_erased_world_spawn<ErasedScheduleTime, ErasedScheduleEvent>(w2);
+    let w4 = registry_erased_world_insert<ErasedSchedulePos, ErasedScheduleTime, ErasedScheduleEvent>(w3, entity, position.id, ERASED_SCHEDULE_POS_TYPE, ErasedSchedulePos { x: 3, y: 0 });
+    let w5 = registry_erased_world_insert<ErasedScheduleVel, ErasedScheduleTime, ErasedScheduleEvent>(w4, entity, velocity.id, ERASED_SCHEDULE_VEL_TYPE, ErasedScheduleVel { x: 4, y: 0 });
+    let move_access = registry_erased_access_read_component(registry_erased_access_write_component(registry_erased_system_access_none(), position.id), velocity.id);
+    let resource_access = registry_erased_access_write_resource(registry_erased_system_access_none());
+    let message_access = registry_erased_access_write_messages(registry_erased_system_access_none());
+    let s0 = registry_erased_schedule_default<ErasedScheduleTime, ErasedScheduleEvent>();
+    let s1 = registry_erased_schedule_add_systems<ErasedScheduleTime, ErasedScheduleEvent>(s0, registry_erased_system_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_move_system, move_access));
+    let s2 = registry_erased_schedule_add_systems<ErasedScheduleTime, ErasedScheduleEvent>(s1, registry_erased_system_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_resource_system, resource_access));
+    let s3 = registry_erased_schedule_add_systems<ErasedScheduleTime, ErasedScheduleEvent>(s2, registry_erased_system_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_message_system, message_access));
+    let w6 = registry_erased_schedule_run<ErasedScheduleTime, ErasedScheduleEvent>(s3, w5);
+    let position_out = registry_erased_world_get<ErasedSchedulePos, ErasedScheduleTime, ErasedScheduleEvent>(w6, entity, position.id, ERASED_SCHEDULE_POS_TYPE);
+    let time = registry_erased_world_get_resource<ErasedScheduleTime, ErasedScheduleEvent>(w6);
+    let read = registry_erased_world_read_message<ErasedScheduleTime, ErasedScheduleEvent>(w6, message_reader_new(), erased_schedule_event_default());
+    if position_out.x != 7 { panic(9600); };
+    if time.tick != 2 { panic(9601); };
+    if read.value.amount != 9 { panic(9602); };
+}
+
+@test "registry erased schedule records component id conflicts"() {
+    let write_position = registry_erased_access_write_component(registry_erased_system_access_none(), 1);
+    let read_position = registry_erased_access_read_component(registry_erased_system_access_none(), 1);
+    let write_message = registry_erased_access_write_messages(registry_erased_system_access_none());
+    let s0 = registry_erased_schedule_default<ErasedScheduleTime, ErasedScheduleEvent>();
+    let s1 = registry_erased_schedule_add_systems<ErasedScheduleTime, ErasedScheduleEvent>(s0, registry_erased_system_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_move_system, write_position));
+    let s2 = registry_erased_schedule_add_systems<ErasedScheduleTime, ErasedScheduleEvent>(s1, registry_erased_system_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_move_system, read_position));
+    let s3 = registry_erased_schedule_add_systems<ErasedScheduleTime, ErasedScheduleEvent>(s2, registry_erased_system_new<ErasedScheduleTime, ErasedScheduleEvent>(erased_schedule_message_system, write_message));
+    if registry_erased_schedule_conflict_count<ErasedScheduleTime, ErasedScheduleEvent>(s3) != 1 { panic(9610); };
+}

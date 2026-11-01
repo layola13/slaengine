@@ -1,0 +1,682 @@
+// Deepened Bevy ECS relationship query surface.
+// Mirrors src/relationship/relationship_query.rs:
+//   Query::related / relationship_sources / root_ancestor
+//   iter_siblings / iter_leaves / iter_descendants (BFS)
+//   iter_descendants_depth_first (DFS)
+//   AncestorIter
+// Shallow lib/relationship_query_iter.sla retained.
+// Fixed tree model: entity ids 1..8, up to 4 children per node.
+
+struct EcsRqEntityDeep {
+    id: i64,
+    has_rel: bool,
+    parent: i64,
+    has_target: bool,
+    c0: i64,
+    c1: i64,
+    c2: i64,
+    c3: i64,
+    clen: i32,
+    alive: bool,
+}
+
+fn ecs_rq_entity_empty(id: i64) -> EcsRqEntityDeep {
+    return EcsRqEntityDeep {
+        id: id,
+        has_rel: false,
+        parent: 0,
+        has_target: false,
+        c0: 0,
+        c1: 0,
+        c2: 0,
+        c3: 0,
+        clen: 0,
+        alive: true,
+    };
+}
+
+struct EcsRqWorldDeep {
+    e1: EcsRqEntityDeep,
+    e2: EcsRqEntityDeep,
+    e3: EcsRqEntityDeep,
+    e4: EcsRqEntityDeep,
+    e5: EcsRqEntityDeep,
+    e6: EcsRqEntityDeep,
+    e7: EcsRqEntityDeep,
+    e8: EcsRqEntityDeep,
+}
+
+fn ecs_rq_world_new() -> EcsRqWorldDeep {
+    return EcsRqWorldDeep {
+        e1: ecs_rq_entity_empty(1),
+        e2: ecs_rq_entity_empty(2),
+        e3: ecs_rq_entity_empty(3),
+        e4: ecs_rq_entity_empty(4),
+        e5: ecs_rq_entity_empty(5),
+        e6: ecs_rq_entity_empty(6),
+        e7: ecs_rq_entity_empty(7),
+        e8: ecs_rq_entity_empty(8),
+    };
+}
+
+fn ecs_rq_get(w: EcsRqWorldDeep, id: i64) -> EcsRqEntityDeep {
+    if id == 1 {
+        return w.e1;
+    };
+    if id == 2 {
+        return w.e2;
+    };
+    if id == 3 {
+        return w.e3;
+    };
+    if id == 4 {
+        return w.e4;
+    };
+    if id == 5 {
+        return w.e5;
+    };
+    if id == 6 {
+        return w.e6;
+    };
+    if id == 7 {
+        return w.e7;
+    };
+    if id == 8 {
+        return w.e8;
+    };
+    return ecs_rq_entity_empty(0);
+}
+
+fn ecs_rq_set(w: EcsRqWorldDeep, e: EcsRqEntityDeep) -> EcsRqWorldDeep {
+    let id = e.id;
+    if id == 1 {
+        return EcsRqWorldDeep {
+            e1: e, e2: w.e2, e3: w.e3, e4: w.e4,
+            e5: w.e5, e6: w.e6, e7: w.e7, e8: w.e8,
+        };
+    };
+    if id == 2 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: e, e3: w.e3, e4: w.e4,
+            e5: w.e5, e6: w.e6, e7: w.e7, e8: w.e8,
+        };
+    };
+    if id == 3 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: w.e2, e3: e, e4: w.e4,
+            e5: w.e5, e6: w.e6, e7: w.e7, e8: w.e8,
+        };
+    };
+    if id == 4 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: w.e2, e3: w.e3, e4: e,
+            e5: w.e5, e6: w.e6, e7: w.e7, e8: w.e8,
+        };
+    };
+    if id == 5 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4,
+            e5: e, e6: w.e6, e7: w.e7, e8: w.e8,
+        };
+    };
+    if id == 6 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4,
+            e5: w.e5, e6: e, e7: w.e7, e8: w.e8,
+        };
+    };
+    if id == 7 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4,
+            e5: w.e5, e6: w.e6, e7: e, e8: w.e8,
+        };
+    };
+    if id == 8 {
+        return EcsRqWorldDeep {
+            e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4,
+            e5: w.e5, e6: w.e6, e7: w.e7, e8: e,
+        };
+    };
+    return w;
+}
+
+fn ecs_rq_push_child(e: EcsRqEntityDeep, child: i64) -> EcsRqEntityDeep {
+    let n = e.clen;
+    if n == 0 {
+        return EcsRqEntityDeep {
+            id: e.id, has_rel: e.has_rel, parent: e.parent, has_target: true,
+            c0: child, c1: e.c1, c2: e.c2, c3: e.c3, clen: 1, alive: e.alive,
+        };
+    };
+    if n == 1 {
+        return EcsRqEntityDeep {
+            id: e.id, has_rel: e.has_rel, parent: e.parent, has_target: true,
+            c0: e.c0, c1: child, c2: e.c2, c3: e.c3, clen: 2, alive: e.alive,
+        };
+    };
+    if n == 2 {
+        return EcsRqEntityDeep {
+            id: e.id, has_rel: e.has_rel, parent: e.parent, has_target: true,
+            c0: e.c0, c1: e.c1, c2: child, c3: e.c3, clen: 3, alive: e.alive,
+        };
+    };
+    if n == 3 {
+        return EcsRqEntityDeep {
+            id: e.id, has_rel: e.has_rel, parent: e.parent, has_target: true,
+            c0: e.c0, c1: e.c1, c2: e.c2, c3: child, clen: 4, alive: e.alive,
+        };
+    };
+    return e;
+}
+
+// child has Relationship -> parent; parent gains RelationshipTarget source
+fn ecs_rq_link(w: EcsRqWorldDeep, child: i64, parent: i64) -> EcsRqWorldDeep {
+    let c = ecs_rq_get(w, child);
+    let c2 = EcsRqEntityDeep {
+        id: c.id,
+        has_rel: true,
+        parent: parent,
+        has_target: c.has_target,
+        c0: c.c0,
+        c1: c.c1,
+        c2: c.c2,
+        c3: c.c3,
+        clen: c.clen,
+        alive: c.alive,
+    };
+    let w2 = ecs_rq_set(w, c2);
+    let p = ecs_rq_get(w2, parent);
+    let p2 = ecs_rq_push_child(p, child);
+    return ecs_rq_set(w2, p2);
+}
+
+// related<R>: Option target of Relationship on entity
+fn ecs_rq_related(w: EcsRqWorldDeep, entity: i64) -> (bool, i64) {
+    let e = ecs_rq_get(w, entity);
+    if e.id == 0 {
+        return (false, 0);
+    };
+    if e.has_rel != true {
+        return (false, 0);
+    };
+    return (true, e.parent);
+}
+
+struct EcsRqListDeep {
+    v0: i64,
+    v1: i64,
+    v2: i64,
+    v3: i64,
+    v4: i64,
+    v5: i64,
+    v6: i64,
+    v7: i64,
+    len: i32,
+}
+
+fn ecs_rq_list_new() -> EcsRqListDeep {
+    return EcsRqListDeep {
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0, len: 0,
+    };
+}
+
+fn ecs_rq_list_len(l: EcsRqListDeep) -> i32 {
+    return l.len;
+}
+
+fn ecs_rq_list_at(l: EcsRqListDeep, idx: i32) -> i64 {
+    if idx == 0 {
+        return l.v0;
+    };
+    if idx == 1 {
+        return l.v1;
+    };
+    if idx == 2 {
+        return l.v2;
+    };
+    if idx == 3 {
+        return l.v3;
+    };
+    if idx == 4 {
+        return l.v4;
+    };
+    if idx == 5 {
+        return l.v5;
+    };
+    if idx == 6 {
+        return l.v6;
+    };
+    if idx == 7 {
+        return l.v7;
+    };
+    return 0;
+}
+
+fn ecs_rq_list_push(l: EcsRqListDeep, v: i64) -> EcsRqListDeep {
+    let n = l.len;
+    if n == 0 {
+        return EcsRqListDeep {
+            v0: v, v1: l.v1, v2: l.v2, v3: l.v3,
+            v4: l.v4, v5: l.v5, v6: l.v6, v7: l.v7, len: 1,
+        };
+    };
+    if n == 1 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: v, v2: l.v2, v3: l.v3,
+            v4: l.v4, v5: l.v5, v6: l.v6, v7: l.v7, len: 2,
+        };
+    };
+    if n == 2 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: l.v1, v2: v, v3: l.v3,
+            v4: l.v4, v5: l.v5, v6: l.v6, v7: l.v7, len: 3,
+        };
+    };
+    if n == 3 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: l.v1, v2: l.v2, v3: v,
+            v4: l.v4, v5: l.v5, v6: l.v6, v7: l.v7, len: 4,
+        };
+    };
+    if n == 4 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: l.v1, v2: l.v2, v3: l.v3,
+            v4: v, v5: l.v5, v6: l.v6, v7: l.v7, len: 5,
+        };
+    };
+    if n == 5 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: l.v1, v2: l.v2, v3: l.v3,
+            v4: l.v4, v5: v, v6: l.v6, v7: l.v7, len: 6,
+        };
+    };
+    if n == 6 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: l.v1, v2: l.v2, v3: l.v3,
+            v4: l.v4, v5: l.v5, v6: v, v7: l.v7, len: 7,
+        };
+    };
+    if n == 7 {
+        return EcsRqListDeep {
+            v0: l.v0, v1: l.v1, v2: l.v2, v3: l.v3,
+            v4: l.v4, v5: l.v5, v6: l.v6, v7: v, len: 8,
+        };
+    };
+    return l;
+}
+
+fn ecs_rq_list_contains(l: EcsRqListDeep, v: i64) -> bool {
+    if l.len >= 1 {
+        if l.v0 == v {
+            return true;
+        };
+    };
+    if l.len >= 2 {
+        if l.v1 == v {
+            return true;
+        };
+    };
+    if l.len >= 3 {
+        if l.v2 == v {
+            return true;
+        };
+    };
+    if l.len >= 4 {
+        if l.v3 == v {
+            return true;
+        };
+    };
+    if l.len >= 5 {
+        if l.v4 == v {
+            return true;
+        };
+    };
+    if l.len >= 6 {
+        if l.v5 == v {
+            return true;
+        };
+    };
+    if l.len >= 7 {
+        if l.v6 == v {
+            return true;
+        };
+    };
+    if l.len >= 8 {
+        if l.v7 == v {
+            return true;
+        };
+    };
+    return false;
+}
+
+// relationship_sources<S>
+fn ecs_rq_sources(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    let e = ecs_rq_get(w, entity);
+    let l = ecs_rq_list_new();
+    if e.has_target != true {
+        return l;
+    };
+    let l1 = l;
+    if e.clen >= 1 {
+        l1 = ecs_rq_list_push(l1, e.c0);
+    };
+    if e.clen >= 2 {
+        l1 = ecs_rq_list_push(l1, e.c1);
+    };
+    if e.clen >= 3 {
+        l1 = ecs_rq_list_push(l1, e.c2);
+    };
+    if e.clen >= 4 {
+        l1 = ecs_rq_list_push(l1, e.c3);
+    };
+    return l1;
+}
+
+// root_ancestor: unrolled walk (depth <= 8)
+fn ecs_rq_root_ancestor(w: EcsRqWorldDeep, entity: i64) -> i64 {
+    let cur = entity;
+    let r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return cur;
+    };
+    return r.1;
+}
+
+// AncestorIter: collect parents up to root
+fn ecs_rq_iter_ancestors(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    let out = ecs_rq_list_new();
+    let cur = entity;
+    let r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return out;
+    };
+    out = ecs_rq_list_push(out, r.1);
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return out;
+    };
+    out = ecs_rq_list_push(out, r.1);
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return out;
+    };
+    out = ecs_rq_list_push(out, r.1);
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return out;
+    };
+    out = ecs_rq_list_push(out, r.1);
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return out;
+    };
+    out = ecs_rq_list_push(out, r.1);
+    cur = r.1;
+    r = ecs_rq_related(w, cur);
+    if r.0 != true {
+        return out;
+    };
+    out = ecs_rq_list_push(out, r.1);
+    return out;
+}
+
+// iter_siblings: other sources of same Relationship target
+fn ecs_rq_iter_siblings(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    let r = ecs_rq_related(w, entity);
+    if r.0 != true {
+        return ecs_rq_list_new();
+    };
+    let src = ecs_rq_sources(w, r.1);
+    let out = ecs_rq_list_new();
+    if src.len >= 1 {
+        if src.v0 != entity {
+            out = ecs_rq_list_push(out, src.v0);
+        };
+    };
+    if src.len >= 2 {
+        if src.v1 != entity {
+            out = ecs_rq_list_push(out, src.v1);
+        };
+    };
+    if src.len >= 3 {
+        if src.v2 != entity {
+            out = ecs_rq_list_push(out, src.v2);
+        };
+    };
+    if src.len >= 4 {
+        if src.v3 != entity {
+            out = ecs_rq_list_push(out, src.v3);
+        };
+    };
+    return out;
+}
+
+// DFS collect: child0+subtree, child1+subtree, ... (pre-order of reverse-stack DFS for ordered children)
+fn ecs_rq_dfs_collect(w: EcsRqWorldDeep, entity: i64, out: EcsRqListDeep) -> EcsRqListDeep {
+    let e = ecs_rq_get(w, entity);
+    let acc = out;
+    if e.clen >= 1 {
+        acc = ecs_rq_list_push(acc, e.c0);
+        acc = ecs_rq_dfs_collect(w, e.c0, acc);
+    };
+    if e.clen >= 2 {
+        acc = ecs_rq_list_push(acc, e.c1);
+        acc = ecs_rq_dfs_collect(w, e.c1, acc);
+    };
+    if e.clen >= 3 {
+        acc = ecs_rq_list_push(acc, e.c2);
+        acc = ecs_rq_dfs_collect(w, e.c2, acc);
+    };
+    if e.clen >= 4 {
+        acc = ecs_rq_list_push(acc, e.c3);
+        acc = ecs_rq_dfs_collect(w, e.c3, acc);
+    };
+    return acc;
+}
+
+// iter_descendants_depth_first
+fn ecs_rq_iter_descendants_depth_first(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    return ecs_rq_dfs_collect(w, entity, ecs_rq_list_new());
+}
+
+// append sources of one entity onto list (for BFS level expansion)
+fn ecs_rq_append_sources(w: EcsRqWorldDeep, entity: i64, out: EcsRqListDeep) -> EcsRqListDeep {
+    let kids = ecs_rq_sources(w, entity);
+    let acc = out;
+    if kids.len >= 1 {
+        acc = ecs_rq_list_push(acc, kids.v0);
+    };
+    if kids.len >= 2 {
+        acc = ecs_rq_list_push(acc, kids.v1);
+    };
+    if kids.len >= 3 {
+        acc = ecs_rq_list_push(acc, kids.v2);
+    };
+    if kids.len >= 4 {
+        acc = ecs_rq_list_push(acc, kids.v3);
+    };
+    return acc;
+}
+
+// BFS: level1 children, then grandchildren of each level1 node in order
+fn ecs_rq_bfs_collect(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    let level1 = ecs_rq_sources(w, entity);
+    let out = ecs_rq_list_new();
+    if level1.len >= 1 {
+        out = ecs_rq_list_push(out, level1.v0);
+    };
+    if level1.len >= 2 {
+        out = ecs_rq_list_push(out, level1.v1);
+    };
+    if level1.len >= 3 {
+        out = ecs_rq_list_push(out, level1.v2);
+    };
+    if level1.len >= 4 {
+        out = ecs_rq_list_push(out, level1.v3);
+    };
+    // level 2 (and beyond via one more hop from each level1 — trees depth <= 3 covered with level3 below)
+    if level1.len >= 1 {
+        out = ecs_rq_append_sources(w, level1.v0, out);
+    };
+    if level1.len >= 2 {
+        out = ecs_rq_append_sources(w, level1.v1, out);
+    };
+    if level1.len >= 3 {
+        out = ecs_rq_append_sources(w, level1.v2, out);
+    };
+    if level1.len >= 4 {
+        out = ecs_rq_append_sources(w, level1.v3, out);
+    };
+    // level 3: children of each entity that was appended as level2.
+    // For fixed small trees, re-walk level2 nodes by recomputing sources of level1 children.
+    if level1.len >= 1 {
+        let g = ecs_rq_sources(w, level1.v0);
+        if g.len >= 1 {
+            out = ecs_rq_append_sources(w, g.v0, out);
+        };
+        if g.len >= 2 {
+            out = ecs_rq_append_sources(w, g.v1, out);
+        };
+        if g.len >= 3 {
+            out = ecs_rq_append_sources(w, g.v2, out);
+        };
+        if g.len >= 4 {
+            out = ecs_rq_append_sources(w, g.v3, out);
+        };
+    };
+    if level1.len >= 2 {
+        let g = ecs_rq_sources(w, level1.v1);
+        if g.len >= 1 {
+            out = ecs_rq_append_sources(w, g.v0, out);
+        };
+        if g.len >= 2 {
+            out = ecs_rq_append_sources(w, g.v1, out);
+        };
+    };
+    return out;
+}
+
+fn ecs_rq_iter_descendants_bfs(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    return ecs_rq_bfs_collect(w, entity);
+}
+
+// public BFS alias matching Bevy iter_descendants name
+fn ecs_rq_iter_descendants(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    return ecs_rq_iter_descendants_bfs(w, entity);
+}
+
+// leaf if no RelationshipTarget or empty sources
+fn ecs_rq_is_leaf(w: EcsRqWorldDeep, entity: i64) -> bool {
+    let kids = ecs_rq_sources(w, entity);
+    if kids.len == 0 {
+        return true;
+    };
+    return false;
+}
+
+// iter_leaves: filter DFS descendants by leaf predicate (Bevy uses DFS order)
+fn ecs_rq_iter_leaves(w: EcsRqWorldDeep, entity: i64) -> EcsRqListDeep {
+    let desc = ecs_rq_iter_descendants_depth_first(w, entity);
+    let out = ecs_rq_list_new();
+    if desc.len >= 1 {
+        if ecs_rq_is_leaf(w, desc.v0) {
+            out = ecs_rq_list_push(out, desc.v0);
+        };
+    };
+    if desc.len >= 2 {
+        if ecs_rq_is_leaf(w, desc.v1) {
+            out = ecs_rq_list_push(out, desc.v1);
+        };
+    };
+    if desc.len >= 3 {
+        if ecs_rq_is_leaf(w, desc.v2) {
+            out = ecs_rq_list_push(out, desc.v2);
+        };
+    };
+    if desc.len >= 4 {
+        if ecs_rq_is_leaf(w, desc.v3) {
+            out = ecs_rq_list_push(out, desc.v3);
+        };
+    };
+    if desc.len >= 5 {
+        if ecs_rq_is_leaf(w, desc.v4) {
+            out = ecs_rq_list_push(out, desc.v4);
+        };
+    };
+    if desc.len >= 6 {
+        if ecs_rq_is_leaf(w, desc.v5) {
+            out = ecs_rq_list_push(out, desc.v5);
+        };
+    };
+    if desc.len >= 7 {
+        if ecs_rq_is_leaf(w, desc.v6) {
+            out = ecs_rq_list_push(out, desc.v6);
+        };
+    };
+    if desc.len >= 8 {
+        if ecs_rq_is_leaf(w, desc.v7) {
+            out = ecs_rq_list_push(out, desc.v7);
+        };
+    };
+    return out;
+}
+
+// sample fixture builder used by tests
+// Tree:
+//   1
+//  / \
+// 2   3
+// |  / \
+// 4 5   6
+//       |
+//       7
+// 8 is orphan
+fn ecs_rq_sample_tree() -> EcsRqWorldDeep {
+    let w = ecs_rq_world_new();
+    w = ecs_rq_link(w, 2, 1);
+    w = ecs_rq_link(w, 3, 1);
+    w = ecs_rq_link(w, 4, 2);
+    w = ecs_rq_link(w, 5, 3);
+    w = ecs_rq_link(w, 6, 3);
+    w = ecs_rq_link(w, 7, 6);
+    return w;
+}

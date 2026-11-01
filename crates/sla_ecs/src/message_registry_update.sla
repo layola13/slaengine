@@ -1,0 +1,132 @@
+@import "message_cursor.sla"
+// Bevy ECS message::message_registry (src/message/message_registry.rs): MessageRegistry.
+// + message::update (already in message_update.sla, but registry is separate).
+
+// === ShouldUpdateMessages (enum) ===
+// 0 = No, 1 = Yes, 2 = Forced
+const ECS_SUM_NO: i32 = 0;
+const ECS_SUM_YES: i32 = 1;
+const ECS_SUM_FORCED: i32 = 2;
+
+// === MessageRegistry ===
+struct EcsMessageRegistry {
+    registered_message_ids: Vec<i32>,   // registered message type ids
+    update_signal: bool,
+    update_count: i64,
+    last_change_tick: i32,
+}
+
+fn ecs_message_registry_new() -> EcsMessageRegistry {
+    return EcsMessageRegistry { registered_message_ids: Vec::new(), update_signal: false, update_count: 0, last_change_tick: 0 };
+}
+
+// register_message: register a message type by id
+fn ecs_message_registry_register(r: EcsMessageRegistry, message_id: i32) -> EcsMessageRegistry {
+    let i: i64 = 0;
+    let n: i64 = len(r.registered_message_ids) as i64;
+    while i < n {
+        if r.registered_message_ids[i] == message_id { return r; };
+        i = i + 1;
+    }
+    r.registered_message_ids.push(message_id);
+    return r;
+}
+
+// deregister_messages: remove a message type
+fn ecs_message_registry_deregister(r: EcsMessageRegistry, message_id: i32) -> (EcsMessageRegistry, bool) {
+    let new_ids: Vec<i32> = Vec::new();
+    let removed = false;
+    let i: i64 = 0;
+    let n: i64 = len(r.registered_message_ids) as i64;
+    while i < n {
+        if r.registered_message_ids[i] == message_id {
+            removed = true;
+        } else {
+            new_ids.push(r.registered_message_ids[i]);
+        };
+        i = i + 1;
+    }
+    r.registered_message_ids = new_ids;
+    return (r, removed);
+}
+
+fn ecs_message_registry_count(r: EcsMessageRegistry) -> i64 { return len(r.registered_message_ids) as i64; }
+
+fn ecs_message_registry_is_registered(r: EcsMessageRegistry, message_id: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(r.registered_message_ids) as i64;
+    while i < n {
+        if r.registered_message_ids[i] == message_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// signal: set the update signal flag
+fn ecs_message_registry_signal(r: EcsMessageRegistry, signal: bool) -> EcsMessageRegistry {
+    r.update_signal = signal;
+    return r;
+}
+
+fn ecs_message_registry_has_signal(r: EcsMessageRegistry) -> bool { return r.update_signal; }
+
+// should_update: returns the ShouldUpdateMessages kind
+fn ecs_message_registry_should_update(r: EcsMessageRegistry) -> i32 {
+    if r.update_signal { return ECS_SUM_YES; };
+    return ECS_SUM_NO;
+}
+
+// run_updates: perform the message update, bumping the change tick
+fn ecs_message_registry_run_updates(r: EcsMessageRegistry, current_tick: i32) -> EcsMessageRegistry {
+    r.last_change_tick = current_tick;
+    r.update_count = r.update_count + 1;
+    r.update_signal = false;
+    return r;
+}
+
+fn ecs_message_registry_update_count(r: EcsMessageRegistry) -> i64 { return r.update_count; }
+fn ecs_message_registry_last_change_tick(r: EcsMessageRegistry) -> i32 { return r.last_change_tick; }
+
+// === MessageMutIterator / MessageMutParIter (mut_iterators.rs) ===
+// Modeled as iteration state over a mutator.
+struct EcsMessageMutIterator {
+    cursor: EcsMessageCursor,
+    remaining: i64,
+}
+
+fn ecs_message_mut_iterator_new(cursor: EcsMessageCursor) -> EcsMessageMutIterator {
+    return EcsMessageMutIterator { cursor: cursor, remaining: ecs_message_cursor_len(cursor) };
+}
+
+fn ecs_message_mut_iterator_len(it: EcsMessageMutIterator) -> i64 { return it.remaining; }
+fn ecs_message_mut_iterator_is_empty(it: EcsMessageMutIterator) -> bool { return it.remaining == 0; }
+
+// without_id: returns a plain iterator (no id) — modeled as same struct
+fn ecs_message_mut_iterator_without_id(it: EcsMessageMutIterator) -> EcsMessageMutIterator { return it; }
+
+// === MessageMutParIter ===
+struct EcsMessageMutParIter {
+    batch_size: i64,
+    remaining: i64,
+}
+
+fn ecs_message_mut_par_iter_new(remaining: i64) -> EcsMessageMutParIter {
+    return EcsMessageMutParIter { batch_size: 128, remaining: remaining };
+}
+
+fn ecs_message_mut_par_iter_batching_strategy(p: EcsMessageMutParIter, batch_size: i64) -> EcsMessageMutParIter {
+    p.batch_size = batch_size;
+    return p;
+}
+
+fn ecs_message_mut_par_iter_len(p: EcsMessageMutParIter) -> i64 { return p.remaining; }
+
+fn ecs_message_mut_par_iter_batch_count(p: EcsMessageMutParIter) -> i64 {
+    if p.batch_size <= 0 { return 0; };
+    let n = p.remaining / p.batch_size;
+    if p.remaining % p.batch_size != 0 { return n + 1; };
+    return n;
+}
+
+// for_each: process all (modeled as returning processed count)
+fn ecs_message_mut_par_iter_for_each(p: EcsMessageMutParIter) -> i64 { return p.remaining; }

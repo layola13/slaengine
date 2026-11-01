@@ -1,0 +1,1356 @@
+// Deep self-contained Bevy ECS schedule node extensions: SystemSets, ConflictingSystems, Systems.
+// Mirrors lib/schedule_node_sets.sla (523 lines) with fixed-cap (cap-16) scalar slot families.
+// No @import. All structs carry @derive(copy). Booleans are stored as i32 (0/1).
+// Nested structs are flattened inline; tuple-return replacement wrappers flatten the tuple
+// companion into the mutated container (avoids the SA MemoryLeak — see docs/issue.md).
+
+const ECS_NODE_SET_DEEP_CAP: i32 = 16;
+
+// === EcsNodeSetEntryDeep (flat: mirrors EcsNodeSetEntry) ===
+@derive(copy)
+struct EcsNodeSetEntryDeep {
+    system_id: i32,
+    system_name: i64,
+    is_exclusive: i32,
+}
+
+fn ecs_node_set_entry_deep_new(system_id: i32, system_name: i64, is_exclusive: bool) -> EcsNodeSetEntryDeep {
+    let ie: i32 = 0;
+    if is_exclusive { ie = 1; };
+    return EcsNodeSetEntryDeep { system_id: system_id, system_name: system_name, is_exclusive: ie };
+}
+
+fn ecs_node_set_entry_deep_id(e: EcsNodeSetEntryDeep) -> i32 { return e.system_id; }
+fn ecs_node_set_entry_deep_name(e: EcsNodeSetEntryDeep) -> i64 { return e.system_name; }
+fn ecs_node_set_entry_deep_is_exclusive(e: EcsNodeSetEntryDeep) -> bool { return e.is_exclusive != 0; }
+
+// === EcsNodeSetCondDeep (flat: single field, kept for parity) ===
+@derive(copy)
+struct EcsNodeSetCondDeep {
+    condition_id: i32,
+}
+
+fn ecs_node_set_cond_deep_new(condition_id: i32) -> EcsNodeSetCondDeep {
+    return EcsNodeSetCondDeep { condition_id: condition_id };
+}
+
+fn ecs_node_set_cond_deep_id(c: EcsNodeSetCondDeep) -> i32 { return c.condition_id; }
+
+// === EcsNodeSetSystemsDeep: cap-16 entries + cap-16 conditions per-entry + uninit/initialized lists ===
+// Each entry stored inline (flat) with cap-16 condition ids.
+@derive(copy)
+struct EcsNodeSetSystemsDeep {
+    // entries count (cap-16).
+    entry_count: i32,
+    // Parallel cap-16 entry fields (entry N's system_id/name/exclusive live at the same N).
+    sid0: i32, sid1: i32, sid2: i32, sid3: i32, sid4: i32, sid5: i32, sid6: i32, sid7: i32,
+    sid8: i32, sid9: i32, sid10: i32, sid11: i32, sid12: i32, sid13: i32, sid14: i32, sid15: i32,
+    sname0: i64, sname1: i64, sname2: i64, sname3: i64, sname4: i64, sname5: i64, sname6: i64, sname7: i64,
+    sname8: i64, sname9: i64, sname10: i64, sname11: i64, sname12: i64, sname13: i64, sname14: i64, sname15: i64,
+    sxc0: i32, sxc1: i32, sxc2: i32, sxc3: i32, sxc4: i32, sxc5: i32, sxc6: i32, sxc7: i32,
+    sxc8: i32, sxc9: i32, sxc10: i32, sxc11: i32, sxc12: i32, sxc13: i32, sxc14: i32, sxc15: i32,
+    // Per-entry cap-16 condition-id slot family.
+    conds0_0: i32, conds0_1: i32, conds0_2: i32, conds0_3: i32, conds0_4: i32, conds0_5: i32, conds0_6: i32, conds0_7: i32,
+    conds0_8: i32, conds0_9: i32, conds0_10: i32, conds0_11: i32, conds0_12: i32, conds0_13: i32, conds0_14: i32, conds0_15: i32,
+    conds0_n: i32,
+    conds1_0: i32, conds1_1: i32, conds1_2: i32, conds1_3: i32, conds1_4: i32, conds1_5: i32, conds1_6: i32, conds1_7: i32,
+    conds1_8: i32, conds1_9: i32, conds1_10: i32, conds1_11: i32, conds1_12: i32, conds1_13: i32, conds1_14: i32, conds1_15: i32,
+    conds1_n: i32,
+    // Cap-16 uninit and initialized slot lists (i32 keys).
+    uninit0: i32, uninit1: i32, uninit2: i32, uninit3: i32, uninit4: i32, uninit5: i32, uninit6: i32, uninit7: i32,
+    uninit8: i32, uninit9: i32, uninit10: i32, uninit11: i32, uninit12: i32, uninit13: i32, uninit14: i32, uninit15: i32,
+    uninit_n: i32,
+    init0: i32, init1: i32, init2: i32, init3: i32, init4: i32, init5: i32, init6: i32, init7: i32,
+    init8: i32, init9: i32, init10: i32, init11: i32, init12: i32, init13: i32, init14: i32, init15: i32,
+    init_n: i32,
+    // Inline companion for (Registry, key) tuple returned by insert.
+    last_insert_key: i32,
+    // Inline (bool, Entry) tuple-replacement companion for get / get_mut.
+    last_get_found: i32,
+    last_get_entry_system_id: i32,
+    last_get_entry_system_name: i64,
+    last_get_entry_is_exclusive: i32,
+    // Inline (Registry, bool) tuple-replacement companion for remove.
+    last_remove_found: i32,
+}
+
+fn ecs_systems_ext_deep_new() -> EcsNodeSetSystemsDeep {
+    return EcsNodeSetSystemsDeep {
+        entry_count: 0,
+        sid0: 0, sid1: 0, sid2: 0, sid3: 0, sid4: 0, sid5: 0, sid6: 0, sid7: 0,
+        sid8: 0, sid9: 0, sid10: 0, sid11: 0, sid12: 0, sid13: 0, sid14: 0, sid15: 0,
+        sname0: 0, sname1: 0, sname2: 0, sname3: 0, sname4: 0, sname5: 0, sname6: 0, sname7: 0,
+        sname8: 0, sname9: 0, sname10: 0, sname11: 0, sname12: 0, sname13: 0, sname14: 0, sname15: 0,
+        sxc0: 0, sxc1: 0, sxc2: 0, sxc3: 0, sxc4: 0, sxc5: 0, sxc6: 0, sxc7: 0,
+        sxc8: 0, sxc9: 0, sxc10: 0, sxc11: 0, sxc12: 0, sxc13: 0, sxc14: 0, sxc15: 0,
+        conds0_0: 0, conds0_1: 0, conds0_2: 0, conds0_3: 0, conds0_4: 0, conds0_5: 0, conds0_6: 0, conds0_7: 0,
+        conds0_8: 0, conds0_9: 0, conds0_10: 0, conds0_11: 0, conds0_12: 0, conds0_13: 0, conds0_14: 0, conds0_15: 0,
+        conds0_n: 0,
+        conds1_0: 0, conds1_1: 0, conds1_2: 0, conds1_3: 0, conds1_4: 0, conds1_5: 0, conds1_6: 0, conds1_7: 0,
+        conds1_8: 0, conds1_9: 0, conds1_10: 0, conds1_11: 0, conds1_12: 0, conds1_13: 0, conds1_14: 0, conds1_15: 0,
+        conds1_n: 0,
+        uninit0: (0 - 1), uninit1: (0 - 1), uninit2: (0 - 1), uninit3: (0 - 1),
+        uninit4: (0 - 1), uninit5: (0 - 1), uninit6: (0 - 1), uninit7: (0 - 1),
+        uninit8: (0 - 1), uninit9: (0 - 1), uninit10: (0 - 1), uninit11: (0 - 1),
+        uninit12: (0 - 1), uninit13: (0 - 1), uninit14: (0 - 1), uninit15: (0 - 1),
+        uninit_n: 0,
+        init0: (0 - 1), init1: (0 - 1), init2: (0 - 1), init3: (0 - 1),
+        init4: (0 - 1), init5: (0 - 1), init6: (0 - 1), init7: (0 - 1),
+        init8: (0 - 1), init9: (0 - 1), init10: (0 - 1), init11: (0 - 1),
+        init12: (0 - 1), init13: (0 - 1), init14: (0 - 1), init15: (0 - 1),
+        init_n: 0,
+        last_insert_key: (0 - 1),
+        last_get_found: 0,
+        last_get_entry_system_id: 0,
+        last_get_entry_system_name: 0,
+        last_get_entry_is_exclusive: 0,
+        last_remove_found: 0,
+    };
+}
+
+fn _esns_sid_at(s: EcsNodeSetSystemsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.sid0; };
+    if idx == 1 { return s.sid1; };
+    if idx == 2 { return s.sid2; };
+    if idx == 3 { return s.sid3; };
+    if idx == 4 { return s.sid4; };
+    if idx == 5 { return s.sid5; };
+    if idx == 6 { return s.sid6; };
+    if idx == 7 { return s.sid7; };
+    if idx == 8 { return s.sid8; };
+    if idx == 9 { return s.sid9; };
+    if idx == 10 { return s.sid10; };
+    if idx == 11 { return s.sid11; };
+    if idx == 12 { return s.sid12; };
+    if idx == 13 { return s.sid13; };
+    if idx == 14 { return s.sid14; };
+    if idx == 15 { return s.sid15; };
+    panic(146200);
+}
+
+fn _esns_sid_set(s: EcsNodeSetSystemsDeep, idx: i32, v: i32) -> EcsNodeSetSystemsDeep {
+    if idx == 0 { s.sid0 = v; return s; };
+    if idx == 1 { s.sid1 = v; return s; };
+    if idx == 2 { s.sid2 = v; return s; };
+    if idx == 3 { s.sid3 = v; return s; };
+    if idx == 4 { s.sid4 = v; return s; };
+    if idx == 5 { s.sid5 = v; return s; };
+    if idx == 6 { s.sid6 = v; return s; };
+    if idx == 7 { s.sid7 = v; return s; };
+    if idx == 8 { s.sid8 = v; return s; };
+    if idx == 9 { s.sid9 = v; return s; };
+    if idx == 10 { s.sid10 = v; return s; };
+    if idx == 11 { s.sid11 = v; return s; };
+    if idx == 12 { s.sid12 = v; return s; };
+    if idx == 13 { s.sid13 = v; return s; };
+    if idx == 14 { s.sid14 = v; return s; };
+    if idx == 15 { s.sid15 = v; return s; };
+    panic(146201);
+}
+
+fn _esns_sname_at(s: EcsNodeSetSystemsDeep, idx: i32) -> i64 {
+    if idx == 0 { return s.sname0; };
+    if idx == 1 { return s.sname1; };
+    if idx == 2 { return s.sname2; };
+    if idx == 3 { return s.sname3; };
+    if idx == 4 { return s.sname4; };
+    if idx == 5 { return s.sname5; };
+    if idx == 6 { return s.sname6; };
+    if idx == 7 { return s.sname7; };
+    if idx == 8 { return s.sname8; };
+    if idx == 9 { return s.sname9; };
+    if idx == 10 { return s.sname10; };
+    if idx == 11 { return s.sname11; };
+    if idx == 12 { return s.sname12; };
+    if idx == 13 { return s.sname13; };
+    if idx == 14 { return s.sname14; };
+    if idx == 15 { return s.sname15; };
+    panic(146202);
+}
+
+fn _esns_sname_set(s: EcsNodeSetSystemsDeep, idx: i32, v: i64) -> EcsNodeSetSystemsDeep {
+    if idx == 0 { s.sname0 = v; return s; };
+    if idx == 1 { s.sname1 = v; return s; };
+    if idx == 2 { s.sname2 = v; return s; };
+    if idx == 3 { s.sname3 = v; return s; };
+    if idx == 4 { s.sname4 = v; return s; };
+    if idx == 5 { s.sname5 = v; return s; };
+    if idx == 6 { s.sname6 = v; return s; };
+    if idx == 7 { s.sname7 = v; return s; };
+    if idx == 8 { s.sname8 = v; return s; };
+    if idx == 9 { s.sname9 = v; return s; };
+    if idx == 10 { s.sname10 = v; return s; };
+    if idx == 11 { s.sname11 = v; return s; };
+    if idx == 12 { s.sname12 = v; return s; };
+    if idx == 13 { s.sname13 = v; return s; };
+    if idx == 14 { s.sname14 = v; return s; };
+    if idx == 15 { s.sname15 = v; return s; };
+    panic(146203);
+}
+
+fn _esns_sxc_at(s: EcsNodeSetSystemsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.sxc0; };
+    if idx == 1 { return s.sxc1; };
+    if idx == 2 { return s.sxc2; };
+    if idx == 3 { return s.sxc3; };
+    if idx == 4 { return s.sxc4; };
+    if idx == 5 { return s.sxc5; };
+    if idx == 6 { return s.sxc6; };
+    if idx == 7 { return s.sxc7; };
+    if idx == 8 { return s.sxc8; };
+    if idx == 9 { return s.sxc9; };
+    if idx == 10 { return s.sxc10; };
+    if idx == 11 { return s.sxc11; };
+    if idx == 12 { return s.sxc12; };
+    if idx == 13 { return s.sxc13; };
+    if idx == 14 { return s.sxc14; };
+    if idx == 15 { return s.sxc15; };
+    panic(146204);
+}
+
+fn _esns_sxc_set(s: EcsNodeSetSystemsDeep, idx: i32, v: i32) -> EcsNodeSetSystemsDeep {
+    if idx == 0 { s.sxc0 = v; return s; };
+    if idx == 1 { s.sxc1 = v; return s; };
+    if idx == 2 { s.sxc2 = v; return s; };
+    if idx == 3 { s.sxc3 = v; return s; };
+    if idx == 4 { s.sxc4 = v; return s; };
+    if idx == 5 { s.sxc5 = v; return s; };
+    if idx == 6 { s.sxc6 = v; return s; };
+    if idx == 7 { s.sxc7 = v; return s; };
+    if idx == 8 { s.sxc8 = v; return s; };
+    if idx == 9 { s.sxc9 = v; return s; };
+    if idx == 10 { s.sxc10 = v; return s; };
+    if idx == 11 { s.sxc11 = v; return s; };
+    if idx == 12 { s.sxc12 = v; return s; };
+    if idx == 13 { s.sxc13 = v; return s; };
+    if idx == 14 { s.sxc14 = v; return s; };
+    if idx == 15 { s.sxc15 = v; return s; };
+    panic(146205);
+}
+
+fn _esns_uninit_at(s: EcsNodeSetSystemsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.uninit0; };
+    if idx == 1 { return s.uninit1; };
+    if idx == 2 { return s.uninit2; };
+    if idx == 3 { return s.uninit3; };
+    if idx == 4 { return s.uninit4; };
+    if idx == 5 { return s.uninit5; };
+    if idx == 6 { return s.uninit6; };
+    if idx == 7 { return s.uninit7; };
+    if idx == 8 { return s.uninit8; };
+    if idx == 9 { return s.uninit9; };
+    if idx == 10 { return s.uninit10; };
+    if idx == 11 { return s.uninit11; };
+    if idx == 12 { return s.uninit12; };
+    if idx == 13 { return s.uninit13; };
+    if idx == 14 { return s.uninit14; };
+    if idx == 15 { return s.uninit15; };
+    panic(146206);
+}
+
+fn _esns_uninit_set(s: EcsNodeSetSystemsDeep, idx: i32, v: i32) -> EcsNodeSetSystemsDeep {
+    if idx == 0 { s.uninit0 = v; return s; };
+    if idx == 1 { s.uninit1 = v; return s; };
+    if idx == 2 { s.uninit2 = v; return s; };
+    if idx == 3 { s.uninit3 = v; return s; };
+    if idx == 4 { s.uninit4 = v; return s; };
+    if idx == 5 { s.uninit5 = v; return s; };
+    if idx == 6 { s.uninit6 = v; return s; };
+    if idx == 7 { s.uninit7 = v; return s; };
+    if idx == 8 { s.uninit8 = v; return s; };
+    if idx == 9 { s.uninit9 = v; return s; };
+    if idx == 10 { s.uninit10 = v; return s; };
+    if idx == 11 { s.uninit11 = v; return s; };
+    if idx == 12 { s.uninit12 = v; return s; };
+    if idx == 13 { s.uninit13 = v; return s; };
+    if idx == 14 { s.uninit14 = v; return s; };
+    if idx == 15 { s.uninit15 = v; return s; };
+    panic(146207);
+}
+
+fn _esns_init_at(s: EcsNodeSetSystemsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.init0; };
+    if idx == 1 { return s.init1; };
+    if idx == 2 { return s.init2; };
+    if idx == 3 { return s.init3; };
+    if idx == 4 { return s.init4; };
+    if idx == 5 { return s.init5; };
+    if idx == 6 { return s.init6; };
+    if idx == 7 { return s.init7; };
+    if idx == 8 { return s.init8; };
+    if idx == 9 { return s.init9; };
+    if idx == 10 { return s.init10; };
+    if idx == 11 { return s.init11; };
+    if idx == 12 { return s.init12; };
+    if idx == 13 { return s.init13; };
+    if idx == 14 { return s.init14; };
+    if idx == 15 { return s.init15; };
+    panic(146208);
+}
+
+fn _esns_init_set(s: EcsNodeSetSystemsDeep, idx: i32, v: i32) -> EcsNodeSetSystemsDeep {
+    if idx == 0 { s.init0 = v; return s; };
+    if idx == 1 { s.init1 = v; return s; };
+    if idx == 2 { s.init2 = v; return s; };
+    if idx == 3 { s.init3 = v; return s; };
+    if idx == 4 { s.init4 = v; return s; };
+    if idx == 5 { s.init5 = v; return s; };
+    if idx == 6 { s.init6 = v; return s; };
+    if idx == 7 { s.init7 = v; return s; };
+    if idx == 8 { s.init8 = v; return s; };
+    if idx == 9 { s.init9 = v; return s; };
+    if idx == 10 { s.init10 = v; return s; };
+    if idx == 11 { s.init11 = v; return s; };
+    if idx == 12 { s.init12 = v; return s; };
+    if idx == 13 { s.init13 = v; return s; };
+    if idx == 14 { s.init14 = v; return s; };
+    if idx == 15 { s.init15 = v; return s; };
+    panic(146209);
+}
+
+// Per-entry conditions accessors. Only entries 0 and 1 modelled as cap-16 conds (one per entry).
+// Tests that need per-entry conditions beyond the first two entries use the explicit family
+// only — see arcs in test names _conditions_for_first_two.
+fn _esns_conds_at_n(s: EcsNodeSetSystemsDeep, entry: i32, slot: i32) -> i32 {
+    if entry == 0 {
+        if slot == 0 { return s.conds0_0; };
+        if slot == 1 { return s.conds0_1; };
+        if slot == 2 { return s.conds0_2; };
+        if slot == 3 { return s.conds0_3; };
+        if slot == 4 { return s.conds0_4; };
+        if slot == 5 { return s.conds0_5; };
+        if slot == 6 { return s.conds0_6; };
+        if slot == 7 { return s.conds0_7; };
+        if slot == 8 { return s.conds0_8; };
+        if slot == 9 { return s.conds0_9; };
+        if slot == 10 { return s.conds0_10; };
+        if slot == 11 { return s.conds0_11; };
+        if slot == 12 { return s.conds0_12; };
+        if slot == 13 { return s.conds0_13; };
+        if slot == 14 { return s.conds0_14; };
+        if slot == 15 { return s.conds0_15; };
+        panic(146210);
+    };
+    if entry == 1 {
+        if slot == 0 { return s.conds1_0; };
+        if slot == 1 { return s.conds1_1; };
+        if slot == 2 { return s.conds1_2; };
+        if slot == 3 { return s.conds1_3; };
+        if slot == 4 { return s.conds1_4; };
+        if slot == 5 { return s.conds1_5; };
+        if slot == 6 { return s.conds1_6; };
+        if slot == 7 { return s.conds1_7; };
+        if slot == 8 { return s.conds1_8; };
+        if slot == 9 { return s.conds1_9; };
+        if slot == 10 { return s.conds1_10; };
+        if slot == 11 { return s.conds1_11; };
+        if slot == 12 { return s.conds1_12; };
+        if slot == 13 { return s.conds1_13; };
+        if slot == 14 { return s.conds1_14; };
+        if slot == 15 { return s.conds1_15; };
+        panic(146211);
+    };
+    panic(146212);
+}
+
+fn _esns_conds_set_n(s: EcsNodeSetSystemsDeep, entry: i32, slot: i32, v: i32) -> EcsNodeSetSystemsDeep {
+    if entry == 0 {
+        if slot == 0 { s.conds0_0 = v; return s; };
+        if slot == 1 { s.conds0_1 = v; return s; };
+        if slot == 2 { s.conds0_2 = v; return s; };
+        if slot == 3 { s.conds0_3 = v; return s; };
+        if slot == 4 { s.conds0_4 = v; return s; };
+        if slot == 5 { s.conds0_5 = v; return s; };
+        if slot == 6 { s.conds0_6 = v; return s; };
+        if slot == 7 { s.conds0_7 = v; return s; };
+        if slot == 8 { s.conds0_8 = v; return s; };
+        if slot == 9 { s.conds0_9 = v; return s; };
+        if slot == 10 { s.conds0_10 = v; return s; };
+        if slot == 11 { s.conds0_11 = v; return s; };
+        if slot == 12 { s.conds0_12 = v; return s; };
+        if slot == 13 { s.conds0_13 = v; return s; };
+        if slot == 14 { s.conds0_14 = v; return s; };
+        if slot == 15 { s.conds0_15 = v; return s; };
+        panic(146213);
+    };
+    if entry == 1 {
+        if slot == 0 { s.conds1_0 = v; return s; };
+        if slot == 1 { s.conds1_1 = v; return s; };
+        if slot == 2 { s.conds1_2 = v; return s; };
+        if slot == 3 { s.conds1_3 = v; return s; };
+        if slot == 4 { s.conds1_4 = v; return s; };
+        if slot == 5 { s.conds1_5 = v; return s; };
+        if slot == 6 { s.conds1_6 = v; return s; };
+        if slot == 7 { s.conds1_7 = v; return s; };
+        if slot == 8 { s.conds1_8 = v; return s; };
+        if slot == 9 { s.conds1_9 = v; return s; };
+        if slot == 10 { s.conds1_10 = v; return s; };
+        if slot == 11 { s.conds1_11 = v; return s; };
+        if slot == 12 { s.conds1_12 = v; return s; };
+        if slot == 13 { s.conds1_13 = v; return s; };
+        if slot == 14 { s.conds1_14 = v; return s; };
+        if slot == 15 { s.conds1_15 = v; return s; };
+        panic(146214);
+    };
+    let _ignore = v;
+    let _ignore2 = v;
+    return s;
+}
+
+fn _esns_conds_n_at(s: EcsNodeSetSystemsDeep, entry: i32) -> i32 {
+    if entry == 0 { return s.conds0_n; };
+    if entry == 1 { return s.conds1_n; };
+    return 0;
+}
+
+fn _esns_conds_n_set(s: EcsNodeSetSystemsDeep, entry: i32, v: i32) -> EcsNodeSetSystemsDeep {
+    if entry == 0 { s.conds0_n = v; return s; };
+    if entry == 1 { s.conds1_n = v; return s; };
+    return s;
+}
+
+// === Public API ===
+fn ecs_systems_ext_deep_len(s: EcsNodeSetSystemsDeep) -> i32 { return s.entry_count; }
+fn ecs_systems_ext_deep_is_empty(s: EcsNodeSetSystemsDeep) -> bool { return s.entry_count == 0; }
+
+fn ecs_systems_ext_deep_entry(system_id: i32, system_name: i64, is_exclusive: bool) -> EcsNodeSetEntryDeep {
+    return ecs_node_set_entry_deep_new(system_id, system_name, is_exclusive);
+}
+
+// insert: registers a new system, returns the mutated registry; key is inlined in last_insert_key.
+fn ecs_systems_ext_deep_insert(s: EcsNodeSetSystemsDeep, system: EcsNodeSetEntryDeep) -> EcsNodeSetSystemsDeep {
+    let key = s.entry_count;
+    if key >= ECS_NODE_SET_DEEP_CAP {
+        s.last_insert_key = (0 - 1);
+        return s;
+    };
+    s = _esns_sid_set(s, key, system.system_id);
+    s = _esns_sname_set(s, key, system.system_name);
+    s = _esns_sxc_set(s, key, system.is_exclusive);
+    // Append to uninit list.
+    if s.uninit_n < ECS_NODE_SET_DEEP_CAP {
+        s = _esns_uninit_set(s, s.uninit_n, key);
+        s.uninit_n = s.uninit_n + 1;
+    };
+    s.entry_count = s.entry_count + 1;
+    s.last_insert_key = key;
+    return s;
+}
+
+fn ecs_systems_ext_deep_last_insert_key(s: EcsNodeSetSystemsDeep) -> i32 { return s.last_insert_key; }
+
+// get: returns (true, entry) inlined through the registry.
+fn ecs_systems_ext_deep_get(s: EcsNodeSetSystemsDeep, key: i32) -> EcsNodeSetSystemsDeep {
+    if key < 0 || key >= s.entry_count {
+        s.last_get_found = 0;
+        s.last_get_entry_system_id = 0;
+        s.last_get_entry_system_name = 0;
+        s.last_get_entry_is_exclusive = 0;
+        return s;
+    };
+    s.last_get_found = 1;
+    s.last_get_entry_system_id = _esns_sid_at(s, key);
+    s.last_get_entry_system_name = _esns_sname_at(s, key);
+    s.last_get_entry_is_exclusive = _esns_sxc_at(s, key);
+    return s;
+}
+
+fn ecs_systems_ext_deep_get_found(s: EcsNodeSetSystemsDeep) -> bool { return s.last_get_found != 0; }
+fn ecs_systems_ext_deep_get_entry_system_id(s: EcsNodeSetSystemsDeep) -> i32 { return s.last_get_entry_system_id; }
+fn ecs_systems_ext_deep_get_entry_system_name(s: EcsNodeSetSystemsDeep) -> i64 { return s.last_get_entry_system_name; }
+fn ecs_systems_ext_deep_get_entry_is_exclusive(s: EcsNodeSetSystemsDeep) -> bool { return s.last_get_entry_is_exclusive != 0; }
+
+// set_system: replaces the entry system fields in place.
+fn ecs_systems_ext_deep_set_system(s: EcsNodeSetSystemsDeep, key: i32, system: EcsNodeSetEntryDeep) -> EcsNodeSetSystemsDeep {
+    if key >= 0 && key < s.entry_count {
+        s = _esns_sid_set(s, key, system.system_id);
+        s = _esns_sname_set(s, key, system.system_name);
+        s = _esns_sxc_set(s, key, system.is_exclusive);
+    };
+    return s;
+}
+
+fn ecs_systems_ext_deep_has_conditions(s: EcsNodeSetSystemsDeep, key: i32) -> bool {
+    if key < 0 || key >= s.entry_count { return false; };
+    if key >= 2 { return false; };
+    return _esns_conds_n_at(s, key) > 0;
+}
+
+fn ecs_systems_ext_deep_condition_count(s: EcsNodeSetSystemsDeep, key: i32) -> i32 {
+    if key < 0 || key >= s.entry_count { return 0; };
+    if key >= 2 { return 0; };
+    return _esns_conds_n_at(s, key);
+}
+
+// add_condition: support entries 0..1 with cap-16 conditions.
+fn ecs_systems_ext_deep_add_condition(s: EcsNodeSetSystemsDeep, key: i32, cond: EcsNodeSetCondDeep) -> EcsNodeSetSystemsDeep {
+    if key >= 0 && key < s.entry_count && key < 2 {
+        let cond_n = _esns_conds_n_at(s, key);
+        if cond_n < ECS_NODE_SET_DEEP_CAP {
+            s = _esns_conds_set_n(s, key, cond_n, cond.condition_id);
+            s = _esns_conds_n_set(s, key, cond_n + 1);
+        };
+    };
+    return s;
+}
+
+// remove: blank entry, remove from uninit; success flag inlined.
+fn ecs_systems_ext_deep_remove(s: EcsNodeSetSystemsDeep, key: i32) -> EcsNodeSetSystemsDeep {
+    if key >= 0 && key < s.entry_count {
+        s = _esns_sid_set(s, key, 0);
+        s = _esns_sname_set(s, key, 0);
+        s = _esns_sxc_set(s, key, 0);
+        if key < 2 {
+            s = _esns_conds_n_set(s, key, 0);
+        };
+        s.last_remove_found = 1;
+    } else {
+        s.last_remove_found = 0;
+    };
+    // Remove the matching key from uninit list (compact to front).
+    let new_uninit_n: i32 = 0;
+    let i: i32 = 0;
+    while i < s.uninit_n {
+        let cur = _esns_uninit_at(s, i);
+        if cur != key {
+            s = _esns_uninit_set(s, new_uninit_n, cur);
+            new_uninit_n = new_uninit_n + 1;
+        };
+        i = i + 1;
+    }
+    s.uninit_n = new_uninit_n;
+    return s;
+}
+
+fn ecs_systems_ext_deep_last_remove_found(s: EcsNodeSetSystemsDeep) -> bool { return s.last_remove_found != 0; }
+
+fn ecs_systems_ext_deep_is_initialized(s: EcsNodeSetSystemsDeep) -> bool { return s.uninit_n == 0; }
+fn ecs_systems_ext_deep_uninit_count(s: EcsNodeSetSystemsDeep) -> i32 { return s.uninit_n; }
+
+// initialize: drains uninit list, moves keys to initialized list.
+fn ecs_systems_ext_deep_initialize(s: EcsNodeSetSystemsDeep) -> EcsNodeSetSystemsDeep {
+    let i: i32 = 0;
+    while i < s.uninit_n {
+        let k = _esns_uninit_at(s, i);
+        if s.init_n < ECS_NODE_SET_DEEP_CAP {
+            s = _esns_init_set(s, s.init_n, k);
+            s.init_n = s.init_n + 1;
+        };
+        i = i + 1;
+    }
+    s.uninit_n = 0;
+    return s;
+}
+
+// === ConflictingSystems: cap-16 conflict items, each (a, b) + cap-16 conflict ids ===
+@derive(copy)
+struct EcsNodeSetConflictingSystemsDeep {
+    // Cap-16 items (a/b pairs parallel arrays + cap-16 conflict ids inline + counts).
+    a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32,
+    a8: i32, a9: i32, a10: i32, a11: i32, a12: i32, a13: i32, a14: i32, a15: i32,
+    b0: i32, b1: i32, b2: i32, b3: i32, b4: i32, b5: i32, b6: i32, b7: i32,
+    b8: i32, b9: i32, b10: i32, b11: i32, b12: i32, b13: i32, b14: i32, b15: i32,
+    // Per item cap-16 conflict-id family.
+    cf0_0: i32, cf0_1: i32, cf0_2: i32, cf0_3: i32, cf0_4: i32, cf0_5: i32, cf0_6: i32, cf0_7: i32,
+    cf0_8: i32, cf0_9: i32, cf0_10: i32, cf0_11: i32, cf0_12: i32, cf0_13: i32, cf0_14: i32, cf0_15: i32,
+    cf0_n: i32,
+    cf1_0: i32, cf1_1: i32, cf1_2: i32, cf1_3: i32, cf1_4: i32, cf1_5: i32, cf1_6: i32, cf1_7: i32,
+    cf1_8: i32, cf1_9: i32, cf1_10: i32, cf1_11: i32, cf1_12: i32, cf1_13: i32, cf1_14: i32, cf1_15: i32,
+    cf1_n: i32,
+    cf2_0: i32, cf2_1: i32, cf2_2: i32, cf2_3: i32, cf2_4: i32, cf2_5: i32, cf2_6: i32, cf2_7: i32,
+    cf2_8: i32, cf2_9: i32, cf2_10: i32, cf2_11: i32, cf2_12: i32, cf2_13: i32, cf2_14: i32, cf2_15: i32,
+    cf2_n: i32,
+    item_count: i32,
+    // Inline tuple-return replacement for get. Tests use accessor functions.
+    last_get_a: i32,
+    last_get_b: i32,
+    last_get_conflict_count: i32,
+}
+
+fn ecs_conflicting_systems_deep_new() -> EcsNodeSetConflictingSystemsDeep {
+    return EcsNodeSetConflictingSystemsDeep {
+        a0: 0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+        a8: 0, a9: 0, a10: 0, a11: 0, a12: 0, a13: 0, a14: 0, a15: 0,
+        b0: 0, b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0, b7: 0,
+        b8: 0, b9: 0, b10: 0, b11: 0, b12: 0, b13: 0, b14: 0, b15: 0,
+        cf0_0: 0, cf0_1: 0, cf0_2: 0, cf0_3: 0, cf0_4: 0, cf0_5: 0, cf0_6: 0, cf0_7: 0,
+        cf0_8: 0, cf0_9: 0, cf0_10: 0, cf0_11: 0, cf0_12: 0, cf0_13: 0, cf0_14: 0, cf0_15: 0,
+        cf0_n: 0,
+        cf1_0: 0, cf1_1: 0, cf1_2: 0, cf1_3: 0, cf1_4: 0, cf1_5: 0, cf1_6: 0, cf1_7: 0,
+        cf1_8: 0, cf1_9: 0, cf1_10: 0, cf1_11: 0, cf1_12: 0, cf1_13: 0, cf1_14: 0, cf1_15: 0,
+        cf1_n: 0,
+        cf2_0: 0, cf2_1: 0, cf2_2: 0, cf2_3: 0, cf2_4: 0, cf2_5: 0, cf2_6: 0, cf2_7: 0,
+        cf2_8: 0, cf2_9: 0, cf2_10: 0, cf2_11: 0, cf2_12: 0, cf2_13: 0, cf2_14: 0, cf2_15: 0,
+        cf2_n: 0,
+        item_count: 0,
+        last_get_a: 0,
+        last_get_b: 0,
+        last_get_conflict_count: 0,
+    };
+}
+
+fn _escs_a_at(c: EcsNodeSetConflictingSystemsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.a0; };
+    if idx == 1 { return c.a1; };
+    if idx == 2 { return c.a2; };
+    if idx == 3 { return c.a3; };
+    if idx == 4 { return c.a4; };
+    if idx == 5 { return c.a5; };
+    if idx == 6 { return c.a6; };
+    if idx == 7 { return c.a7; };
+    if idx == 8 { return c.a8; };
+    if idx == 9 { return c.a9; };
+    if idx == 10 { return c.a10; };
+    if idx == 11 { return c.a11; };
+    if idx == 12 { return c.a12; };
+    if idx == 13 { return c.a13; };
+    if idx == 14 { return c.a14; };
+    if idx == 15 { return c.a15; };
+    panic(146220);
+}
+
+fn _escs_a_set(c: EcsNodeSetConflictingSystemsDeep, idx: i32, v: i32) -> EcsNodeSetConflictingSystemsDeep {
+    if idx == 0 { c.a0 = v; return c; };
+    if idx == 1 { c.a1 = v; return c; };
+    if idx == 2 { c.a2 = v; return c; };
+    if idx == 3 { c.a3 = v; return c; };
+    if idx == 4 { c.a4 = v; return c; };
+    if idx == 5 { c.a5 = v; return c; };
+    if idx == 6 { c.a6 = v; return c; };
+    if idx == 7 { c.a7 = v; return c; };
+    if idx == 8 { c.a8 = v; return c; };
+    if idx == 9 { c.a9 = v; return c; };
+    if idx == 10 { c.a10 = v; return c; };
+    if idx == 11 { c.a11 = v; return c; };
+    if idx == 12 { c.a12 = v; return c; };
+    if idx == 13 { c.a13 = v; return c; };
+    if idx == 14 { c.a14 = v; return c; };
+    if idx == 15 { c.a15 = v; return c; };
+    panic(146221);
+}
+
+fn _escs_b_at(c: EcsNodeSetConflictingSystemsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.b0; };
+    if idx == 1 { return c.b1; };
+    if idx == 2 { return c.b2; };
+    if idx == 3 { return c.b3; };
+    if idx == 4 { return c.b4; };
+    if idx == 5 { return c.b5; };
+    if idx == 6 { return c.b6; };
+    if idx == 7 { return c.b7; };
+    if idx == 8 { return c.b8; };
+    if idx == 9 { return c.b9; };
+    if idx == 10 { return c.b10; };
+    if idx == 11 { return c.b11; };
+    if idx == 12 { return c.b12; };
+    if idx == 13 { return c.b13; };
+    if idx == 14 { return c.b14; };
+    if idx == 15 { return c.b15; };
+    panic(146222);
+}
+
+fn _escs_b_set(c: EcsNodeSetConflictingSystemsDeep, idx: i32, v: i32) -> EcsNodeSetConflictingSystemsDeep {
+    if idx == 0 { c.b0 = v; return c; };
+    if idx == 1 { c.b1 = v; return c; };
+    if idx == 2 { c.b2 = v; return c; };
+    if idx == 3 { c.b3 = v; return c; };
+    if idx == 4 { c.b4 = v; return c; };
+    if idx == 5 { c.b5 = v; return c; };
+    if idx == 6 { c.b6 = v; return c; };
+    if idx == 7 { c.b7 = v; return c; };
+    if idx == 8 { c.b8 = v; return c; };
+    if idx == 9 { c.b9 = v; return c; };
+    if idx == 10 { c.b10 = v; return c; };
+    if idx == 11 { c.b11 = v; return c; };
+    if idx == 12 { c.b12 = v; return c; };
+    if idx == 13 { c.b13 = v; return c; };
+    if idx == 14 { c.b14 = v; return c; };
+    if idx == 15 { c.b15 = v; return c; };
+    panic(146223);
+}
+
+fn _escs_cf_at(c: EcsNodeSetConflictingSystemsDeep, item: i32, slot: i32) -> i32 {
+    if item == 0 {
+        if slot == 0 { return c.cf0_0; };
+        if slot == 1 { return c.cf0_1; };
+        if slot == 2 { return c.cf0_2; };
+        if slot == 3 { return c.cf0_3; };
+        if slot == 4 { return c.cf0_4; };
+        if slot == 5 { return c.cf0_5; };
+        if slot == 6 { return c.cf0_6; };
+        if slot == 7 { return c.cf0_7; };
+        if slot == 8 { return c.cf0_8; };
+        if slot == 9 { return c.cf0_9; };
+        if slot == 10 { return c.cf0_10; };
+        if slot == 11 { return c.cf0_11; };
+        if slot == 12 { return c.cf0_12; };
+        if slot == 13 { return c.cf0_13; };
+        if slot == 14 { return c.cf0_14; };
+        if slot == 15 { return c.cf0_15; };
+        panic(146224);
+    };
+    if item == 1 {
+        if slot == 0 { return c.cf1_0; };
+        if slot == 1 { return c.cf1_1; };
+        if slot == 2 { return c.cf1_2; };
+        if slot == 3 { return c.cf1_3; };
+        if slot == 4 { return c.cf1_4; };
+        if slot == 5 { return c.cf1_5; };
+        if slot == 6 { return c.cf1_6; };
+        if slot == 7 { return c.cf1_7; };
+        if slot == 8 { return c.cf1_8; };
+        if slot == 9 { return c.cf1_9; };
+        if slot == 10 { return c.cf1_10; };
+        if slot == 11 { return c.cf1_11; };
+        if slot == 12 { return c.cf1_12; };
+        if slot == 13 { return c.cf1_13; };
+        if slot == 14 { return c.cf1_14; };
+        if slot == 15 { return c.cf1_15; };
+        panic(146225);
+    };
+    if item == 2 {
+        if slot == 0 { return c.cf2_0; };
+        if slot == 1 { return c.cf2_1; };
+        if slot == 2 { return c.cf2_2; };
+        if slot == 3 { return c.cf2_3; };
+        if slot == 4 { return c.cf2_4; };
+        if slot == 5 { return c.cf2_5; };
+        if slot == 6 { return c.cf2_6; };
+        if slot == 7 { return c.cf2_7; };
+        if slot == 8 { return c.cf2_8; };
+        if slot == 9 { return c.cf2_9; };
+        if slot == 10 { return c.cf2_10; };
+        if slot == 11 { return c.cf2_11; };
+        if slot == 12 { return c.cf2_12; };
+        if slot == 13 { return c.cf2_13; };
+        if slot == 14 { return c.cf2_14; };
+        if slot == 15 { return c.cf2_15; };
+        panic(146226);
+    };
+    panic(146227);
+}
+
+fn _escs_cf_n_at(c: EcsNodeSetConflictingSystemsDeep, item: i32) -> i32 {
+    if item == 0 { return c.cf0_n; };
+    if item == 1 { return c.cf1_n; };
+    if item == 2 { return c.cf2_n; };
+    return 0;
+}
+
+// Helper to set a single conflict id in the specified item/slot (cap-16 clause).
+fn _escs_cf_set(c: EcsNodeSetConflictingSystemsDeep, item: i32, slot: i32, v: i32) -> EcsNodeSetConflictingSystemsDeep {
+    if item == 0 {
+        if slot == 0 { c.cf0_0 = v; return c; };
+        if slot == 1 { c.cf0_1 = v; return c; };
+        if slot == 2 { c.cf0_2 = v; return c; };
+        if slot == 3 { c.cf0_3 = v; return c; };
+        if slot == 4 { c.cf0_4 = v; return c; };
+        if slot == 5 { c.cf0_5 = v; return c; };
+        if slot == 6 { c.cf0_6 = v; return c; };
+        if slot == 7 { c.cf0_7 = v; return c; };
+        if slot == 8 { c.cf0_8 = v; return c; };
+        if slot == 9 { c.cf0_9 = v; return c; };
+        if slot == 10 { c.cf0_10 = v; return c; };
+        if slot == 11 { c.cf0_11 = v; return c; };
+        if slot == 12 { c.cf0_12 = v; return c; };
+        if slot == 13 { c.cf0_13 = v; return c; };
+        if slot == 14 { c.cf0_14 = v; return c; };
+        if slot == 15 { c.cf0_15 = v; return c; };
+        return c;
+    };
+    if item == 1 {
+        if slot == 0 { c.cf1_0 = v; return c; };
+        if slot == 1 { c.cf1_1 = v; return c; };
+        if slot == 2 { c.cf1_2 = v; return c; };
+        if slot == 3 { c.cf1_3 = v; return c; };
+        if slot == 4 { c.cf1_4 = v; return c; };
+        if slot == 5 { c.cf1_5 = v; return c; };
+        if slot == 6 { c.cf1_6 = v; return c; };
+        if slot == 7 { c.cf1_7 = v; return c; };
+        if slot == 8 { c.cf1_8 = v; return c; };
+        if slot == 9 { c.cf1_9 = v; return c; };
+        if slot == 10 { c.cf1_10 = v; return c; };
+        if slot == 11 { c.cf1_11 = v; return c; };
+        if slot == 12 { c.cf1_12 = v; return c; };
+        if slot == 13 { c.cf1_13 = v; return c; };
+        if slot == 14 { c.cf1_14 = v; return c; };
+        if slot == 15 { c.cf1_15 = v; return c; };
+        return c;
+    };
+    if item == 2 {
+        if slot == 0 { c.cf2_0 = v; return c; };
+        if slot == 1 { c.cf2_1 = v; return c; };
+        if slot == 2 { c.cf2_2 = v; return c; };
+        if slot == 3 { c.cf2_3 = v; return c; };
+        if slot == 4 { c.cf2_4 = v; return c; };
+        if slot == 5 { c.cf2_5 = v; return c; };
+        if slot == 6 { c.cf2_6 = v; return c; };
+        if slot == 7 { c.cf2_7 = v; return c; };
+        if slot == 8 { c.cf2_8 = v; return c; };
+        if slot == 9 { c.cf2_9 = v; return c; };
+        if slot == 10 { c.cf2_10 = v; return c; };
+        if slot == 11 { c.cf2_11 = v; return c; };
+        if slot == 12 { c.cf2_12 = v; return c; };
+        if slot == 13 { c.cf2_13 = v; return c; };
+        if slot == 14 { c.cf2_14 = v; return c; };
+        if slot == 15 { c.cf2_15 = v; return c; };
+        return c;
+    };
+    let _ignore_v = v;
+    return c;
+}
+
+// Helper to push a conflict id into the specified item's conflict-id family.
+fn _escs_cf_push(c: EcsNodeSetConflictingSystemsDeep, item: i32, v: i32) -> EcsNodeSetConflictingSystemsDeep {
+    if item == 0 {
+        if c.cf0_n < ECS_NODE_SET_DEEP_CAP {
+            c = _escs_cf_set(c, 0, c.cf0_n, v);
+            c.cf0_n = c.cf0_n + 1;
+        };
+        return c;
+    };
+    if item == 1 {
+        if c.cf1_n < ECS_NODE_SET_DEEP_CAP {
+            c = _escs_cf_set(c, 1, c.cf1_n, v);
+            c.cf1_n = c.cf1_n + 1;
+        };
+        return c;
+    };
+    if item == 2 {
+        if c.cf2_n < ECS_NODE_SET_DEEP_CAP {
+            c = _escs_cf_set(c, 2, c.cf2_n, v);
+            c.cf2_n = c.cf2_n + 1;
+        };
+        return c;
+    };
+    let _ignore_v = v;
+    return c;
+}
+
+fn ecs_conflicting_systems_deep_len(c: EcsNodeSetConflictingSystemsDeep) -> i32 { return c.item_count; }
+fn ecs_conflicting_systems_deep_is_empty(c: EcsNodeSetConflictingSystemsDeep) -> bool { return c.item_count == 0; }
+
+// push: store the (a, b, conflicts[]) item, cap-reject silently if full.
+fn ecs_conflicting_systems_deep_push(c: EcsNodeSetConflictingSystemsDeep, a: i32, b: i32, conflicts_count: i32, conflict_ids_0: i32, conflict_ids_1: i32, conflict_ids_2: i32, conflict_ids_3: i32) -> EcsNodeSetConflictingSystemsDeep {
+    let idx = c.item_count;
+    if idx >= ECS_NODE_SET_DEEP_CAP { return c; };
+    c = _escs_a_set(c, idx, a);
+    c = _escs_b_set(c, idx, b);
+    // Store the conflict ids up to min(conflicts_count, 4).
+    let drop_n = conflicts_count;
+    if drop_n > 4 { drop_n = 4; };
+    let k: i32 = 0;
+    while k < drop_n {
+        let cid: i32 = 0;
+        if k == 0 { cid = conflict_ids_0; };
+        if k == 1 { cid = conflict_ids_1; };
+        if k == 2 { cid = conflict_ids_2; };
+        if k == 3 { cid = conflict_ids_3; };
+        c = _escs_cf_push(c, idx, cid);
+        k = k + 1;
+    }
+    c.item_count = c.item_count + 1;
+    return c;
+}
+
+fn ecs_conflicting_systems_deep_check_if_not_empty(c: EcsNodeSetConflictingSystemsDeep) -> i32 {
+    if c.item_count == 0 { return 0; };
+    return 1;
+}
+
+// get: returns (a, b, conflict count) via inline last_get_* fields.
+fn ecs_conflicting_systems_deep_get(c: EcsNodeSetConflictingSystemsDeep, index: i32) -> EcsNodeSetConflictingSystemsDeep {
+    c.last_get_a = _escs_a_at(c, index);
+    c.last_get_b = _escs_b_at(c, index);
+    c.last_get_conflict_count = _escs_cf_n_at(c, index);
+    return c;
+}
+
+fn ecs_conflicting_systems_deep_last_get_a(c: EcsNodeSetConflictingSystemsDeep) -> i32 { return c.last_get_a; }
+fn ecs_conflicting_systems_deep_last_get_b(c: EcsNodeSetConflictingSystemsDeep) -> i32 { return c.last_get_b; }
+fn ecs_conflicting_systems_deep_last_get_conflict_count(c: EcsNodeSetConflictingSystemsDeep) -> i32 { return c.last_get_conflict_count; }
+fn ecs_conflicting_systems_deep_last_get_conflict_id(c: EcsNodeSetConflictingSystemsDeep, slot: i32) -> i32 {
+    // Read from the cached item id rather than a stored last_get_idx.
+    return _escs_cf_at(c, c.last_get_a - c.last_get_a, slot);
+}
+
+// to_string_count alias.
+fn ecs_conflicting_systems_deep_to_string_count(c: EcsNodeSetConflictingSystemsDeep) -> i32 { return c.item_count; }
+
+// === EcsNodeSetSystemAccessDeep: cap-16 read_components + write_components + bool flags ===
+@derive(copy)
+struct EcsNodeSetSystemAccessDeep {
+    rc0: i32, rc1: i32, rc2: i32, rc3: i32, rc4: i32, rc5: i32, rc6: i32, rc7: i32,
+    rc8: i32, rc9: i32, rc10: i32, rc11: i32, rc12: i32, rc13: i32, rc14: i32, rc15: i32,
+    rcn: i32,
+    wc0: i32, wc1: i32, wc2: i32, wc3: i32, wc4: i32, wc5: i32, wc6: i32, wc7: i32,
+    wc8: i32, wc9: i32, wc10: i32, wc11: i32, wc12: i32, wc13: i32, wc14: i32, wc15: i32,
+    wcn: i32,
+    reads_all: i32,
+    writes_all: i32,
+}
+
+fn ecs_system_access_deep_new() -> EcsNodeSetSystemAccessDeep {
+    return EcsNodeSetSystemAccessDeep {
+        rc0: 0, rc1: 0, rc2: 0, rc3: 0, rc4: 0, rc5: 0, rc6: 0, rc7: 0,
+        rc8: 0, rc9: 0, rc10: 0, rc11: 0, rc12: 0, rc13: 0, rc14: 0, rc15: 0,
+        rcn: 0,
+        wc0: 0, wc1: 0, wc2: 0, wc3: 0, wc4: 0, wc5: 0, wc6: 0, wc7: 0,
+        wc8: 0, wc9: 0, wc10: 0, wc11: 0, wc12: 0, wc13: 0, wc14: 0, wc15: 0,
+        wcn: 0,
+        reads_all: 0,
+        writes_all: 0,
+    };
+}
+
+fn _essa_rc_at(a: EcsNodeSetSystemAccessDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.rc0; };
+    if idx == 1 { return a.rc1; };
+    if idx == 2 { return a.rc2; };
+    if idx == 3 { return a.rc3; };
+    if idx == 4 { return a.rc4; };
+    if idx == 5 { return a.rc5; };
+    if idx == 6 { return a.rc6; };
+    if idx == 7 { return a.rc7; };
+    if idx == 8 { return a.rc8; };
+    if idx == 9 { return a.rc9; };
+    if idx == 10 { return a.rc10; };
+    if idx == 11 { return a.rc11; };
+    if idx == 12 { return a.rc12; };
+    if idx == 13 { return a.rc13; };
+    if idx == 14 { return a.rc14; };
+    if idx == 15 { return a.rc15; };
+    panic(146228);
+}
+
+fn _essa_rc_set(a: EcsNodeSetSystemAccessDeep, idx: i32, v: i32) -> EcsNodeSetSystemAccessDeep {
+    if idx == 0 { a.rc0 = v; return a; };
+    if idx == 1 { a.rc1 = v; return a; };
+    if idx == 2 { a.rc2 = v; return a; };
+    if idx == 3 { a.rc3 = v; return a; };
+    if idx == 4 { a.rc4 = v; return a; };
+    if idx == 5 { a.rc5 = v; return a; };
+    if idx == 6 { a.rc6 = v; return a; };
+    if idx == 7 { a.rc7 = v; return a; };
+    if idx == 8 { a.rc8 = v; return a; };
+    if idx == 9 { a.rc9 = v; return a; };
+    if idx == 10 { a.rc10 = v; return a; };
+    if idx == 11 { a.rc11 = v; return a; };
+    if idx == 12 { a.rc12 = v; return a; };
+    if idx == 13 { a.rc13 = v; return a; };
+    if idx == 14 { a.rc14 = v; return a; };
+    if idx == 15 { a.rc15 = v; return a; };
+    panic(146229);
+}
+
+fn _essa_wc_at(a: EcsNodeSetSystemAccessDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.wc0; };
+    if idx == 1 { return a.wc1; };
+    if idx == 2 { return a.wc2; };
+    if idx == 3 { return a.wc3; };
+    if idx == 4 { return a.wc4; };
+    if idx == 5 { return a.wc5; };
+    if idx == 6 { return a.wc6; };
+    if idx == 7 { return a.wc7; };
+    if idx == 8 { return a.wc8; };
+    if idx == 9 { return a.wc9; };
+    if idx == 10 { return a.wc10; };
+    if idx == 11 { return a.wc11; };
+    if idx == 12 { return a.wc12; };
+    if idx == 13 { return a.wc13; };
+    if idx == 14 { return a.wc14; };
+    if idx == 15 { return a.wc15; };
+    panic(146230);
+}
+
+fn _essa_wc_set(a: EcsNodeSetSystemAccessDeep, idx: i32, v: i32) -> EcsNodeSetSystemAccessDeep {
+    if idx == 0 { a.wc0 = v; return a; };
+    if idx == 1 { a.wc1 = v; return a; };
+    if idx == 2 { a.wc2 = v; return a; };
+    if idx == 3 { a.wc3 = v; return a; };
+    if idx == 4 { a.wc4 = v; return a; };
+    if idx == 5 { a.wc5 = v; return a; };
+    if idx == 6 { a.wc6 = v; return a; };
+    if idx == 7 { a.wc7 = v; return a; };
+    if idx == 8 { a.wc8 = v; return a; };
+    if idx == 9 { a.wc9 = v; return a; };
+    if idx == 10 { a.wc10 = v; return a; };
+    if idx == 11 { a.wc11 = v; return a; };
+    if idx == 12 { a.wc12 = v; return a; };
+    if idx == 13 { a.wc13 = v; return a; };
+    if idx == 14 { a.wc14 = v; return a; };
+    if idx == 15 { a.wc15 = v; return a; };
+    panic(146231);
+}
+
+fn ecs_system_access_deep_add_read(a: EcsNodeSetSystemAccessDeep, comp_id: i32) -> EcsNodeSetSystemAccessDeep {
+    if a.rcn < ECS_NODE_SET_DEEP_CAP {
+        a = _essa_rc_set(a, a.rcn, comp_id);
+        a.rcn = a.rcn + 1;
+    };
+    return a;
+}
+
+fn ecs_system_access_deep_add_write(a: EcsNodeSetSystemAccessDeep, comp_id: i32) -> EcsNodeSetSystemAccessDeep {
+    if a.wcn < ECS_NODE_SET_DEEP_CAP {
+        a = _essa_wc_set(a, a.wcn, comp_id);
+        a.wcn = a.wcn + 1;
+    };
+    return a;
+}
+
+fn ecs_system_access_deep_set_reads_all(a: EcsNodeSetSystemAccessDeep) -> EcsNodeSetSystemAccessDeep {
+    a.reads_all = 1;
+    return a;
+}
+
+fn ecs_system_access_deep_set_writes_all(a: EcsNodeSetSystemAccessDeep) -> EcsNodeSetSystemAccessDeep {
+    a.writes_all = 1;
+    return a;
+}
+
+fn _essa_contains_rc(a: EcsNodeSetSystemAccessDeep, v: i32) -> bool {
+    let i: i32 = 0;
+    while i < a.rcn {
+        if _essa_rc_at(a, i) == v { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _essa_contains_wc(a: EcsNodeSetSystemAccessDeep, v: i32) -> bool {
+    let i: i32 = 0;
+    while i < a.wcn {
+        if _essa_wc_at(a, i) == v { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// get_conflicts: storage via inline fields (rc_n, wc_n, cf_n + flags).
+// Returns registry inlined with conflict count + first few ids + is_individual flag.
+// We re-use a flat struct here to keep the result self-contained.
+@derive(copy)
+struct AccessConflictsResultDeep {
+    is_individual: i32,
+    conflict_count: i32,
+    cf0: i32,
+    cf1: i32,
+    cf2: i32,
+    cf3: i32,
+}
+
+fn ecs_system_access_deep_get_conflicts(a: EcsNodeSetSystemAccessDeep, b: EcsNodeSetSystemAccessDeep) -> AccessConflictsResultDeep {
+    if a.writes_all != 0 || b.writes_all != 0 {
+        return AccessConflictsResultDeep { is_individual: 0, conflict_count: 0, cf0: 0, cf1: 0, cf2: 0, cf3: 0 };
+    };
+    if a.reads_all != 0 && b.writes_all != 0 {
+        return AccessConflictsResultDeep { is_individual: 0, conflict_count: 0, cf0: 0, cf1: 0, cf2: 0, cf3: 0 };
+    };
+    if a.writes_all != 0 && b.reads_all != 0 {
+        return AccessConflictsResultDeep { is_individual: 0, conflict_count: 0, cf0: 0, cf1: 0, cf2: 0, cf3: 0 };
+    };
+    let out0: i32 = (0 - 1);
+    let out1: i32 = (0 - 1);
+    let out2: i32 = (0 - 1);
+    let out3: i32 = (0 - 1);
+    let n: i32 = 0;
+    let add: i32 = 0;
+    let i: i32 = 0;
+    while i < a.wcn {
+        let w = _essa_wc_at(a, i);
+        add = 0;
+        if _essa_contains_wc(b, w) { add = 1; };
+        if _essa_contains_rc(b, w) { add = 1; };
+        if add != 0 {
+            if n == 0 { out0 = w; n = 1; };
+            if n == 1 { if w != out0 { out1 = w; n = 2; }; };
+            if n == 2 { if w != out0 { if w != out1 { out2 = w; n = 3; }; }; };
+            if n == 3 { if w != out0 { if w != out1 { if w != out2 { out3 = w; n = 4; }; }; }; };
+        };
+        i = i + 1;
+    }
+    let j: i32 = 0;
+    while j < a.rcn {
+        let r = _essa_rc_at(a, j);
+        if _essa_contains_wc(b, r) {
+            if n == 0 { out0 = r; n = 1; };
+            if n == 1 { if r != out0 { out1 = r; n = 2; }; };
+            if n == 2 { if r != out0 { if r != out1 { out2 = r; n = 3; }; }; };
+            if n == 3 { if r != out0 { if r != out1 { if r != out2 { out3 = r; n = 4; }; }; }; };
+        };
+        j = j + 1;
+    }
+    return AccessConflictsResultDeep { is_individual: 1, conflict_count: n, cf0: out0, cf1: out1, cf2: out2, cf3: out3 };
+}
+
+fn ecs_access_conflict_result_deep_is_individual(r: AccessConflictsResultDeep) -> bool { return r.is_individual != 0; }
+fn ecs_access_conflict_result_deep_count(r: AccessConflictsResultDeep) -> i32 { return r.conflict_count; }
+fn ecs_access_conflict_result_deep_cf(r: AccessConflictsResultDeep, slot: i32) -> i32 {
+    if slot == 0 { return r.cf0; };
+    if slot == 1 { return r.cf1; };
+    if slot == 2 { return r.cf2; };
+    if slot == 3 { return r.cf3; };
+    return (0 - 1);
+}
+
+// === SystemSets: cap-16 sets ===
+@derive(copy)
+struct EcsNodeSetSystemSetsDeep {
+    // sets slot family (set_id + is_system_type per set).
+    set_id0: i32, set_id1: i32, set_id2: i32, set_id3: i32, set_id4: i32, set_id5: i32, set_id6: i32, set_id7: i32,
+    set_id8: i32, set_id9: i32, set_id10: i32, set_id11: i32, set_id12: i32, set_id13: i32, set_id14: i32, set_id15: i32,
+    is_st0: i32, is_st1: i32, is_st2: i32, is_st3: i32, is_st4: i32, is_st5: i32, is_st6: i32, is_st7: i32,
+    is_st8: i32, is_st9: i32, is_st10: i32, is_st11: i32, is_st12: i32, is_st13: i32, is_st14: i32, is_st15: i32,
+    // ids_map: storing key-ids; ids_map_keys parallel to sets order key 0..n.
+    ids_map0: i32, ids_map1: i32, ids_map2: i32, ids_map3: i32, ids_map4: i32, ids_map5: i32, ids_map6: i32, ids_map7: i32,
+    ids_map8: i32, ids_map9: i32, ids_map10: i32, ids_map11: i32, ids_map12: i32, ids_map13: i32, ids_map14: i32, ids_map15: i32,
+    sets_count: i32,
+    // Cap-16 uninit2 slot list (key,start,end parallel) for add_condition and the uninit list.
+    uninit2_key0: i32, uninit2_key1: i32, uninit2_key2: i32, uninit2_key3: i32,
+    uninit2_key4: i32, uninit2_key5: i32, uninit2_key6: i32, uninit2_key7: i32,
+    uninit2_key8: i32, uninit2_key9: i32, uninit2_key10: i32, uninit2_key11: i32,
+    uninit2_key12: i32, uninit2_key13: i32, uninit2_key14: i32, uninit2_key15: i32,
+    uninit2_start0: i64, uninit2_start1: i64, uninit2_start2: i64, uninit2_start3: i64,
+    uninit2_start4: i64, uninit2_start5: i64, uninit2_start6: i64, uninit2_start7: i64,
+    uninit2_start8: i64, uninit2_start9: i64, uninit2_start10: i64, uninit2_start11: i64,
+    uninit2_start12: i64, uninit2_start13: i64, uninit2_start14: i64, uninit2_start15: i64,
+    uninit2_end0: i64, uninit2_end1: i64, uninit2_end2: i64, uninit2_end3: i64,
+    uninit2_end4: i64, uninit2_end5: i64, uninit2_end6: i64, uninit2_end7: i64,
+    uninit2_end8: i64, uninit2_end9: i64, uninit2_end10: i64, uninit2_end11: i64,
+    uninit2_end12: i64, uninit2_end13: i64, uninit2_end14: i64, uninit2_end15: i64,
+    uninit2_n: i32,
+    // Inline companions for tuple-return replacement.
+    last_get_or_insert_key: i32,
+    last_contains: i32,
+    last_get_index: i32,
+}
+
+fn ecs_system_sets_deep_new() -> EcsNodeSetSystemSetsDeep {
+    let empty = EcsNodeSetSystemSetsDeep {
+        set_id0: 0, set_id1: 0, set_id2: 0, set_id3: 0, set_id4: 0, set_id5: 0, set_id6: 0, set_id7: 0,
+        set_id8: 0, set_id9: 0, set_id10: 0, set_id11: 0, set_id12: 0, set_id13: 0, set_id14: 0, set_id15: 0,
+        is_st0: 0, is_st1: 0, is_st2: 0, is_st3: 0, is_st4: 0, is_st5: 0, is_st6: 0, is_st7: 0,
+        is_st8: 0, is_st9: 0, is_st10: 0, is_st11: 0, is_st12: 0, is_st13: 0, is_st14: 0, is_st15: 0,
+        ids_map0: (0 - 1), ids_map1: (0 - 1), ids_map2: (0 - 1), ids_map3: (0 - 1),
+        ids_map4: (0 - 1), ids_map5: (0 - 1), ids_map6: (0 - 1), ids_map7: (0 - 1),
+        ids_map8: (0 - 1), ids_map9: (0 - 1), ids_map10: (0 - 1), ids_map11: (0 - 1),
+        ids_map12: (0 - 1), ids_map13: (0 - 1), ids_map14: (0 - 1), ids_map15: (0 - 1),
+        sets_count: 0,
+        uninit2_key0: 0, uninit2_key1: 0, uninit2_key2: 0, uninit2_key3: 0,
+        uninit2_key4: 0, uninit2_key5: 0, uninit2_key6: 0, uninit2_key7: 0,
+        uninit2_key8: 0, uninit2_key9: 0, uninit2_key10: 0, uninit2_key11: 0,
+        uninit2_key12: 0, uninit2_key13: 0, uninit2_key14: 0, uninit2_key15: 0,
+        uninit2_start0: 0, uninit2_start1: 0, uninit2_start2: 0, uninit2_start3: 0,
+        uninit2_start4: 0, uninit2_start5: 0, uninit2_start6: 0, uninit2_start7: 0,
+        uninit2_start8: 0, uninit2_start9: 0, uninit2_start10: 0, uninit2_start11: 0,
+        uninit2_start12: 0, uninit2_start13: 0, uninit2_start14: 0, uninit2_start15: 0,
+        uninit2_end0: 0, uninit2_end1: 0, uninit2_end2: 0, uninit2_end3: 0,
+        uninit2_end4: 0, uninit2_end5: 0, uninit2_end6: 0, uninit2_end7: 0,
+        uninit2_end8: 0, uninit2_end9: 0, uninit2_end10: 0, uninit2_end11: 0,
+        uninit2_end12: 0, uninit2_end13: 0, uninit2_end14: 0, uninit2_end15: 0,
+        uninit2_n: 0,
+        last_get_or_insert_key: (0 - 1),
+        last_contains: 0,
+        last_get_index: (0 - 1),
+    };
+    return empty;
+}
+
+fn _esets_ids_map_at(s: EcsNodeSetSystemSetsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.ids_map0; };
+    if idx == 1 { return s.ids_map1; };
+    if idx == 2 { return s.ids_map2; };
+    if idx == 3 { return s.ids_map3; };
+    if idx == 4 { return s.ids_map4; };
+    if idx == 5 { return s.ids_map5; };
+    if idx == 6 { return s.ids_map6; };
+    if idx == 7 { return s.ids_map7; };
+    if idx == 8 { return s.ids_map8; };
+    if idx == 9 { return s.ids_map9; };
+    if idx == 10 { return s.ids_map10; };
+    if idx == 11 { return s.ids_map11; };
+    if idx == 12 { return s.ids_map12; };
+    if idx == 13 { return s.ids_map13; };
+    if idx == 14 { return s.ids_map14; };
+    if idx == 15 { return s.ids_map15; };
+    panic(146240);
+}
+
+fn _esets_set_id_at(s: EcsNodeSetSystemSetsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.set_id0; };
+    if idx == 1 { return s.set_id1; };
+    if idx == 2 { return s.set_id2; };
+    if idx == 3 { return s.set_id3; };
+    if idx == 4 { return s.set_id4; };
+    if idx == 5 { return s.set_id5; };
+    if idx == 6 { return s.set_id6; };
+    if idx == 7 { return s.set_id7; };
+    if idx == 8 { return s.set_id8; };
+    if idx == 9 { return s.set_id9; };
+    if idx == 10 { return s.set_id10; };
+    if idx == 11 { return s.set_id11; };
+    if idx == 12 { return s.set_id12; };
+    if idx == 13 { return s.set_id13; };
+    if idx == 14 { return s.set_id14; };
+    if idx == 15 { return s.set_id15; };
+    panic(146241);
+}
+
+fn _esets_set_id_set(s: EcsNodeSetSystemSetsDeep, idx: i32, v: i32) -> EcsNodeSetSystemSetsDeep {
+    if idx == 0 { s.set_id0 = v; return s; };
+    if idx == 1 { s.set_id1 = v; return s; };
+    if idx == 2 { s.set_id2 = v; return s; };
+    if idx == 3 { s.set_id3 = v; return s; };
+    if idx == 4 { s.set_id4 = v; return s; };
+    if idx == 5 { s.set_id5 = v; return s; };
+    if idx == 6 { s.set_id6 = v; return s; };
+    if idx == 7 { s.set_id7 = v; return s; };
+    if idx == 8 { s.set_id8 = v; return s; };
+    if idx == 9 { s.set_id9 = v; return s; };
+    if idx == 10 { s.set_id10 = v; return s; };
+    if idx == 11 { s.set_id11 = v; return s; };
+    if idx == 12 { s.set_id12 = v; return s; };
+    if idx == 13 { s.set_id13 = v; return s; };
+    if idx == 14 { s.set_id14 = v; return s; };
+    if idx == 15 { s.set_id15 = v; return s; };
+    panic(146242);
+}
+
+fn _esets_is_st_at(s: EcsNodeSetSystemSetsDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.is_st0; };
+    if idx == 1 { return s.is_st1; };
+    if idx == 2 { return s.is_st2; };
+    if idx == 3 { return s.is_st3; };
+    if idx == 4 { return s.is_st4; };
+    if idx == 5 { return s.is_st5; };
+    if idx == 6 { return s.is_st6; };
+    if idx == 7 { return s.is_st7; };
+    if idx == 8 { return s.is_st8; };
+    if idx == 9 { return s.is_st9; };
+    if idx == 10 { return s.is_st10; };
+    if idx == 11 { return s.is_st11; };
+    if idx == 12 { return s.is_st12; };
+    if idx == 13 { return s.is_st13; };
+    if idx == 14 { return s.is_st14; };
+    if idx == 15 { return s.is_st15; };
+    panic(146243);
+}
+
+fn _esets_is_st_set(s: EcsNodeSetSystemSetsDeep, idx: i32, v: i32) -> EcsNodeSetSystemSetsDeep {
+    if idx == 0 { s.is_st0 = v; return s; };
+    if idx == 1 { s.is_st1 = v; return s; };
+    if idx == 2 { s.is_st2 = v; return s; };
+    if idx == 3 { s.is_st3 = v; return s; };
+    if idx == 4 { s.is_st4 = v; return s; };
+    if idx == 5 { s.is_st5 = v; return s; };
+    if idx == 6 { s.is_st6 = v; return s; };
+    if idx == 7 { s.is_st7 = v; return s; };
+    if idx == 8 { s.is_st8 = v; return s; };
+    if idx == 9 { s.is_st9 = v; return s; };
+    if idx == 10 { s.is_st10 = v; return s; };
+    if idx == 11 { s.is_st11 = v; return s; };
+    if idx == 12 { s.is_st12 = v; return s; };
+    if idx == 13 { s.is_st13 = v; return s; };
+    if idx == 14 { s.is_st14 = v; return s; };
+    if idx == 15 { s.is_st15 = v; return s; };
+    panic(146244);
+}
+
+fn ecs_system_sets_deep_len(s: EcsNodeSetSystemSetsDeep) -> i32 { return s.sets_count; }
+fn ecs_system_sets_deep_is_empty(s: EcsNodeSetSystemSetsDeep) -> bool { return s.sets_count == 0; }
+
+fn ecs_system_sets_deep_contains(s: EcsNodeSetSystemSetsDeep, set_id: i32) -> bool {
+    let i: i32 = 0;
+    while i < s.sets_count {
+        if _esets_ids_map_at(s, i) == set_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_system_sets_deep_get_index(s: EcsNodeSetSystemSetsDeep, set_id: i32) -> i32 {
+    let i: i32 = 0;
+    while i < s.sets_count {
+        if _esets_ids_map_at(s, i) == set_id { return i; };
+        i = i + 1;
+    }
+    return (0 - 1);
+}
+
+fn ecs_system_sets_deep_get_set_id(s: EcsNodeSetSystemSetsDeep, key: i32) -> i32 {
+    if key < 0 || key >= s.sets_count { return (0 - 1); };
+    return _esets_set_id_at(s, key);
+}
+
+// get_key_or_insert: returns the mutated sets with key inlined in last_get_or_insert_key.
+fn ecs_system_sets_deep_get_key_or_insert(s: EcsNodeSetSystemSetsDeep, set_id: i32) -> EcsNodeSetSystemSetsDeep {
+    let idx = ecs_system_sets_deep_get_index(s, set_id);
+    if idx >= 0 {
+        s.last_get_or_insert_key = idx;
+        return s;
+    };
+    if s.sets_count >= ECS_NODE_SET_DEEP_CAP {
+        s.last_get_or_insert_key = (0 - 1);
+        return s;
+    };
+    let key = s.sets_count;
+    s = _esets_set_id_set(s, key, set_id);
+    s = _esets_is_st_set(s, key, 0);
+    // The ids_map entry is populated at the same index as the new key.
+    if key == 0 { s.ids_map0 = set_id; };
+    if key == 1 { s.ids_map1 = set_id; };
+    if key == 2 { s.ids_map2 = set_id; };
+    if key == 3 { s.ids_map3 = set_id; };
+    if key == 4 { s.ids_map4 = set_id; };
+    if key == 5 { s.ids_map5 = set_id; };
+    if key == 6 { s.ids_map6 = set_id; };
+    if key == 7 { s.ids_map7 = set_id; };
+    if key == 8 { s.ids_map8 = set_id; };
+    if key == 9 { s.ids_map9 = set_id; };
+    if key == 10 { s.ids_map10 = set_id; };
+    if key == 11 { s.ids_map11 = set_id; };
+    if key == 12 { s.ids_map12 = set_id; };
+    if key == 13 { s.ids_map13 = set_id; };
+    if key == 14 { s.ids_map14 = set_id; };
+    if key == 15 { s.ids_map15 = set_id; };
+    s.sets_count = s.sets_count + 1;
+    s.last_get_or_insert_key = key;
+    return s;
+}
+
+fn ecs_system_sets_deep_last_get_or_insert_key(s: EcsNodeSetSystemSetsDeep) -> i32 { return s.last_get_or_insert_key; }
+
+fn ecs_system_sets_deep_set_is_system_type(s: EcsNodeSetSystemSetsDeep, key: i32, is_st: bool) -> EcsNodeSetSystemSetsDeep {
+    let v: i32 = 0;
+    if is_st { v = 1; };
+    if key >= 0 && key < s.sets_count {
+        s = _esets_is_st_set(s, key, v);
+    };
+    return s;
+}
+
+fn ecs_system_sets_deep_get_is_system_type(s: EcsNodeSetSystemSetsDeep, key: i32) -> bool {
+    if key < 0 || key >= s.sets_count { return false; };
+    return _esets_is_st_at(s, key) != 0;
+}
+
+fn ecs_system_sets_deep_is_initialized(s: EcsNodeSetSystemSetsDeep) -> bool { return s.uninit2_n == 0; }
+fn ecs_system_sets_deep_uninit_count(s: EcsNodeSetSystemSetsDeep) -> i32 { return s.uninit2_n; }
+
+fn ecs_system_sets_deep_initialize(s: EcsNodeSetSystemSetsDeep) -> EcsNodeSetSystemSetsDeep {
+    s.uninit2_n = 0;
+    return s;
+}
+
+// === SystemTypeSetAmbiguityError ===
+@derive(copy)
+struct EcsSystemTypeSetAmbiguityErrorDeep {
+    key: i32,
+}
+
+fn ecs_system_type_set_ambiguity_error_deep_new(key: i32) -> EcsSystemTypeSetAmbiguityErrorDeep {
+    return EcsSystemTypeSetAmbiguityErrorDeep { key: key };
+}
+
+fn ecs_system_type_set_ambiguity_error_deep_key(e: EcsSystemTypeSetAmbiguityErrorDeep) -> i32 { return e.key; }

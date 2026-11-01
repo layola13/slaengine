@@ -1,0 +1,274 @@
+// Archetype grouping sidecar for RegistryWorld.
+// Each archetype is keyed by the exact registered component-id signature. Entity
+// locations are updated when components are added, removed, or despawned.
+@import "world_registry.sla"
+
+struct RegistryArchetype {
+    id: i32,
+    component_ids: Vec<i32>,
+    entity_ids: Vec<i32>,
+}
+
+struct RegistryArchetypeLocation {
+    entity_id: i32,
+    archetype_id: i32,
+    row: i64,
+}
+
+struct RegistryArchetypeWorld {
+    registry: RegistryWorld,
+    archetypes: Vec<RegistryArchetype>,
+    locations: Vec<RegistryArchetypeLocation>,
+}
+
+fn registry_archetype_new(id: i32, component_ids: Vec<i32>) -> RegistryArchetype {
+    let entity_ids: Vec<i32> = Vec::new();
+    return RegistryArchetype { id: id, component_ids: component_ids, entity_ids: entity_ids };
+}
+
+fn registry_archetype_location_empty(entity_id: i32) -> RegistryArchetypeLocation {
+    return RegistryArchetypeLocation { entity_id: entity_id, archetype_id: -1, row: -1 };
+}
+
+fn registry_archetype_signature_empty() -> Vec<i32> {
+    let ids: Vec<i32> = Vec::new();
+    return ids;
+}
+
+fn registry_archetype_world_new() -> RegistryArchetypeWorld {
+    let archetypes: Vec<RegistryArchetype> = Vec::new();
+    let locations: Vec<RegistryArchetypeLocation> = Vec::new();
+    let world = RegistryArchetypeWorld {
+        registry: registry_world_new(),
+        archetypes: archetypes,
+        locations: locations,
+    };
+    world.archetypes.push(registry_archetype_new(0, registry_archetype_signature_empty()));
+    return world;
+}
+
+fn registry_archetype_world_register_table(world: RegistryArchetypeWorld) -> (RegistryArchetypeWorld, ComponentInfo) {
+    let (registry, info) = registry_world_register_table(world.registry);
+    world.registry = registry;
+    return (world, info);
+}
+
+fn registry_archetype_world_register_sparse_set(world: RegistryArchetypeWorld) -> (RegistryArchetypeWorld, ComponentInfo) {
+    let (registry, info) = registry_world_register_sparse_set(world.registry);
+    world.registry = registry;
+    return (world, info);
+}
+
+fn registry_archetype_world_archetype_count(world: RegistryArchetypeWorld) -> i64 {
+    return len(world.archetypes) as i64;
+}
+
+fn registry_archetype_signature_equals(left: Vec<i32>, right: Vec<i32>) -> bool {
+    let left_len = len(left) as i64;
+    let right_len = len(right) as i64;
+    if left_len != right_len { return false; };
+    let i: i64 = 0;
+    while i < left_len {
+        if left[i] != right[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn registry_archetype_signature_has(signature: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(signature) as i64;
+    while i < cnt {
+        if signature[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn registry_archetype_world_signature_for_entity(world: RegistryArchetypeWorld, entity: Entity) -> Vec<i32> {
+    let ids: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(world.registry.columns) as i64;
+    while i < cnt {
+        let component_id = world.registry.columns[i].info.id;
+        if registry_world_has_component(world.registry, entity, component_id) {
+            ids.push(component_id);
+        };
+        i = i + 1;
+    }
+    return ids;
+}
+
+fn registry_archetype_world_find_archetype(world: RegistryArchetypeWorld, component_ids: Vec<i32>) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.archetypes) as i64;
+    while i < cnt {
+        if registry_archetype_signature_equals(world.archetypes[i].component_ids, component_ids) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn registry_archetype_world_get_or_create_archetype(world: RegistryArchetypeWorld, component_ids: Vec<i32>) -> (RegistryArchetypeWorld, i64) {
+    let existing = registry_archetype_world_find_archetype(world, component_ids);
+    if existing >= 0 { return (world, existing); };
+    let id = len(world.archetypes) as i32;
+    world.archetypes.push(registry_archetype_new(id, component_ids));
+    return (world, id as i64);
+}
+
+fn registry_archetype_world_ensure_location(world: RegistryArchetypeWorld, entity: Entity) -> RegistryArchetypeWorld {
+    while (len(world.locations) as i32) < entity.id + 1 {
+        let next_id = len(world.locations) as i32;
+        world.locations.push(registry_archetype_location_empty(next_id));
+    }
+    return world;
+}
+
+fn registry_archetype_world_detach(world: RegistryArchetypeWorld, entity: Entity) -> RegistryArchetypeWorld {
+    let location_count = len(world.locations) as i32;
+    if entity.id >= location_count { return world; };
+    let location = world.locations[entity.id];
+    if location.archetype_id < 0 { return world; };
+    let archetype_slot = location.archetype_id as i64;
+    let last = (len(world.archetypes[archetype_slot].entity_ids) as i64) - 1;
+    if location.row != last {
+        let moved_entity_id = world.archetypes[archetype_slot].entity_ids[last];
+        world.archetypes[archetype_slot].entity_ids[location.row] = moved_entity_id;
+        world.locations[moved_entity_id].row = location.row;
+    };
+    let removed = world.archetypes[archetype_slot].entity_ids.remove(last);
+    world.locations[entity.id].archetype_id = -1;
+    world.locations[entity.id].row = -1;
+    return world;
+}
+
+fn registry_archetype_world_attach(world: RegistryArchetypeWorld, entity: Entity, component_ids: Vec<i32>) -> RegistryArchetypeWorld {
+    world = registry_archetype_world_ensure_location(world, entity);
+    let (next_world, archetype_slot) = registry_archetype_world_get_or_create_archetype(world, component_ids);
+    world = next_world;
+    let row = len(world.archetypes[archetype_slot].entity_ids) as i64;
+    world.archetypes[archetype_slot].entity_ids.push(entity.id);
+    world.locations[entity.id].entity_id = entity.id;
+    world.locations[entity.id].archetype_id = world.archetypes[archetype_slot].id;
+    world.locations[entity.id].row = row;
+    return world;
+}
+
+fn registry_archetype_world_sync_entity(world: RegistryArchetypeWorld, entity: Entity) -> RegistryArchetypeWorld {
+    world = registry_archetype_world_detach(world, entity);
+    let signature = registry_archetype_world_signature_for_entity(world, entity);
+    return registry_archetype_world_attach(world, entity, signature);
+}
+
+fn registry_archetype_world_spawn(world: RegistryArchetypeWorld) -> (RegistryArchetypeWorld, Entity) {
+    let (registry, entity) = registry_world_spawn(world.registry);
+    world.registry = registry;
+    world = registry_archetype_world_attach(world, entity, registry_archetype_signature_empty());
+    return (world, entity);
+}
+
+fn registry_archetype_world_insert_component(world: RegistryArchetypeWorld, entity: Entity, component_id: i32) -> RegistryArchetypeWorld {
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    return registry_archetype_world_sync_entity(world, entity);
+}
+
+fn registry_archetype_world_remove_component(world: RegistryArchetypeWorld, entity: Entity, component_id: i32) -> RegistryArchetypeWorld {
+    world.registry = registry_world_remove_component(world.registry, entity, component_id);
+    return registry_archetype_world_sync_entity(world, entity);
+}
+
+fn registry_archetype_world_despawn(world: RegistryArchetypeWorld, entity: Entity) -> RegistryArchetypeWorld {
+    world = registry_archetype_world_detach(world, entity);
+    world.registry = registry_world_despawn(world.registry, entity);
+    return world;
+}
+
+fn registry_archetype_world_is_alive(world: RegistryArchetypeWorld, entity: Entity) -> bool {
+    return registry_world_is_alive(world.registry, entity);
+}
+
+fn registry_archetype_world_entity_archetype_id(world: RegistryArchetypeWorld, entity: Entity) -> i32 {
+    let location_count = len(world.locations) as i32;
+    if entity.id >= location_count { return -1; };
+    return world.locations[entity.id].archetype_id;
+}
+
+fn registry_archetype_world_entity_row(world: RegistryArchetypeWorld, entity: Entity) -> i64 {
+    let location_count = len(world.locations) as i32;
+    if entity.id >= location_count { return -1; };
+    return world.locations[entity.id].row;
+}
+
+fn registry_archetype_world_archetype_entity_count(world: RegistryArchetypeWorld, archetype_id: i32) -> i64 {
+    if archetype_id < 0 { return 0; };
+    return len(world.archetypes[archetype_id].entity_ids) as i64;
+}
+
+fn registry_archetype_world_query_component(world: RegistryArchetypeWorld, component_id: i32) -> RegistryEntityQuery {
+    let query = registry_entity_query_new();
+    let i: i64 = 0;
+    let archetype_count = len(world.archetypes) as i64;
+    while i < archetype_count {
+        if registry_archetype_signature_has(world.archetypes[i].component_ids, component_id) {
+            let row: i64 = 0;
+            let row_count = len(world.archetypes[i].entity_ids) as i64;
+            while row < row_count {
+                let eid = world.archetypes[i].entity_ids[row];
+                let entity = entity_new(eid, world.registry.entities.generations[eid]);
+                if registry_archetype_world_is_alive(world, entity) {
+                    query.items.push(entity);
+                };
+                row = row + 1;
+            }
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+@test "registry archetype groups identical component signatures"() {
+    let w0 = registry_archetype_world_new();
+    let (w1, position) = registry_archetype_world_register_table(w0);
+    let (w2, velocity) = registry_archetype_world_register_table(w1);
+    let (w3, marker) = registry_archetype_world_register_sparse_set(w2);
+    let (w4, e1) = registry_archetype_world_spawn(w3);
+    let (w5, e2) = registry_archetype_world_spawn(w4);
+    let w6 = registry_archetype_world_insert_component(w5, e1, position.id);
+    let w7 = registry_archetype_world_insert_component(w6, e1, velocity.id);
+    let w8 = registry_archetype_world_insert_component(w7, e2, velocity.id);
+    let w9 = registry_archetype_world_insert_component(w8, e2, position.id);
+    let a1 = registry_archetype_world_entity_archetype_id(w9, e1);
+    let a2 = registry_archetype_world_entity_archetype_id(w9, e2);
+    if a1 != a2 { panic(9800); };
+    if registry_archetype_world_archetype_entity_count(w9, a1) != 2 { panic(9801); };
+    let q = registry_archetype_world_query_component(w9, position.id);
+    if len(q.items) != 2 { panic(9802); };
+    if registry_archetype_world_archetype_count(w9) < 4 { panic(9803); };
+}
+
+@test "registry archetype migrates on remove and despawn"() {
+    let w0 = registry_archetype_world_new();
+    let (w1, position) = registry_archetype_world_register_table(w0);
+    let (w2, velocity) = registry_archetype_world_register_table(w1);
+    let (w3, e1) = registry_archetype_world_spawn(w2);
+    let (w4, e2) = registry_archetype_world_spawn(w3);
+    let w5 = registry_archetype_world_insert_component(w4, e1, position.id);
+    let w6 = registry_archetype_world_insert_component(w5, e1, velocity.id);
+    let w7 = registry_archetype_world_insert_component(w6, e2, position.id);
+    let w8 = registry_archetype_world_remove_component(w7, e1, velocity.id);
+    let a1 = registry_archetype_world_entity_archetype_id(w8, e1);
+    let a2 = registry_archetype_world_entity_archetype_id(w8, e2);
+    if a1 != a2 { panic(9810); };
+    if registry_archetype_world_archetype_entity_count(w8, a1) != 2 { panic(9811); };
+    let row_before = registry_archetype_world_entity_row(w8, e1);
+    if row_before < 0 { panic(9812); };
+    let w9 = registry_archetype_world_despawn(w8, e2);
+    if registry_archetype_world_is_alive(w9, e2) != false { panic(9813); };
+    if registry_archetype_world_entity_archetype_id(w9, e2) != -1 { panic(9814); };
+    let q = registry_archetype_world_query_component(w9, position.id);
+    if len(q.items) != 1 { panic(9815); };
+    if q.items[0].id != e1.id { panic(9816); };
+}

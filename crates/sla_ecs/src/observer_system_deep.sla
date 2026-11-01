@@ -1,0 +1,470 @@
+// Deepened Bevy ECS ObserverSystem + IntoObserverSystem surface.
+// Mirrors src/system/observer_system.rs:
+//   ObserverSystem: System with In = On<E,B>, Out = Out
+//   IntoObserverSystem::into_system conversion
+//   first-arg On requirement marker; subsequent SystemParam count
+//   pipe composition (a.pipe(b)) from Bevy unit tests
+//   initialize / run / name / is_send markers
+// Fixed capacity: 4 system-param slots + pipe chain depth 2.
+// Shallow lib/observer_system.sla retained.
+
+// === Event / Bundle / On markers ===
+struct EcsObsSysEventDeep {
+    event_key: i64,
+    payload: i64,
+}
+
+fn ecs_obs_sys_event_new(event_key: i64, payload: i64) -> EcsObsSysEventDeep {
+    return EcsObsSysEventDeep { event_key: event_key, payload: payload };
+}
+
+fn ecs_obs_sys_event_get_key(e: EcsObsSysEventDeep) -> i64 { return e.event_key; }
+fn ecs_obs_sys_event_get_payload(e: EcsObsSysEventDeep) -> i64 { return e.payload; }
+
+// On<'w,'t,E,B> first system argument
+struct EcsObsSysOnDeep {
+    event_key: i64,
+    payload: i64,
+    observer_entity: i64,
+    target_entity: i64,
+    has_target: bool,
+    bundle_mask: i64, // B interest mask; 0 = any/empty bundle
+}
+
+fn ecs_obs_sys_on_new(event_key: i64, payload: i64, observer_entity: i64) -> EcsObsSysOnDeep {
+    return EcsObsSysOnDeep {
+        event_key: event_key, payload: payload, observer_entity: observer_entity,
+        target_entity: 0, has_target: false, bundle_mask: 0,
+    };
+}
+
+fn ecs_obs_sys_on_with_target(onv: EcsObsSysOnDeep, target: i64, bundle_mask: i64) -> EcsObsSysOnDeep {
+    return EcsObsSysOnDeep {
+        event_key: onv.event_key, payload: onv.payload, observer_entity: onv.observer_entity,
+        target_entity: target, has_target: true, bundle_mask: bundle_mask,
+    };
+}
+
+fn ecs_obs_sys_on_event_key(o: EcsObsSysOnDeep) -> i64 { return o.event_key; }
+fn ecs_obs_sys_on_payload(o: EcsObsSysOnDeep) -> i64 { return o.payload; }
+fn ecs_obs_sys_on_observer(o: EcsObsSysOnDeep) -> i64 { return o.observer_entity; }
+fn ecs_obs_sys_on_target(o: EcsObsSysOnDeep) -> i64 { return o.target_entity; }
+fn ecs_obs_sys_on_has_target(o: EcsObsSysOnDeep) -> bool { return o.has_target; }
+fn ecs_obs_sys_on_bundle_mask(o: EcsObsSysOnDeep) -> i64 { return o.bundle_mask; }
+
+// === System meta for observer systems ===
+struct EcsObsSysMetaDeep {
+    name_id: i64,
+    initialized: bool,
+    is_send: bool,
+    // access flags: observers must be DeferredWorld-safe (no full &mut World)
+    deferred_only: bool,
+    param_count: i32,
+    // first arg must be On
+    has_on_input: bool,
+}
+
+fn ecs_obs_sys_meta_new(name_id: i64) -> EcsObsSysMetaDeep {
+    return EcsObsSysMetaDeep {
+        name_id: name_id, initialized: false, is_send: true,
+        deferred_only: true, param_count: 0, has_on_input: true,
+    };
+}
+
+fn ecs_obs_sys_meta_name(m: EcsObsSysMetaDeep) -> i64 { return m.name_id; }
+fn ecs_obs_sys_meta_initialized(m: EcsObsSysMetaDeep) -> bool { return m.initialized; }
+fn ecs_obs_sys_meta_is_send(m: EcsObsSysMetaDeep) -> bool { return m.is_send; }
+fn ecs_obs_sys_meta_deferred_only(m: EcsObsSysMetaDeep) -> bool { return m.deferred_only; }
+fn ecs_obs_sys_meta_param_count(m: EcsObsSysMetaDeep) -> i32 { return m.param_count; }
+fn ecs_obs_sys_meta_has_on_input(m: EcsObsSysMetaDeep) -> bool { return m.has_on_input; }
+
+fn ecs_obs_sys_meta_rebuild(
+    name_id: i64, initialized: bool, is_send: bool, deferred_only: bool,
+    param_count: i32, has_on_input: bool
+) -> EcsObsSysMetaDeep {
+    return EcsObsSysMetaDeep {
+        name_id: name_id, initialized: initialized, is_send: is_send,
+        deferred_only: deferred_only, param_count: param_count, has_on_input: has_on_input,
+    };
+}
+
+fn ecs_obs_sys_meta_with_name(m: EcsObsSysMetaDeep, name_id: i64) -> EcsObsSysMetaDeep {
+    return ecs_obs_sys_meta_rebuild(
+        name_id, m.initialized, m.is_send, m.deferred_only, m.param_count, m.has_on_input
+    );
+}
+
+fn ecs_obs_sys_meta_with_params(m: EcsObsSysMetaDeep, param_count: i32) -> EcsObsSysMetaDeep {
+    return ecs_obs_sys_meta_rebuild(
+        m.name_id, m.initialized, m.is_send, m.deferred_only, param_count, m.has_on_input
+    );
+}
+
+// === IntoObserverSystem source (function / system-like) ===
+// Models conversion eligibility before into_system.
+struct EcsIntoObsSysDeep {
+    name_id: i64,
+    // first parameter is On marker
+    has_on_first: bool,
+    // subsequent SystemParam count (0..4)
+    extra_params: i32,
+    // output kind: 0=(), 1=i64 value, 2=piped
+    out_kind: i32,
+    // for systems that produce a value for pipe
+    out_const: i64,
+    // event key interest
+    event_key: i64,
+    // convertibility
+    is_send: bool,
+}
+
+fn ecs_into_obs_sys_new(name_id: i64, event_key: i64) -> EcsIntoObsSysDeep {
+    return EcsIntoObsSysDeep {
+        name_id: name_id, has_on_first: true, extra_params: 0,
+        out_kind: 0, out_const: 0, event_key: event_key, is_send: true,
+    };
+}
+
+fn ecs_into_obs_sys_with_params(s: EcsIntoObsSysDeep, extra_params: i32) -> EcsIntoObsSysDeep {
+    return EcsIntoObsSysDeep {
+        name_id: s.name_id, has_on_first: s.has_on_first, extra_params: extra_params,
+        out_kind: s.out_kind, out_const: s.out_const, event_key: s.event_key, is_send: s.is_send,
+    };
+}
+
+fn ecs_into_obs_sys_with_out(s: EcsIntoObsSysDeep, out_kind: i32, out_const: i64) -> EcsIntoObsSysDeep {
+    return EcsIntoObsSysDeep {
+        name_id: s.name_id, has_on_first: s.has_on_first, extra_params: s.extra_params,
+        out_kind: out_kind, out_const: out_const, event_key: s.event_key, is_send: s.is_send,
+    };
+}
+
+fn ecs_into_obs_sys_invalid_no_on(name_id: i64) -> EcsIntoObsSysDeep {
+    return EcsIntoObsSysDeep {
+        name_id: name_id, has_on_first: false, extra_params: 0,
+        out_kind: 0, out_const: 0, event_key: 0, is_send: true,
+    };
+}
+
+fn ecs_into_obs_sys_name(s: EcsIntoObsSysDeep) -> i64 { return s.name_id; }
+fn ecs_into_obs_sys_has_on_first(s: EcsIntoObsSysDeep) -> bool { return s.has_on_first; }
+fn ecs_into_obs_sys_extra_params(s: EcsIntoObsSysDeep) -> i32 { return s.extra_params; }
+fn ecs_into_obs_sys_out_kind(s: EcsIntoObsSysDeep) -> i32 { return s.out_kind; }
+fn ecs_into_obs_sys_event_key(s: EcsIntoObsSysDeep) -> i64 { return s.event_key; }
+
+// Valid IntoObserverSystem if first arg is On and send
+fn ecs_into_obs_sys_is_valid(s: EcsIntoObsSysDeep) -> bool {
+    if s.has_on_first != true { return false; };
+    if s.is_send != true { return false; };
+    return true;
+}
+
+// === ObserverSystem (converted) ===
+struct EcsObsSysDeep {
+    meta: EcsObsSysMetaDeep,
+    event_key: i64,
+    out_kind: i32,
+    out_const: i64,
+    // run stats
+    run_count: i64,
+    last_payload: i64,
+    last_out: i64,
+    // pipe second stage (optional)
+    has_pipe: bool,
+    pipe_name_id: i64,
+    pipe_expects_in: bool,
+    pipe_run_count: i64,
+    last_pipe_in: i64,
+}
+
+fn ecs_obs_sys_meta(s: EcsObsSysDeep) -> EcsObsSysMetaDeep { return s.meta; }
+fn ecs_obs_sys_name(s: EcsObsSysDeep) -> i64 { return s.meta.name_id; }
+fn ecs_obs_sys_event_key(s: EcsObsSysDeep) -> i64 { return s.event_key; }
+fn ecs_obs_sys_run_count(s: EcsObsSysDeep) -> i64 { return s.run_count; }
+fn ecs_obs_sys_last_payload(s: EcsObsSysDeep) -> i64 { return s.last_payload; }
+fn ecs_obs_sys_last_out(s: EcsObsSysDeep) -> i64 { return s.last_out; }
+fn ecs_obs_sys_has_pipe(s: EcsObsSysDeep) -> bool { return s.has_pipe; }
+fn ecs_obs_sys_pipe_run_count(s: EcsObsSysDeep) -> i64 { return s.pipe_run_count; }
+fn ecs_obs_sys_last_pipe_in(s: EcsObsSysDeep) -> i64 { return s.last_pipe_in; }
+fn ecs_obs_sys_initialized(s: EcsObsSysDeep) -> bool { return s.meta.initialized; }
+
+fn ecs_obs_sys_rebuild(
+    meta: EcsObsSysMetaDeep,
+    event_key: i64, out_kind: i32, out_const: i64,
+    run_count: i64, last_payload: i64, last_out: i64,
+    has_pipe: bool, pipe_name_id: i64, pipe_expects_in: bool,
+    pipe_run_count: i64, last_pipe_in: i64
+) -> EcsObsSysDeep {
+    return EcsObsSysDeep {
+        meta: meta, event_key: event_key, out_kind: out_kind, out_const: out_const,
+        run_count: run_count, last_payload: last_payload, last_out: last_out,
+        has_pipe: has_pipe, pipe_name_id: pipe_name_id, pipe_expects_in: pipe_expects_in,
+        pipe_run_count: pipe_run_count, last_pipe_in: last_pipe_in,
+    };
+}
+
+// IntoObserverSystem::into_system
+struct EcsObsSysConvertResult {
+    ok: bool,
+    system: EcsObsSysDeep,
+}
+
+fn ecs_obs_sys_convert_ok(r: EcsObsSysConvertResult) -> bool { return r.ok; }
+fn ecs_obs_sys_convert_system(r: EcsObsSysConvertResult) -> EcsObsSysDeep { return r.system; }
+
+fn ecs_into_obs_sys_into_system(src: EcsIntoObsSysDeep) -> EcsObsSysConvertResult {
+    if ecs_into_obs_sys_is_valid(src) != true {
+        let empty_meta = ecs_obs_sys_meta_new(0);
+        let empty = ecs_obs_sys_rebuild(
+            empty_meta, 0, 0, 0, 0, 0, 0, false, 0, false, 0, 0
+        );
+        return EcsObsSysConvertResult { ok: false, system: empty };
+    };
+    let meta = ecs_obs_sys_meta_with_params(
+        ecs_obs_sys_meta_new(src.name_id),
+        src.extra_params
+    );
+    let sys = ecs_obs_sys_rebuild(
+        meta, src.event_key, src.out_kind, src.out_const,
+        0, 0, 0, false, 0, false, 0, 0
+    );
+    return EcsObsSysConvertResult { ok: true, system: sys };
+}
+
+// initialize (System::initialize stand-in)
+fn ecs_obs_sys_initialize(s: EcsObsSysDeep) -> EcsObsSysDeep {
+    let meta = ecs_obs_sys_meta_rebuild(
+        s.meta.name_id, true, s.meta.is_send, s.meta.deferred_only,
+        s.meta.param_count, s.meta.has_on_input
+    );
+    return ecs_obs_sys_rebuild(
+        meta, s.event_key, s.out_kind, s.out_const,
+        s.run_count, s.last_payload, s.last_out,
+        s.has_pipe, s.pipe_name_id, s.pipe_expects_in, s.pipe_run_count, s.last_pipe_in
+    );
+}
+
+// ObserverSystem marker check: System In = On, Send, static
+fn ecs_obs_sys_is_observer_system(s: EcsObsSysDeep) -> bool {
+    if s.meta.has_on_input != true { return false; };
+    if s.meta.is_send != true { return false; };
+    if s.meta.deferred_only != true { return false; };
+    return true;
+}
+
+// run with On input
+struct EcsObsSysRunResult {
+    system: EcsObsSysDeep,
+    out: i64,
+    ok: bool,
+}
+
+fn ecs_obs_sys_run_system(r: EcsObsSysRunResult) -> EcsObsSysDeep { return r.system; }
+fn ecs_obs_sys_run_out(r: EcsObsSysRunResult) -> i64 { return r.out; }
+fn ecs_obs_sys_run_ok(r: EcsObsSysRunResult) -> bool { return r.ok; }
+
+fn ecs_obs_sys_run(s: EcsObsSysDeep, onv: EcsObsSysOnDeep) -> EcsObsSysRunResult {
+    if s.meta.initialized != true {
+        return EcsObsSysRunResult { system: s, out: 0, ok: false };
+    };
+    // event key interest match (0 = wildcard)
+    if s.event_key != 0 {
+        if s.event_key != onv.event_key {
+            return EcsObsSysRunResult { system: s, out: 0, ok: false };
+        };
+    };
+    let outv: i64 = 0;
+    if s.out_kind == 0 {
+        outv = 0;
+    };
+    if s.out_kind == 1 {
+        outv = s.out_const;
+    };
+    if s.out_kind == 2 {
+        // pipe producer uses payload as intermediate
+        outv = onv.payload;
+    };
+    // if out_const non-zero and out_kind value, prefer const
+    if s.out_kind == 1 {
+        outv = s.out_const;
+    };
+    let pipe_run = s.pipe_run_count;
+    let last_pipe_in = s.last_pipe_in;
+    if s.has_pipe {
+        if s.pipe_expects_in {
+            last_pipe_in = outv;
+        };
+        if s.pipe_expects_in != true {
+            last_pipe_in = 0;
+        };
+        pipe_run = pipe_run + 1;
+    };
+    let s2 = ecs_obs_sys_rebuild(
+        s.meta, s.event_key, s.out_kind, s.out_const,
+        s.run_count + 1, onv.payload, outv,
+        s.has_pipe, s.pipe_name_id, s.pipe_expects_in, pipe_run, last_pipe_in
+    );
+    return EcsObsSysRunResult { system: s2, out: outv, ok: true };
+}
+
+// pipe: a.pipe(b) — Bevy tests cover no-input and In<u32> second stage
+fn ecs_obs_sys_pipe(a: EcsObsSysDeep, pipe_name_id: i64, expects_in: bool) -> EcsObsSysDeep {
+    return ecs_obs_sys_rebuild(
+        a.meta, a.event_key, a.out_kind, a.out_const,
+        a.run_count, a.last_payload, a.last_out,
+        true, pipe_name_id, expects_in, a.pipe_run_count, a.last_pipe_in
+    );
+}
+
+// Convenience: convert + initialize
+fn ecs_into_obs_sys_build(src: EcsIntoObsSysDeep) -> EcsObsSysConvertResult {
+    let cr = ecs_into_obs_sys_into_system(src);
+    if cr.ok != true { return cr; };
+    let s = ecs_obs_sys_initialize(cr.system);
+    return EcsObsSysConvertResult { ok: true, system: s };
+}
+
+// Convenience: build and pipe
+fn ecs_into_obs_sys_build_piped(
+    src: EcsIntoObsSysDeep, pipe_name_id: i64, expects_in: bool
+) -> EcsObsSysConvertResult {
+    let cr = ecs_into_obs_sys_build(src);
+    if cr.ok != true { return cr; };
+    let s = ecs_obs_sys_pipe(cr.system, pipe_name_id, expects_in);
+    return EcsObsSysConvertResult { ok: true, system: s };
+}
+
+// World add_observer stand-in: accepts IntoObserverSystem, stores converted system
+struct EcsObsSysWorldDeep {
+    // up to 4 observers
+    s0: EcsObsSysDeep, used0: bool,
+    s1: EcsObsSysDeep, used1: bool,
+    s2: EcsObsSysDeep, used2: bool,
+    s3: EcsObsSysDeep, used3: bool,
+    count: i32,
+    next_entity: i64,
+}
+
+fn ecs_obs_sys_world_empty_system() -> EcsObsSysDeep {
+    let meta = ecs_obs_sys_meta_new(0);
+    return ecs_obs_sys_rebuild(meta, 0, 0, 0, 0, 0, 0, false, 0, false, 0, 0);
+}
+
+fn ecs_obs_sys_world_new() -> EcsObsSysWorldDeep {
+    let empty = ecs_obs_sys_world_empty_system();
+    return EcsObsSysWorldDeep {
+        s0: empty, used0: false, s1: empty, used1: false,
+        s2: empty, used2: false, s3: empty, used3: false,
+        count: 0, next_entity: 1,
+    };
+}
+
+fn ecs_obs_sys_world_count(w: EcsObsSysWorldDeep) -> i32 { return w.count; }
+
+struct EcsObsSysAddResult {
+    world: EcsObsSysWorldDeep,
+    entity: i64,
+    ok: bool,
+}
+
+fn ecs_obs_sys_add_world(r: EcsObsSysAddResult) -> EcsObsSysWorldDeep { return r.world; }
+fn ecs_obs_sys_add_entity(r: EcsObsSysAddResult) -> i64 { return r.entity; }
+fn ecs_obs_sys_add_ok(r: EcsObsSysAddResult) -> bool { return r.ok; }
+
+fn ecs_obs_sys_world_add_observer(w: EcsObsSysWorldDeep, src: EcsIntoObsSysDeep) -> EcsObsSysAddResult {
+    let cr = ecs_into_obs_sys_build(src);
+    if cr.ok != true {
+        return EcsObsSysAddResult { world: w, entity: 0, ok: false };
+    };
+    let sys = cr.system;
+    let ent = w.next_entity;
+    if w.count == 0 {
+        let w2 = EcsObsSysWorldDeep {
+            s0: sys, used0: true, s1: w.s1, used1: w.used1,
+            s2: w.s2, used2: w.used2, s3: w.s3, used3: w.used3,
+            count: 1, next_entity: ent + 1,
+        };
+        return EcsObsSysAddResult { world: w2, entity: ent, ok: true };
+    };
+    if w.count == 1 {
+        let w2 = EcsObsSysWorldDeep {
+            s0: w.s0, used0: w.used0, s1: sys, used1: true,
+            s2: w.s2, used2: w.used2, s3: w.s3, used3: w.used3,
+            count: 2, next_entity: ent + 1,
+        };
+        return EcsObsSysAddResult { world: w2, entity: ent, ok: true };
+    };
+    if w.count == 2 {
+        let w2 = EcsObsSysWorldDeep {
+            s0: w.s0, used0: w.used0, s1: w.s1, used1: w.used1,
+            s2: sys, used2: true, s3: w.s3, used3: w.used3,
+            count: 3, next_entity: ent + 1,
+        };
+        return EcsObsSysAddResult { world: w2, entity: ent, ok: true };
+    };
+    if w.count == 3 {
+        let w2 = EcsObsSysWorldDeep {
+            s0: w.s0, used0: w.used0, s1: w.s1, used1: w.used1,
+            s2: w.s2, used2: w.used2, s3: sys, used3: true,
+            count: 4, next_entity: ent + 1,
+        };
+        return EcsObsSysAddResult { world: w2, entity: ent, ok: true };
+    };
+    return EcsObsSysAddResult { world: w, entity: 0, ok: false };
+}
+
+// trigger: run all observers interested in event_key
+struct EcsObsSysTriggerResult {
+    world: EcsObsSysWorldDeep,
+    fired: i32,
+}
+
+fn ecs_obs_sys_trigger_world(r: EcsObsSysTriggerResult) -> EcsObsSysWorldDeep { return r.world; }
+fn ecs_obs_sys_trigger_fired(r: EcsObsSysTriggerResult) -> i32 { return r.fired; }
+
+fn ecs_obs_sys_world_trigger(w: EcsObsSysWorldDeep, onv: EcsObsSysOnDeep) -> EcsObsSysTriggerResult {
+    let fired: i32 = 0;
+    let s0 = w.s0; let s1 = w.s1; let s2 = w.s2; let s3 = w.s3;
+    let u0 = w.used0; let u1 = w.used1; let u2 = w.used2; let u3 = w.used3;
+    if u0 {
+        let rr = ecs_obs_sys_run(s0, onv);
+        if rr.ok {
+            s0 = rr.system;
+            fired = fired + 1;
+        };
+    };
+    if u1 {
+        let rr1 = ecs_obs_sys_run(s1, onv);
+        if rr1.ok {
+            s1 = rr1.system;
+            fired = fired + 1;
+        };
+    };
+    if u2 {
+        let rr2 = ecs_obs_sys_run(s2, onv);
+        if rr2.ok {
+            s2 = rr2.system;
+            fired = fired + 1;
+        };
+    };
+    if u3 {
+        let rr3 = ecs_obs_sys_run(s3, onv);
+        if rr3.ok {
+            s3 = rr3.system;
+            fired = fired + 1;
+        };
+    };
+    let w2 = EcsObsSysWorldDeep {
+        s0: s0, used0: u0, s1: s1, used1: u1, s2: s2, used2: u2, s3: s3, used3: u3,
+        count: w.count, next_entity: w.next_entity,
+    };
+    return EcsObsSysTriggerResult { world: w2, fired: fired };
+}
+
+fn ecs_obs_sys_world_system_at(w: EcsObsSysWorldDeep, idx: i32) -> EcsObsSysDeep {
+    if idx == 0 { return w.s0; };
+    if idx == 1 { return w.s1; };
+    if idx == 2 { return w.s2; };
+    if idx == 3 { return w.s3; };
+    return ecs_obs_sys_world_empty_system();
+}

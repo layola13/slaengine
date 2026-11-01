@@ -1,0 +1,174 @@
+// Deferred command queue for TableValueWorld<T, R, M>.
+// Component commands apply through table_value_world_insert/despawn, so queued
+// mutations migrate archetype table rows instead of entity-id side columns.
+@import "world_table_value.sla"
+
+const TABLE_VALUE_COMMAND_INSERT_COMPONENT: i32 = 1;
+const TABLE_VALUE_COMMAND_DESPAWN: i32 = 2;
+const TABLE_VALUE_COMMAND_INSERT_RESOURCE: i32 = 3;
+const TABLE_VALUE_COMMAND_WRITE_MESSAGE: i32 = 4;
+
+struct TableValueCommand {
+    kind: i32,
+    entity: Entity,
+    component_id: i32,
+    value_index: i64,
+}
+
+struct TableValueCommands<T, R, M> {
+    items: Vec<TableValueCommand>,
+    component_values: Vec<T>,
+    resource_values: Vec<R>,
+    message_values: Vec<M>,
+}
+
+fn table_value_commands_new<T, R, M>() -> TableValueCommands<T, R, M> {
+    let items: Vec<TableValueCommand> = Vec::new();
+    let component_values: Vec<T> = Vec::new();
+    let resource_values: Vec<R> = Vec::new();
+    let message_values: Vec<M> = Vec::new();
+    return TableValueCommands<T, R, M> { items: items, component_values: component_values, resource_values: resource_values, message_values: message_values };
+}
+
+fn table_value_command(kind: i32, entity: Entity, component_id: i32, value_index: i64) -> TableValueCommand {
+    return TableValueCommand { kind: kind, entity: entity, component_id: component_id, value_index: value_index };
+}
+
+fn table_value_commands_len<T, R, M>(commands: TableValueCommands<T, R, M>) -> i64 {
+    return len(commands.items) as i64;
+}
+
+fn table_value_commands_reserve_entity<T, R, M>(world: TableValueWorld<T, R, M>, commands: TableValueCommands<T, R, M>) -> (TableValueWorld<T, R, M>, TableValueCommands<T, R, M>, Entity) {
+    let (next_world, entity) = table_value_world_spawn<T, R, M>(world);
+    return (next_world, commands, entity);
+}
+
+fn table_value_commands_insert<T, R, M>(commands: TableValueCommands<T, R, M>, entity: Entity, component_id: i32, value: T) -> TableValueCommands<T, R, M> {
+    commands.component_values.push(value);
+    let idx = (len(commands.component_values) as i64) - 1;
+    commands.items.push(table_value_command(TABLE_VALUE_COMMAND_INSERT_COMPONENT, entity, component_id, idx));
+    return commands;
+}
+
+fn table_value_commands_despawn<T, R, M>(commands: TableValueCommands<T, R, M>, entity: Entity) -> TableValueCommands<T, R, M> {
+    commands.items.push(table_value_command(TABLE_VALUE_COMMAND_DESPAWN, entity, 0, -1));
+    return commands;
+}
+
+fn table_value_commands_insert_resource<T, R, M>(commands: TableValueCommands<T, R, M>, value: R) -> TableValueCommands<T, R, M> {
+    commands.resource_values.push(value);
+    let idx = (len(commands.resource_values) as i64) - 1;
+    commands.items.push(table_value_command(TABLE_VALUE_COMMAND_INSERT_RESOURCE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_value_commands_write_message<T, R, M>(commands: TableValueCommands<T, R, M>, value: M) -> TableValueCommands<T, R, M> {
+    commands.message_values.push(value);
+    let idx = (len(commands.message_values) as i64) - 1;
+    commands.items.push(table_value_command(TABLE_VALUE_COMMAND_WRITE_MESSAGE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_value_commands_apply_insert<T, R, M>(world: TableValueWorld<T, R, M>, commands: TableValueCommands<T, R, M>, command: TableValueCommand) -> TableValueWorld<T, R, M> {
+    if command.kind == TABLE_VALUE_COMMAND_INSERT_COMPONENT {
+        return table_value_world_insert<T, R, M>(world, command.entity, command.component_id, commands.component_values[command.value_index]);
+    };
+    return world;
+}
+
+fn table_value_commands_apply_despawn<T, R, M>(world: TableValueWorld<T, R, M>, command: TableValueCommand) -> TableValueWorld<T, R, M> {
+    if command.kind == TABLE_VALUE_COMMAND_DESPAWN {
+        return table_value_world_despawn<T, R, M>(world, command.entity);
+    };
+    return world;
+}
+
+fn table_value_commands_apply_resource<T, R, M>(world: TableValueWorld<T, R, M>, commands: TableValueCommands<T, R, M>, command: TableValueCommand) -> TableValueWorld<T, R, M> {
+    if command.kind == TABLE_VALUE_COMMAND_INSERT_RESOURCE {
+        return table_value_world_insert_resource<T, R, M>(world, commands.resource_values[command.value_index]);
+    };
+    return world;
+}
+
+fn table_value_commands_apply_message<T, R, M>(world: TableValueWorld<T, R, M>, commands: TableValueCommands<T, R, M>, command: TableValueCommand) -> TableValueWorld<T, R, M> {
+    if command.kind == TABLE_VALUE_COMMAND_WRITE_MESSAGE {
+        return table_value_world_write_message<T, R, M>(world, commands.message_values[command.value_index]);
+    };
+    return world;
+}
+
+fn table_value_commands_apply<T, R, M>(world: TableValueWorld<T, R, M>, commands: TableValueCommands<T, R, M>) -> (TableValueWorld<T, R, M>, TableValueCommands<T, R, M>) {
+    let i: i64 = 0;
+    let cnt = table_value_commands_len<T, R, M>(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = table_value_commands_apply_insert<T, R, M>(world, commands, command);
+        world = table_value_commands_apply_despawn<T, R, M>(world, command);
+        world = table_value_commands_apply_resource<T, R, M>(world, commands, command);
+        world = table_value_commands_apply_message<T, R, M>(world, commands, command);
+        i = i + 1;
+    }
+    let cleared = table_value_commands_new<T, R, M>();
+    return (world, cleared);
+}
+
+struct TableCmdData { amount: i32 }
+struct TableCmdTime { tick: i32 }
+struct TableCmdEvent { amount: i32 }
+
+fn table_cmd_time_default() -> TableCmdTime { return TableCmdTime { tick: 0 }; }
+fn table_cmd_event_default() -> TableCmdEvent { return TableCmdEvent { amount: 0 }; }
+
+fn table_cmd_world_new() -> TableValueWorld<TableCmdData, TableCmdTime, TableCmdEvent> {
+    return table_value_world_new<TableCmdData, TableCmdTime, TableCmdEvent>(table_cmd_time_default(), table_cmd_event_default());
+}
+
+fn table_cmd_commands_new() -> TableValueCommands<TableCmdData, TableCmdTime, TableCmdEvent> {
+    return table_value_commands_new<TableCmdData, TableCmdTime, TableCmdEvent>();
+}
+
+@test "table value commands defer insertions and migrate table rows"() {
+    let w0 = table_cmd_world_new();
+    let (w1, health) = table_value_world_register_table<TableCmdData, TableCmdTime, TableCmdEvent>(w0);
+    let (w2, mana) = table_value_world_register_table<TableCmdData, TableCmdTime, TableCmdEvent>(w1);
+    let c0 = table_cmd_commands_new();
+    let (w3, c1, entity) = table_value_commands_reserve_entity<TableCmdData, TableCmdTime, TableCmdEvent>(w2, c0);
+    let empty_group = table_value_world_entity_archetype_id<TableCmdData, TableCmdTime, TableCmdEvent>(w3, entity);
+    let c2 = table_value_commands_insert<TableCmdData, TableCmdTime, TableCmdEvent>(c1, entity, health.id, TableCmdData { amount: 10 });
+    let c3 = table_value_commands_insert<TableCmdData, TableCmdTime, TableCmdEvent>(c2, entity, mana.id, TableCmdData { amount: 4 });
+    if table_value_world_has<TableCmdData, TableCmdTime, TableCmdEvent>(w3, entity, health.id) != false { panic(11200); };
+    let (w4, c4) = table_value_commands_apply<TableCmdData, TableCmdTime, TableCmdEvent>(w3, c3);
+    if table_value_world_has<TableCmdData, TableCmdTime, TableCmdEvent>(w4, entity, health.id) != true { panic(11201); };
+    if table_value_world_entity_archetype_id<TableCmdData, TableCmdTime, TableCmdEvent>(w4, entity) == empty_group { panic(11202); };
+    if table_value_commands_len<TableCmdData, TableCmdTime, TableCmdEvent>(c4) != 0 { panic(11203); };
+    let pairs = table_value_world_query_pair<TableCmdData, TableCmdTime, TableCmdEvent>(w4, health.id, mana.id);
+    if len(pairs.items) != 1 { panic(11204); };
+    if pairs.items[0].first.amount + pairs.items[0].second.amount != 14 { panic(11205); };
+}
+
+@test "table value commands replace resource message and despawn"() {
+    let w0 = table_cmd_world_new();
+    let (w1, health) = table_value_world_register_table<TableCmdData, TableCmdTime, TableCmdEvent>(w0);
+    let c0 = table_cmd_commands_new();
+    let (w2, c1, entity) = table_value_commands_reserve_entity<TableCmdData, TableCmdTime, TableCmdEvent>(w1, c0);
+    let c2 = table_value_commands_insert<TableCmdData, TableCmdTime, TableCmdEvent>(c1, entity, health.id, TableCmdData { amount: 5 });
+    let (w3, c3) = table_value_commands_apply<TableCmdData, TableCmdTime, TableCmdEvent>(w2, c2);
+    let group_before = table_value_world_entity_archetype_id<TableCmdData, TableCmdTime, TableCmdEvent>(w3, entity);
+    let row_before = table_value_world_entity_row<TableCmdData, TableCmdTime, TableCmdEvent>(w3, entity);
+    let c4 = table_value_commands_insert<TableCmdData, TableCmdTime, TableCmdEvent>(c3, entity, health.id, TableCmdData { amount: 9 });
+    let c5 = table_value_commands_insert_resource<TableCmdData, TableCmdTime, TableCmdEvent>(c4, TableCmdTime { tick: 8 });
+    let c6 = table_value_commands_write_message<TableCmdData, TableCmdTime, TableCmdEvent>(c5, TableCmdEvent { amount: 6 });
+    let (w4, c7) = table_value_commands_apply<TableCmdData, TableCmdTime, TableCmdEvent>(w3, c6);
+    if table_value_world_entity_archetype_id<TableCmdData, TableCmdTime, TableCmdEvent>(w4, entity) != group_before { panic(11210); };
+    if table_value_world_entity_row<TableCmdData, TableCmdTime, TableCmdEvent>(w4, entity) != row_before { panic(11211); };
+    if table_value_world_get<TableCmdData, TableCmdTime, TableCmdEvent>(w4, entity, health.id).amount != 9 { panic(11212); };
+    let c8 = table_value_commands_despawn<TableCmdData, TableCmdTime, TableCmdEvent>(c7, entity);
+    let (w5, c9) = table_value_commands_apply<TableCmdData, TableCmdTime, TableCmdEvent>(w4, c8);
+    if table_value_world_is_alive<TableCmdData, TableCmdTime, TableCmdEvent>(w5, entity) != false { panic(11213); };
+    if table_value_world_entity_archetype_id<TableCmdData, TableCmdTime, TableCmdEvent>(w5, entity) != -1 { panic(11214); };
+    let time = table_value_world_get_resource<TableCmdData, TableCmdTime, TableCmdEvent>(w5);
+    let event = table_value_world_read_message<TableCmdData, TableCmdTime, TableCmdEvent>(w5, message_reader_new(), table_cmd_event_default());
+    if time.tick != 8 { panic(11215); };
+    if event.value.amount != 6 { panic(11216); };
+    if table_value_commands_len<TableCmdData, TableCmdTime, TableCmdEvent>(c9) != 0 { panic(11217); };
+}

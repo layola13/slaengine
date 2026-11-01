@@ -1,0 +1,369 @@
+// Deepened Bevy ECS change_detection composite facade.
+// Mirrors src/change_detection/ (tick + traits + maybe_location):
+//   Tick wrap / is_newer_than / relative_to / check_tick
+//   ComponentTicks is_added/is_changed/set_*
+//   DetectChangesMut set_changed/set_if_neq/bypass
+//   MaybeLocation some/none/map/zip/into_option/unwrap_or_default
+// Fixed simple scalar models. Piece deep modules remain.
+// Shallow lib/change_detection.sla retained.
+
+const ECS_CD_U32_MOD: i64 = 4294967296;
+const ECS_CD_CHECK_TICK_THRESHOLD: i64 = 518400000;
+const ECS_CD_MAX_CHANGE_AGE: i64 = 3258167296;
+
+fn ecs_cd_check_tick_threshold() -> i64 { return ECS_CD_CHECK_TICK_THRESHOLD; }
+fn ecs_cd_max_change_age() -> i64 { return ECS_CD_MAX_CHANGE_AGE; }
+
+fn ecs_cd_wrap(x: i64) -> i64 {
+    let m = ECS_CD_U32_MOD;
+    let r = x % m;
+    if r < 0 { return r + m; };
+    return r;
+}
+
+fn ecs_cd_rel(a: i64, b: i64) -> i64 {
+    return ecs_cd_wrap(a - b);
+}
+
+fn ecs_cd_min(a: i64, b: i64) -> i64 {
+    if a < b { return a; };
+    return b;
+}
+
+fn ecs_cd_is_newer_than(tick: i64, last_run: i64, this_run: i64) -> bool {
+    let since_insert = ecs_cd_rel(this_run, tick);
+    let since_system = ecs_cd_rel(this_run, last_run);
+    let a = ecs_cd_min(since_insert, ECS_CD_MAX_CHANGE_AGE);
+    let b = ecs_cd_min(since_system, ECS_CD_MAX_CHANGE_AGE);
+    return b > a;
+}
+
+// === Tick ===
+struct EcsCdTickDeep {
+    tick: i64,
+}
+
+fn ecs_cd_tick_new(tick: i64) -> EcsCdTickDeep {
+    return EcsCdTickDeep { tick: ecs_cd_wrap(tick) };
+}
+
+fn ecs_cd_tick_get(t: EcsCdTickDeep) -> i64 { return t.tick; }
+
+fn ecs_cd_tick_set(t: EcsCdTickDeep, tick: i64) -> EcsCdTickDeep {
+    return EcsCdTickDeep { tick: ecs_cd_wrap(tick) };
+}
+
+fn ecs_cd_tick_eq(a: EcsCdTickDeep, b: EcsCdTickDeep) -> bool {
+    return a.tick == b.tick;
+}
+
+fn ecs_cd_tick_relative_to(self_tick: EcsCdTickDeep, other: EcsCdTickDeep) -> EcsCdTickDeep {
+    return EcsCdTickDeep { tick: ecs_cd_rel(self_tick.tick, other.tick) };
+}
+
+fn ecs_cd_tick_is_newer_than(self_tick: EcsCdTickDeep, last_run: EcsCdTickDeep, this_run: EcsCdTickDeep) -> bool {
+    return ecs_cd_is_newer_than(self_tick.tick, last_run.tick, this_run.tick);
+}
+
+// check_tick: if too old relative to present, clamp forward
+fn ecs_cd_tick_check(t: EcsCdTickDeep, present: EcsCdTickDeep) -> EcsCdTickDeep {
+    let age = ecs_cd_rel(present.tick, t.tick);
+    if age > ECS_CD_MAX_CHANGE_AGE {
+        // clamp to present - MAX_CHANGE_AGE
+        let clamped = ecs_cd_wrap(present.tick - ECS_CD_MAX_CHANGE_AGE);
+        return EcsCdTickDeep { tick: clamped };
+    };
+    return t;
+}
+
+// === CheckChangeTicks ===
+struct EcsCdCheckDeep {
+    present_tick: i64,
+}
+
+fn ecs_cd_check_new(present: i64) -> EcsCdCheckDeep {
+    return EcsCdCheckDeep { present_tick: ecs_cd_wrap(present) };
+}
+
+fn ecs_cd_check_present(c: EcsCdCheckDeep) -> i64 { return c.present_tick; }
+
+// === ComponentTicks ===
+struct EcsCdCtDeep {
+    added: i64,
+    changed: i64,
+}
+
+fn ecs_cd_ct_new(change_tick: i64) -> EcsCdCtDeep {
+    let t = ecs_cd_wrap(change_tick);
+    return EcsCdCtDeep { added: t, changed: t };
+}
+
+fn ecs_cd_ct_from_parts(added: i64, changed: i64) -> EcsCdCtDeep {
+    return EcsCdCtDeep { added: ecs_cd_wrap(added), changed: ecs_cd_wrap(changed) };
+}
+
+fn ecs_cd_ct_added(ct: EcsCdCtDeep) -> i64 { return ct.added; }
+fn ecs_cd_ct_changed(ct: EcsCdCtDeep) -> i64 { return ct.changed; }
+
+fn ecs_cd_ct_is_added(ct: EcsCdCtDeep, last_run: i64, this_run: i64) -> bool {
+    return ecs_cd_is_newer_than(ct.added, last_run, this_run);
+}
+
+fn ecs_cd_ct_is_changed(ct: EcsCdCtDeep, last_run: i64, this_run: i64) -> bool {
+    return ecs_cd_is_newer_than(ct.changed, last_run, this_run);
+}
+
+fn ecs_cd_ct_set_changed(ct: EcsCdCtDeep, tick: i64) -> EcsCdCtDeep {
+    return EcsCdCtDeep { added: ct.added, changed: ecs_cd_wrap(tick) };
+}
+
+fn ecs_cd_ct_set_added(ct: EcsCdCtDeep, tick: i64) -> EcsCdCtDeep {
+    return EcsCdCtDeep { added: ecs_cd_wrap(tick), changed: ct.changed };
+}
+
+fn ecs_cd_ct_set_both(ct: EcsCdCtDeep, tick: i64) -> EcsCdCtDeep {
+    let t = ecs_cd_wrap(tick);
+    return EcsCdCtDeep { added: t, changed: t };
+}
+
+// === DetectChangesMut smart pointer model ===
+struct EcsCdMutDeep {
+    value: i64,
+    added: i64,
+    changed: i64,
+    last_run: i64,
+    this_run: i64,
+    changed_by: i64,
+    has_changed_by: bool,
+    set_changed_count: i64,
+    bypass_count: i64,
+}
+
+fn ecs_cd_mut_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdMutDeep {
+    return EcsCdMutDeep {
+        value: value,
+        added: ecs_cd_wrap(added),
+        changed: ecs_cd_wrap(changed),
+        last_run: ecs_cd_wrap(last_run),
+        this_run: ecs_cd_wrap(this_run),
+        changed_by: 0,
+        has_changed_by: false,
+        set_changed_count: 0,
+        bypass_count: 0,
+    };
+}
+
+fn ecs_cd_mut_value(m: EcsCdMutDeep) -> i64 { return m.value; }
+fn ecs_cd_mut_added(m: EcsCdMutDeep) -> i64 { return m.added; }
+fn ecs_cd_mut_changed(m: EcsCdMutDeep) -> i64 { return m.changed; }
+fn ecs_cd_mut_last_run(m: EcsCdMutDeep) -> i64 { return m.last_run; }
+fn ecs_cd_mut_this_run(m: EcsCdMutDeep) -> i64 { return m.this_run; }
+fn ecs_cd_mut_changed_by(m: EcsCdMutDeep) -> i64 { return m.changed_by; }
+fn ecs_cd_mut_has_changed_by(m: EcsCdMutDeep) -> bool { return m.has_changed_by; }
+fn ecs_cd_mut_set_changed_count(m: EcsCdMutDeep) -> i64 { return m.set_changed_count; }
+fn ecs_cd_mut_bypass_count(m: EcsCdMutDeep) -> i64 { return m.bypass_count; }
+
+fn ecs_cd_mut_rebuild(
+    value: i64, added: i64, changed: i64, last_run: i64, this_run: i64,
+    changed_by: i64, has_changed_by: bool, set_changed_count: i64, bypass_count: i64
+) -> EcsCdMutDeep {
+    return EcsCdMutDeep {
+        value: value, added: added, changed: changed, last_run: last_run, this_run: this_run,
+        changed_by: changed_by, has_changed_by: has_changed_by,
+        set_changed_count: set_changed_count, bypass_count: bypass_count,
+    };
+}
+
+fn ecs_cd_mut_is_added(m: EcsCdMutDeep) -> bool {
+    return ecs_cd_is_newer_than(m.added, m.last_run, m.this_run);
+}
+
+fn ecs_cd_mut_is_changed(m: EcsCdMutDeep) -> bool {
+    return ecs_cd_is_newer_than(m.changed, m.last_run, m.this_run);
+}
+
+fn ecs_cd_mut_set_changed(m: EcsCdMutDeep) -> EcsCdMutDeep {
+    return ecs_cd_mut_rebuild(
+        m.value, m.added, m.this_run, m.last_run, m.this_run,
+        m.changed_by, m.has_changed_by, m.set_changed_count + 1, m.bypass_count
+    );
+}
+
+fn ecs_cd_mut_set_changed_by(m: EcsCdMutDeep, caller: i64) -> EcsCdMutDeep {
+    return ecs_cd_mut_rebuild(
+        m.value, m.added, m.this_run, m.last_run, m.this_run,
+        caller, true, m.set_changed_count + 1, m.bypass_count
+    );
+}
+
+fn ecs_cd_mut_set_added(m: EcsCdMutDeep) -> EcsCdMutDeep {
+    return ecs_cd_mut_rebuild(
+        m.value, m.this_run, m.this_run, m.last_run, m.this_run,
+        m.changed_by, m.has_changed_by, m.set_changed_count + 1, m.bypass_count
+    );
+}
+
+fn ecs_cd_mut_bypass(m: EcsCdMutDeep, value: i64) -> EcsCdMutDeep {
+    return ecs_cd_mut_rebuild(
+        value, m.added, m.changed, m.last_run, m.this_run,
+        m.changed_by, m.has_changed_by, m.set_changed_count, m.bypass_count + 1
+    );
+}
+
+fn ecs_cd_mut_set_if_neq(m: EcsCdMutDeep, value: i64) -> EcsCdMutDeep {
+    if m.value == value { return m; };
+    return ecs_cd_mut_rebuild(
+        value, m.added, m.this_run, m.last_run, m.this_run,
+        m.changed_by, m.has_changed_by, m.set_changed_count + 1, m.bypass_count
+    );
+}
+
+fn ecs_cd_mut_replace_if_neq(m: EcsCdMutDeep, value: i64) -> EcsCdMutDeep {
+    // same as set_if_neq for scalar model (returns new state; old value via prior get)
+    return ecs_cd_mut_set_if_neq(m, value);
+}
+
+// === MaybeLocation ===
+struct EcsCdLocDeep {
+    has: bool,
+    value: i64,
+}
+
+fn ecs_cd_loc_none() -> EcsCdLocDeep {
+    return EcsCdLocDeep { has: false, value: 0 };
+}
+
+fn ecs_cd_loc_some(value: i64) -> EcsCdLocDeep {
+    return EcsCdLocDeep { has: true, value: value };
+}
+
+fn ecs_cd_loc_has(l: EcsCdLocDeep) -> bool { return l.has; }
+fn ecs_cd_loc_value(l: EcsCdLocDeep) -> i64 { return l.value; }
+
+fn ecs_cd_loc_map_add(l: EcsCdLocDeep, delta: i64) -> EcsCdLocDeep {
+    if l.has != true { return ecs_cd_loc_none(); };
+    return ecs_cd_loc_some(l.value + delta);
+}
+
+fn ecs_cd_loc_zip_add(a: EcsCdLocDeep, b: EcsCdLocDeep) -> EcsCdLocDeep {
+    if a.has != true { return ecs_cd_loc_none(); };
+    if b.has != true { return ecs_cd_loc_none(); };
+    return ecs_cd_loc_some(a.value + b.value);
+}
+
+fn ecs_cd_loc_into_option_has(l: EcsCdLocDeep) -> bool { return l.has; }
+
+fn ecs_cd_loc_unwrap_or_default(l: EcsCdLocDeep) -> i64 {
+    if l.has { return l.value; };
+    return 0;
+}
+
+fn ecs_cd_loc_assign(target: EcsCdLocDeep, source: EcsCdLocDeep) -> EcsCdLocDeep {
+    if source.has != true { return target; };
+    return ecs_cd_loc_some(source.value);
+}
+
+// Contiguous tick cells (params lite)
+struct EcsCdCellsDeep {
+    a0: i64, c0: i64,
+    a1: i64, c1: i64,
+    a2: i64, c2: i64,
+    a3: i64, c3: i64,
+    len: i32,
+    last_run: i64,
+    this_run: i64,
+}
+
+fn ecs_cd_cells_new(last_run: i64, this_run: i64) -> EcsCdCellsDeep {
+    return EcsCdCellsDeep {
+        a0: 0, c0: 0, a1: 0, c1: 0, a2: 0, c2: 0, a3: 0, c3: 0,
+        len: 0, last_run: ecs_cd_wrap(last_run), this_run: ecs_cd_wrap(this_run),
+    };
+}
+
+fn ecs_cd_cells_len(c: EcsCdCellsDeep) -> i32 { return c.len; }
+
+fn ecs_cd_cells_rebuild(
+    a0: i64, c0: i64, a1: i64, c1: i64, a2: i64, c2: i64, a3: i64, c3: i64,
+    len: i32, last_run: i64, this_run: i64
+) -> EcsCdCellsDeep {
+    return EcsCdCellsDeep {
+        a0: a0, c0: c0, a1: a1, c1: c1, a2: a2, c2: c2, a3: a3, c3: c3,
+        len: len, last_run: last_run, this_run: this_run,
+    };
+}
+
+fn ecs_cd_cells_push(c: EcsCdCellsDeep, added: i64, changed: i64) -> EcsCdCellsDeep {
+    let a = ecs_cd_wrap(added);
+    let ch = ecs_cd_wrap(changed);
+    if c.len == 0 {
+        return ecs_cd_cells_rebuild(a, ch, c.a1, c.c1, c.a2, c.c2, c.a3, c.c3, 1, c.last_run, c.this_run);
+    };
+    if c.len == 1 {
+        return ecs_cd_cells_rebuild(c.a0, c.c0, a, ch, c.a2, c.c2, c.a3, c.c3, 2, c.last_run, c.this_run);
+    };
+    if c.len == 2 {
+        return ecs_cd_cells_rebuild(c.a0, c.c0, c.a1, c.c1, a, ch, c.a3, c.c3, 3, c.last_run, c.this_run);
+    };
+    if c.len == 3 {
+        return ecs_cd_cells_rebuild(c.a0, c.c0, c.a1, c.c1, c.a2, c.c2, a, ch, 4, c.last_run, c.this_run);
+    };
+    return c;
+}
+
+fn ecs_cd_cells_mark_changed(c: EcsCdCellsDeep, idx: i32) -> EcsCdCellsDeep {
+    let t = c.this_run;
+    if idx == 0 {
+        if c.len >= 1 {
+            return ecs_cd_cells_rebuild(c.a0, t, c.a1, c.c1, c.a2, c.c2, c.a3, c.c3, c.len, c.last_run, c.this_run);
+        };
+    };
+    if idx == 1 {
+        if c.len >= 2 {
+            return ecs_cd_cells_rebuild(c.a0, c.c0, c.a1, t, c.a2, c.c2, c.a3, c.c3, c.len, c.last_run, c.this_run);
+        };
+    };
+    if idx == 2 {
+        if c.len >= 3 {
+            return ecs_cd_cells_rebuild(c.a0, c.c0, c.a1, c.c1, c.a2, t, c.a3, c.c3, c.len, c.last_run, c.this_run);
+        };
+    };
+    if idx == 3 {
+        if c.len >= 4 {
+            return ecs_cd_cells_rebuild(c.a0, c.c0, c.a1, c.c1, c.a2, c.c2, c.a3, t, c.len, c.last_run, c.this_run);
+        };
+    };
+    return c;
+}
+
+fn ecs_cd_cells_is_changed_at(c: EcsCdCellsDeep, idx: i32) -> bool {
+    if idx == 0 {
+        if c.len >= 1 { return ecs_cd_is_newer_than(c.c0, c.last_run, c.this_run); };
+    };
+    if idx == 1 {
+        if c.len >= 2 { return ecs_cd_is_newer_than(c.c1, c.last_run, c.this_run); };
+    };
+    if idx == 2 {
+        if c.len >= 3 { return ecs_cd_is_newer_than(c.c2, c.last_run, c.this_run); };
+    };
+    if idx == 3 {
+        if c.len >= 4 { return ecs_cd_is_newer_than(c.c3, c.last_run, c.this_run); };
+    };
+    return false;
+}
+
+fn ecs_cd_cells_changed_at(c: EcsCdCellsDeep, idx: i32) -> i64 {
+    if idx == 0 {
+        if c.len >= 1 { return c.c0; };
+    };
+    if idx == 1 {
+        if c.len >= 2 { return c.c1; };
+    };
+    if idx == 2 {
+        if c.len >= 3 { return c.c2; };
+    };
+    if idx == 3 {
+        if c.len >= 4 { return c.c3; };
+    };
+    return 0;
+}

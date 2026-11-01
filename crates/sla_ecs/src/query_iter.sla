@@ -1,0 +1,184 @@
+// Bevy ECS query iterators: QueryIter, QueryParIter, QueryManyIter, QueryContiguousIter.
+// Mirrors src/query/iter.rs + par_iter.rs + access_iter.rs.
+
+// === QueryIter: sequential iteration over query results ===
+struct EcsQueryIter {
+    entities: Vec<i64>,
+    values: Vec<i32>,
+    cursor: i64,
+    total: i64,
+}
+
+fn ecs_query_iter_new(entities: Vec<i64>, values: Vec<i32>) -> EcsQueryIter {
+    return EcsQueryIter { entities: entities, values: values, cursor: 0, total: len(values) as i64 };
+}
+
+fn ecs_query_iter_next(it: EcsQueryIter) -> (bool, i64, i32, EcsQueryIter) {
+    if it.cursor >= it.total { return (false, 0, 0, it); };
+    let entity = it.entities[it.cursor];
+    let value = it.values[it.cursor];
+    it.cursor = it.cursor + 1;
+    return (true, entity, value, it);
+}
+
+fn ecs_query_iter_remaining(it: EcsQueryIter) -> i64 {
+    return it.total - it.cursor;
+}
+
+fn ecs_query_iter_len(it: EcsQueryIter) -> i64 { return it.total; }
+
+fn ecs_query_iter_is_empty(it: EcsQueryIter) -> bool { return it.total == 0; }
+
+fn ecs_query_iter_count(it: EcsQueryIter) -> i64 {
+    return it.total;
+}
+
+fn ecs_query_iter_last(it: EcsQueryIter) -> (bool, i64, i32) {
+    if it.total == 0 { return (false, 0, 0); };
+    return (true, it.entities[it.total - 1], it.values[it.total - 1]);
+}
+
+fn ecs_query_iter_nth(it: EcsQueryIter, n: i64) -> (bool, i64, i32, EcsQueryIter) {
+    let target = it.cursor + n;
+    if target >= it.total { return (false, 0, 0, it); };
+    let entity = it.entities[target];
+    let value = it.values[target];
+    it.cursor = target + 1;
+    return (true, entity, value, it);
+}
+
+// === QueryParIter: parallel iteration (simulated for_each) ===
+struct EcsQueryParIter {
+    entities: Vec<i64>,
+    values: Vec<i32>,
+    batch_size: i64,
+    batches_per_thread: i64,
+}
+
+fn ecs_query_par_iter_new(entities: Vec<i64>, values: Vec<i32>) -> EcsQueryParIter {
+    return EcsQueryParIter { entities: entities, values: values, batch_size: 1, batches_per_thread: 1 };
+}
+
+fn ecs_query_par_iter_batching_strategy(pi: EcsQueryParIter, min_batch: i64, max_batch: i64, bpt: i64) -> EcsQueryParIter {
+    pi.batch_size = min_batch;
+    pi.batches_per_thread = bpt;
+    return pi;
+}
+
+fn ecs_query_par_iter_for_each(pi: EcsQueryParIter, collected: Vec<i64>) -> (Vec<i64>, Vec<i32>) {
+    let entities: Vec<i64> = Vec::new();
+    let values: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(pi.values) as i64;
+    while i < cnt {
+        collected.push(pi.entities[i]);
+        entities.push(pi.entities[i]);
+        values.push(pi.values[i]);
+        i = i + 1;
+    }
+    return (collected, values);
+}
+
+fn ecs_query_par_iter_len(pi: EcsQueryParIter) -> i64 { return len(pi.values) as i64; }
+
+// === QueryManyIter: iterate over specific entities ===
+struct EcsQueryManyIter {
+    target_entities: Vec<i64>,
+    found_values: Vec<i32>,
+    found_mask: Vec<bool>,
+    cursor: i64,
+    total: i64,
+}
+
+fn ecs_query_many_iter_new(targets: Vec<i64>) -> EcsQueryManyIter {
+    let total = len(targets) as i64;
+    let found_values: Vec<i32> = Vec::new();
+    let found_mask: Vec<bool> = Vec::new();
+    let i: i64 = 0;
+    while i < total { found_values.push(0); found_mask.push(false); i = i + 1; }
+    return EcsQueryManyIter { target_entities: targets, found_values: found_values, found_mask: found_mask, cursor: 0, total: total };
+}
+
+fn ecs_query_many_iter_set_found(it: EcsQueryManyIter, idx: i64, value: i32) -> EcsQueryManyIter {
+    it.found_values[idx] = value;
+    it.found_mask[idx] = true;
+    return it;
+}
+
+fn ecs_query_many_iter_next(it: EcsQueryManyIter) -> (bool, i64, i32, bool, EcsQueryManyIter) {
+    if it.cursor >= it.total { return (false, 0, 0, false, it); };
+    let entity = it.target_entities[it.cursor];
+    let value = it.found_values[it.cursor];
+    let found = it.found_mask[it.cursor];
+    it.cursor = it.cursor + 1;
+    return (true, entity, value, found, it);
+}
+
+fn ecs_query_many_iter_len(it: EcsQueryManyIter) -> i64 { return it.total; }
+
+// === QueryContiguousIter: iteration over contiguous storage (table) ===
+struct EcsQueryContiguousIter {
+    values: Vec<i32>,
+    cursor: i64,
+    total: i64,
+}
+
+fn ecs_query_contiguous_iter_new(values: Vec<i32>) -> EcsQueryContiguousIter {
+    return EcsQueryContiguousIter { values: values, cursor: 0, total: len(values) as i64 };
+}
+
+fn ecs_query_contiguous_iter_next(it: EcsQueryContiguousIter) -> (bool, i32, EcsQueryContiguousIter) {
+    if it.cursor >= it.total { return (false, 0, it); };
+    let value = it.values[it.cursor];
+    it.cursor = it.cursor + 1;
+    return (true, value, it);
+}
+
+fn ecs_query_contiguous_iter_remaining(it: EcsQueryContiguousIter) -> i64 {
+    return it.total - it.cursor;
+}
+
+// === QuerySortedIter: iteration over sorted results (supports fetch_next_back) ===
+struct EcsQuerySortedIter {
+    values: Vec<i32>,
+    front_cursor: i64,
+    back_cursor: i64,
+    total: i64,
+}
+
+fn ecs_query_sorted_iter_new(values: Vec<i32>) -> EcsQuerySortedIter {
+    let total = len(values) as i64;
+    return EcsQuerySortedIter { values: values, front_cursor: 0, back_cursor: total - 1, total: total };
+}
+
+fn ecs_query_sorted_iter_fetch_next(it: EcsQuerySortedIter) -> (bool, i32, EcsQuerySortedIter) {
+    if it.front_cursor > it.back_cursor { return (false, 0, it); };
+    let value = it.values[it.front_cursor];
+    it.front_cursor = it.front_cursor + 1;
+    return (true, value, it);
+}
+
+fn ecs_query_sorted_iter_fetch_next_back(it: EcsQuerySortedIter) -> (bool, i32, EcsQuerySortedIter) {
+    if it.front_cursor > it.back_cursor { return (false, 0, it); };
+    let value = it.values[it.back_cursor];
+    it.back_cursor = it.back_cursor - 1;
+    return (true, value, it);
+}
+
+// === AccessConflictError ===
+struct EcsAccessConflictError {
+    a: i32,
+    b: i32,
+}
+
+fn ecs_access_conflict_error_new(a: i32, b: i32) -> EcsAccessConflictError {
+    return EcsAccessConflictError { a: a, b: b };
+}
+
+fn ecs_access_conflict_error_a(e: EcsAccessConflictError) -> i32 { return e.a; }
+fn ecs_access_conflict_error_b(e: EcsAccessConflictError) -> i32 { return e.b; }
+
+// has_conflicts: check if query data has internal access conflicts
+fn ecs_query_has_conflicts(access_a: i32, access_b: i32) -> bool {
+    return access_a == access_b;
+}

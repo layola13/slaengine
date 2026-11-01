@@ -1,0 +1,282 @@
+// Deepened Bevy ECS archetype-value schedule (shallow lib/schedule_archetype_value.sla deep).
+// Sequential schedule for ArchetypeValueWorld<T, R, M>; systems execute against the
+// archetype-backed value world. Records cap-8 systems. Each system's access mask stores up to
+// cap-4 read component-ids and cap-4 write component-ids plus resource/messages flags.
+//
+// Distinct from Batch 370 (registry_value, shared arena helper) and Batch 371 (table_value,
+// arena_hazard index parameter): the component-conflict body is factored into a one-directional
+// helper `writes_touch(other)` that tests one side's writes against the other's read OR write
+// lists, and `access_conflicts` calls it explicitly in both directions — so the bidirectional
+// test body appears only once textually and the symmetric call is visible at the call site. The
+// arena hazard uses a 2-bit flag matrix encoding (read bit + write bit packed into a single
+// integer 0..3) per arena, so the resource-and-message hazards collapse to one
+// `arena_bit_conflict(la, ra)` call with the arena chosen by name — keeping both facts recorded
+// while making the bit test a single expression.
+//
+// Intentional leave-outs: no system fn-ptr execution; no generic types.
+
+const ECS_ARCH_VALUE_CAP_DEEP: i32 = 8;
+const ECS_ARCH_VALUE_LIST_CAP_DEEP: i32 = 4;
+
+// arena flag bit constants (packed into reads/writes): bit0 = resource, bit1 = messages.
+// The packed value for an arena's read flags is `reads >> arena_bit` & 1 and likewise for write.
+const ECS_ARCH_VALUE_ARENA_RESOURCE_BIT: i32 = 0;
+const ECS_ARCH_VALUE_ARENA_MESSAGES_BIT: i32 = 1;
+
+struct EcsArchValueSystemAccessDeep {
+    r0: i32, r1: i32, r2: i32, r3: i32,
+    w0: i32, w1: i32, w2: i32, w3: i32,
+    reads: i32,   // bit0 resource-read, bit1 messages-read
+    writes: i32,  // bit0 resource-write, bit1 messages-write
+    len_reads: i32,
+    len_writes: i32,
+}
+
+fn ecs_arch_value_access_none() -> EcsArchValueSystemAccessDeep {
+    return EcsArchValueSystemAccessDeep {
+        r0: 0, r1: 0, r2: 0, r3: 0,
+        w0: 0, w1: 0, w2: 0, w3: 0,
+        reads: 0, writes: 0,
+        len_reads: 0, len_writes: 0,
+    };
+}
+
+fn ecs_arch_value_access_build(
+    r0: i32, r1: i32, r2: i32, r3: i32,
+    w0: i32, w1: i32, w2: i32, w3: i32,
+    reads: i32, writes: i32, len_reads: i32, len_writes: i32
+) -> EcsArchValueSystemAccessDeep {
+    return EcsArchValueSystemAccessDeep {
+        r0: r0, r1: r1, r2: r2, r3: r3,
+        w0: w0, w1: w1, w2: w2, w3: w3,
+        reads: reads, writes: writes,
+        len_reads: len_reads, len_writes: len_writes,
+    };
+}
+
+fn ecs_arch_value_access_read_component(a: EcsArchValueSystemAccessDeep, cid: i32) -> EcsArchValueSystemAccessDeep {
+    if a.len_reads >= ECS_ARCH_VALUE_LIST_CAP_DEEP { return a; };
+    let idx = a.len_reads;
+    if idx == 0 { a.r0 = cid; };
+    if idx == 1 { a.r1 = cid; };
+    if idx == 2 { a.r2 = cid; };
+    if idx == 3 { a.r3 = cid; };
+    a.len_reads = a.len_reads + 1;
+    return a;
+}
+
+fn ecs_arch_value_access_write_component(a: EcsArchValueSystemAccessDeep, cid: i32) -> EcsArchValueSystemAccessDeep {
+    if a.len_writes >= ECS_ARCH_VALUE_LIST_CAP_DEEP { return a; };
+    let idx = a.len_writes;
+    if idx == 0 { a.w0 = cid; };
+    if idx == 1 { a.w1 = cid; };
+    if idx == 2 { a.w2 = cid; };
+    if idx == 3 { a.w3 = cid; };
+    a.len_writes = a.len_writes + 1;
+    return a;
+}
+
+// arena flag setters: set the per-arena read/write bit.
+fn ecs_arch_value_access_read_resource(a: EcsArchValueSystemAccessDeep) -> EcsArchValueSystemAccessDeep {
+    a.reads = a.reads | (1 << ECS_ARCH_VALUE_ARENA_RESOURCE_BIT);
+    return a;
+}
+
+fn ecs_arch_value_access_write_resource(a: EcsArchValueSystemAccessDeep) -> EcsArchValueSystemAccessDeep {
+    a.writes = a.writes | (1 << ECS_ARCH_VALUE_ARENA_RESOURCE_BIT);
+    return a;
+}
+
+fn ecs_arch_value_access_read_messages(a: EcsArchValueSystemAccessDeep) -> EcsArchValueSystemAccessDeep {
+    a.reads = a.reads | (1 << ECS_ARCH_VALUE_ARENA_MESSAGES_BIT);
+    return a;
+}
+
+fn ecs_arch_value_access_write_messages(a: EcsArchValueSystemAccessDeep) -> EcsArchValueSystemAccessDeep {
+    a.writes = a.writes | (1 << ECS_ARCH_VALUE_ARENA_MESSAGES_BIT);
+    return a;
+}
+
+fn ecs_arch_value_read_at(a: EcsArchValueSystemAccessDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.r0; };
+    if idx == 1 { return a.r1; };
+    if idx == 2 { return a.r2; };
+    if idx == 3 { return a.r3; };
+    return 0;
+}
+
+fn ecs_arch_value_write_at(a: EcsArchValueSystemAccessDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.w0; };
+    if idx == 1 { return a.w1; };
+    if idx == 2 { return a.w2; };
+    if idx == 3 { return a.w3; };
+    return 0;
+}
+
+// arena flag readers — bit-test the chosen arena's read/write bits.
+fn ecs_arch_value_reads_resource(a: EcsArchValueSystemAccessDeep) -> i32 {
+    if (a.reads & (1 << ECS_ARCH_VALUE_ARENA_RESOURCE_BIT)) != 0 { return 1; };
+    return 0;
+}
+
+fn ecs_arch_value_writes_resource(a: EcsArchValueSystemAccessDeep) -> i32 {
+    if (a.writes & (1 << ECS_ARCH_VALUE_ARENA_RESOURCE_BIT)) != 0 { return 1; };
+    return 0;
+}
+
+fn ecs_arch_value_reads_messages(a: EcsArchValueSystemAccessDeep) -> i32 {
+    if (a.reads & (1 << ECS_ARCH_VALUE_ARENA_MESSAGES_BIT)) != 0 { return 1; };
+    return 0;
+}
+
+fn ecs_arch_value_writes_messages(a: EcsArchValueSystemAccessDeep) -> i32 {
+    if (a.writes & (1 << ECS_ARCH_VALUE_ARENA_MESSAGES_BIT)) != 0 { return 1; };
+    return 0;
+}
+
+fn ecs_arch_value_len_reads(a: EcsArchValueSystemAccessDeep) -> i32 { return a.len_reads; }
+fn ecs_arch_value_len_writes(a: EcsArchValueSystemAccessDeep) -> i32 { return a.len_writes; }
+
+fn ecs_arch_value_read_list_has(a: EcsArchValueSystemAccessDeep, cid: i32) -> bool {
+    let i: i32 = 0;
+    while i < a.len_reads {
+        if ecs_arch_value_read_at(a, i) == cid { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_arch_value_write_list_has(a: EcsArchValueSystemAccessDeep, cid: i32) -> bool {
+    let i: i32 = 0;
+    while i < a.len_writes {
+        if ecs_arch_value_write_at(a, i) == cid { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// One-directional: do `writer`'s writes touch `reader`'s reads OR writes? Returns true if any of
+// writer's write component-ids appears in reader's read or write list. `access_conflicts` calls
+// this once in each direction so the test body appears once (factor-out vs the duplicated body in
+// the registry_value + table_value variants).
+fn ecs_arch_value_writes_touch(writer: EcsArchValueSystemAccessDeep, other: EcsArchValueSystemAccessDeep) -> bool {
+    let i: i32 = 0;
+    while i < writer.len_writes {
+        let cid = ecs_arch_value_write_at(writer, i);
+        if ecs_arch_value_read_list_has(other, cid) { return true; };
+        if ecs_arch_value_write_list_has(other, cid) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_arch_value_component_conflicts(left: EcsArchValueSystemAccessDeep, right: EcsArchValueSystemAccessDeep) -> bool {
+    if ecs_arch_value_writes_touch(left, right) { return true; };
+    if ecs_arch_value_writes_touch(right, left) { return true; };
+    return false;
+}
+
+// Arena hazard via 2-bit packed flags: returns true if either system's packed writes-bit for the
+// chosen arena overlaps the other's packed reads-bit OR writes-bit. Single-line bit expression
+// per arena (distinct from 370/371's explicit if-chains).
+fn ecs_arch_value_arena_conflict(left: EcsArchValueSystemAccessDeep, right: EcsArchValueSystemAccessDeep, bit: i32) -> bool {
+    let lw = (left.writes >> bit) & 1;
+    let rw = (right.writes >> bit) & 1;
+    let lr = (left.reads >> bit) & 1;
+    let rr = (right.reads >> bit) & 1;
+    // any writer is dangerous to a reader or writer on the other side; symmetrically.
+    if (lw != 0 && (rr != 0 || rw != 0)) { return true; };
+    if (rw != 0 && lr != 0) { return true; };
+    return false;
+}
+
+fn ecs_arch_value_access_conflicts(left: EcsArchValueSystemAccessDeep, right: EcsArchValueSystemAccessDeep) -> bool {
+    if ecs_arch_value_component_conflicts(left, right) { return true; };
+    if ecs_arch_value_arena_conflict(left, right, ECS_ARCH_VALUE_ARENA_RESOURCE_BIT) { return true; };
+    if ecs_arch_value_arena_conflict(left, right, ECS_ARCH_VALUE_ARENA_MESSAGES_BIT) { return true; };
+    return false;
+}
+
+// === Schedule with 8 slots ===
+
+struct EcsArchValueScheduleDeep {
+    s0: EcsArchValueSystemAccessDeep, s1: EcsArchValueSystemAccessDeep,
+    s2: EcsArchValueSystemAccessDeep, s3: EcsArchValueSystemAccessDeep,
+    s4: EcsArchValueSystemAccessDeep, s5: EcsArchValueSystemAccessDeep,
+    s6: EcsArchValueSystemAccessDeep, s7: EcsArchValueSystemAccessDeep,
+    count: i32,
+    conflict_count: i32,
+}
+
+fn ecs_arch_value_schedule_default() -> EcsArchValueScheduleDeep {
+    let s = EcsArchValueScheduleDeep {
+        s0: ecs_arch_value_access_none(),
+        s1: ecs_arch_value_access_none(),
+        s2: ecs_arch_value_access_none(),
+        s3: ecs_arch_value_access_none(),
+        s4: ecs_arch_value_access_none(),
+        s5: ecs_arch_value_access_none(),
+        s6: ecs_arch_value_access_none(),
+        s7: ecs_arch_value_access_none(),
+        count: 0,
+        conflict_count: 0,
+    };
+    return s;
+}
+
+fn ecs_arch_value_schedule_len(s: EcsArchValueScheduleDeep) -> i32 { return s.count; }
+fn ecs_arch_value_schedule_conflict_count(s: EcsArchValueScheduleDeep) -> i32 { return s.conflict_count; }
+
+fn ecs_arch_value_access_set_a(s: EcsArchValueScheduleDeep, idx: i32, a: EcsArchValueSystemAccessDeep) -> EcsArchValueScheduleDeep {
+    let r0 = ecs_arch_value_read_at(a, 0);
+    let r1 = ecs_arch_value_read_at(a, 1);
+    let r2 = ecs_arch_value_read_at(a, 2);
+    let r3 = ecs_arch_value_read_at(a, 3);
+    let w0 = ecs_arch_value_write_at(a, 0);
+    let w1 = ecs_arch_value_write_at(a, 1);
+    let w2 = ecs_arch_value_write_at(a, 2);
+    let w3 = ecs_arch_value_write_at(a, 3);
+    let reads = a.reads;
+    let writes = a.writes;
+    let lr = a.len_reads;
+    let lw = a.len_writes;
+    if idx == 0 { s.s0 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 1 { s.s1 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 2 { s.s2 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 3 { s.s3 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 4 { s.s4 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 5 { s.s5 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 6 { s.s6 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    if idx == 7 { s.s7 = ecs_arch_value_access_build(r0, r1, r2, r3, w0, w1, w2, w3, reads, writes, lr, lw); };
+    return s;
+}
+
+fn ecs_arch_value_access_at(s: EcsArchValueScheduleDeep, idx: i32) -> EcsArchValueSystemAccessDeep {
+    if idx == 0 { return s.s0; };
+    if idx == 1 { return s.s1; };
+    if idx == 2 { return s.s2; };
+    if idx == 3 { return s.s3; };
+    if idx == 4 { return s.s4; };
+    if idx == 5 { return s.s5; };
+    if idx == 6 { return s.s6; };
+    if idx == 7 { return s.s7; };
+    return ecs_arch_value_access_none();
+}
+
+fn ecs_arch_value_schedule_add_systems(s: EcsArchValueScheduleDeep, access: EcsArchValueSystemAccessDeep) -> EcsArchValueScheduleDeep {
+    if s.count >= ECS_ARCH_VALUE_CAP_DEEP { return s; };
+    let i: i32 = 0;
+    while i < s.count {
+        let other = ecs_arch_value_access_at(s, i);
+        if ecs_arch_value_access_conflicts(access, other) { s.conflict_count = s.conflict_count + 1; };
+        i = i + 1;
+    }
+    let slot = s.count;
+    s = ecs_arch_value_access_set_a(s, slot, access);
+    s.count = s.count + 1;
+    return s;
+}
+
+fn ecs_arch_value_schedule_clear(s: EcsArchValueScheduleDeep) -> EcsArchValueScheduleDeep {
+    return ecs_arch_value_schedule_default();
+}

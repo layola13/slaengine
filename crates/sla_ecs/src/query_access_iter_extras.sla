@@ -1,0 +1,324 @@
+// Bevy ECS EcsAccessType + EcsAccessLevel + AccessConflictError — mirrors src/query/access_iter.rs.
+//
+//   pub enum EcsAccessType<'a> { Component(EcsAccessLevel), Access(&'a Access), Empty }
+//   pub enum EcsAccessLevel    { Read(ComponentId), Write(ComponentId), ReadAll, WriteAll }
+//   pub struct AccessConflictError<'a>(EcsAccessType<'a>, EcsAccessType<'a>)
+//   impl EcsAccessType {
+//       pub fn is_compatible(&self, other) -> Result<(), AccessConflictError>
+//   }
+//
+// `&'a Access` borrowed variant is modelled as an access-id i32 (the borrowed Access lives in a
+// registry; here we expose its `has_read` / `has_write` / `has_any_read` / `has_any_write`
+// observable via a payload: the set of read ids + write ids + read_all + write_all flags).
+// Returns a single-field result struct (avoids scalar-tuple corruption).
+//
+// EcsAccessLevel encoded as (level_kind, component_id):
+//   level_kind 0 => Read(id), 1 => Write(id), 2 => ReadAll, 3 => WriteAll.
+//   component_id is meaningful for kinds 0/1 (sentinel -1 for kinds 2/3).
+// EcsAccessType encoded as (variant, level_kind, component_id, access_id):
+//   variant 0 => Empty, 1 => Component(level), 2 => Access(access_id).
+
+struct EcsAccessLevel {
+    level_kind: i32,
+    component_id: i32,
+}
+
+fn ecs_access_level_read(component_id: i32) -> EcsAccessLevel {
+    return EcsAccessLevel { level_kind: 0, component_id: component_id };
+}
+
+fn ecs_access_level_write(component_id: i32) -> EcsAccessLevel {
+    return EcsAccessLevel { level_kind: 1, component_id: component_id };
+}
+
+fn ecs_access_level_read_all() -> EcsAccessLevel {
+    return EcsAccessLevel { level_kind: 2, component_id: (0 - 1) };
+}
+
+fn ecs_access_level_write_all() -> EcsAccessLevel {
+    return EcsAccessLevel { level_kind: 3, component_id: (0 - 1) };
+}
+
+fn ecs_access_level_kind(l: EcsAccessLevel) -> i32 {
+    return l.level_kind;
+}
+
+fn ecs_access_level_component_id(l: EcsAccessLevel) -> i32 {
+    return l.component_id;
+}
+
+// === EcsAccessType model ===
+struct EcsAccessType {
+    variant: i32,        // 0 Empty, 1 Component, 2 Access-borrowed
+    level_kind: i32,    // valid when variant == 1
+    component_id: i32,
+    access_id: i32,     // valid when variant == 2 — index into the access registry / inline data
+    access_reads: Vec<i32>,   // for variant 2: the borrowed Access's read ids
+    access_writes: Vec<i32>,  // for variant 2: the borrowed Access's write ids
+    access_read_all: bool,    // for variant 2: borrowed Access.read_all
+    access_write_all: bool,   // for variant 2: borrowed Access.write_all
+}
+
+fn ecs_access_type_empty() -> EcsAccessType {
+    return EcsAccessType {
+        variant: 0, level_kind: 0, component_id: (0 - 1), access_id: (0 - 1),
+        access_reads: Vec::new(), access_writes: Vec::new(),
+        access_read_all: false, access_write_all: false,
+    };
+}
+
+fn ecs_access_type_component(level: EcsAccessLevel) -> EcsAccessType {
+    return EcsAccessType {
+        variant: 1, level_kind: level.level_kind, component_id: level.component_id, access_id: (0 - 1),
+        access_reads: Vec::new(), access_writes: Vec::new(),
+        access_read_all: false, access_write_all: false,
+    };
+}
+
+fn ecs_access_type_access(access_id: i32, reads: Vec<i32>, writes: Vec<i32>, read_all: bool, write_all: bool) -> EcsAccessType {
+    return EcsAccessType {
+        variant: 2, level_kind: 0, component_id: (0 - 1), access_id: access_id,
+        access_reads: reads, access_writes: writes,
+        access_read_all: read_all, access_write_all: write_all,
+    };
+}
+
+fn ecs_access_type_variant(t: EcsAccessType) -> i32 {
+    return t.variant;
+}
+
+fn ecs_access_type_level_kind(t: EcsAccessType) -> i32 {
+    return t.level_kind;
+}
+
+fn ecs_access_type_component_id(t: EcsAccessType) -> i32 {
+    return t.component_id;
+}
+
+fn ecs_access_type_access_id(t: EcsAccessType) -> i32 {
+    return t.access_id;
+}
+
+// === AccessConflictError model ===
+// We model the (self, other) conflict pair and the Display kind for the message-prefix tests.
+struct EcsAccessConflictError {
+    a_variant: i32,
+    a_level_kind: i32,
+    a_component_id: i32,
+    b_variant: i32,
+    b_level_kind: i32,
+    b_component_id: i32,
+}
+
+fn ecs_ace_a_variant(e: EcsAccessConflictError) -> i32 { return e.a_variant; }
+fn ecs_ace_a_level(e: EcsAccessConflictError) -> i32 { return e.a_level_kind; }
+fn ecs_ace_a_component_id(e: EcsAccessConflictError) -> i32 { return e.a_component_id; }
+fn ecs_ace_b_variant(e: EcsAccessConflictError) -> i32 { return e.b_variant; }
+fn ecs_ace_b_level(e: EcsAccessConflictError) -> i32 { return e.b_level_kind; }
+fn ecs_ace_b_component_id(e: EcsAccessConflictError) -> i32 { return e.b_component_id; }
+
+// === is_compatible result ===
+// Returns (ok: bool, conflict: EcsAccessConflictError-or-empty).
+struct AccessIsCompatibleResult {
+    ok: bool,
+    conflict: EcsAccessConflictError,
+}
+
+fn ecs_acr_ok(r: AccessIsCompatibleResult) -> bool {
+    return r.ok;
+}
+
+fn ecs_acr_conflict_a_variant(r: AccessIsCompatibleResult) -> i32 {
+    return r.conflict.a_variant;
+}
+
+fn ecs_acr_conflict_b_variant(r: AccessIsCompatibleResult) -> i32 {
+    return r.conflict.b_variant;
+}
+
+// helper: build a conflict pair from two access types' encoded forms (only Component-Component
+// conflicts carry meaningful component_ids).
+fn ecs_ace_build(a: EcsAccessType, b: EcsAccessType) -> EcsAccessConflictError {
+    return EcsAccessConflictError {
+        a_variant: a.variant, a_level_kind: a.level_kind, a_component_id: a.component_id,
+        b_variant: b.variant, b_level_kind: b.level_kind, b_component_id: b.component_id,
+    };
+}
+
+fn ecs_ace_empty() -> EcsAccessConflictError {
+    return EcsAccessConflictError { a_variant: 0, a_level_kind: 0, a_component_id: (0 - 1), b_variant: 0, b_level_kind: 0, b_component_id: (0 - 1) };
+}
+
+// helper: does a borrowed Access (variant 2 model) write a given component id?
+fn _ecs_access_has_write(t: EcsAccessType, component_id: i32) -> bool {
+    if t.access_write_all { return true; };
+    let i = 0;
+    while i < len(t.access_writes) as i32 {
+        if t.access_writes[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _ecs_access_has_read(t: EcsAccessType, component_id: i32) -> bool {
+    if t.access_read_all { return true; };
+    let i = 0;
+    while i < len(t.access_reads) as i32 {
+        if t.access_reads[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _ecs_access_has_any_write(t: EcsAccessType) -> bool {
+    if t.access_write_all { return true; };
+    return len(t.access_writes) as i32 > 0;
+}
+
+fn _ecs_access_has_any_read(t: EcsAccessType) -> bool {
+    if t.access_read_all { return true; };
+    return len(t.access_reads) as i32 > 0;
+}
+
+// === is_compatible — mirrors the Bevy match matrix ===
+fn ecs_access_type_is_compatible(a: EcsAccessType, b: EcsAccessType) -> AccessIsCompatibleResult {
+    let empty_ok = AccessIsCompatibleResult { ok: true, conflict: ecs_ace_empty() };
+    // (Empty, _) and (_, Empty) are Ok.
+    if a.variant == 0 || b.variant == 0 {
+        return empty_ok;
+    };
+    // Both Component variants:
+    if a.variant == 1 && b.variant == 1 {
+        // ReadAll + Write(id) (either order) -> Err
+        // (Component(_), Component(WriteAll)) + (WriteAll, Component(_)) -> Err
+        if (a.level_kind == 2 && b.level_kind == 1) || (a.level_kind == 1 && b.level_kind == 2) {
+            return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+        };
+        if a.level_kind == 3 || b.level_kind == 3 {
+            return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+        };
+        // read-read family Ok (Read/Read, ReadAll/Read, Read/ReadAll, ReadAll/ReadAll)
+        if (a.level_kind == 0 && b.level_kind == 0)
+            || (a.level_kind == 2 && b.level_kind == 0)
+            || (a.level_kind == 0 && b.level_kind == 2)
+            || (a.level_kind == 2 && b.level_kind == 2) {
+            return empty_ok;
+        };
+        // Read(id)/Write(id), Write(id)/Read(id), Write(id)/Write(id): Err iff same id, else Ok
+        if a.component_id == b.component_id {
+            return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+        };
+        return empty_ok;
+    };
+    // Component vs Access (borrowed)
+    if a.variant == 1 && b.variant == 2 {
+        // Component(Read(cid)) + Access -> Err iff access.has_write(cid)
+        if a.level_kind == 0 {
+            if _ecs_access_has_write(b, a.component_id) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        // Component(Write(cid)) + Access -> Err iff access.has_read(cid)
+        if a.level_kind == 1 {
+            if _ecs_access_has_read(b, a.component_id) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        // Component(ReadAll) + Access -> Err iff access.has_any_write()
+        if a.level_kind == 2 {
+            if _ecs_access_has_any_write(b) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        // Component(WriteAll) + Access -> Err iff access.has_any_read()
+        if a.level_kind == 3 {
+            if _ecs_access_has_any_read(b) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        return empty_ok;
+    };
+    // Access vs Component — symmetric. We reuse the Component-vs-Access guards but mirror.
+    if a.variant == 2 && b.variant == 1 {
+        if b.level_kind == 0 {
+            if _ecs_access_has_write(a, b.component_id) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        if b.level_kind == 1 {
+            if _ecs_access_has_read(a, b.component_id) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        if b.level_kind == 2 {
+            if _ecs_access_has_any_write(a) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        if b.level_kind == 3 {
+            if _ecs_access_has_any_read(a) {
+                return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+            };
+            return empty_ok;
+        };
+        return empty_ok;
+    };
+    // Access vs Access — rely on the borrowed Access::is_compatible. We model it as: Err iff
+    // any write on either side overlaps a read or write of the other (same as our Access::is_compatible
+    // helper). ReadAll/WriteAll propagate.
+    if a.variant == 2 && b.variant == 2 {
+        let conflict = _ecs_borrowed_access_is_compatible(a, b);
+        if conflict {
+            return AccessIsCompatibleResult { ok: false, conflict: ecs_ace_build(a, b) };
+        };
+        return empty_ok;
+    };
+    return empty_ok;
+}
+
+// Borrowed-Access compatibility (mirrors Access::is_compatible). Returns true on conflict.
+fn _ecs_borrowed_access_is_compatible(a: EcsAccessType, b: EcsAccessType) -> bool {
+    // Any write_all OR read_all+write anywhere (either side) is a conflict in this 모델.
+    // Mirrors Access::is_compatible: write_a overlaps read-or-write_b OR write_b overlaps read-or-write_a, or any write_all vs any read/write/read_all/write_all.
+    if a.access_write_all || b.access_write_all {
+        // write_all conflicts with any read_all, any writes, or any reads on the other.
+        return true;
+    };
+    // Write ids on a overlap read-or-write ids on b?
+    let i = 0;
+    while i < len(a.access_writes) as i32 {
+        let wid = a.access_writes[i];
+        if b.access_read_all { return true; };
+        let j = 0;
+        while j < len(b.access_writes) as i32 {
+            if b.access_writes[j] == wid { return true; };
+            j = j + 1;
+        }
+        let k = 0;
+        while k < len(b.access_reads) as i32 {
+            if b.access_reads[k] == wid { return true; };
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // Write ids on b overlap read ids on a (read-read is fine).
+    let m = 0;
+    while m < len(b.access_writes) as i32 {
+        let wid = b.access_writes[m];
+        if a.access_read_all { return true; };
+        let n = 0;
+        while n < len(a.access_reads) as i32 {
+            if a.access_reads[n] == wid { return true; };
+            n = n + 1;
+        }
+        m = m + 1;
+    }
+    return false;
+}

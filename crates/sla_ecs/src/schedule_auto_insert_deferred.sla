@@ -1,0 +1,108 @@
+// Bevy ECS schedule::auto_insert_apply_deferred (src/schedule/auto_insert_apply_deferred.rs):
+// AutoInsertApplyDeferredPass — inserts ApplyDeferred sync points into the schedule graph
+// when there are deferred params (e.g. Commands) and ordering dependencies.
+
+struct EcsAutoInsertApplyDeferredPass {
+    // edges that should NOT get auto sync points (IgnoreDeferred)
+    no_sync_edges: Vec<i32>,  // flattened pairs: from*10000+to
+    // cached sync point node ids by distance
+    sync_distances: Vec<i32>,
+    sync_node_ids: Vec<i32>,
+    next_sync_node: i32,
+}
+
+fn ecs_auto_insert_pass_new() -> EcsAutoInsertApplyDeferredPass {
+    return EcsAutoInsertApplyDeferredPass {
+        no_sync_edges: Vec::new(),
+        sync_distances: Vec::new(),
+        sync_node_ids: Vec::new(),
+        next_sync_node: 0
+    };
+}
+
+// edge_key: encode (from, to) as a single i32 for storage
+fn ecs_auto_insert_edge_key(from: i32, to: i32) -> i32 {
+    return from * 10000 + to;
+}
+
+// add_dependency: if options present (IgnoreDeferred), mark edge as no-sync
+fn ecs_auto_insert_add_dependency(pass: EcsAutoInsertApplyDeferredPass, from: i32, to: i32, ignore_deferred: bool) -> EcsAutoInsertApplyDeferredPass {
+    if ignore_deferred {
+        pass.no_sync_edges.push(ecs_auto_insert_edge_key(from, to));
+    };
+    return pass;
+}
+
+// is_no_sync: check if an edge should NOT get a sync point
+fn ecs_auto_insert_is_no_sync(pass: EcsAutoInsertApplyDeferredPass, from: i32, to: i32) -> bool {
+    let key = ecs_auto_insert_edge_key(from, to);
+    let i: i64 = 0;
+    let n: i64 = len(pass.no_sync_edges) as i64;
+    while i < n {
+        if pass.no_sync_edges[i] == key { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// get_sync_point: returns existing sync node for distance, or creates new one
+fn ecs_auto_insert_get_sync_point(pass: EcsAutoInsertApplyDeferredPass, distance: i32) -> (EcsAutoInsertApplyDeferredPass, i32) {
+    let i: i64 = 0;
+    let n: i64 = len(pass.sync_distances) as i64;
+    while i < n {
+        if pass.sync_distances[i] == distance { return (pass, pass.sync_node_ids[i]); };
+        i = i + 1;
+    }
+    // create new sync point
+    let node_id = pass.next_sync_node;
+    pass.next_sync_node = pass.next_sync_node + 1;
+    pass.sync_distances.push(distance);
+    pass.sync_node_ids.push(node_id);
+    return (pass, node_id);
+}
+
+// add_auto_sync: creates a new sync point unconditionally
+fn ecs_auto_insert_add_auto_sync(pass: EcsAutoInsertApplyDeferredPass) -> (EcsAutoInsertApplyDeferredPass, i32) {
+    let node_id = pass.next_sync_node;
+    pass.next_sync_node = pass.next_sync_node + 1;
+    return (pass, node_id);
+}
+
+// should_insert_sync: determines if a sync point should be inserted on an edge
+// Returns true if: edge is not no_sync AND source has deferred params
+fn ecs_auto_insert_should_insert_sync(pass: EcsAutoInsertApplyDeferredPass, from: i32, to: i32, source_has_deferred: bool) -> bool {
+    if source_has_deferred != true { return false; };
+    if ecs_auto_insert_is_no_sync(pass, from, to) { return false; };
+    return true;
+}
+
+// build: process edges and return list of edges that need sync points
+// Returns (pass, sync_edges) where sync_edges is a Vec of (from, to, sync_node_id)
+fn ecs_auto_insert_build(pass: EcsAutoInsertApplyDeferredPass, edges_from: Vec<i32>, edges_to: Vec<i32>, deferred_flags: Vec<bool>) -> (EcsAutoInsertApplyDeferredPass, Vec<i32>) {
+    let result = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(edges_from) as i64;
+    while i < n {
+        let from = edges_from[i];
+        let to = edges_to[i];
+        let has_deferred = deferred_flags[i];
+        let should = ecs_auto_insert_should_insert_sync(pass, from, to, has_deferred);
+        if should {
+            let sync_result = ecs_auto_insert_get_sync_point(pass, 0);
+            pass = sync_result.0;
+            let sync_node = sync_result.1;
+            result.push(from);
+            result.push(sync_node);
+            result.push(to);
+        } else {
+            result.push(from);
+            result.push(to);
+        };
+        i = i + 1;
+    }
+    return (pass, result);
+}
+
+// stats
+fn ecs_auto_insert_sync_point_count(pass: EcsAutoInsertApplyDeferredPass) -> i64 { return len(pass.sync_node_ids) as i64; }
+fn ecs_auto_insert_no_sync_edge_count(pass: EcsAutoInsertApplyDeferredPass) -> i64 { return len(pass.no_sync_edges) as i64; }

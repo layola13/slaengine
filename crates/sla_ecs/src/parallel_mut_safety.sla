@@ -1,0 +1,350 @@
+// Bevy-style concurrent mutable World execution safety model.
+//
+// Bevy's multithreaded executor only runs systems concurrently when their
+// component/resource/message access is compatible. This module models that
+// access gate and batch selection over explicit metadata. It deliberately does
+// not execute a World mutation runtime; it proves the safety decision made
+// before thread-backed mutable systems are dispatched.
+@import "sa_std/vec.sa"
+
+struct EcsParallelMutAccess {
+    read_components: Vec<i32>,
+    write_components: Vec<i32>,
+    reads_resource: bool,
+    writes_resource: bool,
+    reads_messages: bool,
+    writes_messages: bool,
+}
+
+struct EcsParallelMutSystemSpec {
+    system_id: i64,
+    access: EcsParallelMutAccess,
+    is_exclusive: bool,
+    is_local: bool,
+    should_run: bool,
+}
+
+struct EcsParallelMutSafetyPlan {
+    specs: Vec<EcsParallelMutSystemSpec>,
+}
+
+struct EcsParallelMutSafetyBatch {
+    systems: Vec<i64>,
+    skipped: Vec<i64>,
+    deferred: Vec<i64>,
+    conflict_count: i64,
+    serialized: bool,
+    used_threads: bool,
+    all_remaining_safe: bool,
+}
+
+struct EcsParallelMutSafetyRunResult {
+    batches: Vec<EcsParallelMutSafetyBatch>,
+    ran_count: i64,
+    skipped_count: i64,
+    conflict_count: i64,
+    threaded_batch_count: i64,
+    serialized_batch_count: i64,
+    completed: bool,
+}
+
+fn ecs_parallel_mut_access_none() -> EcsParallelMutAccess {
+    let reads: Vec<i32> = Vec::new();
+    let writes: Vec<i32> = Vec::new();
+    return EcsParallelMutAccess { read_components: reads, write_components: writes, reads_resource: false, writes_resource: false, reads_messages: false, writes_messages: false };
+}
+
+fn ecs_parallel_mut_access_read_component(access: EcsParallelMutAccess, component_id: i32) -> EcsParallelMutAccess {
+    access.read_components.push(component_id);
+    return access;
+}
+
+fn ecs_parallel_mut_access_write_component(access: EcsParallelMutAccess, component_id: i32) -> EcsParallelMutAccess {
+    access.write_components.push(component_id);
+    return access;
+}
+
+fn ecs_parallel_mut_access_read_resource(access: EcsParallelMutAccess) -> EcsParallelMutAccess { access.reads_resource = true; return access; }
+fn ecs_parallel_mut_access_write_resource(access: EcsParallelMutAccess) -> EcsParallelMutAccess { access.writes_resource = true; return access; }
+fn ecs_parallel_mut_access_read_messages(access: EcsParallelMutAccess) -> EcsParallelMutAccess { access.reads_messages = true; return access; }
+fn ecs_parallel_mut_access_write_messages(access: EcsParallelMutAccess) -> EcsParallelMutAccess { access.writes_messages = true; return access; }
+
+fn ecs_parallel_mut_component_list_has(values: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let n = len(values) as i64;
+    while i < n {
+        if values[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_parallel_mut_access_component_conflicts(left: EcsParallelMutAccess, right: EcsParallelMutAccess) -> bool {
+    let i: i64 = 0;
+    let left_writes = len(left.write_components) as i64;
+    while i < left_writes {
+        let component_id = left.write_components[i];
+        if ecs_parallel_mut_component_list_has(right.read_components, component_id) { return true; };
+        if ecs_parallel_mut_component_list_has(right.write_components, component_id) { return true; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let right_writes = len(right.write_components) as i64;
+    while j < right_writes {
+        let component_id = right.write_components[j];
+        if ecs_parallel_mut_component_list_has(left.read_components, component_id) { return true; };
+        if ecs_parallel_mut_component_list_has(left.write_components, component_id) { return true; };
+        j = j + 1;
+    }
+    return false;
+}
+
+fn ecs_parallel_mut_access_conflicts(left: EcsParallelMutAccess, right: EcsParallelMutAccess) -> bool {
+    if ecs_parallel_mut_access_component_conflicts(left, right) { return true; };
+    if left.writes_resource { if right.reads_resource { return true; }; if right.writes_resource { return true; }; };
+    if right.writes_resource { if left.reads_resource { return true; }; if left.writes_resource { return true; }; };
+    if left.writes_messages { if right.reads_messages { return true; }; if right.writes_messages { return true; }; };
+    if right.writes_messages { if left.reads_messages { return true; }; if left.writes_messages { return true; }; };
+    return false;
+}
+
+fn ecs_parallel_mut_system_spec(system_id: i64, access: EcsParallelMutAccess, is_exclusive: bool, is_local: bool, should_run: bool) -> EcsParallelMutSystemSpec {
+    return EcsParallelMutSystemSpec { system_id: system_id, access: access, is_exclusive: is_exclusive, is_local: is_local, should_run: should_run };
+}
+
+fn ecs_parallel_mut_safety_plan_new() -> EcsParallelMutSafetyPlan {
+    let specs: Vec<EcsParallelMutSystemSpec> = Vec::new();
+    return EcsParallelMutSafetyPlan { specs: specs };
+}
+
+fn ecs_parallel_mut_safety_plan_add(plan: EcsParallelMutSafetyPlan, spec: EcsParallelMutSystemSpec) -> EcsParallelMutSafetyPlan {
+    plan.specs.push(spec);
+    return plan;
+}
+
+fn ecs_parallel_mut_batch_new() -> EcsParallelMutSafetyBatch {
+    let systems: Vec<i64> = Vec::new();
+    let skipped: Vec<i64> = Vec::new();
+    let deferred: Vec<i64> = Vec::new();
+    return EcsParallelMutSafetyBatch { systems: systems, skipped: skipped, deferred: deferred, conflict_count: 0, serialized: false, used_threads: false, all_remaining_safe: true };
+}
+
+fn ecs_parallel_mut_batch_has_system(batch: EcsParallelMutSafetyBatch, system_id: i64) -> bool {
+    let i: i64 = 0;
+    let n = len(batch.systems) as i64;
+    while i < n {
+        if batch.systems[i] == system_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_parallel_mut_plan_spec_index(plan: EcsParallelMutSafetyPlan, system_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(plan.specs) as i64;
+    while i < n {
+        if plan.specs[i].system_id == system_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_parallel_mut_batch_conflicts_with_spec(plan: EcsParallelMutSafetyPlan, batch: EcsParallelMutSafetyBatch, spec: EcsParallelMutSystemSpec) -> bool {
+    let i: i64 = 0;
+    let n = len(batch.systems) as i64;
+    while i < n {
+        let existing_index = ecs_parallel_mut_plan_spec_index(plan, batch.systems[i]);
+        if existing_index >= 0 {
+            let existing = plan.specs[existing_index];
+            if ecs_parallel_mut_access_conflicts(existing.access, spec.access) { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_parallel_mut_take_safe_batch(plan: EcsParallelMutSafetyPlan, completed: Vec<bool>, max_width: i64) -> EcsParallelMutSafetyBatch {
+    let batch = ecs_parallel_mut_batch_new();
+    let width = max_width;
+    if width <= 0 { batch.all_remaining_safe = false; return batch; };
+    let i: i64 = 0;
+    let n = len(plan.specs) as i64;
+    while i < n {
+        if len(batch.systems) as i64 >= width { return batch; };
+        if completed[i] != true {
+            let spec = plan.specs[i];
+            if spec.should_run != true {
+                batch.skipped.push(spec.system_id);
+            } else {
+                if spec.is_exclusive || spec.is_local {
+                    if len(batch.systems) as i64 == 0 {
+                        batch.systems.push(spec.system_id);
+                        batch.serialized = true;
+                    } else {
+                        batch.deferred.push(spec.system_id);
+                    };
+                    return batch;
+                };
+                if ecs_parallel_mut_batch_conflicts_with_spec(plan, batch, spec) {
+                    batch.deferred.push(spec.system_id);
+                    batch.conflict_count = batch.conflict_count + 1;
+                    batch.all_remaining_safe = false;
+                } else {
+                    batch.systems.push(spec.system_id);
+                };
+            };
+        };
+        i = i + 1;
+    }
+    if len(batch.systems) as i64 > 1 { batch.used_threads = true; };
+    return batch;
+}
+
+fn ecs_parallel_mut_mark_batch_completed(plan: EcsParallelMutSafetyPlan, completed: Vec<bool>, batch: EcsParallelMutSafetyBatch) -> Vec<bool> {
+    let i: i64 = 0;
+    let ran = len(batch.systems) as i64;
+    while i < ran {
+        let idx = ecs_parallel_mut_plan_spec_index(plan, batch.systems[i]);
+        if idx >= 0 { completed[idx] = true; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let skipped = len(batch.skipped) as i64;
+    while j < skipped {
+        let idx = ecs_parallel_mut_plan_spec_index(plan, batch.skipped[j]);
+        if idx >= 0 { completed[idx] = true; };
+        j = j + 1;
+    }
+    return completed;
+}
+
+fn ecs_parallel_mut_safety_run(plan: EcsParallelMutSafetyPlan, max_width: i64) -> EcsParallelMutSafetyRunResult {
+    let completed: Vec<bool> = Vec::new();
+    let batches: Vec<EcsParallelMutSafetyBatch> = Vec::new();
+    let i: i64 = 0;
+    let n = len(plan.specs) as i64;
+    while i < n { completed.push(false); i = i + 1; }
+    let ran_count: i64 = 0;
+    let skipped_count: i64 = 0;
+    let conflict_count: i64 = 0;
+    let threaded_batch_count: i64 = 0;
+    let serialized_batch_count: i64 = 0;
+    let guard: i64 = 0;
+    let limit = n * 2 + 1;
+    while guard < limit {
+        let done: i64 = 0;
+        let done_i: i64 = 0;
+        while done_i < n { if completed[done_i] { done = done + 1; }; done_i = done_i + 1; }
+        if done >= n { return EcsParallelMutSafetyRunResult { batches: batches, ran_count: ran_count, skipped_count: skipped_count, conflict_count: conflict_count, threaded_batch_count: threaded_batch_count, serialized_batch_count: serialized_batch_count, completed: true }; };
+        let batch = ecs_parallel_mut_take_safe_batch(plan, completed, max_width);
+        let batch_ran = len(batch.systems) as i64;
+        let batch_skipped = len(batch.skipped) as i64;
+        if batch_ran == 0 {
+            if batch_skipped == 0 { return EcsParallelMutSafetyRunResult { batches: batches, ran_count: ran_count, skipped_count: skipped_count, conflict_count: conflict_count, threaded_batch_count: threaded_batch_count, serialized_batch_count: serialized_batch_count, completed: false }; };
+        };
+        if batch_ran > 1 { threaded_batch_count = threaded_batch_count + 1; };
+        if batch.serialized { serialized_batch_count = serialized_batch_count + 1; };
+        ran_count = ran_count + batch_ran;
+        skipped_count = skipped_count + batch_skipped;
+        conflict_count = conflict_count + batch.conflict_count;
+        completed = ecs_parallel_mut_mark_batch_completed(plan, completed, batch);
+        batches.push(batch);
+        guard = guard + 1;
+    }
+    return EcsParallelMutSafetyRunResult { batches: batches, ran_count: ran_count, skipped_count: skipped_count, conflict_count: conflict_count, threaded_batch_count: threaded_batch_count, serialized_batch_count: serialized_batch_count, completed: false };
+}
+
+@test "parallel mut safety allows disjoint writes in same threaded batch"() {
+    let pos = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let vel = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 2);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, pos, false, false, true));
+    let plan2 = ecs_parallel_mut_safety_plan_add(plan1, ecs_parallel_mut_system_spec(1, vel, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan2, 4);
+    if run.completed != true { panic(32710); };
+    if run.ran_count != 2 { panic(32711); };
+    if run.threaded_batch_count != 1 { panic(32712); };
+    if len(run.batches) != 1 { panic(32713); };
+}
+
+@test "parallel mut safety defers read write component conflict"() {
+    let writer = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let reader = ecs_parallel_mut_access_read_component(ecs_parallel_mut_access_none(), 1);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, writer, false, false, true));
+    let plan2 = ecs_parallel_mut_safety_plan_add(plan1, ecs_parallel_mut_system_spec(1, reader, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan2, 4);
+    if run.completed != true { panic(32720); };
+    if run.conflict_count != 1 { panic(32721); };
+    if len(run.batches) != 2 { panic(32722); };
+    if len(run.batches[0].deferred) != 1 { panic(32723); };
+    if run.threaded_batch_count != 0 { panic(32724); };
+}
+
+@test "parallel mut safety serializes exclusive systems"() {
+    let a = ecs_parallel_mut_access_read_component(ecs_parallel_mut_access_none(), 1);
+    let b = ecs_parallel_mut_access_read_component(ecs_parallel_mut_access_none(), 2);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, a, true, false, true));
+    let plan2 = ecs_parallel_mut_safety_plan_add(plan1, ecs_parallel_mut_system_spec(1, b, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan2, 4);
+    if run.serialized_batch_count != 1 { panic(32730); };
+    if len(run.batches) != 2 { panic(32731); };
+    if run.batches[0].systems[0] != 0 { panic(32732); };
+}
+
+@test "parallel mut safety serializes local systems"() {
+    let a = ecs_parallel_mut_access_read_component(ecs_parallel_mut_access_none(), 1);
+    let b = ecs_parallel_mut_access_read_component(ecs_parallel_mut_access_none(), 2);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, a, false, true, true));
+    let plan2 = ecs_parallel_mut_safety_plan_add(plan1, ecs_parallel_mut_system_spec(1, b, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan2, 4);
+    if run.serialized_batch_count != 1 { panic(32740); };
+    if run.threaded_batch_count != 0 { panic(32741); };
+}
+
+@test "parallel mut safety skips should run false before batching"() {
+    let a = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let b = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, a, false, false, false));
+    let plan2 = ecs_parallel_mut_safety_plan_add(plan1, ecs_parallel_mut_system_spec(1, b, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan2, 4);
+    if run.skipped_count != 1 { panic(32750); };
+    if run.ran_count != 1 { panic(32751); };
+    if run.conflict_count != 0 { panic(32752); };
+}
+
+@test "parallel mut safety detects resource and message writer conflicts"() {
+    let resource_reader = ecs_parallel_mut_access_read_resource(ecs_parallel_mut_access_none());
+    let resource_writer = ecs_parallel_mut_access_write_resource(ecs_parallel_mut_access_none());
+    let message_reader = ecs_parallel_mut_access_read_messages(ecs_parallel_mut_access_none());
+    let message_writer = ecs_parallel_mut_access_write_messages(ecs_parallel_mut_access_none());
+    if ecs_parallel_mut_access_conflicts(resource_reader, resource_writer) != true { panic(32760); };
+    if ecs_parallel_mut_access_conflicts(message_reader, message_writer) != true { panic(32761); };
+}
+
+@test "parallel mut safety max width limits threaded batch"() {
+    let a = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let b = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 2);
+    let c = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 3);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, a, false, false, true));
+    let plan2 = ecs_parallel_mut_safety_plan_add(plan1, ecs_parallel_mut_system_spec(1, b, false, false, true));
+    let plan3 = ecs_parallel_mut_safety_plan_add(plan2, ecs_parallel_mut_system_spec(2, c, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan3, 2);
+    if run.completed != true { panic(32770); };
+    if len(run.batches) != 2 { panic(32771); };
+    if len(run.batches[0].systems) != 2 { panic(32772); };
+    if len(run.batches[1].systems) != 1 { panic(32773); };
+}
+
+@test "parallel mut safety rejects zero width run"() {
+    let a = ecs_parallel_mut_access_read_component(ecs_parallel_mut_access_none(), 1);
+    let plan0 = ecs_parallel_mut_safety_plan_new();
+    let plan1 = ecs_parallel_mut_safety_plan_add(plan0, ecs_parallel_mut_system_spec(0, a, false, false, true));
+    let run = ecs_parallel_mut_safety_run(plan1, 0);
+    if run.completed { panic(32780); };
+    if run.ran_count != 0 { panic(32781); };
+}

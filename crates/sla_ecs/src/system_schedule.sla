@@ -1,0 +1,148 @@
+// Bevy ECS schedule (src/schedule/executor/mod.rs):
+// SystemSchedule + SystemExecutor trait + ApplyDeferred + default_executor
+// SystemSchedule holds systems and conditions sorted in topological order.
+
+struct EcsSystemSchedule {
+    // System node ids (parallel arrays indexed by system node id)
+    system_ids: Vec<i64>,
+    system_conditions: Vec<i64>,    // condition count per system
+    system_dependencies: Vec<i64>,  // number of immediate dependencies per system
+    // Set node ids
+    set_ids: Vec<i64>,
+    set_conditions: Vec<i64>,       // condition count per set
+    // Running state
+    systems_run: i64,
+    systems_skipped: i64,
+}
+
+fn ecs_system_schedule_new() -> EcsSystemSchedule {
+    return EcsSystemSchedule {
+        system_ids: Vec::new(), system_conditions: Vec::new(), system_dependencies: Vec::new(),
+        set_ids: Vec::new(), set_conditions: Vec::new(),
+        systems_run: 0, systems_skipped: 0
+    };
+}
+
+// add_system: add a system to the schedule
+fn ecs_system_schedule_add_system(s: EcsSystemSchedule, system_id: i64, condition_count: i64, dependency_count: i64) -> EcsSystemSchedule {
+    s.system_ids.push(system_id);
+    s.system_conditions.push(condition_count);
+    s.system_dependencies.push(dependency_count);
+    return s;
+}
+
+// add_set: add a system set to the schedule
+fn ecs_system_schedule_add_set(s: EcsSystemSchedule, set_id: i64, condition_count: i64) -> EcsSystemSchedule {
+    s.set_ids.push(set_id);
+    s.set_conditions.push(condition_count);
+    return s;
+}
+
+fn ecs_system_schedule_system_count(s: EcsSystemSchedule) -> i64 { return len(s.system_ids) as i64; }
+fn ecs_system_schedule_set_count(s: EcsSystemSchedule) -> i64 { return len(s.set_ids) as i64; }
+
+fn ecs_system_schedule_get_system_id(s: EcsSystemSchedule, index: i64) -> (bool, i64) {
+    if index < 0 { return (false, 0); };
+    if index >= len(s.system_ids) as i64 { return (false, 0); };
+    return (true, s.system_ids[index]);
+}
+
+fn ecs_system_schedule_get_system_conditions(s: EcsSystemSchedule, index: i64) -> (bool, i64) {
+    if index < 0 { return (false, 0); };
+    if index >= len(s.system_conditions) as i64 { return (false, 0); };
+    return (true, s.system_conditions[index]);
+}
+
+fn ecs_system_schedule_get_system_dependencies(s: EcsSystemSchedule, index: i64) -> (bool, i64) {
+    if index < 0 { return (false, 0); };
+    if index >= len(s.system_dependencies) as i64 { return (false, 0); };
+    return (true, s.system_dependencies[index]);
+}
+
+fn ecs_system_schedule_get_set_id(s: EcsSystemSchedule, index: i64) -> (bool, i64) {
+    if index < 0 { return (false, 0); };
+    if index >= len(s.set_ids) as i64 { return (false, 0); };
+    return (true, s.set_ids[index]);
+}
+
+// mark_run / mark_skip
+fn ecs_system_schedule_mark_run(s: EcsSystemSchedule) -> EcsSystemSchedule {
+    s.systems_run = s.systems_run + 1;
+    return s;
+}
+
+fn ecs_system_schedule_mark_skip(s: EcsSystemSchedule) -> EcsSystemSchedule {
+    s.systems_skipped = s.systems_skipped + 1;
+    return s;
+}
+
+fn ecs_system_schedule_systems_run(s: EcsSystemSchedule) -> i64 { return s.systems_run; }
+fn ecs_system_schedule_systems_skipped(s: EcsSystemSchedule) -> i64 { return s.systems_skipped; }
+
+// reset: clear run/skip counts
+fn ecs_system_schedule_reset(s: EcsSystemSchedule) -> EcsSystemSchedule {
+    s.systems_run = 0;
+    s.systems_skipped = 0;
+    return s;
+}
+
+// clear: remove all systems and sets
+fn ecs_system_schedule_clear(s: EcsSystemSchedule) -> EcsSystemSchedule {
+    s.system_ids = Vec::new();
+    s.system_conditions = Vec::new();
+    s.system_dependencies = Vec::new();
+    s.set_ids = Vec::new();
+    s.set_conditions = Vec::new();
+    s.systems_run = 0;
+    s.systems_skipped = 0;
+    return s;
+}
+
+// is_empty
+fn ecs_system_schedule_is_empty(s: EcsSystemSchedule) -> bool { return len(s.system_ids) == 0; }
+
+// total_conditions: sum of all condition counts
+fn ecs_system_schedule_total_conditions(s: EcsSystemSchedule) -> i64 {
+    let total: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(s.system_conditions) as i64;
+    while i < n {
+        total = total + s.system_conditions[i];
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let m: i64 = len(s.set_conditions) as i64;
+    while j < m {
+        total = total + s.set_conditions[j];
+        j = j + 1;
+    }
+    return total;
+}
+
+// total_dependencies: sum of all dependency counts
+fn ecs_system_schedule_total_dependencies(s: EcsSystemSchedule) -> i64 {
+    let total: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(s.system_dependencies) as i64;
+    while i < n {
+        total = total + s.system_dependencies[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+// === ApplyDeferred marker ===
+const ECS_APPLY_DEFERRED: i32 = 999999;
+
+// is_apply_deferred: check if a system is the ApplyDeferred marker
+fn ecs_is_apply_deferred(system_type: i32) -> bool { return system_type == ECS_APPLY_DEFERRED; }
+
+// === SystemExecutor trait (modeled as executor kind) ===
+const ECS_EXECUTOR_SINGLE: i32 = 0;
+const ECS_EXECUTOR_MULTI: i32 = 1;
+
+// default_executor: returns the default executor kind for the platform
+fn ecs_default_executor_kind(multi_threaded: bool) -> i32 {
+    if multi_threaded { return ECS_EXECUTOR_MULTI; };
+    return ECS_EXECUTOR_SINGLE;
+}

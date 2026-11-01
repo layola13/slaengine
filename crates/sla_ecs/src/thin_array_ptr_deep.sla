@@ -1,0 +1,382 @@
+// Deepened Bevy ECS ThinArrayPtr surface.
+// Mirrors src/storage/thin_array_ptr.rs:
+//   empty / with_capacity / alloc / realloc
+//   initialize_unchecked / get_unchecked / get_unchecked_mut
+//   swap_remove_unchecked / swap_remove_unchecked_nonoverlapping
+//   clear_elements / drop / as_slice
+// Owning type tracks length; capacity is debug-tracked (always tracked here).
+// Shallow lib/thin_array_ptr.sla retained.
+//
+// SLA model: fixed slot array (cap up to 16) + explicit len/capacity fields.
+// Values are i64 stand-ins for T. Drop counters model needs_drop path.
+
+const ECS_TAP_MAX: i32 = 16;
+
+// Error / panic markers (returned codes; tests assert)
+const ECS_TAP_OK: i32 = 0;
+const ECS_TAP_ERR_OVERFLOW: i32 = 1;
+const ECS_TAP_ERR_CAP_MISMATCH: i32 = 2;
+const ECS_TAP_ERR_OOB: i32 = 3;
+const ECS_TAP_ERR_SAME_INDEX: i32 = 4;
+const ECS_TAP_ERR_ZERO_CAP_ALLOC: i32 = 5;
+
+struct EcsThinArrayPtrDeep {
+    // storage slots
+    s0: i64, s1: i64, s2: i64, s3: i64,
+    s4: i64, s5: i64, s6: i64, s7: i64,
+    s8: i64, s9: i64, s10: i64, s11: i64,
+    s12: i64, s13: i64, s14: i64, s15: i64,
+    capacity: i64,
+    // owner-tracked length (Bevy keeps this outside ThinArrayPtr)
+    len: i64,
+    // debug / lifecycle counters
+    alloc_count: i64,
+    realloc_count: i64,
+    drop_elem_count: i64,
+    dealloc_count: i64,
+    last_error: i32,
+    // when false, clear_elements skips per-element drop (needs_drop = false)
+    needs_drop: bool,
+    // alive flag after full drop
+    alive: bool,
+}
+
+fn ecs_tap_empty() -> EcsThinArrayPtrDeep {
+    return EcsThinArrayPtrDeep {
+        s0: 0, s1: 0, s2: 0, s3: 0,
+        s4: 0, s5: 0, s6: 0, s7: 0,
+        s8: 0, s9: 0, s10: 0, s11: 0,
+        s12: 0, s13: 0, s14: 0, s15: 0,
+        capacity: 0,
+        len: 0,
+        alloc_count: 0,
+        realloc_count: 0,
+        drop_elem_count: 0,
+        dealloc_count: 0,
+        last_error: ECS_TAP_OK,
+        needs_drop: true,
+        alive: true,
+    };
+}
+
+fn ecs_tap_set_needs_drop(a: EcsThinArrayPtrDeep, needs: bool) -> EcsThinArrayPtrDeep {
+    a.needs_drop = needs;
+    return a;
+}
+
+fn ecs_tap_capacity(a: EcsThinArrayPtrDeep) -> i64 { return a.capacity; }
+fn ecs_tap_len(a: EcsThinArrayPtrDeep) -> i64 { return a.len; }
+fn ecs_tap_is_empty(a: EcsThinArrayPtrDeep) -> bool { return a.len == 0; }
+fn ecs_tap_alive(a: EcsThinArrayPtrDeep) -> bool { return a.alive; }
+fn ecs_tap_last_error(a: EcsThinArrayPtrDeep) -> i32 { return a.last_error; }
+fn ecs_tap_alloc_count(a: EcsThinArrayPtrDeep) -> i64 { return a.alloc_count; }
+fn ecs_tap_realloc_count(a: EcsThinArrayPtrDeep) -> i64 { return a.realloc_count; }
+fn ecs_tap_drop_elem_count(a: EcsThinArrayPtrDeep) -> i64 { return a.drop_elem_count; }
+fn ecs_tap_dealloc_count(a: EcsThinArrayPtrDeep) -> i64 { return a.dealloc_count; }
+
+fn ecs_tap_slot_get(a: EcsThinArrayPtrDeep, idx: i64) -> i64 {
+    if idx == 0 { return a.s0; };
+    if idx == 1 { return a.s1; };
+    if idx == 2 { return a.s2; };
+    if idx == 3 { return a.s3; };
+    if idx == 4 { return a.s4; };
+    if idx == 5 { return a.s5; };
+    if idx == 6 { return a.s6; };
+    if idx == 7 { return a.s7; };
+    if idx == 8 { return a.s8; };
+    if idx == 9 { return a.s9; };
+    if idx == 10 { return a.s10; };
+    if idx == 11 { return a.s11; };
+    if idx == 12 { return a.s12; };
+    if idx == 13 { return a.s13; };
+    if idx == 14 { return a.s14; };
+    if idx == 15 { return a.s15; };
+    return 0;
+}
+
+fn ecs_tap_slot_set(a: EcsThinArrayPtrDeep, idx: i64, value: i64) -> EcsThinArrayPtrDeep {
+    if idx == 0 { a.s0 = value; };
+    if idx == 1 { a.s1 = value; };
+    if idx == 2 { a.s2 = value; };
+    if idx == 3 { a.s3 = value; };
+    if idx == 4 { a.s4 = value; };
+    if idx == 5 { a.s5 = value; };
+    if idx == 6 { a.s6 = value; };
+    if idx == 7 { a.s7 = value; };
+    if idx == 8 { a.s8 = value; };
+    if idx == 9 { a.s9 = value; };
+    if idx == 10 { a.s10 = value; };
+    if idx == 11 { a.s11 = value; };
+    if idx == 12 { a.s12 = value; };
+    if idx == 13 { a.s13 = value; };
+    if idx == 14 { a.s14 = value; };
+    if idx == 15 { a.s15 = value; };
+    return a;
+}
+
+// with_capacity: empty then alloc if capacity > 0
+fn ecs_tap_with_capacity(capacity: i64) -> EcsThinArrayPtrDeep {
+    let a = ecs_tap_empty();
+    if capacity <= 0 {
+        return a;
+    };
+    return ecs_tap_alloc(a, capacity);
+}
+
+// alloc: only when current capacity is 0 (Bevy contract for first allocation)
+fn ecs_tap_alloc(a: EcsThinArrayPtrDeep, capacity: i64) -> EcsThinArrayPtrDeep {
+    a.last_error = ECS_TAP_OK;
+    if capacity <= 0 {
+        a.last_error = ECS_TAP_ERR_ZERO_CAP_ALLOC;
+        return a;
+    };
+    if capacity > (ECS_TAP_MAX as i64) {
+        a.last_error = ECS_TAP_ERR_OVERFLOW;
+        return a;
+    };
+    // debug: allow alloc only from capacity 0 in strict mode; still set if already allocated
+    a.capacity = capacity;
+    a.alloc_count = a.alloc_count + 1;
+    a.alive = true;
+    return a;
+}
+
+// realloc: current_capacity must match tracked capacity and be > 0
+fn ecs_tap_realloc(a: EcsThinArrayPtrDeep, current_capacity: i64, new_capacity: i64) -> EcsThinArrayPtrDeep {
+    a.last_error = ECS_TAP_OK;
+    if current_capacity <= 0 {
+        a.last_error = ECS_TAP_ERR_ZERO_CAP_ALLOC;
+        return a;
+    };
+    if a.capacity != current_capacity {
+        a.last_error = ECS_TAP_ERR_CAP_MISMATCH;
+        return a;
+    };
+    if new_capacity <= 0 {
+        a.last_error = ECS_TAP_ERR_OVERFLOW;
+        return a;
+    };
+    if new_capacity > (ECS_TAP_MAX as i64) {
+        a.last_error = ECS_TAP_ERR_OVERFLOW;
+        return a;
+    };
+    // preserve existing values up to min(len, new_capacity)
+    if a.len > new_capacity {
+        // truncate length conceptually; drop extra elements
+        if a.needs_drop {
+            let i = a.len - 1;
+            while i >= new_capacity {
+                a.drop_elem_count = a.drop_elem_count + 1;
+                a = ecs_tap_slot_set(a, i, 0);
+                i = i - 1;
+            }
+        };
+        a.len = new_capacity;
+    };
+    a.capacity = new_capacity;
+    a.realloc_count = a.realloc_count + 1;
+    return a;
+}
+
+// initialize_unchecked: write value at index; if index == len, grow len by 1
+fn ecs_tap_initialize_unchecked(a: EcsThinArrayPtrDeep, index: i64, value: i64) -> EcsThinArrayPtrDeep {
+    a.last_error = ECS_TAP_OK;
+    if index < 0 {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return a;
+    };
+    if index >= a.capacity {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return a;
+    };
+    a = ecs_tap_slot_set(a, index, value);
+    if index == a.len {
+        a.len = a.len + 1;
+    };
+    return a;
+}
+
+// get_unchecked (shared)
+fn ecs_tap_get_unchecked(a: EcsThinArrayPtrDeep, index: i64) -> (bool, i64) {
+    if index < 0 { return (false, 0); };
+    if index >= a.len { return (false, 0); };
+    return (true, ecs_tap_slot_get(a, index));
+}
+
+// get_unchecked_mut modeled as set returning new array + old value
+fn ecs_tap_get_unchecked_mut_set(a: EcsThinArrayPtrDeep, index: i64, value: i64) -> (EcsThinArrayPtrDeep, bool, i64) {
+    if index < 0 {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, false, 0);
+    };
+    if index >= a.len {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, false, 0);
+    };
+    let old = ecs_tap_slot_get(a, index);
+    a = ecs_tap_slot_set(a, index, value);
+    a.last_error = ECS_TAP_OK;
+    return (a, true, old);
+}
+
+// swap_remove_unchecked_nonoverlapping: remove index_to_remove by copying index_to_keep over it
+// Returns (array', removed_value). Caller must update len if index_to_keep was last.
+fn ecs_tap_swap_remove_nonoverlapping(
+    a: EcsThinArrayPtrDeep,
+    index_to_remove: i64,
+    index_to_keep: i64
+) -> (EcsThinArrayPtrDeep, i64) {
+    a.last_error = ECS_TAP_OK;
+    if index_to_remove == index_to_keep {
+        a.last_error = ECS_TAP_ERR_SAME_INDEX;
+        return (a, 0);
+    };
+    if index_to_remove < 0 {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, 0);
+    };
+    if index_to_keep < 0 {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, 0);
+    };
+    if index_to_remove >= a.capacity {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, 0);
+    };
+    if index_to_keep >= a.capacity {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, 0);
+    };
+    let removed = ecs_tap_slot_get(a, index_to_remove);
+    let keep = ecs_tap_slot_get(a, index_to_keep);
+    a = ecs_tap_slot_set(a, index_to_remove, keep);
+    // hole at index_to_keep — caller decides; we zero it and shrink if last
+    a = ecs_tap_slot_set(a, index_to_keep, 0);
+    if index_to_keep == a.len - 1 {
+        a.len = a.len - 1;
+    };
+    return (a, removed);
+}
+
+// swap_remove_unchecked: if same index, just read; else nonoverlapping
+fn ecs_tap_swap_remove_unchecked(
+    a: EcsThinArrayPtrDeep,
+    index_to_remove: i64,
+    index_to_keep: i64
+) -> (EcsThinArrayPtrDeep, i64) {
+    if index_to_remove == index_to_keep {
+        a.last_error = ECS_TAP_OK;
+        if index_to_remove < 0 {
+            a.last_error = ECS_TAP_ERR_OOB;
+            return (a, 0);
+        };
+        if index_to_remove >= a.len {
+            a.last_error = ECS_TAP_ERR_OOB;
+            return (a, 0);
+        };
+        let removed = ecs_tap_slot_get(a, index_to_remove);
+        a = ecs_tap_slot_set(a, index_to_remove, 0);
+        if index_to_remove == a.len - 1 {
+            a.len = a.len - 1;
+        };
+        return (a, removed);
+    };
+    return ecs_tap_swap_remove_nonoverlapping(a, index_to_remove, index_to_keep);
+}
+
+// Convenience: classic Vec swap_remove at index (keep = last)
+fn ecs_tap_swap_remove_last(a: EcsThinArrayPtrDeep, index: i64) -> (EcsThinArrayPtrDeep, i64) {
+    if a.len <= 0 {
+        a.last_error = ECS_TAP_ERR_OOB;
+        return (a, 0);
+    };
+    let last = a.len - 1;
+    return ecs_tap_swap_remove_unchecked(a, index, last);
+}
+
+// clear_elements: drop each element from the end; capacity unchanged; len -> 0
+fn ecs_tap_clear_elements(a: EcsThinArrayPtrDeep) -> EcsThinArrayPtrDeep {
+    a.last_error = ECS_TAP_OK;
+    if a.needs_drop {
+        let i = a.len - 1;
+        while i >= 0 {
+            a.drop_elem_count = a.drop_elem_count + 1;
+            a = ecs_tap_slot_set(a, i, 0);
+            i = i - 1;
+        }
+    };
+    // even without needs_drop, logical clear zeros slots for model determinism
+    if a.needs_drop != true {
+        let j: i64 = 0;
+        while j < a.len {
+            a = ecs_tap_slot_set(a, j, 0);
+            j = j + 1;
+        }
+    };
+    a.len = 0;
+    return a;
+}
+
+// drop: clear elements if capacity > 0, dealloc, capacity=0, alive=false
+fn ecs_tap_drop(a: EcsThinArrayPtrDeep, current_capacity: i64, current_len: i64) -> EcsThinArrayPtrDeep {
+    a.last_error = ECS_TAP_OK;
+    if a.capacity != current_capacity {
+        a.last_error = ECS_TAP_ERR_CAP_MISMATCH;
+        return a;
+    };
+    // sync owner-provided len
+    a.len = current_len;
+    if current_capacity != 0 {
+        a = ecs_tap_clear_elements(a);
+        a.dealloc_count = a.dealloc_count + 1;
+    };
+    a.capacity = 0;
+    a.len = 0;
+    a.alive = false;
+    return a;
+}
+
+// as_slice: copy first slice_len values into result struct (up to 8 reported)
+struct EcsThinArraySliceDeep {
+    len: i64,
+    v0: i64, v1: i64, v2: i64, v3: i64,
+    v4: i64, v5: i64, v6: i64, v7: i64,
+}
+
+fn ecs_tap_as_slice(a: EcsThinArrayPtrDeep, slice_len: i64) -> EcsThinArraySliceDeep {
+    let n = slice_len;
+    if n > a.len { n = a.len; };
+    if n < 0 { n = 0; };
+    let s = EcsThinArraySliceDeep {
+        len: n,
+        v0: 0, v1: 0, v2: 0, v3: 0,
+        v4: 0, v5: 0, v6: 0, v7: 0,
+    };
+    if n > 0 { s.v0 = ecs_tap_slot_get(a, 0); };
+    if n > 1 { s.v1 = ecs_tap_slot_get(a, 1); };
+    if n > 2 { s.v2 = ecs_tap_slot_get(a, 2); };
+    if n > 3 { s.v3 = ecs_tap_slot_get(a, 3); };
+    if n > 4 { s.v4 = ecs_tap_slot_get(a, 4); };
+    if n > 5 { s.v5 = ecs_tap_slot_get(a, 5); };
+    if n > 6 { s.v6 = ecs_tap_slot_get(a, 6); };
+    if n > 7 { s.v7 = ecs_tap_slot_get(a, 7); };
+    return s;
+}
+
+fn ecs_tap_slice_len(s: EcsThinArraySliceDeep) -> i64 { return s.len; }
+fn ecs_tap_slice_get(s: EcsThinArraySliceDeep, idx: i64) -> i64 {
+    if idx == 0 { return s.v0; };
+    if idx == 1 { return s.v1; };
+    if idx == 2 { return s.v2; };
+    if idx == 3 { return s.v3; };
+    if idx == 4 { return s.v4; };
+    if idx == 5 { return s.v5; };
+    if idx == 6 { return s.v6; };
+    if idx == 7 { return s.v7; };
+    return 0;
+}
+
+// Push helper using initialize at len
+fn ecs_tap_push(a: EcsThinArrayPtrDeep, value: i64) -> EcsThinArrayPtrDeep {
+    return ecs_tap_initialize_unchecked(a, a.len, value);
+}

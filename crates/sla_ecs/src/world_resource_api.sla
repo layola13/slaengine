@@ -1,0 +1,230 @@
+// Bevy ECS world (src/world/mod.rs):
+// World resource management deep API — init_resource, insert_resource, remove_resource,
+// contains_resource, is_resource_added, is_resource_changed, get_resource_change_ticks,
+// resource, resource_ref, resource_mut, get_resource, get_resource_or_insert_with,
+// modify_resource, init_non_send, insert_non_send, remove_non_send, contains_non_send,
+// resource_scope, try_resource_scope.
+
+struct EcsWorldResource {
+    resource_ids: Vec<i32>,
+    resource_values: Vec<i64>,
+    resource_added_ticks: Vec<i64>,
+    resource_changed_ticks: Vec<i64>,
+    current_tick: i64,
+    // non-send resources (same storage, just tracked separately)
+    non_send_ids: Vec<i32>,
+    non_send_values: Vec<i64>,
+}
+
+fn ecs_world_resource_new() -> EcsWorldResource {
+    return EcsWorldResource {
+        resource_ids: Vec::new(), resource_values: Vec::new(),
+        resource_added_ticks: Vec::new(), resource_changed_ticks: Vec::new(),
+        current_tick: 0,
+        non_send_ids: Vec::new(), non_send_values: Vec::new()
+    };
+}
+
+fn ecs_world_resource_tick(w: EcsWorldResource) -> EcsWorldResource {
+    w.current_tick = w.current_tick + 1;
+    return w;
+}
+
+fn ecs_world_resource_current_tick(w: EcsWorldResource) -> i64 { return w.current_tick; }
+
+// === find resource index ===
+
+fn ecs_world_resource_find(w: EcsWorldResource, resource_id: i32) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(w.resource_ids) as i64;
+    while i < n {
+        if w.resource_ids[i] == resource_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// === insert_resource ===
+
+fn ecs_world_resource_insert(w: EcsWorldResource, resource_id: i32, value: i64) -> EcsWorldResource {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx >= 0 {
+        w.resource_values[idx] = value;
+        w.resource_changed_ticks[idx] = w.current_tick;
+    } else {
+        w.resource_ids.push(resource_id);
+        w.resource_values.push(value);
+        w.resource_added_ticks.push(w.current_tick);
+        w.resource_changed_ticks.push(w.current_tick);
+    };
+    return w;
+}
+
+// === init_resource (insert default if not present) ===
+
+fn ecs_world_resource_init(w: EcsWorldResource, resource_id: i32) -> EcsWorldResource {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx >= 0 { return w; };
+    w.resource_ids.push(resource_id);
+    w.resource_values.push(0);
+    w.resource_added_ticks.push(w.current_tick);
+    w.resource_changed_ticks.push(w.current_tick);
+    return w;
+}
+
+// === get_resource_or_insert_with ===
+
+fn ecs_world_resource_get_or_insert_with(w: EcsWorldResource, resource_id: i32, default_value: i64) -> (EcsWorldResource, i64) {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx >= 0 { return (w, w.resource_values[idx]); };
+    w.resource_ids.push(resource_id);
+    w.resource_values.push(default_value);
+    w.resource_added_ticks.push(w.current_tick);
+    w.resource_changed_ticks.push(w.current_tick);
+    return (w, default_value);
+}
+
+// === remove_resource ===
+
+fn ecs_world_resource_remove(w: EcsWorldResource, resource_id: i32) -> (EcsWorldResource, bool, i64) {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return (w, false, 0); };
+    let val = w.resource_values[idx];
+    let last = (len(w.resource_ids) as i64) - 1;
+    if idx != last {
+        w.resource_ids[idx] = w.resource_ids[last];
+        w.resource_values[idx] = w.resource_values[last];
+        w.resource_added_ticks[idx] = w.resource_added_ticks[last];
+        w.resource_changed_ticks[idx] = w.resource_changed_ticks[last];
+    };
+    w.resource_ids.pop();
+    w.resource_values.pop();
+    w.resource_added_ticks.pop();
+    w.resource_changed_ticks.pop();
+    return (w, true, val);
+}
+
+// === contains_resource ===
+
+fn ecs_world_resource_contains(w: EcsWorldResource, resource_id: i32) -> bool {
+    let idx = ecs_world_resource_find(w, resource_id);
+    return idx >= 0;
+}
+
+// === get_resource ===
+
+fn ecs_world_resource_get(w: EcsWorldResource, resource_id: i32) -> (bool, i64) {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return (false, 0); };
+    return (true, w.resource_values[idx]);
+}
+
+// === resource (panics if not found — modeled as returning value) ===
+
+fn ecs_world_resource_value(w: EcsWorldResource, resource_id: i32) -> i64 {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return 0; };
+    return w.resource_values[idx];
+}
+
+// === is_resource_added ===
+
+fn ecs_world_resource_is_added(w: EcsWorldResource, resource_id: i32, since_tick: i64) -> bool {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return false; };
+    return w.resource_added_ticks[idx] > since_tick;
+}
+
+// === is_resource_changed ===
+
+fn ecs_world_resource_is_changed(w: EcsWorldResource, resource_id: i32, since_tick: i64) -> bool {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return false; };
+    return w.resource_changed_ticks[idx] > since_tick;
+}
+
+// === get_resource_change_ticks ===
+
+fn ecs_world_resource_get_change_ticks(w: EcsWorldResource, resource_id: i32) -> (bool, i64, i64) {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return (false, 0, 0); };
+    return (true, w.resource_added_ticks[idx], w.resource_changed_ticks[idx]);
+}
+
+// === modify_resource ===
+
+fn ecs_world_resource_modify(w: EcsWorldResource, resource_id: i32, delta: i64) -> (EcsWorldResource, bool, i64) {
+    let idx = ecs_world_resource_find(w, resource_id);
+    if idx < 0 { return (w, false, 0); };
+    let new_val = w.resource_values[idx] + delta;
+    w.resource_values[idx] = new_val;
+    w.resource_changed_ticks[idx] = w.current_tick;
+    return (w, true, new_val);
+}
+
+// === resource_count ===
+
+fn ecs_world_resource_count(w: EcsWorldResource) -> i64 { return len(w.resource_ids) as i64; }
+
+// === Non-send resources ===
+
+fn ecs_world_resource_find_non_send(w: EcsWorldResource, resource_id: i32) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(w.non_send_ids) as i64;
+    while i < n {
+        if w.non_send_ids[i] == resource_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_world_resource_init_non_send(w: EcsWorldResource, resource_id: i32) -> EcsWorldResource {
+    let idx = ecs_world_resource_find_non_send(w, resource_id);
+    if idx >= 0 { return w; };
+    w.non_send_ids.push(resource_id);
+    w.non_send_values.push(0);
+    return w;
+}
+
+fn ecs_world_resource_insert_non_send(w: EcsWorldResource, resource_id: i32, value: i64) -> EcsWorldResource {
+    let idx = ecs_world_resource_find_non_send(w, resource_id);
+    if idx >= 0 {
+        w.non_send_values[idx] = value;
+    } else {
+        w.non_send_ids.push(resource_id);
+        w.non_send_values.push(value);
+    };
+    return w;
+}
+
+fn ecs_world_resource_remove_non_send(w: EcsWorldResource, resource_id: i32) -> (EcsWorldResource, bool) {
+    let idx = ecs_world_resource_find_non_send(w, resource_id);
+    if idx < 0 { return (w, false); };
+    let last = (len(w.non_send_ids) as i64) - 1;
+    if idx != last {
+        w.non_send_ids[idx] = w.non_send_ids[last];
+        w.non_send_values[idx] = w.non_send_values[last];
+    };
+    w.non_send_ids.pop();
+    w.non_send_values.pop();
+    return (w, true);
+}
+
+fn ecs_world_resource_contains_non_send(w: EcsWorldResource, resource_id: i32) -> bool {
+    let idx = ecs_world_resource_find_non_send(w, resource_id);
+    return idx >= 0;
+}
+
+fn ecs_world_resource_get_non_send(w: EcsWorldResource, resource_id: i32) -> (bool, i64) {
+    let idx = ecs_world_resource_find_non_send(w, resource_id);
+    if idx < 0 { return (false, 0); };
+    return (true, w.non_send_values[idx]);
+}
+
+fn ecs_world_resource_non_send_count(w: EcsWorldResource) -> i64 { return len(w.non_send_ids) as i64; }
+
+// === resource_scope (returns the resource value and removes it from world temporarily) ===
+
+fn ecs_world_resource_scope(w: EcsWorldResource, resource_id: i32) -> (EcsWorldResource, bool, i64) {
+    return ecs_world_resource_remove(w, resource_id);
+}

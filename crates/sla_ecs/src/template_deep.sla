@@ -1,0 +1,399 @@
+// Deepened Bevy ECS template surface.
+// Mirrors src/template.rs:
+//   Template { build_template, clone_template }
+//   FromTemplate { type Template }
+//   TemplateContext { entity, entity_references, get_entity, resource/resource_mut }
+//   SceneEntityReferences get/set (spawn-on-miss)
+//   SceneEntityReference identity (file/line/column/name_id/runtime)
+//   Built-in templates: Identity/DefaultClone, OptionTemplate, VecTemplate, FnTemplate, EntityTemplate
+// Shallow lib/template.sla retained.
+
+// === SceneEntityReference ===
+struct EcsTplRefDeep {
+    file_id: i64,
+    line: i64,
+    column: i64,
+    name_id: i64,
+    runtime: i64,
+    hash: i64,
+}
+
+fn ecs_tpl_ref_new(file_id: i64, line: i64, column: i64, name_id: i64, runtime: i64) -> EcsTplRefDeep {
+    // simple stable hash
+    let h = file_id * 1315423911 + line * 1000003 + column * 1009 + name_id * 97 + runtime;
+    if h < 0 { h = 0 - h; };
+    return EcsTplRefDeep {
+        file_id: file_id,
+        line: line,
+        column: column,
+        name_id: name_id,
+        runtime: runtime,
+        hash: h,
+    };
+}
+
+fn ecs_tpl_ref_hash(r: EcsTplRefDeep) -> i64 { return r.hash; }
+fn ecs_tpl_ref_file(r: EcsTplRefDeep) -> i64 { return r.file_id; }
+fn ecs_tpl_ref_line(r: EcsTplRefDeep) -> i64 { return r.line; }
+fn ecs_tpl_ref_column(r: EcsTplRefDeep) -> i64 { return r.column; }
+fn ecs_tpl_ref_name_id(r: EcsTplRefDeep) -> i64 { return r.name_id; }
+fn ecs_tpl_ref_runtime(r: EcsTplRefDeep) -> i64 { return r.runtime; }
+
+fn ecs_tpl_ref_eq(a: EcsTplRefDeep, b: EcsTplRefDeep) -> bool {
+    return a.file_id == b.file_id && a.line == b.line && a.column == b.column && a.name_id == b.name_id && a.runtime == b.runtime;
+}
+
+// === SceneEntityReferences map (4 slots) ===
+struct EcsTplRefsDeep {
+    k0: i64, e0: i64,
+    k1: i64, e1: i64,
+    k2: i64, e2: i64,
+    k3: i64, e3: i64,
+    len: i32,
+    next_spawn: i64,
+    spawn_count: i64,
+}
+
+fn ecs_tpl_refs_new(next_spawn: i64) -> EcsTplRefsDeep {
+    return EcsTplRefsDeep {
+        k0: 0, e0: 0, k1: 0, e1: 0, k2: 0, e2: 0, k3: 0, e3: 0,
+        len: 0,
+        next_spawn: next_spawn,
+        spawn_count: 0,
+    };
+}
+
+fn ecs_tpl_refs_len(r: EcsTplRefsDeep) -> i32 { return r.len; }
+fn ecs_tpl_refs_spawn_count(r: EcsTplRefsDeep) -> i64 { return r.spawn_count; }
+
+fn ecs_tpl_refs_find(r: EcsTplRefsDeep, key: i64) -> (bool, i64) {
+    if r.len >= 1 && r.k0 == key { return (true, r.e0); };
+    if r.len >= 2 && r.k1 == key { return (true, r.e1); };
+    if r.len >= 3 && r.k2 == key { return (true, r.e2); };
+    if r.len >= 4 && r.k3 == key { return (true, r.e3); };
+    return (false, 0);
+}
+
+fn ecs_tpl_refs_insert(r: EcsTplRefsDeep, key: i64, entity: i64) -> EcsTplRefsDeep {
+    let f = ecs_tpl_refs_find(r, key);
+    if f.0 {
+        // Occupied set is no-op in Bevy set(); get returns existing
+        return r;
+    };
+    let k0 = r.k0; let e0 = r.e0;
+    let k1 = r.k1; let e1 = r.e1;
+    let k2 = r.k2; let e2 = r.e2;
+    let k3 = r.k3; let e3 = r.e3;
+    let n = r.len;
+    let ns = r.next_spawn;
+    let sc = r.spawn_count;
+    if n == 0 {
+        return EcsTplRefsDeep { k0: key, e0: entity, k1: k1, e1: e1, k2: k2, e2: e2, k3: k3, e3: e3, len: 1, next_spawn: ns, spawn_count: sc };
+    };
+    if n == 1 {
+        return EcsTplRefsDeep { k0: k0, e0: e0, k1: key, e1: entity, k2: k2, e2: e2, k3: k3, e3: e3, len: 2, next_spawn: ns, spawn_count: sc };
+    };
+    if n == 2 {
+        return EcsTplRefsDeep { k0: k0, e0: e0, k1: k1, e1: e1, k2: key, e2: entity, k3: k3, e3: e3, len: 3, next_spawn: ns, spawn_count: sc };
+    };
+    if n == 3 {
+        return EcsTplRefsDeep { k0: k0, e0: e0, k1: k1, e1: e1, k2: k2, e2: e2, k3: key, e3: entity, len: 4, next_spawn: ns, spawn_count: sc };
+    };
+    return r;
+}
+
+// get: spawn empty entity on miss
+fn ecs_tpl_refs_get(r: EcsTplRefsDeep, key: i64) -> (EcsTplRefsDeep, i64) {
+    let f = ecs_tpl_refs_find(r, key);
+    if f.0 {
+        return (r, f.1);
+    };
+    let entity = r.next_spawn;
+    let ns = r.next_spawn + 1;
+    let sc = r.spawn_count + 1;
+    r = EcsTplRefsDeep {
+        k0: r.k0, e0: r.e0, k1: r.k1, e1: r.e1, k2: r.k2, e2: r.e2, k3: r.k3, e3: r.e3,
+        len: r.len, next_spawn: ns, spawn_count: sc,
+    };
+    r = ecs_tpl_refs_insert(r, key, entity);
+    return (r, entity);
+}
+
+// set: only insert if vacant
+fn ecs_tpl_refs_set(r: EcsTplRefsDeep, key: i64, entity: i64) -> EcsTplRefsDeep {
+    return ecs_tpl_refs_insert(r, key, entity);
+}
+
+// === TemplateContext ===
+struct EcsTplCtxDeep {
+    entity: i64,
+    resource_value: i64,
+    resource_changed: i64,
+    this_run: i64,
+}
+
+fn ecs_tpl_ctx_new(entity: i64, resource_value: i64, this_run: i64) -> EcsTplCtxDeep {
+    return EcsTplCtxDeep {
+        entity: entity,
+        resource_value: resource_value,
+        resource_changed: 0,
+        this_run: this_run,
+    };
+}
+
+fn ecs_tpl_ctx_entity(c: EcsTplCtxDeep) -> i64 { return c.entity; }
+fn ecs_tpl_ctx_resource(c: EcsTplCtxDeep) -> i64 { return c.resource_value; }
+fn ecs_tpl_ctx_resource_mut(c: EcsTplCtxDeep, value: i64) -> EcsTplCtxDeep {
+    let e = c.entity;
+    let tr = c.this_run;
+    return EcsTplCtxDeep {
+        entity: e,
+        resource_value: value,
+        resource_changed: tr,
+        this_run: tr,
+    };
+}
+fn ecs_tpl_ctx_resource_changed(c: EcsTplCtxDeep) -> i64 { return c.resource_changed; }
+
+// === Template kinds ===
+const ECS_TPL_KIND_IDENTITY: i32 = 0;
+const ECS_TPL_KIND_DEFAULT: i32 = 1;
+const ECS_TPL_KIND_OPTION_SOME: i32 = 2;
+const ECS_TPL_KIND_OPTION_NONE: i32 = 3;
+const ECS_TPL_KIND_VEC: i32 = 4;
+const ECS_TPL_KIND_FN: i32 = 5;
+const ECS_TPL_KIND_ENTITY: i32 = 6;
+const ECS_TPL_KIND_ERROR: i32 = 7;
+
+struct EcsTplDeep {
+    kind: i32,
+    // IDENTITY/DEFAULT/FN/ENTITY payload
+    value: i64,
+    // VEC: up to 4 element values
+    v0: i64, v1: i64, v2: i64, v3: i64, vlen: i32,
+    // error code when build fails
+    err: i64,
+}
+
+fn ecs_tpl_identity(value: i64) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_IDENTITY, value: value,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+fn ecs_tpl_default(default_value: i64) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_DEFAULT, value: default_value,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+fn ecs_tpl_option_some(inner: i64) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_OPTION_SOME, value: inner,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+fn ecs_tpl_option_none() -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_OPTION_NONE, value: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+fn ecs_tpl_vec_empty() -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_VEC, value: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+fn ecs_tpl_vec_push(t: EcsTplDeep, item: i64) -> EcsTplDeep {
+    let k = t.kind;
+    let val = t.value;
+    let v0 = t.v0; let v1 = t.v1; let v2 = t.v2; let v3 = t.v3;
+    let n = t.vlen;
+    let err = t.err;
+    if n == 0 {
+        return EcsTplDeep { kind: k, value: val, v0: item, v1: v1, v2: v2, v3: v3, vlen: 1, err: err };
+    };
+    if n == 1 {
+        return EcsTplDeep { kind: k, value: val, v0: v0, v1: item, v2: v2, v3: v3, vlen: 2, err: err };
+    };
+    if n == 2 {
+        return EcsTplDeep { kind: k, value: val, v0: v0, v1: v1, v2: item, v3: v3, vlen: 3, err: err };
+    };
+    if n == 3 {
+        return EcsTplDeep { kind: k, value: val, v0: v0, v1: v1, v2: v2, v3: item, vlen: 4, err: err };
+    };
+    return t;
+}
+
+fn ecs_tpl_fn(func_id: i64) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_FN, value: func_id,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+// EntityTemplate: holds SceneEntityReference hash key to resolve via context refs
+fn ecs_tpl_entity(ref_hash: i64) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_ENTITY, value: ref_hash,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0,
+    };
+}
+
+fn ecs_tpl_error(code: i64) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: ECS_TPL_KIND_ERROR, value: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: code,
+    };
+}
+
+fn ecs_tpl_kind(t: EcsTplDeep) -> i32 { return t.kind; }
+fn ecs_tpl_value(t: EcsTplDeep) -> i64 { return t.value; }
+fn ecs_tpl_vlen(t: EcsTplDeep) -> i32 { return t.vlen; }
+fn ecs_tpl_err(t: EcsTplDeep) -> i64 { return t.err; }
+
+// clone_template
+fn ecs_tpl_clone(t: EcsTplDeep) -> EcsTplDeep {
+    return EcsTplDeep {
+        kind: t.kind, value: t.value,
+        v0: t.v0, v1: t.v1, v2: t.v2, v3: t.v3, vlen: t.vlen, err: t.err,
+    };
+}
+
+// Build result
+struct EcsTplBuildDeep {
+    ok: bool,
+    // for scalar outputs
+    value: i64,
+    has_value: bool,
+    // for option
+    is_none: bool,
+    // for vec
+    v0: i64, v1: i64, v2: i64, v3: i64, vlen: i32,
+    err: i64,
+    // updated refs when entity template resolves
+    refs: EcsTplRefsDeep,
+    ctx: EcsTplCtxDeep,
+}
+
+fn ecs_tpl_build_ok(b: EcsTplBuildDeep) -> bool { return b.ok; }
+fn ecs_tpl_build_value(b: EcsTplBuildDeep) -> i64 { return b.value; }
+fn ecs_tpl_build_has_value(b: EcsTplBuildDeep) -> bool { return b.has_value; }
+fn ecs_tpl_build_is_none(b: EcsTplBuildDeep) -> bool { return b.is_none; }
+fn ecs_tpl_build_vlen(b: EcsTplBuildDeep) -> i32 { return b.vlen; }
+fn ecs_tpl_build_err(b: EcsTplBuildDeep) -> i64 { return b.err; }
+fn ecs_tpl_build_refs(b: EcsTplBuildDeep) -> EcsTplRefsDeep { return b.refs; }
+fn ecs_tpl_build_ctx(b: EcsTplBuildDeep) -> EcsTplCtxDeep { return b.ctx; }
+fn ecs_tpl_build_vat(b: EcsTplBuildDeep, idx: i32) -> i64 {
+    if idx == 0 { return b.v0; };
+    if idx == 1 { return b.v1; };
+    if idx == 2 { return b.v2; };
+    if idx == 3 { return b.v3; };
+    return 0;
+}
+
+// Fn template execution table: func_id -> value; also can read context entity
+fn ecs_tpl_eval_fn(func_id: i64, ctx: EcsTplCtxDeep) -> i64 {
+    // 1: constant 100
+    if func_id == 1 { return 100; };
+    // 2: return context entity
+    if func_id == 2 { return ctx.entity; };
+    // 3: resource value
+    if func_id == 3 { return ctx.resource_value; };
+    return 0;
+}
+
+fn ecs_tpl_build(t: EcsTplDeep, ctx: EcsTplCtxDeep, refs: EcsTplRefsDeep) -> EcsTplBuildDeep {
+    let kind = t.kind;
+    let val = t.value;
+    let v0 = t.v0; let v1 = t.v1; let v2 = t.v2; let v3 = t.v3;
+    let vlen = t.vlen;
+    let err = t.err;
+    if kind == ECS_TPL_KIND_ERROR {
+        return EcsTplBuildDeep {
+            ok: false, value: 0, has_value: false, is_none: false,
+            v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: err, refs: refs, ctx: ctx,
+        };
+    };
+    if kind == ECS_TPL_KIND_IDENTITY || kind == ECS_TPL_KIND_DEFAULT {
+        return EcsTplBuildDeep {
+            ok: true, value: val, has_value: true, is_none: false,
+            v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0, refs: refs, ctx: ctx,
+        };
+    };
+    if kind == ECS_TPL_KIND_OPTION_NONE {
+        return EcsTplBuildDeep {
+            ok: true, value: 0, has_value: false, is_none: true,
+            v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0, refs: refs, ctx: ctx,
+        };
+    };
+    if kind == ECS_TPL_KIND_OPTION_SOME {
+        return EcsTplBuildDeep {
+            ok: true, value: val, has_value: true, is_none: false,
+            v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0, refs: refs, ctx: ctx,
+        };
+    };
+    if kind == ECS_TPL_KIND_VEC {
+        return EcsTplBuildDeep {
+            ok: true, value: 0, has_value: false, is_none: false,
+            v0: v0, v1: v1, v2: v2, v3: v3, vlen: vlen, err: 0, refs: refs, ctx: ctx,
+        };
+    };
+    if kind == ECS_TPL_KIND_FN {
+        let out = ecs_tpl_eval_fn(val, ctx);
+        return EcsTplBuildDeep {
+            ok: true, value: out, has_value: true, is_none: false,
+            v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0, refs: refs, ctx: ctx,
+        };
+    };
+    if kind == ECS_TPL_KIND_ENTITY {
+        let g = ecs_tpl_refs_get(refs, val);
+        refs = g.0;
+        return EcsTplBuildDeep {
+            ok: true, value: g.1, has_value: true, is_none: false,
+            v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 0, refs: refs, ctx: ctx,
+        };
+    };
+    return EcsTplBuildDeep {
+        ok: false, value: 0, has_value: false, is_none: false,
+        v0: 0, v1: 0, v2: 0, v3: 0, vlen: 0, err: 999, refs: refs, ctx: ctx,
+    };
+}
+
+// FromTemplate: type has associated template id
+struct EcsFromTemplateDeep {
+    type_id: i64,
+    template_type_id: i64,
+    has_manual: bool,
+}
+
+fn ecs_from_tpl_auto(type_id: i64) -> EcsFromTemplateDeep {
+    // blanket Default+Clone → template type id = type_id + 100000
+    return EcsFromTemplateDeep {
+        type_id: type_id,
+        template_type_id: type_id + 100000,
+        has_manual: false,
+    };
+}
+
+fn ecs_from_tpl_manual(type_id: i64, template_type_id: i64) -> EcsFromTemplateDeep {
+    return EcsFromTemplateDeep {
+        type_id: type_id,
+        template_type_id: template_type_id,
+        has_manual: true,
+    };
+}
+
+fn ecs_from_tpl_type_id(f: EcsFromTemplateDeep) -> i64 { return f.type_id; }
+fn ecs_from_tpl_template_type_id(f: EcsFromTemplateDeep) -> i64 { return f.template_type_id; }
+fn ecs_from_tpl_has_manual(f: EcsFromTemplateDeep) -> bool { return f.has_manual; }
+
+fn ecs_tpl_kind_identity() -> i32 { return ECS_TPL_KIND_IDENTITY; }
+fn ecs_tpl_kind_entity() -> i32 { return ECS_TPL_KIND_ENTITY; }
+fn ecs_tpl_kind_option_none() -> i32 { return ECS_TPL_KIND_OPTION_NONE; }

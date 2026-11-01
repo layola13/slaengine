@@ -1,0 +1,354 @@
+// Deepened Bevy ECS system::exclusive_function_system + exclusive_system_param.
+// Mirrors src/system/exclusive_function_system.rs and exclusive_system_param.rs.
+// Flags always NON_SEND|EXCLUSIVE, no deferred buffers; initialize builds param
+// state; run_unsafe requires state, flushes world, updates last_run, IntoResult.
+// Shallow exclusive_function_system.sla / exclusive_system_param.sla kept.
+
+// === flags (from SystemStateFlags, exclusive always NON_SEND|EXCLUSIVE) ===
+const ECS_EFS_NON_SEND: i32 = 1;
+const ECS_EFS_EXCLUSIVE: i32 = 4;
+const ECS_EFS_DEFAULT_FLAGS: i32 = 5; // NON_SEND | EXCLUSIVE
+
+// === ExclusiveSystemParam kinds (Bevy impls) ===
+const ECS_ESP_WORLD: i32 = 0;       // &mut World as run arg (not a Param state)
+const ECS_ESP_QUERY_STATE: i32 = 1; // &mut QueryState
+const ECS_ESP_SYSTEM_STATE: i32 = 2; // &mut SystemState
+const ECS_ESP_LOCAL: i32 = 3;       // Local<T>
+const ECS_ESP_PHANTOM: i32 = 4;     // PhantomData
+const ECS_ESP_TUPLE: i32 = 5;       // tuple of params
+
+// run / get_param errors
+const ECS_EFS_ERR_OK: i32 = 0;
+const ECS_EFS_ERR_UNINITIALIZED: i32 = 1;
+const ECS_EFS_ERR_PARAM: i32 = 2;
+const ECS_EFS_ERR_INTO_RESULT: i32 = 3;
+
+// === ExclusiveSystemParam state (flattened) ===
+struct EcsExclusiveSystemParamDeep {
+    kind: i32,
+    state_id: i64,
+    local_value: i64,
+    param_count: i32, // for tuples
+    world_id: i64,
+    initialized: bool,
+}
+
+fn ecs_esp_deep_query_state(state_id: i64) -> EcsExclusiveSystemParamDeep {
+    return EcsExclusiveSystemParamDeep {
+        kind: ECS_ESP_QUERY_STATE,
+        state_id: state_id,
+        local_value: 0,
+        param_count: 1,
+        world_id: 0,
+        initialized: false,
+    };
+}
+
+fn ecs_esp_deep_system_state(state_id: i64) -> EcsExclusiveSystemParamDeep {
+    return EcsExclusiveSystemParamDeep {
+        kind: ECS_ESP_SYSTEM_STATE,
+        state_id: state_id,
+        local_value: 0,
+        param_count: 1,
+        world_id: 0,
+        initialized: false,
+    };
+}
+
+fn ecs_esp_deep_local(initial: i64) -> EcsExclusiveSystemParamDeep {
+    return EcsExclusiveSystemParamDeep {
+        kind: ECS_ESP_LOCAL,
+        state_id: 0,
+        local_value: initial,
+        param_count: 1,
+        world_id: 0,
+        initialized: false,
+    };
+}
+
+fn ecs_esp_deep_phantom() -> EcsExclusiveSystemParamDeep {
+    return EcsExclusiveSystemParamDeep {
+        kind: ECS_ESP_PHANTOM,
+        state_id: 0,
+        local_value: 0,
+        param_count: 0,
+        world_id: 0,
+        initialized: false,
+    };
+}
+
+fn ecs_esp_deep_tuple(count: i32) -> EcsExclusiveSystemParamDeep {
+    return EcsExclusiveSystemParamDeep {
+        kind: ECS_ESP_TUPLE,
+        state_id: 0,
+        local_value: 0,
+        param_count: count,
+        world_id: 0,
+        initialized: false,
+    };
+}
+
+fn ecs_esp_deep_kind(p: EcsExclusiveSystemParamDeep) -> i32 { return p.kind; }
+fn ecs_esp_deep_state_id(p: EcsExclusiveSystemParamDeep) -> i64 { return p.state_id; }
+fn ecs_esp_deep_local_value(p: EcsExclusiveSystemParamDeep) -> i64 { return p.local_value; }
+fn ecs_esp_deep_param_count(p: EcsExclusiveSystemParamDeep) -> i32 { return p.param_count; }
+fn ecs_esp_deep_initialized(p: EcsExclusiveSystemParamDeep) -> bool { return p.initialized; }
+fn ecs_esp_deep_world_id(p: EcsExclusiveSystemParamDeep) -> i64 { return p.world_id; }
+
+// init: ExclusiveSystemParam::init(world, system_meta)
+fn ecs_esp_deep_init(p: EcsExclusiveSystemParamDeep, world_id: i64) -> EcsExclusiveSystemParamDeep {
+    p.world_id = world_id;
+    p.initialized = true;
+    // QueryState/SystemState get state_id from world seed if zero
+    if p.kind == ECS_ESP_QUERY_STATE {
+        if p.state_id == 0 {
+            p.state_id = world_id + 1000;
+        };
+    };
+    if p.kind == ECS_ESP_SYSTEM_STATE {
+        if p.state_id == 0 {
+            p.state_id = world_id + 2000;
+        };
+    };
+    return p;
+}
+
+// get_param: returns (ok, err_code) — validation may fail
+fn ecs_esp_deep_get_param_ok(p: EcsExclusiveSystemParamDeep) -> bool {
+    if p.initialized != true { return false; };
+    return true;
+}
+
+// Local mutates via get_param + bump helper (mirrors Local persistence)
+fn ecs_esp_deep_local_bump(p: EcsExclusiveSystemParamDeep) -> EcsExclusiveSystemParamDeep {
+    if p.kind == ECS_ESP_LOCAL {
+        p.local_value = p.local_value + 1;
+    };
+    return p;
+}
+
+fn ecs_esp_deep_set_local(p: EcsExclusiveSystemParamDeep, v: i64) -> EcsExclusiveSystemParamDeep {
+    p.local_value = v;
+    return p;
+}
+
+// === ExclusiveFunctionSystem (flattened) ===
+struct EcsExclusiveFunctionSystemDeep {
+    name_id: i64,
+    flags: i32,
+    last_run: i64,
+    has_param_state: bool,
+    has_input: bool,
+    param_kind: i32,
+    param_state_id: i64,
+    local_value: i64,
+    world_id: i64,
+    run_count: i64,
+    last_output: i64,
+    last_error: i32,
+    last_err_code: i64,
+    flush_count: i64,
+    change_tick: i64,
+}
+
+fn ecs_efs_deep_new(name_id: i64, has_input: bool) -> EcsExclusiveFunctionSystemDeep {
+    return EcsExclusiveFunctionSystemDeep {
+        name_id: name_id,
+        flags: ECS_EFS_DEFAULT_FLAGS,
+        last_run: 0,
+        has_param_state: false,
+        has_input: has_input,
+        param_kind: ECS_ESP_PHANTOM,
+        param_state_id: 0,
+        local_value: 0,
+        world_id: 0,
+        run_count: 0,
+        last_output: 0,
+        last_error: ECS_EFS_ERR_OK,
+        last_err_code: 0,
+        flush_count: 0,
+        change_tick: 0,
+    };
+}
+
+// IntoSystem for exclusive F
+fn ecs_efs_deep_from_func(name_id: i64, has_input: bool) -> EcsExclusiveFunctionSystemDeep {
+    return ecs_efs_deep_new(name_id, has_input);
+}
+
+fn ecs_efs_deep_name(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.name_id; }
+fn ecs_efs_deep_flags(s: EcsExclusiveFunctionSystemDeep) -> i32 { return s.flags; }
+fn ecs_efs_deep_has_param_state(s: EcsExclusiveFunctionSystemDeep) -> bool { return s.has_param_state; }
+fn ecs_efs_deep_has_input(s: EcsExclusiveFunctionSystemDeep) -> bool { return s.has_input; }
+fn ecs_efs_deep_world_id(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.world_id; }
+fn ecs_efs_deep_run_count(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.run_count; }
+fn ecs_efs_deep_last_output(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.last_output; }
+fn ecs_efs_deep_last_error(s: EcsExclusiveFunctionSystemDeep) -> i32 { return s.last_error; }
+fn ecs_efs_deep_last_err_code(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.last_err_code; }
+fn ecs_efs_deep_last_run(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.last_run; }
+fn ecs_efs_deep_flush_count(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.flush_count; }
+fn ecs_efs_deep_local_value(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.local_value; }
+fn ecs_efs_deep_param_kind(s: EcsExclusiveFunctionSystemDeep) -> i32 { return s.param_kind; }
+fn ecs_efs_deep_param_state_id(s: EcsExclusiveFunctionSystemDeep) -> i64 { return s.param_state_id; }
+
+// flags always NON_SEND | EXCLUSIVE; never deferred
+fn ecs_efs_deep_is_non_send(s: EcsExclusiveFunctionSystemDeep) -> bool {
+    return (s.flags & ECS_EFS_NON_SEND) != 0;
+}
+
+fn ecs_efs_deep_is_exclusive(s: EcsExclusiveFunctionSystemDeep) -> bool {
+    return (s.flags & ECS_EFS_EXCLUSIVE) != 0;
+}
+
+fn ecs_efs_deep_has_deferred(s: EcsExclusiveFunctionSystemDeep) -> bool {
+    return false;
+}
+
+fn ecs_efs_deep_with_name(s: EcsExclusiveFunctionSystemDeep, new_name: i64) -> EcsExclusiveFunctionSystemDeep {
+    s.name_id = new_name;
+    return s;
+}
+
+fn ecs_efs_deep_set_last_run(s: EcsExclusiveFunctionSystemDeep, tick: i64) -> EcsExclusiveFunctionSystemDeep {
+    s.last_run = tick;
+    return s;
+}
+
+// initialize(world): last_run = change_tick relative; param_state = Some(Param::init)
+fn ecs_efs_deep_initialize(
+    s: EcsExclusiveFunctionSystemDeep,
+    world_id: i64,
+    change_tick: i64,
+    param: EcsExclusiveSystemParamDeep
+) -> EcsExclusiveFunctionSystemDeep {
+    let p = ecs_esp_deep_init(param, world_id);
+    s.has_param_state = true;
+    s.world_id = world_id;
+    s.last_run = change_tick;
+    s.param_kind = p.kind;
+    s.param_state_id = p.state_id;
+    s.local_value = p.local_value;
+    s.change_tick = change_tick;
+    s.last_error = ECS_EFS_ERR_OK;
+    return s;
+}
+
+// apply_deferred / queue_deferred: pure exclusive systems are no-ops
+fn ecs_efs_deep_apply_deferred(s: EcsExclusiveFunctionSystemDeep) -> EcsExclusiveFunctionSystemDeep {
+    return s;
+}
+
+fn ecs_efs_deep_queue_deferred(s: EcsExclusiveFunctionSystemDeep) -> EcsExclusiveFunctionSystemDeep {
+    return s;
+}
+
+// run_unsafe:
+// - !has_param_state => UNINITIALIZED (PARAM_MESSAGE)
+// - param_ok false => PARAM
+// - else: run func, world.flush(), last_run = increment_change_tick, IntoResult
+fn ecs_efs_deep_run_unsafe(
+    s: EcsExclusiveFunctionSystemDeep,
+    input: i64,
+    param_ok: bool,
+    param_err_code: i64,
+    plain_out: i64,
+    out_is_result: bool,
+    out_ok: bool,
+    out_err_code: i64
+) -> EcsExclusiveFunctionSystemDeep {
+    if s.has_param_state != true {
+        s.last_error = ECS_EFS_ERR_UNINITIALIZED;
+        s.last_err_code = 0;
+        return s;
+    };
+    if param_ok != true {
+        s.last_error = ECS_EFS_ERR_PARAM;
+        s.last_err_code = param_err_code;
+        return s;
+    };
+    // Local param persists across runs when present
+    if s.param_kind == ECS_ESP_LOCAL {
+        s.local_value = s.local_value + 1;
+    };
+    // world.flush()
+    s.flush_count = s.flush_count + 1;
+    s.change_tick = s.change_tick + 1;
+    s.last_run = s.change_tick;
+    s.run_count = s.run_count + 1;
+    // IntoResult
+    if out_is_result {
+        if out_ok {
+            s.last_output = plain_out;
+            s.last_error = ECS_EFS_ERR_OK;
+            s.last_err_code = 0;
+        } else {
+            s.last_error = ECS_EFS_ERR_INTO_RESULT;
+            s.last_err_code = out_err_code;
+        };
+    } else {
+        s.last_output = plain_out;
+        s.last_error = ECS_EFS_ERR_OK;
+        s.last_err_code = 0;
+    };
+    // input only used when has_input; still allowed as unit systems ignore it
+    if s.has_input {
+        // fold input into output for observability when plain
+        if out_is_result != true {
+            s.last_output = plain_out + input;
+        };
+    };
+    return s;
+}
+
+fn ecs_efs_deep_run_plain(
+    s: EcsExclusiveFunctionSystemDeep,
+    input: i64,
+    output: i64
+) -> EcsExclusiveFunctionSystemDeep {
+    return ecs_efs_deep_run_unsafe(s, input, true, 0, output, false, true, 0);
+}
+
+// check_change_tick: clamp last_run if change ticks overflow/check
+fn ecs_efs_deep_check_change_tick(
+    s: EcsExclusiveFunctionSystemDeep,
+    check_tick: i64
+) -> EcsExclusiveFunctionSystemDeep {
+    // if last_run is "stale" relative to check, reset to check_tick
+    if s.last_run < check_tick {
+        // still valid; no change in simple model unless last_run is zero after huge gap
+        if (check_tick - s.last_run) > 1000000 {
+            s.last_run = check_tick;
+        };
+    };
+    return s;
+}
+
+// default_system_sets: SystemTypeSet marker id
+fn ecs_efs_deep_default_system_set_id(s: EcsExclusiveFunctionSystemDeep) -> i64 {
+    return s.name_id;
+}
+
+// markers
+fn ecs_is_exclusive_function_system_marker_deep() -> i32 { return 1; }
+fn ecs_has_exclusive_system_input_marker_deep() -> i32 { return 1; }
+
+// clone / re-into: param_state None again
+fn ecs_efs_deep_clone(s: EcsExclusiveFunctionSystemDeep) -> EcsExclusiveFunctionSystemDeep {
+    return EcsExclusiveFunctionSystemDeep {
+        name_id: s.name_id,
+        flags: ECS_EFS_DEFAULT_FLAGS,
+        last_run: 0,
+        has_param_state: false,
+        has_input: s.has_input,
+        param_kind: ECS_ESP_PHANTOM,
+        param_state_id: 0,
+        local_value: 0,
+        world_id: 0,
+        run_count: 0,
+        last_output: 0,
+        last_error: ECS_EFS_ERR_OK,
+        last_err_code: 0,
+        flush_count: 0,
+        change_tick: 0,
+    };
+}

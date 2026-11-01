@@ -1,0 +1,239 @@
+// Deepened Bevy ECS schedule (src/schedule/executor/mod.rs): SystemSchedule + ApplyDeferred +
+// default_executor. Shallow: lib/system_schedule.sla (Vec-backed SystemSchedule + executor kind).
+//
+// The deep variant mirrors SystemSchedule with two fixed-cap-8 subsystems — a systems subsystem
+// (system_ids + system_conditions + system_dependencies arrays of i64) and a sets subsystem
+// (set_ids + set_conditions arrays of i64) — both as parallel-array storage with per-subsystem
+// count fields. No Vec, no recursion. Field-assign on a struct-by-value param is SLA-legal on SA
+// (verified in Batch 374) so add_system/add_set/mark_*/reset/clear use direct field-reassign.
+// Multi-slot return accessors (get_system_id/_conditions/_dependencies / get_set_id in the shallow
+// return (bool, i64) tuples) are exposed as scalar `*_valid` and `*_value` accessors or wrapper
+// structs instead of tuple-return callsites (Batch 373 observation). Activity totals are stored
+// per-struct as i64 counters. ApplyDeferred marker + executor-kind constants/queries mirror the
+// shallow.
+
+const ECS_SYS_SCHED_DEEP_CAP: i32 = 8;
+const ECS_APPLY_DEFERRED_DEEP: i32 = 999999;
+const ECS_EXECUTOR_SINGLE_DEEP: i32 = 0;
+const ECS_EXECUTOR_MULTI_DEEP: i32 = 1;
+
+// === EcsSystemScheduleDeep ===
+struct EcsSystemScheduleDeep {
+    // systems parallel arrays (cap-8 each)
+    sys_id0: i64, sys_id1: i64, sys_id2: i64, sys_id3: i64, sys_id4: i64, sys_id5: i64, sys_id6: i64, sys_id7: i64,
+    sys_cond0: i64, sys_cond1: i64, sys_cond2: i64, sys_cond3: i64, sys_cond4: i64, sys_cond5: i64, sys_cond6: i64, sys_cond7: i64,
+    sys_dep0: i64, sys_dep1: i64, sys_dep2: i64, sys_dep3: i64, sys_dep4: i64, sys_dep5: i64, sys_dep6: i64, sys_dep7: i64,
+    sys_count: i32,
+    // sets parallel arrays (cap-8 each)
+    set_id0: i64, set_id1: i64, set_id2: i64, set_id3: i64, set_id4: i64, set_id5: i64, set_id6: i64, set_id7: i64,
+    set_cond0: i64, set_cond1: i64, set_cond2: i64, set_cond3: i64, set_cond4: i64, set_cond5: i64, set_cond6: i64, set_cond7: i64,
+    set_count: i32,
+    // running state
+    systems_run: i64,
+    systems_skipped: i64,
+}
+
+// Wrapper-result structs for the (bool, i64)-returning accessors — avoided tuple-return callsites.
+struct EcsSystemIdDeep { valid: bool, id: i64 }
+struct EcsSystemConditionsDeep { valid: bool, count: i64 }
+struct EcsSystemDependenciesDeep { valid: bool, count: i64 }
+struct EcsSetIdDeep { valid: bool, id: i64 }
+struct EcsSetConditionsDeep { valid: bool, count: i64 }
+
+fn ecs_system_schedule_deep_new() -> EcsSystemScheduleDeep {
+    return EcsSystemScheduleDeep {
+        sys_id0: 0, sys_id1: 0, sys_id2: 0, sys_id3: 0, sys_id4: 0, sys_id5: 0, sys_id6: 0, sys_id7: 0,
+        sys_cond0: 0, sys_cond1: 0, sys_cond2: 0, sys_cond3: 0, sys_cond4: 0, sys_cond5: 0, sys_cond6: 0, sys_cond7: 0,
+        sys_dep0: 0, sys_dep1: 0, sys_dep2: 0, sys_dep3: 0, sys_dep4: 0, sys_dep5: 0, sys_dep6: 0, sys_dep7: 0,
+        sys_count: 0,
+        set_id0: 0, set_id1: 0, set_id2: 0, set_id3: 0, set_id4: 0, set_id5: 0, set_id6: 0, set_id7: 0,
+        set_cond0: 0, set_cond1: 0, set_cond2: 0, set_cond3: 0, set_cond4: 0, set_cond5: 0, set_cond6: 0, set_cond7: 0,
+        set_count: 0,
+        systems_run: 0,
+        systems_skipped: 0,
+    };
+}
+
+fn ecs_system_schedule_deep_add_system(s: EcsSystemScheduleDeep, system_id: i64, condition_count: i64, dependency_count: i64) -> EcsSystemScheduleDeep {
+    if s.sys_count >= ECS_SYS_SCHED_DEEP_CAP { return s; };
+    if s.sys_count == 0 { s.sys_id0 = system_id; s.sys_cond0 = condition_count; s.sys_dep0 = dependency_count; };
+    if s.sys_count == 1 { s.sys_id1 = system_id; s.sys_cond1 = condition_count; s.sys_dep1 = dependency_count; };
+    if s.sys_count == 2 { s.sys_id2 = system_id; s.sys_cond2 = condition_count; s.sys_dep2 = dependency_count; };
+    if s.sys_count == 3 { s.sys_id3 = system_id; s.sys_cond3 = condition_count; s.sys_dep3 = dependency_count; };
+    if s.sys_count == 4 { s.sys_id4 = system_id; s.sys_cond4 = condition_count; s.sys_dep4 = dependency_count; };
+    if s.sys_count == 5 { s.sys_id5 = system_id; s.sys_cond5 = condition_count; s.sys_dep5 = dependency_count; };
+    if s.sys_count == 6 { s.sys_id6 = system_id; s.sys_cond6 = condition_count; s.sys_dep6 = dependency_count; };
+    if s.sys_count == 7 { s.sys_id7 = system_id; s.sys_cond7 = condition_count; s.sys_dep7 = dependency_count; };
+    s.sys_count = s.sys_count + 1;
+    return s;
+}
+
+fn ecs_system_schedule_deep_add_set(s: EcsSystemScheduleDeep, set_id: i64, condition_count: i64) -> EcsSystemScheduleDeep {
+    if s.set_count >= ECS_SYS_SCHED_DEEP_CAP { return s; };
+    if s.set_count == 0 { s.set_id0 = set_id; s.set_cond0 = condition_count; };
+    if s.set_count == 1 { s.set_id1 = set_id; s.set_cond1 = condition_count; };
+    if s.set_count == 2 { s.set_id2 = set_id; s.set_cond2 = condition_count; };
+    if s.set_count == 3 { s.set_id3 = set_id; s.set_cond3 = condition_count; };
+    if s.set_count == 4 { s.set_id4 = set_id; s.set_cond4 = condition_count; };
+    if s.set_count == 5 { s.set_id5 = set_id; s.set_cond5 = condition_count; };
+    if s.set_count == 6 { s.set_id6 = set_id; s.set_cond6 = condition_count; };
+    if s.set_count == 7 { s.set_id7 = set_id; s.set_cond7 = condition_count; };
+    s.set_count = s.set_count + 1;
+    return s;
+}
+
+fn ecs_system_schedule_deep_system_count(s: EcsSystemScheduleDeep) -> i32 { return s.sys_count; }
+fn ecs_system_schedule_deep_set_count(s: EcsSystemScheduleDeep) -> i32 { return s.set_count; }
+
+// get_system_id / _conditions / _dependencies — return wrapper structs (no tuple-return).
+fn ecs_system_schedule_deep_get_system_id(s: EcsSystemScheduleDeep, index: i32) -> EcsSystemIdDeep {
+    if index < 0 { return EcsSystemIdDeep { valid: false, id: 0 }; };
+    if index >= s.sys_count { return EcsSystemIdDeep { valid: false, id: 0 }; };
+    if index == 0 { return EcsSystemIdDeep { valid: true, id: s.sys_id0 }; };
+    if index == 1 { return EcsSystemIdDeep { valid: true, id: s.sys_id1 }; };
+    if index == 2 { return EcsSystemIdDeep { valid: true, id: s.sys_id2 }; };
+    if index == 3 { return EcsSystemIdDeep { valid: true, id: s.sys_id3 }; };
+    if index == 4 { return EcsSystemIdDeep { valid: true, id: s.sys_id4 }; };
+    if index == 5 { return EcsSystemIdDeep { valid: true, id: s.sys_id5 }; };
+    if index == 6 { return EcsSystemIdDeep { valid: true, id: s.sys_id6 }; };
+    return EcsSystemIdDeep { valid: true, id: s.sys_id7 };
+}
+
+fn ecs_system_schedule_deep_get_system_conditions(s: EcsSystemScheduleDeep, index: i32) -> EcsSystemConditionsDeep {
+    if index < 0 { return EcsSystemConditionsDeep { valid: false, count: 0 }; };
+    if index >= s.sys_count { return EcsSystemConditionsDeep { valid: false, count: 0 }; };
+    if index == 0 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond0 }; };
+    if index == 1 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond1 }; };
+    if index == 2 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond2 }; };
+    if index == 3 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond3 }; };
+    if index == 4 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond4 }; };
+    if index == 5 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond5 }; };
+    if index == 6 { return EcsSystemConditionsDeep { valid: true, count: s.sys_cond6 }; };
+    return EcsSystemConditionsDeep { valid: true, count: s.sys_cond7 };
+}
+
+fn ecs_system_schedule_deep_get_system_dependencies(s: EcsSystemScheduleDeep, index: i32) -> EcsSystemDependenciesDeep {
+    if index < 0 { return EcsSystemDependenciesDeep { valid: false, count: 0 }; };
+    if index >= s.sys_count { return EcsSystemDependenciesDeep { valid: false, count: 0 }; };
+    if index == 0 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep0 }; };
+    if index == 1 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep1 }; };
+    if index == 2 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep2 }; };
+    if index == 3 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep3 }; };
+    if index == 4 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep4 }; };
+    if index == 5 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep5 }; };
+    if index == 6 { return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep6 }; };
+    return EcsSystemDependenciesDeep { valid: true, count: s.sys_dep7 };
+}
+
+fn ecs_system_schedule_deep_get_set_id(s: EcsSystemScheduleDeep, index: i32) -> EcsSetIdDeep {
+    if index < 0 { return EcsSetIdDeep { valid: false, id: 0 }; };
+    if index >= s.set_count { return EcsSetIdDeep { valid: false, id: 0 }; };
+    if index == 0 { return EcsSetIdDeep { valid: true, id: s.set_id0 }; };
+    if index == 1 { return EcsSetIdDeep { valid: true, id: s.set_id1 }; };
+    if index == 2 { return EcsSetIdDeep { valid: true, id: s.set_id2 }; };
+    if index == 3 { return EcsSetIdDeep { valid: true, id: s.set_id3 }; };
+    if index == 4 { return EcsSetIdDeep { valid: true, id: s.set_id4 }; };
+    if index == 5 { return EcsSetIdDeep { valid: true, id: s.set_id5 }; };
+    if index == 6 { return EcsSetIdDeep { valid: true, id: s.set_id6 }; };
+    return EcsSetIdDeep { valid: true, id: s.set_id7 };
+}
+
+fn ecs_system_schedule_deep_get_set_conditions(s: EcsSystemScheduleDeep, index: i32) -> EcsSetConditionsDeep {
+    if index < 0 { return EcsSetConditionsDeep { valid: false, count: 0 }; };
+    if index >= s.set_count { return EcsSetConditionsDeep { valid: false, count: 0 }; };
+    if index == 0 { return EcsSetConditionsDeep { valid: true, count: s.set_cond0 }; };
+    if index == 1 { return EcsSetConditionsDeep { valid: true, count: s.set_cond1 }; };
+    if index == 2 { return EcsSetConditionsDeep { valid: true, count: s.set_cond2 }; };
+    if index == 3 { return EcsSetConditionsDeep { valid: true, count: s.set_cond3 }; };
+    if index == 4 { return EcsSetConditionsDeep { valid: true, count: s.set_cond4 }; };
+    if index == 5 { return EcsSetConditionsDeep { valid: true, count: s.set_cond5 }; };
+    if index == 6 { return EcsSetConditionsDeep { valid: true, count: s.set_cond6 }; };
+    return EcsSetConditionsDeep { valid: true, count: s.set_cond7 };
+}
+
+// mark_run/mark_skip — divide the systems into run / skipped counters.
+fn ecs_system_schedule_deep_mark_run(s: EcsSystemScheduleDeep) -> EcsSystemScheduleDeep {
+    s.systems_run = s.systems_run + 1;
+    return s;
+}
+
+fn ecs_system_schedule_deep_mark_skip(s: EcsSystemScheduleDeep) -> EcsSystemScheduleDeep {
+    s.systems_skipped = s.systems_skipped + 1;
+    return s;
+}
+
+fn ecs_system_schedule_deep_systems_run(s: EcsSystemScheduleDeep) -> i64 { return s.systems_run; }
+fn ecs_system_schedule_deep_systems_skipped(s: EcsSystemScheduleDeep) -> i64 { return s.systems_skipped; }
+
+// reset: clear run/skip state
+fn ecs_system_schedule_deep_reset(s: EcsSystemScheduleDeep) -> EcsSystemScheduleDeep {
+    s.systems_run = 0;
+    s.systems_skipped = 0;
+    return s;
+}
+
+// clear: blank everything
+fn ecs_system_schedule_deep_clear(s: EcsSystemScheduleDeep) -> EcsSystemScheduleDeep {
+    s.sys_count = 0;
+    s.set_count = 0;
+    s.systems_run = 0;
+    s.systems_skipped = 0;
+    s.sys_id0 = 0; s.sys_id1 = 0; s.sys_id2 = 0; s.sys_id3 = 0; s.sys_id4 = 0; s.sys_id5 = 0; s.sys_id6 = 0; s.sys_id7 = 0;
+    s.sys_cond0 = 0; s.sys_cond1 = 0; s.sys_cond2 = 0; s.sys_cond3 = 0; s.sys_cond4 = 0; s.sys_cond5 = 0; s.sys_cond6 = 0; s.sys_cond7 = 0;
+    s.sys_dep0 = 0; s.sys_dep1 = 0; s.sys_dep2 = 0; s.sys_dep3 = 0; s.sys_dep4 = 0; s.sys_dep5 = 0; s.sys_dep6 = 0; s.sys_dep7 = 0;
+    s.set_id0 = 0; s.set_id1 = 0; s.set_id2 = 0; s.set_id3 = 0; s.set_id4 = 0; s.set_id5 = 0; s.set_id6 = 0; s.set_id7 = 0;
+    s.set_cond0 = 0; s.set_cond1 = 0; s.set_cond2 = 0; s.set_cond3 = 0; s.set_cond4 = 0; s.set_cond5 = 0; s.set_cond6 = 0; s.set_cond7 = 0;
+    return s;
+}
+
+fn ecs_system_schedule_deep_is_empty(s: EcsSystemScheduleDeep) -> bool {
+    if s.sys_count != 0 { return false; };
+    if s.set_count != 0 { return false; };
+    return true;
+}
+
+// total_conditions: sum systems + sets condition counts.
+fn ecs_system_schedule_deep_total_conditions(s: EcsSystemScheduleDeep) -> i64 {
+    let total: i64 = 0;
+    if s.sys_count > 0 { total = total + s.sys_cond0; };
+    if s.sys_count > 1 { total = total + s.sys_cond1; };
+    if s.sys_count > 2 { total = total + s.sys_cond2; };
+    if s.sys_count > 3 { total = total + s.sys_cond3; };
+    if s.sys_count > 4 { total = total + s.sys_cond4; };
+    if s.sys_count > 5 { total = total + s.sys_cond5; };
+    if s.sys_count > 6 { total = total + s.sys_cond6; };
+    if s.sys_count > 7 { total = total + s.sys_cond7; };
+    if s.set_count > 0 { total = total + s.set_cond0; };
+    if s.set_count > 1 { total = total + s.set_cond1; };
+    if s.set_count > 2 { total = total + s.set_cond2; };
+    if s.set_count > 3 { total = total + s.set_cond3; };
+    if s.set_count > 4 { total = total + s.set_cond4; };
+    if s.set_count > 5 { total = total + s.set_cond5; };
+    if s.set_count > 6 { total = total + s.set_cond6; };
+    if s.set_count > 7 { total = total + s.set_cond7; };
+    return total;
+}
+
+fn ecs_system_schedule_deep_total_dependencies(s: EcsSystemScheduleDeep) -> i64 {
+    let total: i64 = 0;
+    if s.sys_count > 0 { total = total + s.sys_dep0; };
+    if s.sys_count > 1 { total = total + s.sys_dep1; };
+    if s.sys_count > 2 { total = total + s.sys_dep2; };
+    if s.sys_count > 3 { total = total + s.sys_dep3; };
+    if s.sys_count > 4 { total = total + s.sys_dep4; };
+    if s.sys_count > 5 { total = total + s.sys_dep5; };
+    if s.sys_count > 6 { total = total + s.sys_dep6; };
+    if s.sys_count > 7 { total = total + s.sys_dep7; };
+    return total;
+}
+
+// === ApplyDeferred marker + executor kind ===
+fn ecs_is_apply_deferred_deep(system_type: i32) -> bool {
+    if system_type == ECS_APPLY_DEFERRED_DEEP { return true; };
+    return false;
+}
+
+fn ecs_default_executor_kind_deep(multi_threaded: bool) -> i32 {
+    if multi_threaded { return ECS_EXECUTOR_MULTI_DEEP; };
+    return ECS_EXECUTOR_SINGLE_DEEP;
+}

@@ -1,0 +1,139 @@
+// Entity identity and fixed-capacity allocator used by the compatibility World.
+// Dynamic worlds reuse the Entity handle but use DynamicEntityAllocator.
+
+@derive(copy, eq, ord, hash, debug)
+struct Entity {
+    id: i32,
+    gen: i32,
+}
+
+struct EntityAllocator {
+    next_id: i32,
+    free_count: i32,
+    generations: [i32; 16],
+    free_ids: [i32; 16],
+}
+
+fn entity_new(id: i32, gen: i32) -> Entity {
+    return Entity { id: id, gen: gen };
+}
+
+fn entity_placeholder() -> Entity {
+    return Entity { id: 0, gen: -1 };
+}
+
+fn entity_index(entity: Entity) -> i32 { return entity.id; }
+fn entity_generation(entity: Entity) -> i32 { return entity.gen; }
+
+fn entity_eq(a: Entity, b: Entity) -> bool {
+    return a == b;
+}
+
+fn entity_to_bits(entity: Entity) -> i64 {
+    let gen_part = entity.gen as i64;
+    let id_part = entity.id as i64;
+    return gen_part * 4294967296 + id_part;
+}
+
+fn entity_from_bits(bits: i64) -> Entity {
+    let gen64 = bits / 4294967296;
+    let id64 = bits - gen64 * 4294967296;
+    return Entity { id: id64 as i32, gen: gen64 as i32 };
+}
+
+fn allocator_new() -> EntityAllocator {
+    return EntityAllocator {
+        next_id: 1,
+        free_count: 0,
+        generations: [0; 16],
+        free_ids: [0; 16],
+    };
+}
+
+fn alloc_entity(a: EntityAllocator) -> (EntityAllocator, Entity) {
+    if a.free_count > 0 {
+        let next_free_count = a.free_count - 1;
+        let id = a.free_ids[next_free_count];
+        a.free_count = next_free_count;
+        a.free_ids[next_free_count] = 0;
+        return (a, entity_new(id, a.generations[id]));
+    };
+    if a.next_id >= 16 { panic(2001); };
+    let id = a.next_id;
+    a.next_id = id + 1;
+    return (a, entity_new(id, a.generations[id]));
+}
+
+fn allocator_id_is_free(a: EntityAllocator, id: i32) -> bool {
+    let i: i32 = 0;
+    while i < a.free_count {
+        if a.free_ids[i] == id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn is_alive(a: EntityAllocator, entity: Entity) -> bool {
+    if entity.id <= 0 { return false; };
+    if entity.id >= 16 { return false; };
+    if entity.id >= a.next_id { return false; };
+    if allocator_id_is_free(a, entity.id) { return false; };
+    return a.generations[entity.id] == entity.gen;
+}
+
+fn free_entity(a: EntityAllocator, entity: Entity) -> EntityAllocator {
+    if is_alive(a, entity) != true { return a; };
+    a.generations[entity.id] = a.generations[entity.id] + 1;
+    a.free_ids[a.free_count] = entity.id;
+    a.free_count = a.free_count + 1;
+    return a;
+}
+
+@test "entity placeholder is never allocated"() {
+    let placeholder = entity_placeholder();
+    let a = allocator_new();
+    let (a1, e1) = alloc_entity(a);
+    if placeholder.id == e1.id { panic(2100); };
+    if is_alive(a1, placeholder) != false { panic(2101); };
+}
+
+@test "entity bit roundtrip"() {
+    let e = entity_new(42, 7);
+    let bits = entity_to_bits(e);
+    let out = entity_from_bits(bits);
+    if entity_eq(e, out) != true { panic(2110); };
+}
+
+@test "entity derives value semantics"() {
+    let e = entity_new(42, 7);
+    let copied = e;
+    if copied != e { panic(2115); };
+    if e.id != 42 { panic(2116); };
+    if hash(copied) != hash(e) { panic(2117); };
+
+    let later = entity_new(42, 8);
+    if (e < later) != true { panic(2118); };
+    if (later > e) != true { panic(2119); };
+
+    let text = debug(e);
+    if len(text) == 0 { panic(2124); };
+}
+
+@test "allocator rejects stale generation"() {
+    let a0 = allocator_new();
+    let (a1, e1) = alloc_entity(a0);
+    let a2 = free_entity(a1, e1);
+    let stale = entity_new(e1.id, e1.gen);
+    let fabricated = entity_new(e1.id, e1.gen + 1);
+    if is_alive(a2, stale) != false { panic(2120); };
+    if is_alive(a2, fabricated) != false { panic(2121); };
+    let (a3, e2) = alloc_entity(a2);
+    if entity_eq(e2, fabricated) != true { panic(2122); };
+    if is_alive(a3, e2) != true { panic(2123); };
+}
+
+@test "entity index generation accessors"() {
+    let e = entity_new(5, 3);
+    if entity_index(e) != 5 { panic(2130); };
+    if entity_generation(e) != 3 { panic(2131); };
+}

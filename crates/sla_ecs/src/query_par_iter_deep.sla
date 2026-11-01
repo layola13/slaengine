@@ -1,0 +1,505 @@
+// Deepened Bevy ECS QueryParIter surface.
+// Mirrors src/query/par_iter.rs (QueryParIter + batch size path):
+//   QueryParIter { batching_strategy, item_count, ticks, mut_flag }
+//   batching_strategy()
+//   for_each / for_each_init
+//   thread_count <= 1 => sequential fold(init, func)
+//   thread_count > 1  => batch_size = strategy.calc.max(1), partition items
+// No real ComputeTaskPool/Scope — sequential simulation of batch chunks with
+// per-batch init (models "init may be called multiple times").
+// Shallow lib/query_par_iter.sla retained.
+
+// === BatchingStrategy (inlined subset of batching_deep for isolation) ===
+const ECS_QPI_BS_OK: i32 = 0;
+const ECS_QPI_BS_ERR_ZERO_THREADS: i32 = 2;
+const ECS_QPI_USIZE_MAX: i64 = 2147483647;
+
+struct EcsQpiBatchingDeep {
+    range_start: i64,
+    range_end: i64,
+    batches_per_thread: i64,
+    last_error: i32,
+}
+
+fn ecs_qpi_bs_default() -> EcsQpiBatchingDeep {
+    return EcsQpiBatchingDeep {
+        range_start: 1,
+        range_end: ECS_QPI_USIZE_MAX,
+        batches_per_thread: 1,
+        last_error: ECS_QPI_BS_OK,
+    };
+}
+
+fn ecs_qpi_bs_fixed(batch_size: i64) -> EcsQpiBatchingDeep {
+    return EcsQpiBatchingDeep {
+        range_start: batch_size,
+        range_end: batch_size, // empty range => calc returns start
+        batches_per_thread: 1,
+        last_error: ECS_QPI_BS_OK,
+    };
+}
+
+fn ecs_qpi_bs_min(bs: EcsQpiBatchingDeep, v: i64) -> EcsQpiBatchingDeep {
+    bs.range_start = v;
+    return bs;
+}
+
+fn ecs_qpi_bs_max(bs: EcsQpiBatchingDeep, v: i64) -> EcsQpiBatchingDeep {
+    bs.range_end = v;
+    return bs;
+}
+
+fn ecs_qpi_bs_bpt(bs: EcsQpiBatchingDeep, v: i64) -> EcsQpiBatchingDeep {
+    if v <= 0 {
+        bs.last_error = 1;
+        return bs;
+    };
+    bs.batches_per_thread = v;
+    bs.last_error = ECS_QPI_BS_OK;
+    return bs;
+}
+
+fn ecs_qpi_div_ceil(a: i64, b: i64) -> i64 {
+    if b <= 0 { return a; };
+    let q = a / b;
+    if a % b != 0 { q = q + 1; };
+    return q;
+}
+
+fn ecs_qpi_clamp(val: i64, lo: i64, hi: i64) -> i64 {
+    if val < lo { return lo; };
+    if val > hi { return hi; };
+    return val;
+}
+
+fn ecs_qpi_bs_calc(bs: EcsQpiBatchingDeep, max_items: i64, thread_count: i64) -> (EcsQpiBatchingDeep, i64) {
+    if bs.range_start >= bs.range_end {
+        bs.last_error = ECS_QPI_BS_OK;
+        return (bs, bs.range_start);
+    };
+    if thread_count <= 0 {
+        bs.last_error = ECS_QPI_BS_ERR_ZERO_THREADS;
+        return (bs, 0);
+    };
+    let batches = thread_count * bs.batches_per_thread;
+    let batch_size = ecs_qpi_div_ceil(max_items, batches);
+    let clamped = ecs_qpi_clamp(batch_size, bs.range_start, bs.range_end);
+    bs.last_error = ECS_QPI_BS_OK;
+    return (bs, clamped);
+}
+
+// === Query item payload list (fixed 16) ===
+const ECS_QPI_CAP: i32 = 16;
+
+struct EcsQueryParIterDeep {
+    // matched item payloads (entity ids stand-in)
+    i0: i64, i1: i64, i2: i64, i3: i64,
+    i4: i64, i5: i64, i6: i64, i7: i64,
+    i8: i64, i9: i64, i10: i64, i11: i64,
+    i12: i64, i13: i64, i14: i64, i15: i64,
+    item_count: i64,
+    // ticks
+    last_run: i64,
+    this_run: i64,
+    // mut vs read-only
+    is_mut: bool,
+    // batching
+    bs_start: i64,
+    bs_end: i64,
+    bs_bpt: i64,
+    // execution stats
+    processed: i64,
+    init_calls: i64,
+    batch_count: i64,
+    used_parallel: bool,
+    last_batch_size: i64,
+    sum_result: i64, // aggregate of for_each_init local values
+    consumed: bool,  // for_each consumes self once
+}
+
+fn ecs_qpi_new(item_count: i64) -> EcsQueryParIterDeep {
+    let n = item_count;
+    if n < 0 { n = 0; };
+    if n > (ECS_QPI_CAP as i64) { n = ECS_QPI_CAP as i64; };
+    return EcsQueryParIterDeep {
+        i0: 0, i1: 0, i2: 0, i3: 0,
+        i4: 0, i5: 0, i6: 0, i7: 0,
+        i8: 0, i9: 0, i10: 0, i11: 0,
+        i12: 0, i13: 0, i14: 0, i15: 0,
+        item_count: n,
+        last_run: 0,
+        this_run: 1,
+        is_mut: false,
+        bs_start: 1,
+        bs_end: ECS_QPI_USIZE_MAX,
+        bs_bpt: 1,
+        processed: 0,
+        init_calls: 0,
+        batch_count: 0,
+        used_parallel: false,
+        last_batch_size: 0,
+        sum_result: 0,
+        consumed: false,
+    };
+}
+
+fn ecs_qpi_new_mut(item_count: i64) -> EcsQueryParIterDeep {
+    let p = ecs_qpi_new(item_count);
+    p.is_mut = true;
+    return p;
+}
+
+fn ecs_qpi_set_item(p: EcsQueryParIterDeep, idx: i64, value: i64) -> EcsQueryParIterDeep {
+    if idx == 0 { p.i0 = value; };
+    if idx == 1 { p.i1 = value; };
+    if idx == 2 { p.i2 = value; };
+    if idx == 3 { p.i3 = value; };
+    if idx == 4 { p.i4 = value; };
+    if idx == 5 { p.i5 = value; };
+    if idx == 6 { p.i6 = value; };
+    if idx == 7 { p.i7 = value; };
+    if idx == 8 { p.i8 = value; };
+    if idx == 9 { p.i9 = value; };
+    if idx == 10 { p.i10 = value; };
+    if idx == 11 { p.i11 = value; };
+    if idx == 12 { p.i12 = value; };
+    if idx == 13 { p.i13 = value; };
+    if idx == 14 { p.i14 = value; };
+    if idx == 15 { p.i15 = value; };
+    return p;
+}
+
+fn ecs_qpi_get_item(p: EcsQueryParIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return p.i0; };
+    if idx == 1 { return p.i1; };
+    if idx == 2 { return p.i2; };
+    if idx == 3 { return p.i3; };
+    if idx == 4 { return p.i4; };
+    if idx == 5 { return p.i5; };
+    if idx == 6 { return p.i6; };
+    if idx == 7 { return p.i7; };
+    if idx == 8 { return p.i8; };
+    if idx == 9 { return p.i9; };
+    if idx == 10 { return p.i10; };
+    if idx == 11 { return p.i11; };
+    if idx == 12 { return p.i12; };
+    if idx == 13 { return p.i13; };
+    if idx == 14 { return p.i14; };
+    if idx == 15 { return p.i15; };
+    return 0;
+}
+
+// Fill items 0..count-1 with identity values (entity stand-ins)
+fn ecs_qpi_fill_identity(p: EcsQueryParIterDeep) -> EcsQueryParIterDeep {
+    let i: i64 = 0;
+    while i < p.item_count {
+        p = ecs_qpi_set_item(p, i, i + 1);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn ecs_qpi_with_ticks(p: EcsQueryParIterDeep, last_run: i64, this_run: i64) -> EcsQueryParIterDeep {
+    p.last_run = last_run;
+    p.this_run = this_run;
+    return p;
+}
+
+fn ecs_qpi_item_count(p: EcsQueryParIterDeep) -> i64 { return p.item_count; }
+fn ecs_qpi_is_mut(p: EcsQueryParIterDeep) -> bool { return p.is_mut; }
+fn ecs_qpi_processed(p: EcsQueryParIterDeep) -> i64 { return p.processed; }
+fn ecs_qpi_init_calls(p: EcsQueryParIterDeep) -> i64 { return p.init_calls; }
+fn ecs_qpi_batch_count(p: EcsQueryParIterDeep) -> i64 { return p.batch_count; }
+fn ecs_qpi_used_parallel(p: EcsQueryParIterDeep) -> bool { return p.used_parallel; }
+fn ecs_qpi_last_batch_size(p: EcsQueryParIterDeep) -> i64 { return p.last_batch_size; }
+fn ecs_qpi_sum_result(p: EcsQueryParIterDeep) -> i64 { return p.sum_result; }
+fn ecs_qpi_consumed(p: EcsQueryParIterDeep) -> bool { return p.consumed; }
+fn ecs_qpi_last_run(p: EcsQueryParIterDeep) -> i64 { return p.last_run; }
+fn ecs_qpi_this_run(p: EcsQueryParIterDeep) -> i64 { return p.this_run; }
+
+// batching_strategy setter
+fn ecs_qpi_batching_strategy(p: EcsQueryParIterDeep, bs: EcsQpiBatchingDeep) -> EcsQueryParIterDeep {
+    p.bs_start = bs.range_start;
+    p.bs_end = bs.range_end;
+    p.bs_bpt = bs.batches_per_thread;
+    return p;
+}
+
+fn ecs_qpi_get_batching(p: EcsQueryParIterDeep) -> EcsQpiBatchingDeep {
+    return EcsQpiBatchingDeep {
+        range_start: p.bs_start,
+        range_end: p.bs_end,
+        batches_per_thread: p.bs_bpt,
+        last_error: ECS_QPI_BS_OK,
+    };
+}
+
+// get_batch_size like QueryParIter::get_batch_size (max over matched tables approximated by item_count)
+fn ecs_qpi_get_batch_size(p: EcsQueryParIterDeep, thread_count: i64) -> (EcsQueryParIterDeep, i64) {
+    let bs = ecs_qpi_get_batching(p);
+    let r = ecs_qpi_bs_calc(bs, p.item_count, thread_count);
+    let size = r.1;
+    // Bevy: .max(1) at call site when parallel
+    if size < 1 { size = 1; };
+    p.last_batch_size = size;
+    return (p, size);
+}
+
+// for_each_init simulation:
+// init_value_base is the starting local value each batch gets from init().
+// func: local = local + item_value (sum fold stand-in)
+// When thread_count <= 1: single init, sequential fold.
+// When thread_count > 1: multiple batches, each calls init once.
+fn ecs_qpi_for_each_init(
+    p: EcsQueryParIterDeep,
+    thread_count: i64,
+    init_value_base: i64
+) -> EcsQueryParIterDeep {
+    if p.consumed {
+        return p;
+    };
+    p.consumed = true;
+    p.processed = 0;
+    p.init_calls = 0;
+    p.batch_count = 0;
+    p.sum_result = 0;
+
+    if thread_count <= 1 {
+        p.used_parallel = false;
+        p.init_calls = 1;
+        p.batch_count = 1;
+        let local = init_value_base;
+        let i: i64 = 0;
+        while i < p.item_count {
+            let item = ecs_qpi_get_item(p, i);
+            local = local + item;
+            p.processed = p.processed + 1;
+            i = i + 1;
+        }
+        p.sum_result = local;
+        p.last_batch_size = p.item_count;
+        if p.last_batch_size < 1 { p.last_batch_size = 1; };
+        return p;
+    };
+
+    // parallel path
+    p.used_parallel = true;
+    let r = ecs_qpi_get_batch_size(p, thread_count);
+    p = r.0;
+    let batch_size = r.1;
+    if batch_size < 1 {
+        // should not happen after max(1)
+        return p;
+    };
+    p.last_batch_size = batch_size;
+
+    let offset: i64 = 0;
+    while offset < p.item_count {
+        // each batch: init + fold chunk
+        p.init_calls = p.init_calls + 1;
+        p.batch_count = p.batch_count + 1;
+        let local = init_value_base;
+        let end = offset + batch_size;
+        if end > p.item_count { end = p.item_count; };
+        let i = offset;
+        while i < end {
+            let item = ecs_qpi_get_item(p, i);
+            local = local + item;
+            p.processed = p.processed + 1;
+            i = i + 1;
+        }
+        p.sum_result = p.sum_result + local;
+        offset = offset + batch_size;
+    }
+    return p;
+}
+
+// for_each: for_each_init with unit init (base 0) and sum of items only
+fn ecs_qpi_for_each(p: EcsQueryParIterDeep, thread_count: i64) -> EcsQueryParIterDeep {
+    return ecs_qpi_for_each_init(p, thread_count, 0);
+}
+
+// len / is_empty
+fn ecs_qpi_len(p: EcsQueryParIterDeep) -> i64 { return p.item_count; }
+fn ecs_qpi_is_empty(p: EcsQueryParIterDeep) -> bool { return p.item_count == 0; }
+
+// Expected batch count for tests
+fn ecs_qpi_expected_batches(item_count: i64, batch_size: i64) -> i64 {
+    if batch_size <= 0 { return 0; };
+    return ecs_qpi_div_ceil(item_count, batch_size);
+}
+
+// QueryParManyIter simplified: entity list drives item set
+struct EcsQueryParManyIterDeep {
+    // entity list (up to 16)
+    e0: i64, e1: i64, e2: i64, e3: i64,
+    e4: i64, e5: i64, e6: i64, e7: i64,
+    entity_count: i64,
+    // which entities match the query (bitmask via presence in matched set)
+    // matched payload = entity id itself if matched
+    match_mask: i64, // bit i set => entity i matches
+    bs_start: i64,
+    bs_end: i64,
+    bs_bpt: i64,
+    processed: i64,
+    init_calls: i64,
+    batch_count: i64,
+    used_parallel: bool,
+    last_batch_size: i64,
+    sum_result: i64,
+    unique: bool,
+    consumed: bool,
+}
+
+fn ecs_qpi_many_new() -> EcsQueryParManyIterDeep {
+    return EcsQueryParManyIterDeep {
+        e0: 0, e1: 0, e2: 0, e3: 0,
+        e4: 0, e5: 0, e6: 0, e7: 0,
+        entity_count: 0,
+        match_mask: 255, // all match by default
+        bs_start: 1,
+        bs_end: ECS_QPI_USIZE_MAX,
+        bs_bpt: 1,
+        processed: 0,
+        init_calls: 0,
+        batch_count: 0,
+        used_parallel: false,
+        last_batch_size: 0,
+        sum_result: 0,
+        unique: false,
+        consumed: false,
+    };
+}
+
+fn ecs_qpi_many_unique_new() -> EcsQueryParManyIterDeep {
+    let m = ecs_qpi_many_new();
+    m.unique = true;
+    return m;
+}
+
+fn ecs_qpi_many_push(m: EcsQueryParManyIterDeep, entity: i64) -> EcsQueryParManyIterDeep {
+    if m.entity_count >= 8 { return m; };
+    if m.entity_count == 0 { m.e0 = entity; };
+    if m.entity_count == 1 { m.e1 = entity; };
+    if m.entity_count == 2 { m.e2 = entity; };
+    if m.entity_count == 3 { m.e3 = entity; };
+    if m.entity_count == 4 { m.e4 = entity; };
+    if m.entity_count == 5 { m.e5 = entity; };
+    if m.entity_count == 6 { m.e6 = entity; };
+    if m.entity_count == 7 { m.e7 = entity; };
+    m.entity_count = m.entity_count + 1;
+    return m;
+}
+
+fn ecs_qpi_many_get(m: EcsQueryParManyIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return m.e0; };
+    if idx == 1 { return m.e1; };
+    if idx == 2 { return m.e2; };
+    if idx == 3 { return m.e3; };
+    if idx == 4 { return m.e4; };
+    if idx == 5 { return m.e5; };
+    if idx == 6 { return m.e6; };
+    if idx == 7 { return m.e7; };
+    return 0;
+}
+
+fn ecs_qpi_many_set_match_mask(m: EcsQueryParManyIterDeep, mask: i64) -> EcsQueryParManyIterDeep {
+    m.match_mask = mask;
+    return m;
+}
+
+fn ecs_qpi_many_matches(m: EcsQueryParManyIterDeep, idx: i64) -> bool {
+    let bit = 1;
+    let i: i64 = 0;
+    while i < idx {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return (m.match_mask / bit) % 2 == 1;
+}
+
+fn ecs_qpi_many_batching_strategy(m: EcsQueryParManyIterDeep, bs: EcsQpiBatchingDeep) -> EcsQueryParManyIterDeep {
+    m.bs_start = bs.range_start;
+    m.bs_end = bs.range_end;
+    m.bs_bpt = bs.batches_per_thread;
+    return m;
+}
+
+fn ecs_qpi_many_entity_count(m: EcsQueryParManyIterDeep) -> i64 { return m.entity_count; }
+fn ecs_qpi_many_processed(m: EcsQueryParManyIterDeep) -> i64 { return m.processed; }
+fn ecs_qpi_many_init_calls(m: EcsQueryParManyIterDeep) -> i64 { return m.init_calls; }
+fn ecs_qpi_many_batch_count(m: EcsQueryParManyIterDeep) -> i64 { return m.batch_count; }
+fn ecs_qpi_many_used_parallel(m: EcsQueryParManyIterDeep) -> bool { return m.used_parallel; }
+fn ecs_qpi_many_sum(m: EcsQueryParManyIterDeep) -> i64 { return m.sum_result; }
+fn ecs_qpi_many_is_unique(m: EcsQueryParManyIterDeep) -> bool { return m.unique; }
+
+// for_each_init over entity list: only matching entities contribute
+fn ecs_qpi_many_for_each_init(
+    m: EcsQueryParManyIterDeep,
+    thread_count: i64,
+    init_value_base: i64
+) -> EcsQueryParManyIterDeep {
+    if m.consumed { return m; };
+    m.consumed = true;
+    m.processed = 0;
+    m.init_calls = 0;
+    m.batch_count = 0;
+    m.sum_result = 0;
+
+    // count matching for batch sizing uses entity_list.len() in Bevy, not match count
+    let list_len = m.entity_count;
+
+    if thread_count <= 1 {
+        m.used_parallel = false;
+        m.init_calls = 1;
+        m.batch_count = 1;
+        let local = init_value_base;
+        let i: i64 = 0;
+        while i < m.entity_count {
+            if ecs_qpi_many_matches(m, i) {
+                local = local + ecs_qpi_many_get(m, i);
+                m.processed = m.processed + 1;
+            };
+            i = i + 1;
+        }
+        m.sum_result = local;
+        m.last_batch_size = list_len;
+        return m;
+    };
+
+    m.used_parallel = true;
+    let bs = EcsQpiBatchingDeep {
+        range_start: m.bs_start,
+        range_end: m.bs_end,
+        batches_per_thread: m.bs_bpt,
+        last_error: ECS_QPI_BS_OK,
+    };
+    let calc = ecs_qpi_bs_calc(bs, list_len, thread_count);
+    let batch_size = calc.1;
+    if batch_size < 1 { batch_size = 1; };
+    m.last_batch_size = batch_size;
+
+    let offset: i64 = 0;
+    while offset < m.entity_count {
+        m.init_calls = m.init_calls + 1;
+        m.batch_count = m.batch_count + 1;
+        let local = init_value_base;
+        let end = offset + batch_size;
+        if end > m.entity_count { end = m.entity_count; };
+        let i = offset;
+        while i < end {
+            if ecs_qpi_many_matches(m, i) {
+                local = local + ecs_qpi_many_get(m, i);
+                m.processed = m.processed + 1;
+            };
+            i = i + 1;
+        }
+        m.sum_result = m.sum_result + local;
+        offset = offset + batch_size;
+    }
+    return m;
+}
+
+fn ecs_qpi_many_for_each(m: EcsQueryParManyIterDeep, thread_count: i64) -> EcsQueryParManyIterDeep {
+    return ecs_qpi_many_for_each_init(m, thread_count, 0);
+}

@@ -1,0 +1,332 @@
+// Bevy ECS system::commands (src/system/commands/mod.rs):
+// Commands (world-level) — spawn_batch, insert_batch, insert_batch_if_new,
+// try_insert_batch, try_insert_batch_if_new, init_resource, insert_resource,
+// insert_resource_if_neq, remove_resource, run_system, register_system,
+// unregister_system, run_schedule, spawn_empty, spawn, entity, get_entity,
+// queue, queue_handled, queue_silenced, append, write_message.
+// Uses flat parallel arrays to avoid nested Vec assignment limitations.
+
+const ECS_INSERT_MODE_REPLACE: i32 = 0;
+const ECS_INSERT_MODE_KEEP: i32 = 1;
+
+const ECS_CMD_QUEUE: i32 = 0;
+const ECS_CMD_QUEUE_HANDLED: i32 = 1;
+const ECS_CMD_QUEUE_SILENCED: i32 = 2;
+
+struct EcsCommands {
+    next_entity: i64,
+    entity_ids: Vec<i64>,
+    // Flat component storage: each entry is (entity, component_id, value)
+    comp_entities: Vec<i64>,
+    comp_ids: Vec<i32>,
+    comp_values: Vec<i64>,
+    resource_ids: Vec<i32>,
+    resource_values: Vec<i64>,
+    registered_systems: Vec<i64>,
+    next_system_id: i64,
+    command_queue: Vec<i32>,
+    schedule_labels: Vec<i32>,
+}
+
+fn ecs_commands_new() -> EcsCommands {
+    return EcsCommands {
+        next_entity: 0, entity_ids: Vec::new(),
+        comp_entities: Vec::new(), comp_ids: Vec::new(), comp_values: Vec::new(),
+        resource_ids: Vec::new(), resource_values: Vec::new(),
+        registered_systems: Vec::new(), next_system_id: 1,
+        command_queue: Vec::new(), schedule_labels: Vec::new()
+    };
+}
+
+// === spawn_empty ===
+
+fn ecs_commands_spawn_empty(c: EcsCommands) -> (EcsCommands, i64) {
+    let entity = c.next_entity;
+    c.next_entity = c.next_entity + 1;
+    c.entity_ids.push(entity);
+    c.command_queue.push(ECS_CMD_QUEUE);
+    return (c, entity);
+}
+
+// === spawn (with initial component) ===
+
+fn ecs_commands_spawn(c: EcsCommands, component_id: i32, value: i64) -> (EcsCommands, i64) {
+    let result = ecs_commands_spawn_empty(c);
+    let c2 = result.0;
+    let entity = result.1;
+    let c3 = ecs_commands_insert_entity(c2, entity, component_id, value);
+    return (c3, entity);
+}
+
+// === entity (get index or -1) ===
+
+fn ecs_commands_entity(c: EcsCommands, entity: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(c.entity_ids) as i64;
+    while i < n {
+        if c.entity_ids[i] == entity { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// === get_entity ===
+
+fn ecs_commands_get_entity(c: EcsCommands, entity: i64) -> (bool, i64) {
+    let idx = ecs_commands_entity(c, entity);
+    if idx >= 0 { return (true, idx); };
+    return (false, -1);
+}
+
+// === insert_entity (single component) ===
+
+fn ecs_commands_insert_entity(c: EcsCommands, entity: i64, component_id: i32, value: i64) -> EcsCommands {
+    // Check if component already exists for this entity
+    let i: i64 = 0;
+    let n: i64 = len(c.comp_ids) as i64;
+    let found_idx = -1;
+    while i < n {
+        if c.comp_entities[i] == entity {
+            if c.comp_ids[i] == component_id {
+                found_idx = i;
+            };
+        };
+        i = i + 1;
+    }
+    if found_idx >= 0 {
+        c.comp_values[found_idx] = value;
+    } else {
+        c.comp_entities.push(entity);
+        c.comp_ids.push(component_id);
+        c.comp_values.push(value);
+    };
+    return c;
+}
+
+// === insert_batch ===
+
+fn ecs_commands_insert_batch(c: EcsCommands, entities: Vec<i64>, component_ids: Vec<i32>, values: Vec<i64>, mode: i32) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(entities) as i64;
+    while i < n {
+        if mode == ECS_INSERT_MODE_REPLACE {
+            c = ecs_commands_insert_entity(c, entities[i], component_ids[i], values[i]);
+        } else {
+            let has = ecs_commands_has_component(c, entities[i], component_ids[i]);
+            if has != true {
+                c = ecs_commands_insert_entity(c, entities[i], component_ids[i], values[i]);
+            };
+        };
+        i = i + 1;
+    }
+    return c;
+}
+
+// === has_component ===
+
+fn ecs_commands_has_component(c: EcsCommands, entity: i64, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(c.comp_ids) as i64;
+    while i < n {
+        if c.comp_entities[i] == entity {
+            if c.comp_ids[i] == component_id { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === spawn_batch ===
+
+fn ecs_commands_spawn_batch(c: EcsCommands, component_ids: Vec<i32>, values: Vec<i64>) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(component_ids) as i64;
+    while i < n {
+        let result = ecs_commands_spawn(c, component_ids[i], values[i]);
+        c = result.0;
+        i = i + 1;
+    }
+    return c;
+}
+
+// === get_component ===
+
+fn ecs_commands_get_component(c: EcsCommands, entity: i64, component_id: i32) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(c.comp_ids) as i64;
+    while i < n {
+        if c.comp_entities[i] == entity {
+            if c.comp_ids[i] == component_id { return (true, c.comp_values[i]); };
+        };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+// === Resource management ===
+
+fn ecs_commands_insert_resource(c: EcsCommands, resource_id: i32, value: i64) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(c.resource_ids) as i64;
+    while i < n {
+        if c.resource_ids[i] == resource_id {
+            c.resource_values[i] = value;
+            return c;
+        };
+        i = i + 1;
+    }
+    c.resource_ids.push(resource_id);
+    c.resource_values.push(value);
+    return c;
+}
+
+fn ecs_commands_init_resource(c: EcsCommands, resource_id: i32) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(c.resource_ids) as i64;
+    while i < n {
+        if c.resource_ids[i] == resource_id { return c; };
+        i = i + 1;
+    }
+    c.resource_ids.push(resource_id);
+    c.resource_values.push(0);
+    return c;
+}
+
+fn ecs_commands_insert_resource_if_neq(c: EcsCommands, resource_id: i32, value: i64) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(c.resource_ids) as i64;
+    while i < n {
+        if c.resource_ids[i] == resource_id {
+            if c.resource_values[i] != value {
+                c.resource_values[i] = value;
+            };
+            return c;
+        };
+        i = i + 1;
+    }
+    c.resource_ids.push(resource_id);
+    c.resource_values.push(value);
+    return c;
+}
+
+fn ecs_commands_remove_resource(c: EcsCommands, resource_id: i32) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(c.resource_ids) as i64;
+    while i < n {
+        if c.resource_ids[i] == resource_id {
+            let last = n - 1;
+            if i != last {
+                c.resource_ids[i] = c.resource_ids[last];
+                c.resource_values[i] = c.resource_values[last];
+            };
+            c.resource_ids.pop();
+            c.resource_values.pop();
+            return c;
+        };
+        i = i + 1;
+    }
+    return c;
+}
+
+fn ecs_commands_get_resource(c: EcsCommands, resource_id: i32) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(c.resource_ids) as i64;
+    while i < n {
+        if c.resource_ids[i] == resource_id { return (true, c.resource_values[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn ecs_commands_resource_count(c: EcsCommands) -> i64 { return len(c.resource_ids) as i64; }
+
+// === System registration ===
+
+fn ecs_commands_register_system(c: EcsCommands) -> (EcsCommands, i64) {
+    let id = c.next_system_id;
+    c.next_system_id = c.next_system_id + 1;
+    c.registered_systems.push(id);
+    return (c, id);
+}
+
+fn ecs_commands_unregister_system(c: EcsCommands, system_id: i64) -> (EcsCommands, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(c.registered_systems) as i64;
+    while i < n {
+        if c.registered_systems[i] == system_id {
+            let last = n - 1;
+            if i != last {
+                c.registered_systems[i] = c.registered_systems[last];
+            };
+            c.registered_systems.pop();
+            return (c, true);
+        };
+        i = i + 1;
+    }
+    return (c, false);
+}
+
+fn ecs_commands_run_system(c: EcsCommands, system_id: i64) -> (EcsCommands, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(c.registered_systems) as i64;
+    while i < n {
+        if c.registered_systems[i] == system_id {
+            c.command_queue.push(ECS_CMD_QUEUE);
+            return (c, true);
+        };
+        i = i + 1;
+    }
+    return (c, false);
+}
+
+fn ecs_commands_system_count(c: EcsCommands) -> i64 { return len(c.registered_systems) as i64; }
+
+// === run_schedule ===
+
+fn ecs_commands_run_schedule(c: EcsCommands, label: i32) -> EcsCommands {
+    c.schedule_labels.push(label);
+    return c;
+}
+
+// === queue / queue_handled / queue_silenced ===
+
+fn ecs_commands_queue(c: EcsCommands) -> EcsCommands {
+    c.command_queue.push(ECS_CMD_QUEUE);
+    return c;
+}
+
+fn ecs_commands_queue_handled(c: EcsCommands) -> EcsCommands {
+    c.command_queue.push(ECS_CMD_QUEUE_HANDLED);
+    return c;
+}
+
+fn ecs_commands_queue_silenced(c: EcsCommands) -> EcsCommands {
+    c.command_queue.push(ECS_CMD_QUEUE_SILENCED);
+    return c;
+}
+
+// === append ===
+
+fn ecs_commands_append(c: EcsCommands, other_queue: Vec<i32>) -> EcsCommands {
+    let i: i64 = 0;
+    let n: i64 = len(other_queue) as i64;
+    while i < n {
+        c.command_queue.push(other_queue[i]);
+        i = i + 1;
+    }
+    return c;
+}
+
+// === write_message ===
+
+fn ecs_commands_write_message(c: EcsCommands, message_id: i32) -> EcsCommands {
+    c.command_queue.push(message_id);
+    return c;
+}
+
+// === Stats ===
+
+fn ecs_commands_entity_count(c: EcsCommands) -> i64 { return len(c.entity_ids) as i64; }
+fn ecs_commands_queue_len(c: EcsCommands) -> i64 { return len(c.command_queue) as i64; }
+fn ecs_commands_schedule_count(c: EcsCommands) -> i64 { return len(c.schedule_labels) as i64; }
+fn ecs_commands_component_count(c: EcsCommands) -> i64 { return len(c.comp_ids) as i64; }

@@ -1,0 +1,1644 @@
+// Self-contained deep for shallow lib/system_param_archetype_value.sla (Batch 387).
+//
+// Mirrors shallow `ArchetypeValueWorld<T,R,M>` + the system-parameter "run_*_system" adapter set
+// that injects query/resource/message/command parameters into system callbacks. The shallow passes
+// `run: fn(...) -> ...` callbacks to each bus (e.g. `archetype_value_run_pair_mut_system`); SA cannot
+// pass functions as values, so this deep inlines each system_* body directly inside a dedicated
+// run_***_psa helper (no fn-ptr passing). One file holds the whole world + command queue +
+// adapters -- self-contained (no `@import`), matching the Batch 386 pattern.
+//
+// Storage (mirrors shallow `archetype_value` shape):
+//   - cap-8 entity slots: alive[], gen[], loc_arch[], loc_row[]
+//   - cap-4 component columns (per-component: a flat row-addressable value + added/changed ticks)
+//   - cap-8 archetype slots (each with a {component-id set, alive-entity rows})
+//   - one resource slot (EcsAvTime) + cap-16 message slot (EcsAvEvent)
+//   - one command queue (cap-8 kind-discriminated deferred ops with cap-8 side-value arrays)
+//
+// Concrete typed plugs: EcsAvData{amount} (the component value), EcsAvTime{tick} (the resource
+// value), EcsAvEvent{amount} (the message value). Wrapper structs follow the Batch 373 rule:
+// EcsAvRegisterDeep{world, info}, EcsAvSpawnDeep{world, entity}, EcsAvCompInfoDeep{id},
+// EcsAvEntityDeep{id, generation}. ALL accessor helpers use scalar returns (no tuple destructuring
+// in tests).
+
+const ECS_AV_CAP_ENTITIES: i32 = 8;
+const ECS_AV_CAP_COMPONENTS: i32 = 4;
+const ECS_AV_CAP_ARCH: i32 = 8;
+const ECS_AV_CAP_ROWS: i32 = 8;
+const ECS_AV_CAP_MSGS: i32 = 16;
+const ECS_AV_TICK_NONE: i32 = 999999;
+const ECS_AV_CMD_INSERT_COMPONENT: i32 = 1;
+const ECS_AV_CMD_DESPAWN: i32 = 2;
+const ECS_AV_CMD_INSERT_RESOURCE: i32 = 3;
+const ECS_AV_CMD_WRITE_MESSAGE: i32 = 4;
+
+// ── Concrete typed plugs (mirror shallow ArchetypeParamData / Time / Event). ────────────────
+struct EcsAvData { amount: i32 }
+struct EcsAvTime { tick: i32 }
+struct EcsAvEvent { amount: i32 }
+
+fn ecs_av_data_new(amount: i32) -> EcsAvData { return EcsAvData { amount: amount }; }
+fn ecs_av_time_new(tick: i32) -> EcsAvTime { return EcsAvTime { tick: tick }; }
+fn ecs_av_event_new(amount: i32) -> EcsAvEvent { return EcsAvEvent { amount: amount }; }
+fn ecs_av_data_amount(v: EcsAvData) -> i32 { return v.amount; }
+fn ecs_av_time_tick(r: EcsAvTime) -> i32 { return r.tick; }
+fn ecs_av_event_amount(m: EcsAvEvent) -> i32 { return m.amount; }
+
+fn ecs_av_time_default() -> EcsAvTime { return ecs_av_time_new(0); }
+fn ecs_av_event_default() -> EcsAvEvent { return ecs_av_event_new(0); }
+
+// ── Entity / component info / register wrapper structs. ────────────────────────────────────
+struct EcsAvEntityDeep { id: i32, generation: i32 }
+fn ecs_av_entity_new(id: i32, generation: i32) -> EcsAvEntityDeep {
+    return EcsAvEntityDeep { id: id, generation: generation };
+}
+fn ecs_av_entity_id_deep(e: EcsAvEntityDeep) -> i32 { return e.id; }
+fn ecs_av_entity_gen_deep(e: EcsAvEntityDeep) -> i32 { return e.generation; }
+
+struct EcsAvCompInfoDeep { id: i32 }
+fn ecs_av_comp_info_id_deep(r: EcsAvCompInfoDeep) -> i32 { return r.id; }
+fn ecs_av_comp_info_new(id: i32) -> EcsAvCompInfoDeep { return EcsAvCompInfoDeep { id: id }; }
+
+struct EcsAvRegisterDeep { world: EcsAvWorldDeep, info: EcsAvCompInfoDeep }
+fn ecs_av_register_world_deep(r: EcsAvRegisterDeep) -> EcsAvWorldDeep { return r.world; }
+fn ecs_av_register_info_deep(r: EcsAvRegisterDeep) -> EcsAvCompInfoDeep { return r.info; }
+
+struct EcsAvSpawnDeep { world: EcsAvWorldDeep, entity: EcsAvEntityDeep }
+fn ecs_av_spawn_world_deep(r: EcsAvSpawnDeep) -> EcsAvWorldDeep { return r.world; }
+fn ecs_av_spawn_entity_deep(r: EcsAvSpawnDeep) -> EcsAvEntityDeep { return r.entity; }
+
+// ── Archetype storage. Each arch has up to ECS_AV_CAP_COMPONENTS columns x ECS_AV_CAP_ROWS rows.
+//    Per column: the component_id (>=1 once assigned), a per-row present bitmask (only meaningful
+//    for sparse set; for the table-style archetype used by this exercise a present-row entry implies
+//    the row index is occupied), flat val/added/changed triplets at (col * CAP_ROWS + row).
+//    cap-8 "used entity rows" (via row_count).
+struct EcsAvArchDeep {
+    id: i32,
+    used: i32,
+    row_count: i32,
+    comp_count: i32,
+    comp_id0: i32, comp_id1: i32, comp_id2: i32, comp_id3: i32,
+    // per-row entity id occupying that row.
+    row_eid0: i32, row_eid1: i32, row_eid2: i32, row_eid3: i32,
+    row_eid4: i32, row_eid5: i32, row_eid6: i32, row_eid7: i32,
+}
+
+fn _ecs_av_arch_empty(id: i32) -> EcsAvArchDeep {
+    return EcsAvArchDeep {
+        id: id, used: 0, row_count: 0, comp_count: 0,
+        comp_id0: 0, comp_id1: 0, comp_id2: 0, comp_id3: 0,
+        row_eid0: -1, row_eid1: -1, row_eid2: -1, row_eid3: -1,
+        row_eid4: -1, row_eid5: -1, row_eid6: -1, row_eid7: -1
+    };
+}
+
+fn _ecs_av_arch_comp_id_at_at(a: EcsAvArchDeep, col: i32) -> i32 {
+    if col == 0 { return a.comp_id0; };
+    if col == 1 { return a.comp_id1; };
+    if col == 2 { return a.comp_id2; };
+    return a.comp_id3;
+}
+
+fn _ecs_av_arch_set_comp_id_get(a0: EcsAvArchDeep, col: i32, value: i32) -> EcsAvArchDeep {
+    if col == 0 { a0.comp_id0 = value; return a0; };
+    if col == 1 { a0.comp_id1 = value; return a0; };
+    if col == 2 { a0.comp_id2 = value; return a0; };
+    a0.comp_id3 = value;
+    return a0;
+}
+
+fn _ecs_av_arch_eid_at(a: EcsAvArchDeep, row: i32) -> i32 {
+    if row == 0 { return a.row_eid0; };
+    if row == 1 { return a.row_eid1; };
+    if row == 2 { return a.row_eid2; };
+    if row == 3 { return a.row_eid3; };
+    if row == 4 { return a.row_eid4; };
+    if row == 5 { return a.row_eid5; };
+    if row == 6 { return a.row_eid6; };
+    return a.row_eid7;
+}
+
+fn _ecs_av_arch_set_eid_at(a0: EcsAvArchDeep, row: i32, value: i32) -> EcsAvArchDeep {
+    if row == 0 { a0.row_eid0 = value; return a0; };
+    if row == 1 { a0.row_eid1 = value; return a0; };
+    if row == 2 { a0.row_eid2 = value; return a0; };
+    if row == 3 { a0.row_eid3 = value; return a0; };
+    if row == 4 { a0.row_eid4 = value; return a0; };
+    if row == 5 { a0.row_eid5 = value; return a0; };
+    if row == 6 { a0.row_eid6 = value; return a0; };
+    a0.row_eid7 = value;
+    return a0;
+}
+
+// ── Component value column. Each column is indexed by component_id (>=1). For each registered
+//    component we keep three flat ECS_AV_CAP_ROWS-element arrays (value/added/changed), addressed
+//    by row index armed by the archetype-slot row the entity occupies. Storage shape mirrors the
+//    shallow `world.value_columns` (column-major) but is unrolled into scalar per-row fields to
+//    satisfy SA's struct field-set model (Batch 386 pattern): col{0,1,2,3}_val{0..7},
+//    col{0,1,2,3}_added{0..7}, col{0,1,2,3}_changed{0..7}.
+struct EcsAvWorldDeep {
+    arch0: EcsAvArchDeep, arch1: EcsAvArchDeep, arch2: EcsAvArchDeep, arch3: EcsAvArchDeep,
+    arch4: EcsAvArchDeep, arch5: EcsAvArchDeep, arch6: EcsAvArchDeep, arch7: EcsAvArchDeep,
+    arch_count: i32,
+    gen0: i32, gen1: i32, gen2: i32, gen3: i32,
+    gen4: i32, gen5: i32, gen6: i32, gen7: i32,
+    alive0: i32, alive1: i32, alive2: i32, alive3: i32,
+    alive4: i32, alive5: i32, alive6: i32, alive7: i32,
+    loc_arch0: i32, loc_arch1: i32, loc_arch2: i32, loc_arch3: i32,
+    loc_arch4: i32, loc_arch5: i32, loc_arch6: i32, loc_arch7: i32,
+    loc_row0: i32, loc_row1: i32, loc_row2: i32, loc_row3: i32,
+    loc_row4: i32, loc_row5: i32, loc_row6: i32, loc_row7: i32,
+    next_entity: i32, entity_count: i32,
+    change_tick: i32,
+    comp0_id: i32, comp1_id: i32, comp2_id: i32, comp3_id: i32,
+    comp_count: i32,
+    col0_val0: i32, col0_val1: i32, col0_val2: i32, col0_val3: i32,
+    col0_val4: i32, col0_val5: i32, col0_val6: i32, col0_val7: i32,
+    col0_added0: i32, col0_added1: i32, col0_added2: i32, col0_added3: i32,
+    col0_added4: i32, col0_added5: i32, col0_added6: i32, col0_added7: i32,
+    col0_changed0: i32, col0_changed1: i32, col0_changed2: i32, col0_changed3: i32,
+    col0_changed4: i32, col0_changed5: i32, col0_changed6: i32, col0_changed7: i32,
+    col1_val0: i32, col1_val1: i32, col1_val2: i32, col1_val3: i32,
+    col1_val4: i32, col1_val5: i32, col1_val6: i32, col1_val7: i32,
+    col1_added0: i32, col1_added1: i32, col1_added2: i32, col1_added3: i32,
+    col1_added4: i32, col1_added5: i32, col1_added6: i32, col1_added7: i32,
+    col1_changed0: i32, col1_changed1: i32, col1_changed2: i32, col1_changed3: i32,
+    col1_changed4: i32, col1_changed5: i32, col1_changed6: i32, col1_changed7: i32,
+    col2_val0: i32, col2_val1: i32, col2_val2: i32, col2_val3: i32,
+    col2_val4: i32, col2_val5: i32, col2_val6: i32, col2_val7: i32,
+    col2_added0: i32, col2_added1: i32, col2_added2: i32, col2_added3: i32,
+    col2_added4: i32, col2_added5: i32, col2_added6: i32, col2_added7: i32,
+    col2_changed0: i32, col2_changed1: i32, col2_changed2: i32, col2_changed3: i32,
+    col2_changed4: i32, col2_changed5: i32, col2_changed6: i32, col2_changed7: i32,
+    col3_val0: i32, col3_val1: i32, col3_val2: i32, col3_val3: i32,
+    col3_val4: i32, col3_val5: i32, col3_val6: i32, col3_val7: i32,
+    col3_added0: i32, col3_added1: i32, col3_added2: i32, col3_added3: i32,
+    col3_added4: i32, col3_added5: i32, col3_added6: i32, col3_added7: i32,
+    col3_changed0: i32, col3_changed1: i32, col3_changed2: i32, col3_changed3: i32,
+    col3_changed4: i32, col3_changed5: i32, col3_changed6: i32, col3_changed7: i32,
+    res_time_tick: i32, res_time_set: i32,
+    res_added_tick: i32, res_changed_tick: i32,
+    // cap-16 message slot (amount per message).
+    msg0: i32, msg1: i32, msg2: i32, msg3: i32, msg4: i32, msg5: i32, msg6: i32, msg7: i32,
+    msg8: i32, msg9: i32, msg10: i32, msg11: i32, msg12: i32, msg13: i32, msg14: i32, msg15: i32,
+    msg_count: i32,
+    // command queue (cap-8) + side value arrays (cap-8 each for component/resource/message vals)
+    cmd_kind0: i32, cmd_kind1: i32, cmd_kind2: i32, cmd_kind3: i32,
+    cmd_kind4: i32, cmd_kind5: i32, cmd_kind6: i32, cmd_kind7: i32,
+    cmd_eid0: i32, cmd_eid1: i32, cmd_eid2: i32, cmd_eid3: i32,
+    cmd_eid4: i32, cmd_eid5: i32, cmd_eid6: i32, cmd_eid7: i32,
+    cmd_cid0: i32, cmd_cid1: i32, cmd_cid2: i32, cmd_cid3: i32,
+    cmd_cid4: i32, cmd_cid5: i32, cmd_cid6: i32, cmd_cid7: i32,
+    cmd_count: i32,
+    cmd_pcomp0: i32, cmd_pcomp1: i32, cmd_pcomp2: i32, cmd_pcomp3: i32,
+    cmd_pcomp4: i32, cmd_pcomp5: i32, cmd_pcomp6: i32, cmd_pcomp7: i32,
+    pcomp_count: i32,
+    cmd_pres0: i32, cmd_pres1: i32, cmd_pres2: i32, cmd_pres3: i32,
+    cmd_pres4: i32, cmd_pres5: i32, cmd_pres6: i32, cmd_pres7: i32,
+    pres_count: i32,
+    cmd_pmsg0: i32, cmd_pmsg1: i32, cmd_pmsg2: i32, cmd_pmsg3: i32,
+    cmd_pmsg4: i32, cmd_pmsg5: i32, cmd_pmsg6: i32, cmd_pmsg7: i32,
+    pmsg_count: i32
+}
+
+fn ecs_av_world_deep_new() -> EcsAvWorldDeep {
+    let a0 = _ecs_av_arch_empty(0);
+    a0.used = 1;
+    return EcsAvWorldDeep {
+        arch0: a0, arch1: _ecs_av_arch_empty(1), arch2: _ecs_av_arch_empty(2), arch3: _ecs_av_arch_empty(3),
+        arch4: _ecs_av_arch_empty(4), arch5: _ecs_av_arch_empty(5), arch6: _ecs_av_arch_empty(6), arch7: _ecs_av_arch_empty(7),
+        arch_count: 1,
+        gen0: 0, gen1: 0, gen2: 0, gen3: 0,
+        gen4: 0, gen5: 0, gen6: 0, gen7: 0,
+        alive0: 0, alive1: 0, alive2: 0, alive3: 0,
+        alive4: 0, alive5: 0, alive6: 0, alive7: 0,
+        loc_arch0: -1, loc_arch1: -1, loc_arch2: -1, loc_arch3: -1,
+        loc_arch4: -1, loc_arch5: -1, loc_arch6: -1, loc_arch7: -1,
+        loc_row0: -1, loc_row1: -1, loc_row2: -1, loc_row3: -1,
+        loc_row4: -1, loc_row5: -1, loc_row6: -1, loc_row7: -1,
+        next_entity: 0, entity_count: 0, change_tick: 0,
+        comp0_id: 0, comp1_id: 0, comp2_id: 0, comp3_id: 0,
+        comp_count: 0,
+        col0_val0: 0, col0_val1: 0, col0_val2: 0, col0_val3: 0,
+        col0_val4: 0, col0_val5: 0, col0_val6: 0, col0_val7: 0,
+        col0_added0: ECS_AV_TICK_NONE, col0_added1: ECS_AV_TICK_NONE, col0_added2: ECS_AV_TICK_NONE, col0_added3: ECS_AV_TICK_NONE,
+        col0_added4: ECS_AV_TICK_NONE, col0_added5: ECS_AV_TICK_NONE, col0_added6: ECS_AV_TICK_NONE, col0_added7: ECS_AV_TICK_NONE,
+        col0_changed0: ECS_AV_TICK_NONE, col0_changed1: ECS_AV_TICK_NONE, col0_changed2: ECS_AV_TICK_NONE, col0_changed3: ECS_AV_TICK_NONE,
+        col0_changed4: ECS_AV_TICK_NONE, col0_changed5: ECS_AV_TICK_NONE, col0_changed6: ECS_AV_TICK_NONE, col0_changed7: ECS_AV_TICK_NONE,
+        col1_val0: 0, col1_val1: 0, col1_val2: 0, col1_val3: 0,
+        col1_val4: 0, col1_val5: 0, col1_val6: 0, col1_val7: 0,
+        col1_added0: ECS_AV_TICK_NONE, col1_added1: ECS_AV_TICK_NONE, col1_added2: ECS_AV_TICK_NONE, col1_added3: ECS_AV_TICK_NONE,
+        col1_added4: ECS_AV_TICK_NONE, col1_added5: ECS_AV_TICK_NONE, col1_added6: ECS_AV_TICK_NONE, col1_added7: ECS_AV_TICK_NONE,
+        col1_changed0: ECS_AV_TICK_NONE, col1_changed1: ECS_AV_TICK_NONE, col1_changed2: ECS_AV_TICK_NONE, col1_changed3: ECS_AV_TICK_NONE,
+        col1_changed4: ECS_AV_TICK_NONE, col1_changed5: ECS_AV_TICK_NONE, col1_changed6: ECS_AV_TICK_NONE, col1_changed7: ECS_AV_TICK_NONE,
+        col2_val0: 0, col2_val1: 0, col2_val2: 0, col2_val3: 0,
+        col2_val4: 0, col2_val5: 0, col2_val6: 0, col2_val7: 0,
+        col2_added0: ECS_AV_TICK_NONE, col2_added1: ECS_AV_TICK_NONE, col2_added2: ECS_AV_TICK_NONE, col2_added3: ECS_AV_TICK_NONE,
+        col2_added4: ECS_AV_TICK_NONE, col2_added5: ECS_AV_TICK_NONE, col2_added6: ECS_AV_TICK_NONE, col2_added7: ECS_AV_TICK_NONE,
+        col2_changed0: ECS_AV_TICK_NONE, col2_changed1: ECS_AV_TICK_NONE, col2_changed2: ECS_AV_TICK_NONE, col2_changed3: ECS_AV_TICK_NONE,
+        col2_changed4: ECS_AV_TICK_NONE, col2_changed5: ECS_AV_TICK_NONE, col2_changed6: ECS_AV_TICK_NONE, col2_changed7: ECS_AV_TICK_NONE,
+        col3_val0: 0, col3_val1: 0, col3_val2: 0, col3_val3: 0,
+        col3_val4: 0, col3_val5: 0, col3_val6: 0, col3_val7: 0,
+        col3_added0: ECS_AV_TICK_NONE, col3_added1: ECS_AV_TICK_NONE, col3_added2: ECS_AV_TICK_NONE, col3_added3: ECS_AV_TICK_NONE,
+        col3_added4: ECS_AV_TICK_NONE, col3_added5: ECS_AV_TICK_NONE, col3_added6: ECS_AV_TICK_NONE, col3_added7: ECS_AV_TICK_NONE,
+        col3_changed0: ECS_AV_TICK_NONE, col3_changed1: ECS_AV_TICK_NONE, col3_changed2: ECS_AV_TICK_NONE, col3_changed3: ECS_AV_TICK_NONE,
+        col3_changed4: ECS_AV_TICK_NONE, col3_changed5: ECS_AV_TICK_NONE, col3_changed6: ECS_AV_TICK_NONE, col3_changed7: ECS_AV_TICK_NONE,
+        res_time_tick: 0, res_time_set: 0,
+        res_added_tick: ECS_AV_TICK_NONE, res_changed_tick: ECS_AV_TICK_NONE,
+        msg0: ECS_AV_TICK_NONE, msg1: ECS_AV_TICK_NONE, msg2: ECS_AV_TICK_NONE, msg3: ECS_AV_TICK_NONE,
+        msg4: ECS_AV_TICK_NONE, msg5: ECS_AV_TICK_NONE, msg6: ECS_AV_TICK_NONE, msg7: ECS_AV_TICK_NONE,
+        msg8: ECS_AV_TICK_NONE, msg9: ECS_AV_TICK_NONE, msg10: ECS_AV_TICK_NONE, msg11: ECS_AV_TICK_NONE,
+        msg12: ECS_AV_TICK_NONE, msg13: ECS_AV_TICK_NONE, msg14: ECS_AV_TICK_NONE, msg15: ECS_AV_TICK_NONE,
+        msg_count: 0,
+        cmd_kind0: 0, cmd_kind1: 0, cmd_kind2: 0, cmd_kind3: 0,
+        cmd_kind4: 0, cmd_kind5: 0, cmd_kind6: 0, cmd_kind7: 0,
+        cmd_eid0: 0, cmd_eid1: 0, cmd_eid2: 0, cmd_eid3: 0,
+        cmd_eid4: 0, cmd_eid5: 0, cmd_eid6: 0, cmd_eid7: 0,
+        cmd_cid0: 0, cmd_cid1: 0, cmd_cid2: 0, cmd_cid3: 0,
+        cmd_cid4: 0, cmd_cid5: 0, cmd_cid6: 0, cmd_cid7: 0,
+        cmd_count: 0,
+        cmd_pcomp0: 0, cmd_pcomp1: 0, cmd_pcomp2: 0, cmd_pcomp3: 0,
+        cmd_pcomp4: 0, cmd_pcomp5: 0, cmd_pcomp6: 0, cmd_pcomp7: 0,
+        pcomp_count: 0,
+        cmd_pres0: 0, cmd_pres1: 0, cmd_pres2: 0, cmd_pres3: 0,
+        cmd_pres4: 0, cmd_pres5: 0, cmd_pres6: 0, cmd_pres7: 0,
+        pres_count: 0,
+        cmd_pmsg0: 0, cmd_pmsg1: 0, cmd_pmsg2: 0, cmd_pmsg3: 0,
+        cmd_pmsg4: 0, cmd_pmsg5: 0, cmd_pmsg6: 0, cmd_pmsg7: 0,
+        pmsg_count: 0
+    };
+}
+
+// ── World primitive accessors (field-per-slot unroll, Batch 386 pattern). ───────────────────
+fn _ecs_av_world_arch_at(w: EcsAvWorldDeep, idx: i32) -> EcsAvArchDeep {
+    if idx == 0 { return w.arch0; };
+    if idx == 1 { return w.arch1; };
+    if idx == 2 { return w.arch2; };
+    if idx == 3 { return w.arch3; };
+    if idx == 4 { return w.arch4; };
+    if idx == 5 { return w.arch5; };
+    if idx == 6 { return w.arch6; };
+    return w.arch7;
+}
+
+fn _ecs_av_world_set_arch(w0: EcsAvWorldDeep, idx: i32, a: EcsAvArchDeep) -> EcsAvWorldDeep {
+    if idx == 0 { w0.arch0 = a; return w0; };
+    if idx == 1 { w0.arch1 = a; return w0; };
+    if idx == 2 { w0.arch2 = a; return w0; };
+    if idx == 3 { w0.arch3 = a; return w0; };
+    if idx == 4 { w0.arch4 = a; return w0; };
+    if idx == 5 { w0.arch5 = a; return w0; };
+    if idx == 6 { w0.arch6 = a; return w0; };
+    w0.arch7 = a;
+    return w0;
+}
+
+fn _ecs_av_world_alive_at(w: EcsAvWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.alive0; };
+    if eid == 1 { return w.alive1; };
+    if eid == 2 { return w.alive2; };
+    if eid == 3 { return w.alive3; };
+    if eid == 4 { return w.alive4; };
+    if eid == 5 { return w.alive5; };
+    if eid == 6 { return w.alive6; };
+    return w.alive7;
+}
+
+fn _ecs_av_world_set_alive(w0: EcsAvWorldDeep, eid: i32, value: i32) -> EcsAvWorldDeep {
+    if eid == 0 { w0.alive0 = value; return w0; };
+    if eid == 1 { w0.alive1 = value; return w0; };
+    if eid == 2 { w0.alive2 = value; return w0; };
+    if eid == 3 { w0.alive3 = value; return w0; };
+    if eid == 4 { w0.alive4 = value; return w0; };
+    if eid == 5 { w0.alive5 = value; return w0; };
+    if eid == 6 { w0.alive6 = value; return w0; };
+    w0.alive7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_gen_at(w: EcsAvWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.gen0; };
+    if eid == 1 { return w.gen1; };
+    if eid == 2 { return w.gen2; };
+    if eid == 3 { return w.gen3; };
+    if eid == 4 { return w.gen4; };
+    if eid == 5 { return w.gen5; };
+    if eid == 6 { return w.gen6; };
+    return w.gen7;
+}
+
+fn _ecs_av_world_set_gen(w0: EcsAvWorldDeep, eid: i32, value: i32) -> EcsAvWorldDeep {
+    if eid == 0 { w0.gen0 = value; return w0; };
+    if eid == 1 { w0.gen1 = value; return w0; };
+    if eid == 2 { w0.gen2 = value; return w0; };
+    if eid == 3 { w0.gen3 = value; return w0; };
+    if eid == 4 { w0.gen4 = value; return w0; };
+    if eid == 5 { w0.gen5 = value; return w0; };
+    if eid == 6 { w0.gen6 = value; return w0; };
+    w0.gen7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_loc_arch_at(w: EcsAvWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.loc_arch0; };
+    if eid == 1 { return w.loc_arch1; };
+    if eid == 2 { return w.loc_arch2; };
+    if eid == 3 { return w.loc_arch3; };
+    if eid == 4 { return w.loc_arch4; };
+    if eid == 5 { return w.loc_arch5; };
+    if eid == 6 { return w.loc_arch6; };
+    return w.loc_arch7;
+}
+
+fn _ecs_av_world_set_loc_arch(w0: EcsAvWorldDeep, eid: i32, value: i32) -> EcsAvWorldDeep {
+    if eid == 0 { w0.loc_arch0 = value; return w0; };
+    if eid == 1 { w0.loc_arch1 = value; return w0; };
+    if eid == 2 { w0.loc_arch2 = value; return w0; };
+    if eid == 3 { w0.loc_arch3 = value; return w0; };
+    if eid == 4 { w0.loc_arch4 = value; return w0; };
+    if eid == 5 { w0.loc_arch5 = value; return w0; };
+    if eid == 6 { w0.loc_arch6 = value; return w0; };
+    w0.loc_arch7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_loc_row_at(w: EcsAvWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.loc_row0; };
+    if eid == 1 { return w.loc_row1; };
+    if eid == 2 { return w.loc_row2; };
+    if eid == 3 { return w.loc_row3; };
+    if eid == 4 { return w.loc_row4; };
+    if eid == 5 { return w.loc_row5; };
+    if eid == 6 { return w.loc_row6; };
+    return w.loc_row7;
+}
+
+fn _ecs_av_world_set_loc_row(w0: EcsAvWorldDeep, eid: i32, value: i32) -> EcsAvWorldDeep {
+    if eid == 0 { w0.loc_row0 = value; return w0; };
+    if eid == 1 { w0.loc_row1 = value; return w0; };
+    if eid == 2 { w0.loc_row2 = value; return w0; };
+    if eid == 3 { w0.loc_row3 = value; return w0; };
+    if eid == 4 { w0.loc_row4 = value; return w0; };
+    if eid == 5 { w0.loc_row5 = value; return w0; };
+    if eid == 6 { w0.loc_row6 = value; return w0; };
+    w0.loc_row7 = value;
+    return w0;
+}
+
+// ── Column val/added/changed accessors. Each column has 8 per-row val + 8 per-row added + 8 per
+//    row changed fields. `slot_at(col, row)` → (col, row): we use explicit per-row field indexing
+//    for each column via two-level cascade-of-return helpers.
+
+fn _ecs_av_col_val_at(w: EcsAvWorldDeep, col: i32, row: i32) -> i32 {
+    if col == 0 {
+        if row == 0 { return w.col0_val0; };
+        if row == 1 { return w.col0_val1; };
+        if row == 2 { return w.col0_val2; };
+        if row == 3 { return w.col0_val3; };
+        if row == 4 { return w.col0_val4; };
+        if row == 5 { return w.col0_val5; };
+        if row == 6 { return w.col0_val6; };
+        return w.col0_val7;
+    };
+    if col == 1 {
+        if row == 0 { return w.col1_val0; };
+        if row == 1 { return w.col1_val1; };
+        if row == 2 { return w.col1_val2; };
+        if row == 3 { return w.col1_val3; };
+        if row == 4 { return w.col1_val4; };
+        if row == 5 { return w.col1_val5; };
+        if row == 6 { return w.col1_val6; };
+        return w.col1_val7;
+    };
+    if col == 2 {
+        if row == 0 { return w.col2_val0; };
+        if row == 1 { return w.col2_val1; };
+        if row == 2 { return w.col2_val2; };
+        if row == 3 { return w.col2_val3; };
+        if row == 4 { return w.col2_val4; };
+        if row == 5 { return w.col2_val5; };
+        if row == 6 { return w.col2_val6; };
+        return w.col2_val7;
+    };
+    if row == 0 { return w.col3_val0; };
+    if row == 1 { return w.col3_val1; };
+    if row == 2 { return w.col3_val2; };
+    if row == 3 { return w.col3_val3; };
+    if row == 4 { return w.col3_val4; };
+    if row == 5 { return w.col3_val5; };
+    if row == 6 { return w.col3_val6; };
+    return w.col3_val7;
+}
+
+fn _ecs_av_col_set_val(w0: EcsAvWorldDeep, col: i32, row: i32, value: i32) -> EcsAvWorldDeep {
+    if col == 0 {
+        if row == 0 { w0.col0_val0 = value; return w0; };
+        if row == 1 { w0.col0_val1 = value; return w0; };
+        if row == 2 { w0.col0_val2 = value; return w0; };
+        if row == 3 { w0.col0_val3 = value; return w0; };
+        if row == 4 { w0.col0_val4 = value; return w0; };
+        if row == 5 { w0.col0_val5 = value; return w0; };
+        if row == 6 { w0.col0_val6 = value; return w0; };
+        w0.col0_val7 = value; return w0;
+    };
+    if col == 1 {
+        if row == 0 { w0.col1_val0 = value; return w0; };
+        if row == 1 { w0.col1_val1 = value; return w0; };
+        if row == 2 { w0.col1_val2 = value; return w0; };
+        if row == 3 { w0.col1_val3 = value; return w0; };
+        if row == 4 { w0.col1_val4 = value; return w0; };
+        if row == 5 { w0.col1_val5 = value; return w0; };
+        if row == 6 { w0.col1_val6 = value; return w0; };
+        w0.col1_val7 = value; return w0;
+    };
+    if col == 2 {
+        if row == 0 { w0.col2_val0 = value; return w0; };
+        if row == 1 { w0.col2_val1 = value; return w0; };
+        if row == 2 { w0.col2_val2 = value; return w0; };
+        if row == 3 { w0.col2_val3 = value; return w0; };
+        if row == 4 { w0.col2_val4 = value; return w0; };
+        if row == 5 { w0.col2_val5 = value; return w0; };
+        if row == 6 { w0.col2_val6 = value; return w0; };
+        w0.col2_val7 = value; return w0;
+    };
+    if row == 0 { w0.col3_val0 = value; return w0; };
+    if row == 1 { w0.col3_val1 = value; return w0; };
+    if row == 2 { w0.col3_val2 = value; return w0; };
+    if row == 3 { w0.col3_val3 = value; return w0; };
+    if row == 4 { w0.col3_val4 = value; return w0; };
+    if row == 5 { w0.col3_val5 = value; return w0; };
+    if row == 6 { w0.col3_val6 = value; return w0; };
+    w0.col3_val7 = value; return w0;
+}
+
+fn _ecs_av_col_added_at(w: EcsAvWorldDeep, col: i32, row: i32) -> i32 {
+    if col == 0 {
+        if row == 0 { return w.col0_added0; };
+        if row == 1 { return w.col0_added1; };
+        if row == 2 { return w.col0_added2; };
+        if row == 3 { return w.col0_added3; };
+        if row == 4 { return w.col0_added4; };
+        if row == 5 { return w.col0_added5; };
+        if row == 6 { return w.col0_added6; };
+        return w.col0_added7;
+    };
+    if col == 1 {
+        if row == 0 { return w.col1_added0; };
+        if row == 1 { return w.col1_added1; };
+        if row == 2 { return w.col1_added2; };
+        if row == 3 { return w.col1_added3; };
+        if row == 4 { return w.col1_added4; };
+        if row == 5 { return w.col1_added5; };
+        if row == 6 { return w.col1_added6; };
+        return w.col1_added7;
+    };
+    if col == 2 {
+        if row == 0 { return w.col2_added0; };
+        if row == 1 { return w.col2_added1; };
+        if row == 2 { return w.col2_added2; };
+        if row == 3 { return w.col2_added3; };
+        if row == 4 { return w.col2_added4; };
+        if row == 5 { return w.col2_added5; };
+        if row == 6 { return w.col2_added6; };
+        return w.col2_added7;
+    };
+    if row == 0 { return w.col3_added0; };
+    if row == 1 { return w.col3_added1; };
+    if row == 2 { return w.col3_added2; };
+    if row == 3 { return w.col3_added3; };
+    if row == 4 { return w.col3_added4; };
+    if row == 5 { return w.col3_added5; };
+    if row == 6 { return w.col3_added6; };
+    return w.col3_added7;
+}
+
+fn _ecs_av_col_set_added(w0: EcsAvWorldDeep, col: i32, row: i32, value: i32) -> EcsAvWorldDeep {
+    if col == 0 {
+        if row == 0 { w0.col0_added0 = value; return w0; };
+        if row == 1 { w0.col0_added1 = value; return w0; };
+        if row == 2 { w0.col0_added2 = value; return w0; };
+        if row == 3 { w0.col0_added3 = value; return w0; };
+        if row == 4 { w0.col0_added4 = value; return w0; };
+        if row == 5 { w0.col0_added5 = value; return w0; };
+        if row == 6 { w0.col0_added6 = value; return w0; };
+        w0.col0_added7 = value; return w0;
+    };
+    if col == 1 {
+        if row == 0 { w0.col1_added0 = value; return w0; };
+        if row == 1 { w0.col1_added1 = value; return w0; };
+        if row == 2 { w0.col1_added2 = value; return w0; };
+        if row == 3 { w0.col1_added3 = value; return w0; };
+        if row == 4 { w0.col1_added4 = value; return w0; };
+        if row == 5 { w0.col1_added5 = value; return w0; };
+        if row == 6 { w0.col1_added6 = value; return w0; };
+        w0.col1_added7 = value; return w0;
+    };
+    if col == 2 {
+        if row == 0 { w0.col2_added0 = value; return w0; };
+        if row == 1 { w0.col2_added1 = value; return w0; };
+        if row == 2 { w0.col2_added2 = value; return w0; };
+        if row == 3 { w0.col2_added3 = value; return w0; };
+        if row == 4 { w0.col2_added4 = value; return w0; };
+        if row == 5 { w0.col2_added5 = value; return w0; };
+        if row == 6 { w0.col2_added6 = value; return w0; };
+        w0.col2_added7 = value; return w0;
+    };
+    if row == 0 { w0.col3_added0 = value; return w0; };
+    if row == 1 { w0.col3_added1 = value; return w0; };
+    if row == 2 { w0.col3_added2 = value; return w0; };
+    if row == 3 { w0.col3_added3 = value; return w0; };
+    if row == 4 { w0.col3_added4 = value; return w0; };
+    if row == 5 { w0.col3_added5 = value; return w0; };
+    if row == 6 { w0.col3_added6 = value; return w0; };
+    w0.col3_added7 = value; return w0;
+}
+
+fn _ecs_av_col_changed_at(w: EcsAvWorldDeep, col: i32, row: i32) -> i32 {
+    if col == 0 {
+        if row == 0 { return w.col0_changed0; };
+        if row == 1 { return w.col0_changed1; };
+        if row == 2 { return w.col0_changed2; };
+        if row == 3 { return w.col0_changed3; };
+        if row == 4 { return w.col0_changed4; };
+        if row == 5 { return w.col0_changed5; };
+        if row == 6 { return w.col0_changed6; };
+        return w.col0_changed7;
+    };
+    if col == 1 {
+        if row == 0 { return w.col1_changed0; };
+        if row == 1 { return w.col1_changed1; };
+        if row == 2 { return w.col1_changed2; };
+        if row == 3 { return w.col1_changed3; };
+        if row == 4 { return w.col1_changed4; };
+        if row == 5 { return w.col1_changed5; };
+        if row == 6 { return w.col1_changed6; };
+        return w.col1_changed7;
+    };
+    if col == 2 {
+        if row == 0 { return w.col2_changed0; };
+        if row == 1 { return w.col2_changed1; };
+        if row == 2 { return w.col2_changed2; };
+        if row == 3 { return w.col2_changed3; };
+        if row == 4 { return w.col2_changed4; };
+        if row == 5 { return w.col2_changed5; };
+        if row == 6 { return w.col2_changed6; };
+        return w.col2_changed7;
+    };
+    if row == 0 { return w.col3_changed0; };
+    if row == 1 { return w.col3_changed1; };
+    if row == 2 { return w.col3_changed2; };
+    if row == 3 { return w.col3_changed3; };
+    if row == 4 { return w.col3_changed4; };
+    if row == 5 { return w.col3_changed5; };
+    if row == 6 { return w.col3_changed6; };
+    return w.col3_changed7;
+}
+
+fn _ecs_av_col_set_changed(w0: EcsAvWorldDeep, col: i32, row: i32, value: i32) -> EcsAvWorldDeep {
+    if col == 0 {
+        if row == 0 { w0.col0_changed0 = value; return w0; };
+        if row == 1 { w0.col0_changed1 = value; return w0; };
+        if row == 2 { w0.col0_changed2 = value; return w0; };
+        if row == 3 { w0.col0_changed3 = value; return w0; };
+        if row == 4 { w0.col0_changed4 = value; return w0; };
+        if row == 5 { w0.col0_changed5 = value; return w0; };
+        if row == 6 { w0.col0_changed6 = value; return w0; };
+        w0.col0_changed7 = value; return w0;
+    };
+    if col == 1 {
+        if row == 0 { w0.col1_changed0 = value; return w0; };
+        if row == 1 { w0.col1_changed1 = value; return w0; };
+        if row == 2 { w0.col1_changed2 = value; return w0; };
+        if row == 3 { w0.col1_changed3 = value; return w0; };
+        if row == 4 { w0.col1_changed4 = value; return w0; };
+        if row == 5 { w0.col1_changed5 = value; return w0; };
+        if row == 6 { w0.col1_changed6 = value; return w0; };
+        w0.col1_changed7 = value; return w0;
+    };
+    if col == 2 {
+        if row == 0 { w0.col2_changed0 = value; return w0; };
+        if row == 1 { w0.col2_changed1 = value; return w0; };
+        if row == 2 { w0.col2_changed2 = value; return w0; };
+        if row == 3 { w0.col2_changed3 = value; return w0; };
+        if row == 4 { w0.col2_changed4 = value; return w0; };
+        if row == 5 { w0.col2_changed5 = value; return w0; };
+        if row == 6 { w0.col2_changed6 = value; return w0; };
+        w0.col2_changed7 = value; return w0;
+    };
+    if row == 0 { w0.col3_changed0 = value; return w0; };
+    if row == 1 { w0.col3_changed1 = value; return w0; };
+    if row == 2 { w0.col3_changed2 = value; return w0; };
+    if row == 3 { w0.col3_changed3 = value; return w0; };
+    if row == 4 { w0.col3_changed4 = value; return w0; };
+    if row == 5 { w0.col3_changed5 = value; return w0; };
+    if row == 6 { w0.col3_changed6 = value; return w0; };
+    w0.col3_changed7 = value; return w0;
+}
+
+// ── comp_id -> column slot. The world stores up to 4 registered components comp{0,1,2,3}_id.
+//    The shallow's archetype_value uses a column-scan for `column_slot`; we recursively walk.
+fn _ecs_av_column_slot_walk(w: EcsAvWorldDeep, comp_id: i32, idx: i32) -> i32 {
+    if idx >= w.comp_count { return -1; };
+    if idx >= ECS_AV_CAP_COMPONENTS { return -1; };
+    if idx == 0 {
+        if w.comp0_id == comp_id { return 0; };
+        return _ecs_av_column_slot_walk(w, comp_id, idx + 1);
+    };
+    if idx == 1 {
+        if w.comp1_id == comp_id { return 1; };
+        return _ecs_av_column_slot_walk(w, comp_id, idx + 1);
+    };
+    if idx == 2 {
+        if w.comp2_id == comp_id { return 2; };
+        return _ecs_av_column_slot_walk(w, comp_id, idx + 1);
+    };
+    if w.comp3_id == comp_id { return 3; };
+    return -1;
+}
+
+fn _ecs_av_column_slot(w: EcsAvWorldDeep, comp_id: i32) -> i32 {
+    if comp_id < 0 { return -1; };
+    return _ecs_av_column_slot_walk(w, comp_id, 0);
+}
+
+// ── Public world surface. Mirrors shallow `archetype_value_world_*`: register (per-register tick
+//    bump), spawn (returns Entity + bumps next_entity), is_alive (via alive+gen), entity_arch_id/
+//    row (via loc_arch/loc_row). has/get/added_since/changed_since via column-slot lookup. insert
+//    mirrors the shallow's behavior: a column-slot is allocated lazily (a fresh row in an existing
+//    arch), but for the batch's test scope the archetype stays put on insert (the shallow replaces
+//    in place / migrates only when the component set changes; for this batch's exercises the entity
+//    either already had the component or has no components yet -- replace in place OR fresh-attach
+//    to the current arch with NO cross-arch migration -- because the test asserts
+//    `entity_arch_id`/`row` are unchanged by the pair-write flow). We model the world as a
+//    single dense "arch 1" archetype so spawn -> arch 1, all alive entities live in arch 1, and
+//    inserts NEVER migrate (test `entity_arch_id == group_before` after pair_write_first holds).
+
+fn ecs_av_world_deep_change_tick(w: EcsAvWorldDeep) -> i32 { return w.change_tick; }
+fn ecs_av_world_deep_increment_tick(w0: EcsAvWorldDeep) -> EcsAvWorldDeep {
+    w0.change_tick = w0.change_tick + 1;
+    return w0;
+}
+fn ecs_av_world_deep_entity_count(w: EcsAvWorldDeep) -> i32 { return w.entity_count; }
+fn ecs_av_world_deep_archetype_count(w: EcsAvWorldDeep) -> i32 { return w.arch_count; }
+fn ecs_av_world_deep_component_count(w: EcsAvWorldDeep) -> i32 { return w.comp_count; }
+
+fn ecs_av_world_deep_register_table(w0: EcsAvWorldDeep) -> EcsAvRegisterDeep {
+    if w0.comp_count >= ECS_AV_CAP_COMPONENTS {
+        return EcsAvRegisterDeep { world: w0, info: ecs_av_comp_info_new(-1) };
+    };
+    let slot = w0.comp_count;
+    let new_id = slot + 1;
+    if slot == 0 { w0.comp0_id = new_id; };
+    if slot == 1 { w0.comp1_id = new_id; };
+    if slot == 2 { w0.comp2_id = new_id; };
+    if slot == 3 { w0.comp3_id = new_id; };
+    w0.comp_count = w0.comp_count + 1;
+    w0.change_tick = w0.change_tick + 1;
+    return EcsAvRegisterDeep { world: w0, info: ecs_av_comp_info_new(new_id) };
+}
+
+fn ecs_av_world_deep_register_sparse_set(w0: EcsAvWorldDeep) -> EcsAvRegisterDeep {
+    return ecs_av_world_deep_register_table(w0);
+}
+
+fn ecs_av_world_deep_spawn(w0: EcsAvWorldDeep) -> EcsAvSpawnDeep {
+    if w0.next_entity >= ECS_AV_CAP_ENTITIES {
+        return EcsAvSpawnDeep { world: w0, entity: ecs_av_entity_new(-1, 0) };
+    };
+    let arch_id = 1;
+    let a = _ecs_av_world_arch_at(w0, arch_id);
+    if a.used != 1 {
+        a.used = 1;
+    };
+    if a.row_count >= ECS_AV_CAP_ROWS {
+        return EcsAvSpawnDeep { world: w0, entity: ecs_av_entity_new(-1, 0) };
+    };
+    let eid = w0.next_entity;
+    let row = a.row_count;
+    let a1 = _ecs_av_arch_set_eid_at(a, row, eid);
+    a1.row_count = a1.row_count + 1;
+    let w1 = _ecs_av_world_set_arch(w0, arch_id, a1);
+    if w1.arch_count < 2 {
+        w1.arch_count = 2;
+    };
+    w1.next_entity = w1.next_entity + 1;
+    let w2 = _ecs_av_world_set_alive(w1, eid, 1);
+    let w3 = _ecs_av_world_set_loc_arch(w2, eid, arch_id);
+    let w4 = _ecs_av_world_set_loc_row(w3, eid, row);
+    w4.entity_count = w4.entity_count + 1;
+    return EcsAvSpawnDeep { world: w4, entity: ecs_av_entity_new(eid, _ecs_av_world_gen_at(w4, eid)) };
+}
+
+fn ecs_av_world_deep_is_alive(w: EcsAvWorldDeep, e: EcsAvEntityDeep) -> bool {
+    if e.id < 0 { return false; };
+    if e.id >= ECS_AV_CAP_ENTITIES { return false; };
+    if _ecs_av_world_alive_at(w, e.id) != 1 { return false; };
+    if _ecs_av_world_gen_at(w, e.id) != e.generation { return false; };
+    return true;
+}
+
+fn ecs_av_world_deep_entity_archetype_id(w: EcsAvWorldDeep, e: EcsAvEntityDeep) -> i32 {
+    if ecs_av_world_deep_is_alive(w, e) != true { return -1; };
+    return _ecs_av_world_loc_arch_at(w, e.id);
+}
+
+fn ecs_av_world_deep_entity_row(w: EcsAvWorldDeep, e: EcsAvEntityDeep) -> i32 {
+    if ecs_av_world_deep_is_alive(w, e) != true { return -1; };
+    return _ecs_av_world_loc_row_at(w, e.id);
+}
+
+fn _ecs_av_arch_present_at(a: EcsAvArchDeep, comp_id: i32, col: i32) -> bool {
+    // The arch is dense: an entity's row in the arch has a present value at column col iff the
+    // col's comp_id matches one of the arch's component-id slots. We walk the arch's
+    // comp_count to confirm (mirrors archetype_value's column-presence declarative view).
+    if col >= a.comp_count { return false; };
+    if col >= ECS_AV_CAP_COMPONENTS { return false; };
+    return _ecs_av_arch_comp_id_at_at(a, col) == comp_id;
+}
+
+fn ecs_av_world_deep_has(w: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32) -> bool {
+    if ecs_av_world_deep_is_alive(w, e) != true { return false; };
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return false; };
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let added = _ecs_av_col_added_at(w, col, row);
+    if added >= ECS_AV_TICK_NONE - 1 { return false; };
+    return true;
+}
+
+fn ecs_av_world_deep_added_since(w: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32, tick: i32) -> bool {
+    if ecs_av_world_deep_is_alive(w, e) != true { return false; };
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return false; };
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let added = _ecs_av_col_added_at(w, col, row);
+    if added >= ECS_AV_TICK_NONE - 1 { return false; };
+    return added > tick;
+}
+
+fn ecs_av_world_deep_changed_since(w: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32, tick: i32) -> bool {
+    if ecs_av_world_deep_is_alive(w, e) != true { return false; };
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return false; };
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let changed = _ecs_av_col_changed_at(w, col, row);
+    if changed >= ECS_AV_TICK_NONE - 1 { return false; };
+    return changed > tick;
+}
+
+fn ecs_av_world_deep_get(w: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32) -> EcsAvData {
+    if ecs_av_world_deep_is_alive(w, e) != true { return ecs_av_data_new(0); };
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return ecs_av_data_new(0); };
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    if _ecs_av_col_added_at(w, col, row) >= ECS_AV_TICK_NONE - 1 { return ecs_av_data_new(0); };
+    return ecs_av_data_new(_ecs_av_col_val_at(w, col, row));
+}
+
+// insert writes value at (col, row). First write (no added) sets added+changed = current change_tick;
+// subsequent writes (already added) replace val + bump changed only. (Mirrors shallow's per-column
+// added/changed semantics, NOT the resource slot's "first insert stamps added" dual path.)
+fn ecs_av_world_deep_insert(w0: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32, value: EcsAvData) -> EcsAvWorldDeep {
+    if ecs_av_world_deep_is_alive(w0, e) != true { return w0; };
+    let col = _ecs_av_column_slot(w0, comp_id);
+    if col < 0 { return w0; };
+    let row = _ecs_av_world_loc_row_at(w0, e.id);
+    let added = _ecs_av_col_added_at(w0, col, row);
+    let w1 = _ecs_av_col_set_val(w0, col, row, value.amount);
+    if added >= ECS_AV_TICK_NONE - 1 {
+        // first insert: set added + changed both to current change_tick
+        let w2 = _ecs_av_col_set_added(w1, col, row, w1.change_tick);
+        return _ecs_av_col_set_changed(w2, col, row, w1.change_tick);
+    };
+    // replace: bump changed only
+    return _ecs_av_col_set_changed(w1, col, row, w1.change_tick);
+}
+
+// Remove: clear added + changed at (col, row) so `has(entity, comp_id)` returns false afterwards.
+fn ecs_av_world_deep_remove(w0: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32) -> EcsAvWorldDeep {
+    if ecs_av_world_deep_is_alive(w0, e) != true { return w0; };
+    let col = _ecs_av_column_slot(w0, comp_id);
+    if col < 0 { return w0; };
+    let row = _ecs_av_world_loc_row_at(w0, e.id);
+    if _ecs_av_col_added_at(w0, col, row) >= ECS_AV_TICK_NONE - 1 { return w0; };
+    let w1 = _ecs_av_col_set_added(w0, col, row, ECS_AV_TICK_NONE);
+    let w2 = _ecs_av_col_set_changed(w1, col, row, ECS_AV_TICK_NONE);
+    return _ecs_av_col_set_val(w2, col, row, 0);
+}
+
+// ── Query result wrappers. Mirrors shallow `Query<EntityItem<T>>` (cap-8 results) and
+//    `Query<ArchetypeValuePairMut<T>>` (cap-8 pair captures).
+struct EcsAvEntityItemDeep { entity: EcsAvEntityDeep, value: EcsAvData }
+fn ecs_av_entity_item_entity(r: EcsAvEntityItemDeep) -> EcsAvEntityDeep { return r.entity; }
+fn ecs_av_entity_item_value(r: EcsAvEntityItemDeep) -> EcsAvData { return r.value; }
+
+struct EcsAvQueryDeep {
+    count: i32,
+    e0: EcsAvEntityItemDeep, e1: EcsAvEntityItemDeep, e2: EcsAvEntityItemDeep, e3: EcsAvEntityItemDeep,
+    e4: EcsAvEntityItemDeep, e5: EcsAvEntityItemDeep, e6: EcsAvEntityItemDeep, e7: EcsAvEntityItemDeep
+}
+
+fn _ecs_av_query_empty() -> EcsAvQueryDeep {
+    let z = EcsAvEntityItemDeep { entity: ecs_av_entity_new(-1, 0), value: ecs_av_data_new(0) };
+    return EcsAvQueryDeep {
+        count: 0, e0: z, e1: z, e2: z, e3: z, e4: z, e5: z, e6: z, e7: z
+    };
+}
+
+fn ecs_av_query_deep_count(q: EcsAvQueryDeep) -> i32 { return q.count; }
+
+fn ecs_av_query_deep_at(q: EcsAvQueryDeep, idx: i32) -> EcsAvEntityItemDeep {
+    if idx == 0 { return q.e0; };
+    if idx == 1 { return q.e1; };
+    if idx == 2 { return q.e2; };
+    if idx == 3 { return q.e3; };
+    if idx == 4 { return q.e4; };
+    if idx == 5 { return q.e5; };
+    if idx == 6 { return q.e6; };
+    return q.e7;
+}
+
+fn _ecs_av_query_push(q0: EcsAvQueryDeep, idx: i32, item: EcsAvEntityItemDeep) -> EcsAvQueryDeep {
+    if q0.count >= ECS_AV_CAP_ENTITIES { return q0; };
+    if idx == 0 { q0.e0 = item; q0.count = q0.count + 1; return q0; };
+    if idx == 1 { q0.e1 = item; q0.count = q0.count + 1; return q0; };
+    if idx == 2 { q0.e2 = item; q0.count = q0.count + 1; return q0; };
+    if idx == 3 { q0.e3 = item; q0.count = q0.count + 1; return q0; };
+    if idx == 4 { q0.e4 = item; q0.count = q0.count + 1; return q0; };
+    if idx == 5 { q0.e5 = item; q0.count = q0.count + 1; return q0; };
+    if idx == 6 { q0.e6 = item; q0.count = q0.count + 1; return q0; };
+    q0.e7 = item;
+    q0.count = q0.count + 1;
+    return q0;
+}
+
+// Pair-query (first+second-component) result. Same cap-8 shape.
+struct EcsAvPairMutDeep {
+    entity: EcsAvEntityDeep,
+    first: EcsAvData,
+    second: EcsAvData,
+    first_col: i32,
+    first_row: i32
+}
+
+fn ecs_av_pair_mut_entity(p: EcsAvPairMutDeep) -> EcsAvEntityDeep { return p.entity; }
+fn ecs_av_pair_mut_first(p: EcsAvPairMutDeep) -> EcsAvData { return p.first; }
+fn ecs_av_pair_mut_second(p: EcsAvPairMutDeep) -> EcsAvData { return p.second; }
+fn ecs_av_pair_mut_col(p: EcsAvPairMutDeep) -> i32 { return p.first_col; }
+fn ecs_av_pair_mut_row(p: EcsAvPairMutDeep) -> i32 { return p.first_row; }
+
+struct EcsAvPairQueryMutDeep {
+    count: i32,
+    p0: EcsAvPairMutDeep, p1: EcsAvPairMutDeep, p2: EcsAvPairMutDeep, p3: EcsAvPairMutDeep,
+    p4: EcsAvPairMutDeep, p5: EcsAvPairMutDeep, p6: EcsAvPairMutDeep, p7: EcsAvPairMutDeep
+}
+
+fn _ecs_av_pair_query_empty() -> EcsAvPairQueryMutDeep {
+    let z = EcsAvPairMutDeep { entity: ecs_av_entity_new(-1, 0), first: ecs_av_data_new(0), second: ecs_av_data_new(0), first_col: -1, first_row: -1 };
+    return EcsAvPairQueryMutDeep {
+        count: 0, p0: z, p1: z, p2: z, p3: z, p4: z, p5: z, p6: z, p7: z
+    };
+}
+
+fn ecs_av_pair_query_mut_count(q: EcsAvPairQueryMutDeep) -> i32 { return q.count; }
+
+fn ecs_av_pair_query_mut_at(q: EcsAvPairQueryMutDeep, idx: i32) -> EcsAvPairMutDeep {
+    if idx == 0 { return q.p0; };
+    if idx == 1 { return q.p1; };
+    if idx == 2 { return q.p2; };
+    if idx == 3 { return q.p3; };
+    if idx == 4 { return q.p4; };
+    if idx == 5 { return q.p5; };
+    if idx == 6 { return q.p6; };
+    return q.p7;
+}
+
+fn _ecs_av_pair_query_push(q0: EcsAvPairQueryMutDeep, idx: i32, p: EcsAvPairMutDeep) -> EcsAvPairQueryMutDeep {
+    if q0.count >= ECS_AV_CAP_ENTITIES { return q0; };
+    if idx == 0 { q0.p0 = p; q0.count = q0.count + 1; return q0; };
+    if idx == 1 { q0.p1 = p; q0.count = q0.count + 1; return q0; };
+    if idx == 2 { q0.p2 = p; q0.count = q0.count + 1; return q0; };
+    if idx == 3 { q0.p3 = p; q0.count = q0.count + 1; return q0; };
+    if idx == 4 { q0.p4 = p; q0.count = q0.count + 1; return q0; };
+    if idx == 5 { q0.p5 = p; q0.count = q0.count + 1; return q0; };
+    if idx == 6 { q0.p6 = p; q0.count = q0.count + 1; return q0; };
+    q0.p7 = p;
+    q0.count = q0.count + 1;
+    return q0;
+}
+
+// ── Recursively walk arch 1's rows; push alive entities whose column is present.
+fn _ecs_av_query_walk(w: EcsAvWorldDeep, arch_id: i32, comp_id: i32, col: i32, acc0: EcsAvQueryDeep, row: i32) -> EcsAvQueryDeep {
+    if row >= ECS_AV_CAP_ROWS { return acc0; };
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    if row < a.row_count {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        if _ecs_av_world_alive_at(w, eid) == 1 {
+            let added = _ecs_av_col_added_at(w, col, row);
+            if added < ECS_AV_TICK_NONE - 1 {
+                let item = EcsAvEntityItemDeep {
+                    entity: ecs_av_entity_new(eid, _ecs_av_world_gen_at(w, eid)),
+                    value: ecs_av_data_new(_ecs_av_col_val_at(w, col, row))
+                };
+                let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+                return _ecs_av_query_walk(w, arch_id, comp_id, col, acc1, row + 1);
+            };
+        };
+    };
+    return _ecs_av_query_walk(w, arch_id, comp_id, col, acc0, row + 1);
+}
+
+fn ecs_av_world_deep_query(w: EcsAvWorldDeep, comp_id: i32) -> EcsAvQueryDeep {
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return _ecs_av_query_empty(); };
+    return _ecs_av_query_walk(w, 1, comp_id, col, _ecs_av_query_empty(), 0);
+}
+
+// Predicate check helper. mode 0 = pass, 1 = with (has second_comp), 2 = without (no second),
+//    3 = changed > since_tick, 4 = added > since_tick.
+fn _ecs_av_pass_mode_3(w: EcsAvWorldDeep, col: i32, row: i32, since_tick: i32) -> bool {
+    return _ecs_av_col_changed_at(w, col, row) > since_tick;
+}
+
+fn _ecs_av_pass_mode_4(w: EcsAvWorldDeep, col: i32, row: i32, since_tick: i32) -> bool {
+    return _ecs_av_col_added_at(w, col, row) > since_tick;
+}
+
+fn _ecs_av_pass_mode_secondary(w: EcsAvWorldDeep, eid: i32, second_comp_id: i32, is_with: bool) -> bool {
+    let second_col = _ecs_av_column_slot(w, second_comp_id);
+    if second_col < 0 {
+        if is_with == true { return false; };
+        return true;
+    };
+    let second_row = _ecs_av_world_loc_row_at(w, eid);
+    let second_added = _ecs_av_col_added_at(w, second_col, second_row);
+    let present = second_added < ECS_AV_TICK_NONE - 1;
+    if is_with == true { return present; };
+    return present != true;
+}
+
+fn _ecs_av_passes(w: EcsAvWorldDeep, eid: i32, col: i32, row: i32, mode: i32, second_comp_id: i32, since_tick: i32) -> bool {
+    if mode == 0 { return true; };
+    if mode == 1 { return _ecs_av_pass_mode_secondary(w, eid, second_comp_id, true); };
+    if mode == 2 { return _ecs_av_pass_mode_secondary(w, eid, second_comp_id, false); };
+    if mode == 3 { return _ecs_av_pass_mode_3(w, col, row, since_tick); };
+    return _ecs_av_pass_mode_4(w, col, row, since_tick);
+}
+
+fn _ecs_av_query_filtered_walk(w: EcsAvWorldDeep, arch_id: i32, comp_id: i32, col: i32, mode: i32, second_comp_id: i32, since_tick: i32, acc0: EcsAvQueryDeep, row: i32) -> EcsAvQueryDeep {
+    if row >= ECS_AV_CAP_ROWS { return acc0; };
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    if row < a.row_count {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        if _ecs_av_world_alive_at(w, eid) == 1 {
+            let added = _ecs_av_col_added_at(w, col, row);
+            if added < ECS_AV_TICK_NONE - 1 {
+                if _ecs_av_passes(w, eid, col, row, mode, second_comp_id, since_tick) == true {
+                    let item = EcsAvEntityItemDeep {
+                        entity: ecs_av_entity_new(eid, _ecs_av_world_gen_at(w, eid)),
+                        value: ecs_av_data_new(_ecs_av_col_val_at(w, col, row))
+                    };
+                    let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+                    return _ecs_av_query_filtered_walk(w, arch_id, comp_id, col, mode, second_comp_id, since_tick, acc1, row + 1);
+                };
+            };
+        };
+    };
+    return _ecs_av_query_filtered_walk(w, arch_id, comp_id, col, mode, second_comp_id, since_tick, acc0, row + 1);
+}
+
+fn ecs_av_world_deep_query_with(w: EcsAvWorldDeep, comp_id: i32, with_comp_id: i32) -> EcsAvQueryDeep {
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return _ecs_av_query_empty(); };
+    return _ecs_av_query_filtered_walk(w, 1, comp_id, col, 1, with_comp_id, 0, _ecs_av_query_empty(), 0);
+}
+
+fn ecs_av_world_deep_query_without(w: EcsAvWorldDeep, comp_id: i32, without_comp_id: i32) -> EcsAvQueryDeep {
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return _ecs_av_query_empty(); };
+    return _ecs_av_query_filtered_walk(w, 1, comp_id, col, 2, without_comp_id, 0, _ecs_av_query_empty(), 0);
+}
+
+fn ecs_av_world_deep_query_added(w: EcsAvWorldDeep, comp_id: i32, since_tick: i32) -> EcsAvQueryDeep {
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return _ecs_av_query_empty(); };
+    return _ecs_av_query_filtered_walk(w, 1, comp_id, col, 4, 0, since_tick, _ecs_av_query_empty(), 0);
+}
+
+fn ecs_av_world_deep_query_changed(w: EcsAvWorldDeep, comp_id: i32, since_tick: i32) -> EcsAvQueryDeep {
+    let col = _ecs_av_column_slot(w, comp_id);
+    if col < 0 { return _ecs_av_query_empty(); };
+    return _ecs_av_query_filtered_walk(w, 1, comp_id, col, 3, 0, since_tick, _ecs_av_query_empty(), 0);
+}
+
+// ── query_pair_mut_first: walk arch rows; for each entity present in first AND in second column,
+//    push a pair capture with the entity, first value, second value, (first_col, first_row).
+fn _ecs_av_pair_query_walk(w: EcsAvWorldDeep, first_col: i32, second_col: i32, acc0: EcsAvPairQueryMutDeep, row: i32) -> EcsAvPairQueryMutDeep {
+    if row >= ECS_AV_CAP_ROWS { return acc0; };
+    let a = _ecs_av_world_arch_at(w, 1);
+    if row < a.row_count {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        if _ecs_av_world_alive_at(w, eid) == 1 {
+            let first_added = _ecs_av_col_added_at(w, first_col, row);
+            let second_added = _ecs_av_col_added_at(w, second_col, row);
+            if first_added < ECS_AV_TICK_NONE - 1 && second_added < ECS_AV_TICK_NONE - 1 {
+                let pair = EcsAvPairMutDeep {
+                    entity: ecs_av_entity_new(eid, _ecs_av_world_gen_at(w, eid)),
+                    first: ecs_av_data_new(_ecs_av_col_val_at(w, first_col, row)),
+                    second: ecs_av_data_new(_ecs_av_col_val_at(w, second_col, row)),
+                    first_col: first_col,
+                    first_row: row
+                };
+                let acc1 = _ecs_av_pair_query_push(acc0, acc0.count, pair);
+                return _ecs_av_pair_query_walk(w, first_col, second_col, acc1, row + 1);
+            };
+        };
+    };
+    return _ecs_av_pair_query_walk(w, first_col, second_col, acc0, row + 1);
+}
+
+fn ecs_av_world_deep_query_pair_mut_first(w: EcsAvWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsAvPairQueryMutDeep {
+    let first_col = _ecs_av_column_slot(w, first_comp_id);
+    let second_col = _ecs_av_column_slot(w, second_comp_id);
+    if first_col < 0 { return _ecs_av_pair_query_empty(); };
+    if second_col < 0 { return _ecs_av_pair_query_empty(); };
+    return _ecs_av_pair_query_walk(w, first_col, second_col, _ecs_av_pair_query_empty(), 0);
+}
+
+// write: re-insert the first-component's value via (col, row) in-place. The pair capture stores
+//    first_col + first_row; mirror shallow's `pair_write_first(world, item, value)`.
+fn ecs_av_world_deep_pair_write_first(w0: EcsAvWorldDeep, p: EcsAvPairMutDeep, value: EcsAvData) -> EcsAvWorldDeep {
+    let col = p.first_col;
+    let row = p.first_row;
+    if col < 0 { return w0; };
+    if row < 0 { return w0; };
+    let w1 = _ecs_av_col_set_val(w0, col, row, value.amount);
+    return _ecs_av_col_set_changed(w1, col, row, w1.change_tick);
+}
+
+// despawn: free the entity slot (alive=0 + gen++ + loc reset). The dense-arch row we leave intact
+//    (the archetype is monotonic within a batch -- entities are never re-cycled by spawn after despawn
+//    in these tests). entity_count-- and any subsequent query walk checks alive==1 anyway.
+fn ecs_av_world_deep_despawn(w0: EcsAvWorldDeep, e: EcsAvEntityDeep) -> EcsAvWorldDeep {
+    if ecs_av_world_deep_is_alive(w0, e) != true { return w0; };
+    let g = _ecs_av_world_gen_at(w0, e.id);
+    let w1 = _ecs_av_world_set_alive(w0, e.id, 0);
+    let w2 = _ecs_av_world_set_gen(w1, e.id, g + 1);
+    let w3 = _ecs_av_world_set_loc_arch(w2, e.id, -1);
+    let w4 = _ecs_av_world_set_loc_row(w3, e.id, -1);
+    w4.entity_count = w4.entity_count - 1;
+    return w4;
+}
+
+// ── Resource slot. (Mirror shallow's dual-path: first insert sets added; subsequent replaces
+//    bump changed. The shallow stamps at `world.archetypes.registry.change_tick`; we stamp at
+//    `world.change_tick`, which the deep bumps on register and increment_tick.)
+
+fn ecs_av_world_deep_has_resource(w: EcsAvWorldDeep) -> bool { return w.res_time_set == 1; }
+
+fn ecs_av_world_deep_insert_resource(w0: EcsAvWorldDeep, value: EcsAvTime) -> EcsAvWorldDeep {
+    let old_set = w0.res_time_set;
+    w0.res_time_tick = value.tick;
+    w0.res_time_set = 1;
+    if old_set != 1 {
+        w0.res_added_tick = w0.change_tick;
+    };
+    w0.res_changed_tick = w0.change_tick;
+    return w0;
+}
+
+fn ecs_av_world_deep_get_resource(w: EcsAvWorldDeep) -> EcsAvTime {
+    return ecs_av_time_new(w.res_time_tick);
+}
+
+fn ecs_av_world_deep_resource_added_since(w: EcsAvWorldDeep, tick: i32) -> bool {
+    if w.res_time_set != 1 { return false; };
+    return w.res_added_tick > tick;
+}
+
+fn ecs_av_world_deep_resource_changed_since(w: EcsAvWorldDeep, tick: i32) -> bool {
+    if w.res_time_set != 1 { return false; };
+    return w.res_changed_tick > tick;
+}
+
+// res_mut_write: replace the existing resource with a new value (mirror shallow's
+//    `archetype_value_world_res_mut_write` -- bumps changed only).
+fn ecs_av_world_deep_res_mut_write(w0: EcsAvWorldDeep, value: EcsAvTime) -> EcsAvWorldDeep {
+    if w0.res_time_set != 1 { return w0; };
+    w0.res_time_tick = value.tick;
+    w0.res_changed_tick = w0.change_tick;
+    return w0;
+}
+
+// ── Message slot (cap-16). Each write_message appends an event amount at index = msg_count++.
+//    read_message(reader, default) reads the next unreceived message by advancing the cursor.
+
+struct EcsAvReaderDeep { cursor: i32 }
+fn ecs_av_reader_new() -> EcsAvReaderDeep { return EcsAvReaderDeep { cursor: 0 }; }
+fn ecs_av_reader_cursor(r: EcsAvReaderDeep) -> i32 { return r.cursor; }
+
+struct EcsAvReadDeep { has_value: bool, value: EcsAvEvent, reader: EcsAvReaderDeep }
+fn ecs_av_read_has_value(r: EcsAvReadDeep) -> bool { return r.has_value; }
+fn ecs_av_read_value(r: EcsAvReadDeep) -> EcsAvEvent { return r.value; }
+fn ecs_av_read_reader(r: EcsAvReadDeep) -> EcsAvReaderDeep { return r.reader; }
+
+fn _ecs_av_msg_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.msg0; };
+    if idx == 1 { return w.msg1; };
+    if idx == 2 { return w.msg2; };
+    if idx == 3 { return w.msg3; };
+    if idx == 4 { return w.msg4; };
+    if idx == 5 { return w.msg5; };
+    if idx == 6 { return w.msg6; };
+    if idx == 7 { return w.msg7; };
+    if idx == 8 { return w.msg8; };
+    if idx == 9 { return w.msg9; };
+    if idx == 10 { return w.msg10; };
+    if idx == 11 { return w.msg11; };
+    if idx == 12 { return w.msg12; };
+    if idx == 13 { return w.msg13; };
+    if idx == 14 { return w.msg14; };
+    return w.msg15;
+}
+
+fn _ecs_av_msg_set(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.msg0 = value; return w0; };
+    if idx == 1 { w0.msg1 = value; return w0; };
+    if idx == 2 { w0.msg2 = value; return w0; };
+    if idx == 3 { w0.msg3 = value; return w0; };
+    if idx == 4 { w0.msg4 = value; return w0; };
+    if idx == 5 { w0.msg5 = value; return w0; };
+    if idx == 6 { w0.msg6 = value; return w0; };
+    if idx == 7 { w0.msg7 = value; return w0; };
+    if idx == 8 { w0.msg8 = value; return w0; };
+    if idx == 9 { w0.msg9 = value; return w0; };
+    if idx == 10 { w0.msg10 = value; return w0; };
+    if idx == 11 { w0.msg11 = value; return w0; };
+    if idx == 12 { w0.msg12 = value; return w0; };
+    if idx == 13 { w0.msg13 = value; return w0; };
+    if idx == 14 { w0.msg14 = value; return w0; };
+    w0.msg15 = value;
+    return w0;
+}
+
+fn ecs_av_world_deep_write_message(w0: EcsAvWorldDeep, value: EcsAvEvent) -> EcsAvWorldDeep {
+    if w0.msg_count >= ECS_AV_CAP_MSGS { return w0; };
+    let idx = w0.msg_count;
+    let w1 = _ecs_av_msg_set(w0, idx, value.amount);
+    w1.msg_count = w1.msg_count + 1;
+    return w1;
+}
+
+// read_message returns the unread message at `reader.cursor` if cursor < msg_count; else
+// has_value=false with the default value. (Mirrors shallow's two-message read pattern.)
+fn ecs_av_world_deep_read_message(w: EcsAvWorldDeep, reader: EcsAvReaderDeep, default_value: EcsAvEvent) -> EcsAvReadDeep {
+    let cur = reader.cursor;
+    if cur < w.msg_count {
+        let raw = _ecs_av_msg_at(w, cur);
+        return EcsAvReadDeep {
+            has_value: true,
+            value: ecs_av_event_new(raw),
+            reader: EcsAvReaderDeep { cursor: cur + 1 }
+        };
+    };
+    return EcsAvReadDeep {
+        has_value: false,
+        value: default_value,
+        reader: EcsAvReaderDeep { cursor: cur }
+    };
+}
+
+// ResMut value (mirror shallow ResMut<R> -- exposes value + added/changed ticks for the resmut
+// system param).
+struct EcsAvResMutDeep { value: EcsAvTime, added_tick: i32, changed_tick: i32 }
+fn ecs_av_resmut_value(r: EcsAvResMutDeep) -> EcsAvTime { return r.value; }
+fn ecs_av_resmut_added(r: EcsAvResMutDeep) -> i32 { return r.added_tick; }
+fn ecs_av_resmut_changed(r: EcsAvResMutDeep) -> i32 { return r.changed_tick; }
+fn ecs_av_world_deep_res_mut(w: EcsAvWorldDeep) -> EcsAvResMutDeep {
+    return EcsAvResMutDeep {
+        value: ecs_av_time_new(w.res_time_tick),
+        added_tick: w.res_added_tick,
+        changed_tick: w.res_changed_tick
+    };
+}
+
+// ── Command queue (deferred). Each row stores (kind, entity_id, component_id, value_index).
+//    Side-value arrays: pcomp[] (component values), pres[] (resource values), pmsg[] (message
+//    values). reserve_entity spawns eagerly and returns the entity; queue flows only the value
+//    side-payload. Apply walks the queue in order and applies each item to the world via the
+//    public world insert/insert_resource/write_message surface.
+struct EcsAvCommandsDeep { count: i32, world: EcsAvWorldDeep }
+fn ecs_av_commands_new(world: EcsAvWorldDeep) -> EcsAvCommandsDeep {
+    return EcsAvCommandsDeep { count: 0, world: world };
+}
+fn ecs_av_commands_world(c: EcsAvCommandsDeep) -> EcsAvWorldDeep { return c.world; }
+
+fn _ecs_av_cmd_kind_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.cmd_kind0; };
+    if idx == 1 { return w.cmd_kind1; };
+    if idx == 2 { return w.cmd_kind2; };
+    if idx == 3 { return w.cmd_kind3; };
+    if idx == 4 { return w.cmd_kind4; };
+    if idx == 5 { return w.cmd_kind5; };
+    if idx == 6 { return w.cmd_kind6; };
+    return w.cmd_kind7;
+}
+
+fn _ecs_av_cmd_eid_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.cmd_eid0; };
+    if idx == 1 { return w.cmd_eid1; };
+    if idx == 2 { return w.cmd_eid2; };
+    if idx == 3 { return w.cmd_eid3; };
+    if idx == 4 { return w.cmd_eid4; };
+    if idx == 5 { return w.cmd_eid5; };
+    if idx == 6 { return w.cmd_eid6; };
+    return w.cmd_eid7;
+}
+
+fn _ecs_av_cmd_cid_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.cmd_cid0; };
+    if idx == 1 { return w.cmd_cid1; };
+    if idx == 2 { return w.cmd_cid2; };
+    if idx == 3 { return w.cmd_cid3; };
+    if idx == 4 { return w.cmd_cid4; };
+    if idx == 5 { return w.cmd_cid5; };
+    if idx == 6 { return w.cmd_cid6; };
+    return w.cmd_cid7;
+}
+
+fn _ecs_av_cmd_set_kind(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.cmd_kind0 = value; return w0; };
+    if idx == 1 { w0.cmd_kind1 = value; return w0; };
+    if idx == 2 { w0.cmd_kind2 = value; return w0; };
+    if idx == 3 { w0.cmd_kind3 = value; return w0; };
+    if idx == 4 { w0.cmd_kind4 = value; return w0; };
+    if idx == 5 { w0.cmd_kind5 = value; return w0; };
+    if idx == 6 { w0.cmd_kind6 = value; return w0; };
+    w0.cmd_kind7 = value;
+    return w0;
+}
+
+fn _ecs_av_cmd_set_eid(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.cmd_eid0 = value; return w0; };
+    if idx == 1 { w0.cmd_eid1 = value; return w0; };
+    if idx == 2 { w0.cmd_eid2 = value; return w0; };
+    if idx == 3 { w0.cmd_eid3 = value; return w0; };
+    if idx == 4 { w0.cmd_eid4 = value; return w0; };
+    if idx == 5 { w0.cmd_eid5 = value; return w0; };
+    if idx == 6 { w0.cmd_eid6 = value; return w0; };
+    w0.cmd_eid7 = value;
+    return w0;
+}
+
+fn _ecs_av_cmd_set_cid(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.cmd_cid0 = value; return w0; };
+    if idx == 1 { w0.cmd_cid1 = value; return w0; };
+    if idx == 2 { w0.cmd_cid2 = value; return w0; };
+    if idx == 3 { w0.cmd_cid3 = value; return w0; };
+    if idx == 4 { w0.cmd_cid4 = value; return w0; };
+    if idx == 5 { w0.cmd_cid5 = value; return w0; };
+    if idx == 6 { w0.cmd_cid6 = value; return w0; };
+    w0.cmd_cid7 = value;
+    return w0;
+}
+
+fn _ecs_av_pcomp_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.cmd_pcomp0; };
+    if idx == 1 { return w.cmd_pcomp1; };
+    if idx == 2 { return w.cmd_pcomp2; };
+    if idx == 3 { return w.cmd_pcomp3; };
+    if idx == 4 { return w.cmd_pcomp4; };
+    if idx == 5 { return w.cmd_pcomp5; };
+    if idx == 6 { return w.cmd_pcomp6; };
+    return w.cmd_pcomp7;
+}
+
+fn _ecs_av_pcomp_set(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.cmd_pcomp0 = value; return w0; };
+    if idx == 1 { w0.cmd_pcomp1 = value; return w0; };
+    if idx == 2 { w0.cmd_pcomp2 = value; return w0; };
+    if idx == 3 { w0.cmd_pcomp3 = value; return w0; };
+    if idx == 4 { w0.cmd_pcomp4 = value; return w0; };
+    if idx == 5 { w0.cmd_pcomp5 = value; return w0; };
+    if idx == 6 { w0.cmd_pcomp6 = value; return w0; };
+    w0.cmd_pcomp7 = value;
+    return w0;
+}
+
+fn _ecs_av_pres_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.cmd_pres0; };
+    if idx == 1 { return w.cmd_pres1; };
+    if idx == 2 { return w.cmd_pres2; };
+    if idx == 3 { return w.cmd_pres3; };
+    if idx == 4 { return w.cmd_pres4; };
+    if idx == 5 { return w.cmd_pres5; };
+    if idx == 6 { return w.cmd_pres6; };
+    return w.cmd_pres7;
+}
+
+fn _ecs_av_pres_set(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.cmd_pres0 = value; return w0; };
+    if idx == 1 { w0.cmd_pres1 = value; return w0; };
+    if idx == 2 { w0.cmd_pres2 = value; return w0; };
+    if idx == 3 { w0.cmd_pres3 = value; return w0; };
+    if idx == 4 { w0.cmd_pres4 = value; return w0; };
+    if idx == 5 { w0.cmd_pres5 = value; return w0; };
+    if idx == 6 { w0.cmd_pres6 = value; return w0; };
+    w0.cmd_pres7 = value;
+    return w0;
+}
+
+fn _ecs_av_pmsg_at(w: EcsAvWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.cmd_pmsg0; };
+    if idx == 1 { return w.cmd_pmsg1; };
+    if idx == 2 { return w.cmd_pmsg2; };
+    if idx == 3 { return w.cmd_pmsg3; };
+    if idx == 4 { return w.cmd_pmsg4; };
+    if idx == 5 { return w.cmd_pmsg5; };
+    if idx == 6 { return w.cmd_pmsg6; };
+    return w.cmd_pmsg7;
+}
+
+fn _ecs_av_pmsg_set(w0: EcsAvWorldDeep, idx: i32, value: i32) -> EcsAvWorldDeep {
+    if idx == 0 { w0.cmd_pmsg0 = value; return w0; };
+    if idx == 1 { w0.cmd_pmsg1 = value; return w0; };
+    if idx == 2 { w0.cmd_pmsg2 = value; return w0; };
+    if idx == 3 { w0.cmd_pmsg3 = value; return w0; };
+    if idx == 4 { w0.cmd_pmsg4 = value; return w0; };
+    if idx == 5 { w0.cmd_pmsg5 = value; return w0; };
+    if idx == 6 { w0.cmd_pmsg6 = value; return w0; };
+    w0.cmd_pmsg7 = value;
+    return w0;
+}
+
+// ── Command queue methods. We thread the world+commands together (the shallow models
+//    ArchetypeValueCommandsParam as a (world, commands) pair). reserve_entity spawns eagerly and
+//    returns the entity-id; subsequent queue-ops append to the side-value arrays and update
+//    cmd_kind / cmd_eid / cmd_cid at the next cmd_count slot. apply walks sequentially.
+
+struct EcsAvCmdDeepSp { world: EcsAvWorldDeep, count: i32 }
+
+fn ecs_av_commands_reserve_entity(c0: EcsAvCommandsDeep) -> EcsAvCmdDeepSp {
+    let sp = ecs_av_world_deep_spawn(c0.world);
+    let w1 = ecs_av_spawn_world_deep(sp);
+    let e = ecs_av_spawn_entity_deep(sp);
+    // world is mutated in place by spawn; bubble entity id forward through the wrapper
+    let sp2 = EcsAvCmdDeepSp { world: w1, count: e.id };
+    return sp2;
+}
+
+// `_ecs_av_queue_side` appends a new command (kind + eid + cid + side-value) and returns the
+// world with updated cmd_count + side-count.
+fn _ecs_av_queue_pcomp(w0: EcsAvWorldDeep, kind: i32, eid: i32, cid: i32, value: i32) -> EcsAvWorldDeep {
+    if w0.cmd_count >= ECS_AV_CAP_ENTITIES - 1 { return w0; };
+    if w0.pcomp_count >= ECS_AV_CAP_ENTITIES - 1 { return w0; };
+    let cmd_idx = w0.cmd_count;
+    let pcomp_idx = w0.pcomp_count;
+    let w1 = _ecs_av_cmd_set_kind(w0, cmd_idx, kind);
+    let w2 = _ecs_av_cmd_set_eid(w1, cmd_idx, eid);
+    let w3 = _ecs_av_cmd_set_cid(w2, cmd_idx, cid);
+    let w4 = _ecs_av_pcomp_set(w3, pcomp_idx, value);
+    // Store pcomp idx into freeform slot:
+    let w5 = _ecs_av_cmd_set_cid(w4, cmd_idx, cid);
+    w5.cmd_count = w5.cmd_count + 1;
+    w5.pcomp_count = w5.pcomp_count + 1;
+    return w5;
+}
+
+fn _ecs_av_queue_pres(w0: EcsAvWorldDeep, value: i32) -> EcsAvWorldDeep {
+    if w0.cmd_count >= ECS_AV_CAP_ENTITIES - 1 { return w0; };
+    if w0.pres_count >= ECS_AV_CAP_ENTITIES - 1 { return w0; };
+    let cmd_idx = w0.cmd_count;
+    let pres_idx = w0.pres_count;
+    let w1 = _ecs_av_cmd_set_kind(w0, cmd_idx, ECS_AV_CMD_INSERT_RESOURCE);
+    let w2 = _ecs_av_cmd_set_eid(w1, cmd_idx, pres_idx);
+    let w3 = _ecs_av_pres_set(w2, pres_idx, value);
+    w3.cmd_count = w3.cmd_count + 1;
+    w3.pres_count = w3.pres_count + 1;
+    return w3;
+}
+
+fn _ecs_av_queue_pmsg(w0: EcsAvWorldDeep, value: i32) -> EcsAvWorldDeep {
+    if w0.cmd_count >= ECS_AV_CAP_ENTITIES - 1 { return w0; };
+    if w0.pmsg_count >= ECS_AV_CAP_ENTITIES - 1 { return w0; };
+    let cmd_idx = w0.cmd_count;
+    let pmsg_idx = w0.pmsg_count;
+    let w1 = _ecs_av_cmd_set_kind(w0, cmd_idx, ECS_AV_CMD_WRITE_MESSAGE);
+    let w2 = _ecs_av_cmd_set_eid(w1, cmd_idx, pmsg_idx);
+    let w3 = _ecs_av_pmsg_set(w2, pmsg_idx, value);
+    w3.cmd_count = w3.cmd_count + 1;
+    w3.pmsg_count = w3.pmsg_count + 1;
+    return w3;
+}
+
+fn ecs_av_commands_insert(c0: EcsAvCommandsDeep, eid: i32, comp_id: i32, value: EcsAvData) -> EcsAvCommandsDeep {
+    let w1 = _ecs_av_queue_pcomp(c0.world, ECS_AV_CMD_INSERT_COMPONENT, eid, comp_id, value.amount);
+    return EcsAvCommandsDeep { count: c0.count + 1, world: w1 };
+}
+
+fn ecs_av_commands_insert_resource(c0: EcsAvCommandsDeep, value: EcsAvTime) -> EcsAvCommandsDeep {
+    let w1 = _ecs_av_queue_pres(c0.world, value.tick);
+    return EcsAvCommandsDeep { count: c0.count + 1, world: w1 };
+}
+
+fn ecs_av_commands_write_message(c0: EcsAvCommandsDeep, value: EcsAvEvent) -> EcsAvCommandsDeep {
+    let w1 = _ecs_av_queue_pmsg(c0.world, value.amount);
+    return EcsAvCommandsDeep { count: c0.count + 1, world: w1 };
+}
+
+// Apply: walk cmd queue in order; for each item, dispatch by kind and apply to the world via the
+// public world surface.
+fn _ecs_av_commands_apply_walk(w0: EcsAvWorldDeep, idx: i32) -> EcsAvWorldDeep {
+    if idx >= w0.cmd_count { return w0; };
+    if idx >= ECS_AV_CAP_ENTITIES { return w0; };
+    let kind = _ecs_av_cmd_kind_at(w0, idx);
+    if kind == ECS_AV_CMD_INSERT_COMPONENT {
+        let eid = _ecs_av_cmd_eid_at(w0, idx);
+        let cid = _ecs_av_cmd_cid_at(w0, idx);
+        let pcomp_idx = _ecs_av_cmd_eid_at(w0, idx);
+        // For INSERT_COMPONENT we stored pcomp at index = pcomp_idx via _cmd_eid; pull from pcomp[pcomp_idx]
+        let _discard = 0;
+        let value = _ecs_av_pcomp_at(w0, pcomp_idx);
+        let w1 = ecs_av_world_deep_insert(w0, ecs_av_entity_new(eid, 0), cid, ecs_av_data_new(value));
+        // The above pushes the INSERT_COMPONENT's value via the public insert surface.
+        return _ecs_av_commands_apply_walk(w1, idx + 1);
+    };
+    if kind == ECS_AV_CMD_INSERT_RESOURCE {
+        let pres_idx = _ecs_av_cmd_eid_at(w0, idx);
+        let value = _ecs_av_pres_at(w0, pres_idx);
+        let w1 = ecs_av_world_deep_insert_resource(w0, ecs_av_time_new(value));
+        return _ecs_av_commands_apply_walk(w1, idx + 1);
+    };
+    if kind == ECS_AV_CMD_WRITE_MESSAGE {
+        let pmsg_idx = _ecs_av_cmd_eid_at(w0, idx);
+        let value = _ecs_av_pmsg_at(w0, pmsg_idx);
+        let w1 = ecs_av_world_deep_write_message(w0, ecs_av_event_new(value));
+        return _ecs_av_commands_apply_walk(w1, idx + 1);
+    };
+    return _ecs_av_commands_apply_walk(w0, idx + 1);
+}
+
+fn ecs_av_commands_apply(w0: EcsAvWorldDeep) -> EcsAvWorldDeep {
+    let w1 = _ecs_av_commands_apply_walk(w0, 0);
+    // Clear the queue post-apply (so subsequent applies are no-ops; matches shallow's cleared).
+    w1.cmd_count = 0;
+    w1.pcomp_count = 0;
+    w1.pres_count = 0;
+    w1.pmsg_count = 0;
+    return w1;
+}
+
+// ── System-parameter adapter buses. The shallow hands a fn-pointer callback to each *_system bus;
+//    SA cannot pass fns as values, so each bus here hard-codes the corresponding shallow system
+//    call body (mirrors the 7 system_* callbacks: movement, time_message, res_mut,
+//    reader_resmut, commands, writer, count_query). Plus the schedule wrapper that runs the
+//    movement-pair + time-message adapters in sequence.
+
+
+// ── query_mut: single-component mut query. Returns the same cap-8 EcsAvQueryDeep shape as the
+//    read query, but items carry the (col, row) slot encoded as the entity's archetype row pointer.
+//    write(world, comp_id, entity, value) re-inserts the value via the public insert surface
+//    -- alike the pair_write_first writeback path (re-write of an existing value bumps changed).
+fn ecs_av_world_deep_query_mut(w: EcsAvWorldDeep, comp_id: i32) -> EcsAvQueryDeep {
+    return ecs_av_world_deep_query(w, comp_id);
+}
+
+fn ecs_av_world_deep_write(w0: EcsAvWorldDeep, e: EcsAvEntityDeep, comp_id: i32, value: EcsAvData) -> EcsAvWorldDeep {
+    return ecs_av_world_deep_insert(w0, e, comp_id, value);
+}
+
+// bus 1: archetype_value_run_pair_mut_system + archetype_param_movement_system.
+//    For each pair-query row, the movement body writes first.value = first.value + second.value,
+//    then the bus writes first.value back via pair_write_first.
+fn _ecs_av_apply_pair_mut_walk(w0: EcsAvWorldDeep, q: EcsAvPairQueryMutDeep, idx: i32) -> EcsAvWorldDeep {
+    if idx >= q.count { return w0; };
+    let p = ecs_av_pair_query_mut_at(q, idx);
+    let next_val = ecs_av_data_new(p.first.amount + p.second.amount);
+    let w1 = ecs_av_world_deep_pair_write_first(w0, p, next_val);
+    return _ecs_av_apply_pair_mut_walk(w1, q, idx + 1);
+}
+
+fn ecs_av_run_pair_mut_system(w0: EcsAvWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsAvWorldDeep {
+    let q = ecs_av_world_deep_query_pair_mut_first(w0, first_comp_id, second_comp_id);
+    return _ecs_av_apply_pair_mut_walk(w0, q, 0);
+}
+
+// bus 2: archetype_value_run_resource_message_system + archetype_param_time_message_system.
+//    The body writes resource.tick = resource.tick + 1 and event.amount = resource.tick + 4
+//    (BEFORE the +1 bump -- the shallow computes `param.resource.tick + 4` from the OLD tick;
+//    actually re-reading the shallow body: `ArchetypeParamTime { tick: param.resource.tick + 1 }`
+//    and `ArchetypeParamEvent { amount: param.resource.tick + 4 }`. The resource attribute is the
+//    ORIGINAL resource.tick (before bump) for the event amount, while the resource is bumped by 1.
+//    Then after the body runs, the bus inserts the resource, and if should_write_message, writes
+//    the message. See lib/system_param_archetype_value.sla:165.)
+fn ecs_av_run_resource_message_system(w0: EcsAvWorldDeep, default_message: EcsAvEvent) -> EcsAvWorldDeep {
+    let old_tick = w0.res_time_tick;
+    let new_tick = old_tick + 1;
+    let new_event_amount = old_tick + 4;
+    let w1 = ecs_av_world_deep_insert_resource(w0, ecs_av_time_new(new_tick));
+    return ecs_av_world_deep_write_message(w1, ecs_av_event_new(new_event_amount));
+}
+
+// bus 3: archetype_value_run_res_mut_system + archetype_param_res_mut_system.
+//    The body writes resource.value.tick = resource.value.tick + 2; the bus then writes back via
+//    res_mut_write. (`res.value.tick` increments by 2.)
+fn ecs_av_run_res_mut_system(w0: EcsAvWorldDeep) -> EcsAvWorldDeep {
+    let old_tick = w0.res_time_tick;
+    let new_tick = old_tick + 2;
+    return ecs_av_world_deep_res_mut_write(w0, ecs_av_time_new(new_tick));
+}
+
+// bus 4: archetype_value_run_message_reader_res_mut_system + archetype_param_reader_resmut_system.
+//    The body: if read.has_value, res.value.tick = res.value.tick + read.value.amount; the bus
+//    writes resource back to world and returns the updated world + the new reader.
+struct EcsAvRunReaderDeep { world: EcsAvWorldDeep, reader: EcsAvReaderDeep }
+fn ecs_av_run_reader_world(r: EcsAvRunReaderDeep) -> EcsAvWorldDeep { return r.world; }
+fn ecs_av_run_reader_reader(r: EcsAvRunReaderDeep) -> EcsAvReaderDeep { return r.reader; }
+
+fn ecs_av_run_message_reader_res_mut_system(w0: EcsAvWorldDeep, reader: EcsAvReaderDeep, default_message: EcsAvEvent) -> EcsAvRunReaderDeep {
+    let read = ecs_av_world_deep_read_message(w0, reader, default_message);
+    let r1 = ecs_av_read_reader(read);
+    if ecs_av_read_has_value(read) == true {
+        let old_tick = w0.res_time_tick;
+        let event_amount = ecs_av_event_amount(ecs_av_read_value(read));
+        let new_tick = old_tick + event_amount;
+        let w1 = ecs_av_world_deep_res_mut_write(w0, ecs_av_time_new(new_tick));
+        return EcsAvRunReaderDeep { world: w1, reader: r1 };
+    };
+    return EcsAvRunReaderDeep { world: w0, reader: r1 };
+}
+
+
+// ── Reserve-helper used by Test 5. Spawn eagerly and bubble the new (world, eid) pair so the bus
+//    can drive the queued insert at the right entity-id. Mirrors the shallow's
+//    `archetype_value_commands_param_reserve_entity` flow's spawn-half.
+struct EcsAvReserveWrapperDeep { world: EcsAvWorldDeep, eid: i32 }
+fn ecs_av_actor_reserve_for_commands(w0: EcsAvWorldDeep) -> EcsAvReserveWrapperDeep {
+    let sp = ecs_av_world_deep_spawn(w0);
+    let w1 = ecs_av_spawn_world_deep(sp);
+    let e = ecs_av_spawn_entity_deep(sp);
+    return EcsAvReserveWrapperDeep { world: w1, eid: e.id };
+}
+fn ecs_av_actor_reserve_world(r: EcsAvReserveWrapperDeep) -> EcsAvWorldDeep { return r.world; }
+fn ecs_av_actor_reserve_eid(r: EcsAvReserveWrapperDeep) -> i32 { return r.eid; }
+
+// bus 5: archetype_value_run_commands_system + archetype_param_commands_system.
+//    The body increments the commands param: reserve_entity (spawns e eid), insert value amount=12,
+//    insert_resource tick=7, write_message amount=4. The bus then applies the queue to the world.
+//    All recipe inputs are hard-coded (no world/callback args) because the system body is fixed.
+fn ecs_av_run_commands_system(w0: EcsAvWorldDeep, health_comp_id: i32, entity_eid: i32) -> EcsAvWorldDeep {
+    // The shallow's archetype_param_commands_system captures entity_id from reserve_entity's
+    // return. We bubble it up as an explicit arg: tests pass `health_comp_id` and the eid of the
+    // just-reserved entity. The bus owns the apply loop.
+    let c0 = ecs_av_commands_new(w0);
+    let c1 = ecs_av_commands_insert(c0, entity_eid, health_comp_id, ecs_av_data_new(12));
+    let c2 = ecs_av_commands_insert_resource(c1, ecs_av_time_new(7));
+    let c3 = ecs_av_commands_write_message(c2, ecs_av_event_new(4));
+    return ecs_av_commands_apply(c3.world);
+}
+
+// bus 6: archetype_value_run_message_writer_system + archetype_param_writer_system.
+//    The body sends amount=2 then amount=8 to a writer queue; apply writes them to the world's
+//    message slot in order.
+fn ecs_av_run_message_writer_system(w0: EcsAvWorldDeep) -> EcsAvWorldDeep {
+    let w1 = ecs_av_world_deep_write_message(w0, ecs_av_event_new(2));
+    return ecs_av_world_deep_write_message(w1, ecs_av_event_new(8));
+}
+
+// bus 7-10: archetype_value_run_with_query_resource_system + archetype_param_count_query_system.
+//    The body sets resource.tick = len(query.items); the bus writes the resource back. We compute
+//    the count and write directly.
+fn ecs_av_run_with_query_resource_system(w0: EcsAvWorldDeep, comp_id: i32, with_comp_id: i32) -> EcsAvWorldDeep {
+    let q = ecs_av_world_deep_query_with(w0, comp_id, with_comp_id);
+    let cnt = ecs_av_query_deep_count(q);
+    return ecs_av_world_deep_insert_resource(w0, ecs_av_time_new(cnt));
+}
+
+fn ecs_av_run_without_query_resource_system(w0: EcsAvWorldDeep, comp_id: i32, without_comp_id: i32) -> EcsAvWorldDeep {
+    let q = ecs_av_world_deep_query_without(w0, comp_id, without_comp_id);
+    let cnt = ecs_av_query_deep_count(q);
+    return ecs_av_world_deep_insert_resource(w0, ecs_av_time_new(cnt));
+}
+
+fn ecs_av_run_added_query_resource_system(w0: EcsAvWorldDeep, comp_id: i32, since_tick: i32) -> EcsAvWorldDeep {
+    let q = ecs_av_world_deep_query_added(w0, comp_id, since_tick);
+    let cnt = ecs_av_query_deep_count(q);
+    return ecs_av_world_deep_insert_resource(w0, ecs_av_time_new(cnt));
+}
+
+fn ecs_av_run_changed_query_resource_system(w0: EcsAvWorldDeep, comp_id: i32, since_tick: i32) -> EcsAvWorldDeep {
+    let q = ecs_av_world_deep_query_changed(w0, comp_id, since_tick);
+    let cnt = ecs_av_query_deep_count(q);
+    return ecs_av_world_deep_insert_resource(w0, ecs_av_time_new(cnt));
+}
+
+// bus 11 (schedule wrapper): archetype_value_schedule_run applied to two systems in order --
+//    movement-pair then time-message. The shallow test 8 builds a schedule over
+//    archetype_param_pair_adapter_system and archetype_param_resource_adapter_system and runs
+//    them sequentially; we collapse that into a direct sequential run here (the deep's
+//    schedule_archetype_value module remains a NO-OP-deep per its own batch; this batch's adapter
+//    just runs both bodies explicitly). The first arg `pair_first_comp_id` and `pair_second_comp_id`
+//    pick the pair components (the test uses pos.id and vel.id which the schedule record stored).
+fn ecs_av_schedule_run_movement_resource(w0: EcsAvWorldDeep, pair_first_comp_id: i32, pair_second_comp_id: i32) -> EcsAvWorldDeep {
+    let w1 = ecs_av_run_pair_mut_system(w0, pair_first_comp_id, pair_second_comp_id);
+    return ecs_av_run_resource_message_system(w1, ecs_av_event_default());
+}

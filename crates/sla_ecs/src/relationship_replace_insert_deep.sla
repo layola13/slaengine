@@ -1,0 +1,231 @@
+// Deepened Bevy ECS related-methods insert/replace-with-difference (shallow
+// lib/relationship_replace_insert.sla deep; src/relationship/related_methods.rs).
+// Fixed cap-8 storage replaces the shallow's Vec<i64>. Operations retain
+// semantics:
+//   insert_related(start_index, related cap-4) — inserts/reshuffles per Bevy invariant.
+//   replace_related(related cap-4) — de-duplicate related, empty detaches relationship.
+//   replace_related_with_difference(unrelate cap-4, relate cap-4, newly_related cap-4).
+// Slots hold i64 entity bit fields, scalar count and has_target.
+
+const ECS_REPL_INS_CAP_DEEP: i32 = 8;
+
+struct EcsReplaceInsertDeep {
+    r0: i64, r1: i64, r2: i64, r3: i64, r4: i64, r5: i64, r6: i64, r7: i64,
+    count: i32,
+    has_target: i32,
+}
+
+fn ecs_ri_new() -> EcsReplaceInsertDeep {
+    let r = EcsReplaceInsertDeep {
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0,
+        count: 0,
+        has_target: 0,
+    };
+    return r;
+}
+
+fn ecs_ri_related_count(r: EcsReplaceInsertDeep) -> i32 { return r.count; }
+fn ecs_ri_has_target(r: EcsReplaceInsertDeep) -> bool { return r.has_target == 1; }
+
+fn ecs_ri_related_at(r: EcsReplaceInsertDeep, idx: i32) -> i64 {
+    if idx == 0 { return r.r0; };
+    if idx == 1 { return r.r1; };
+    if idx == 2 { return r.r2; };
+    if idx == 3 { return r.r3; };
+    if idx == 4 { return r.r4; };
+    if idx == 5 { return r.r5; };
+    if idx == 6 { return r.r6; };
+    if idx == 7 { return r.r7; };
+    return -1;
+}
+
+fn ecs_ri_set_related_at(r: EcsReplaceInsertDeep, idx: i32, e: i64) -> EcsReplaceInsertDeep {
+    if idx == 0 { r.r0 = e; };
+    if idx == 1 { r.r1 = e; };
+    if idx == 2 { r.r2 = e; };
+    if idx == 3 { r.r3 = e; };
+    if idx == 4 { r.r4 = e; };
+    if idx == 5 { r.r5 = e; };
+    if idx == 6 { r.r6 = e; };
+    if idx == 7 { r.r7 = e; };
+    return r;
+}
+
+// scalar: index of entity in related, or -1
+fn ecs_ri_index_of(r: EcsReplaceInsertDeep, e: i64) -> i32 {
+    let i: i32 = 0;
+    while i < r.count {
+        if ecs_ri_related_at(r, i) == e { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_ri_contains(r: EcsReplaceInsertDeep, e: i64) -> bool {
+    let i = ecs_ri_index_of(r, e);
+    return i >= 0;
+}
+
+// remove_at: shift trailing left by one.
+fn ecs_ri_remove_at(r: EcsReplaceInsertDeep, idx: i32) -> EcsReplaceInsertDeep {
+    if idx < 0 { return r; };
+    if idx >= r.count { return r; };
+    let new_count = r.count - 1;
+    let i: i32 = idx;
+    while i < new_count {
+        let shifted = ecs_ri_related_at(r, i + 1);
+        r = ecs_ri_set_related_at(r, i, shifted);
+        i = i + 1;
+    }
+    r = ecs_ri_set_related_at(r, new_count, 0);
+    r.count = new_count;
+    return r;
+}
+
+// insert_at: clamp insert in place of `place_idx` (out-of-bounds clamps; mid-list rebuilds).
+fn ecs_ri_insert_at(r: EcsReplaceInsertDeep, e: i64, place_idx: i32) -> EcsReplaceInsertDeep {
+    if r.count >= ECS_REPL_INS_CAP_DEEP { return r; };
+    let clamped = place_idx;
+    if clamped > r.count { clamped = r.count; };
+    if clamped < 0 { clamped = 0; };
+    if clamped >= r.count {
+        r = ecs_ri_set_related_at(r, r.count, e);
+        r.count = r.count + 1;
+        return r;
+    };
+    // shift trailing right by one
+    let i: i32 = r.count;
+    while i > clamped {
+        let shifted = ecs_ri_related_at(r, i - 1);
+        r = ecs_ri_set_related_at(r, i, shifted);
+        i = i - 1;
+    }
+    r = ecs_ri_set_related_at(r, clamped, e);
+    r.count = r.count + 1;
+    return r;
+}
+
+fn ecs_ri_relate_one_at(r: EcsReplaceInsertDeep, target_idx: i32, e: i64) -> EcsReplaceInsertDeep {
+    let existing = ecs_ri_index_of(r, e);
+    if existing >= 0 {
+        let removed = ecs_ri_remove_at(r, existing);
+        // adjust target: if existing < target_idx, the shifted schema loses one slot before target.
+        let place_idx = target_idx;
+        if existing < target_idx {
+            // After remove_at left one slot earlier, the target slot index has decreased by 1.
+            // To preserve "insert where the slot went from target_idx shifted": clamp.
+            if place_idx > 0 { return ecs_ri_insert_at(removed, e, place_idx - 1); };
+            return ecs_ri_insert_at(removed, e, 0);
+        };
+        return ecs_ri_insert_at(removed, e, place_idx);
+    };
+    return ecs_ri_insert_at(r, e, target_idx);
+}
+
+// helper: bulk-relate a fixed-cap-4 related batch (passed as 4 i64 scalars + count).
+fn ecs_ri_insert_related_batch(captured_traits: i32) -> i32 {
+    let _ = captured_traits;
+    return 0;
+}
+
+// EcsBatchRelated: a small fixed array (cap-4) representing Bevy's `related` argument.
+struct EcsBatchRelatedDeep {
+    b0: i64, b1: i64, b2: i64, b3: i64,
+    len: i32,
+}
+
+fn ecs_batch_related_new() -> EcsBatchRelatedDeep {
+    return EcsBatchRelatedDeep { b0: 0, b1: 0, b2: 0, b3: 0, len: 0 };
+}
+
+fn ecs_batch_related_at(b: EcsBatchRelatedDeep, idx: i32) -> i64 {
+    if idx == 0 { return b.b0; };
+    if idx == 1 { return b.b1; };
+    if idx == 2 { return b.b2; };
+    if idx == 3 { return b.b3; };
+    return -1;
+}
+
+fn ecs_batch_related_push(b: EcsBatchRelatedDeep, e: i64) -> EcsBatchRelatedDeep {
+    if b.len < 4 {
+        if b.len == 0 { b.b0 = e; };
+        if b.len == 1 { b.b1 = e; };
+        if b.len == 2 { b.b2 = e; };
+        if b.len == 3 { b.b3 = e; };
+        b.len = b.len + 1;
+    };
+    return b;
+}
+
+fn ecs_batch_related_len(b: EcsBatchRelatedDeep) -> i32 { return b.len; }
+
+fn ecs_batch_related_contains(b: EcsBatchRelatedDeep, e: i64) -> bool {
+    let i: i32 = 0;
+    while i < b.len {
+        if ecs_batch_related_at(b, i) == e { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_ri_insert_related(r: EcsReplaceInsertDeep, start_index: i32, related: EcsBatchRelatedDeep) -> EcsReplaceInsertDeep {
+    if related.len == 0 { return r; };
+    r.has_target = 1;
+    let offset: i32 = 0;
+    while offset < related.len {
+        let e = ecs_batch_related_at(related, offset);
+        let target_idx = start_index + offset;
+        r = ecs_ri_relate_one_at(r, target_idx, e);
+        offset = offset + 1;
+    }
+    return r;
+}
+
+fn ecs_ri_replace_related(r: EcsReplaceInsertDeep, related: EcsBatchRelatedDeep) -> EcsReplaceInsertDeep {
+    if related.len == 0 {
+        r = ecs_ri_new();
+        return r;
+    };
+    // De-duplicated insertion while preserving first-occurrence order.
+    let out = ecs_ri_new();
+    let i: i32 = 0;
+    while i < related.len {
+        let e = ecs_batch_related_at(related, i);
+        if ecs_ri_contains(out, e) != true {
+            out = ecs_ri_insert_at(out, e, out.count);
+        };
+        i = i + 1;
+    }
+    out.has_target = 1;
+    return out;
+}
+
+fn ecs_ri_replace_related_with_difference(r: EcsReplaceInsertDeep, unrelate: EcsBatchRelatedDeep, relate: EcsBatchRelatedDeep) -> EcsReplaceInsertDeep {
+    let out = ecs_ri_new();
+    // Copy entries not in unrelate, deduped.
+    let i: i32 = 0;
+    while i < r.count {
+        let e = ecs_ri_related_at(r, i);
+        if ecs_batch_related_contains(unrelate, e) != true {
+            if ecs_ri_contains(out, e) != true {
+                out = ecs_ri_insert_at(out, e, out.count);
+            };
+        };
+        i = i + 1;
+    }
+    // Union-in relate, deduped.
+    let j: i32 = 0;
+    while j < relate.len {
+        let e = ecs_batch_related_at(relate, j);
+        if ecs_ri_contains(out, e) != true {
+            out = ecs_ri_insert_at(out, e, out.count);
+        };
+        j = j + 1;
+    }
+    out.has_target = 1;
+    return out;
+}
+
+fn ecs_ri_clear(r: EcsReplaceInsertDeep) -> EcsReplaceInsertDeep {
+    return ecs_ri_new();
+}

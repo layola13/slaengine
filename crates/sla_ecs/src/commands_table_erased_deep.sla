@@ -1,0 +1,604 @@
+// Deepened Bevy ECS deferred command queue for TableErasedWorld
+// (shallow lib/commands_table_erased.sla deep; src/system/commands/table_erased.rs).
+//
+// Mirrors the shallow queue but replaces the generic `TableErasedCommands<R, M>` and boxed
+// ErasedComponentValue / bundle batch side arrays with fixed-cap kind-discriminated storage and
+// parallel scalar side arrays. Avoids generic type params, fn-ptr world-application, and boxed
+// `ecs_box_drop<T>` style erased pointers: this library owns the command queue and introspects
+// it; applying to a world composes with the world-facade module separately.
+//
+// Kinds (mirror shallow):
+//   INSERT_COMPONENT=1, DESPAWN=2, INSERT_RESOURCE=3, WRITE_MESSAGE=4,
+//   SPAWN_BATCH_BUNDLE2=5, SPAWN_BATCH_BUNDLE3=6, INSERT_BATCH_BUNDLE2=7,
+//   INSERT_BATCH_BUNDLE3=8, INSERT_BATCH_BUNDLE2_IF_NEW=9, INSERT_BATCH_BUNDLE3_IF_NEW=10.
+//
+// INSERT_COMPONENT side payload uses parallel `pt` + `pv` cap-8 arrays sharing pcomp_count.
+// INSERT_RESOURCE / WRITE_MESSAGE use pres / pmsg cap-8 arrays. Batch-bundle commands (5-10) index
+// the bundle2 / bundle3 batch side storage. Each batch slot stores a small fixed-cap-2 bundle set:
+//   - bundle2 batch slot: 2 entities + 2 bundles (each bundle has first_type_id, second_type_id,
+//     first_value, second_value); modeled as parallel per-slot arrays: beN (entity), bftN0/bftN1,
+//     bstN0/bstN1, bfvN0/bfvN1, bsvN0/bsvN1 (cap-2).
+//   - bundle3 batch slot: same bundle2 fields plus third_type/third_value per bundle.
+//
+// Storage caps: command list cap-8, batch count cap-2 per batch kind.
+
+const ECS_CMD_TBL_ERASED_CAP_DEEP: i32 = 8;
+const ECS_CMD_TBL_ERASED_INSERT_COMPONENT: i32 = 1;
+const ECS_CMD_TBL_ERASED_DESPAWN: i32 = 2;
+const ECS_CMD_TBL_ERASED_INSERT_RESOURCE: i32 = 3;
+const ECS_CMD_TBL_ERASED_WRITE_MESSAGE: i32 = 4;
+const ECS_CMD_TBL_ERASED_SPAWN_BATCH_BUNDLE2: i32 = 5;
+const ECS_CMD_TBL_ERASED_SPAWN_BATCH_BUNDLE3: i32 = 6;
+const ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE2: i32 = 7;
+const ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE3: i32 = 8;
+const ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE2_IF_NEW: i32 = 9;
+const ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE3_IF_NEW: i32 = 10;
+const ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP: i32 = 2;
+
+struct EcsTblErasedCommandDeep {
+    kind: i32,
+    entity_id: i32,
+    component_id: i32,
+    value_index: i32,
+}
+
+fn ecs_tbl_erased_command(kind: i32, entity_id: i32, component_id: i32, value_index: i32) -> EcsTblErasedCommandDeep {
+    return EcsTblErasedCommandDeep { kind: kind, entity_id: entity_id, component_id: component_id, value_index: value_index };
+}
+
+fn ecs_tbl_erased_command_kind(c: EcsTblErasedCommandDeep) -> i32 { return c.kind; }
+fn ecs_tbl_erased_command_entity_id(c: EcsTblErasedCommandDeep) -> i32 { return c.entity_id; }
+fn ecs_tbl_erased_command_component_id(c: EcsTblErasedCommandDeep) -> i32 { return c.component_id; }
+fn ecs_tbl_erased_command_value_index(c: EcsTblErasedCommandDeep) -> i32 { return c.value_index; }
+
+struct EcsTblErasedCommandsDeep {
+    k0: i32, k1: i32, k2: i32, k3: i32, k4: i32, k5: i32, k6: i32, k7: i32,
+    e0: i32, e1: i32, e2: i32, e3: i32, e4: i32, e5: i32, e6: i32, e7: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c4: i32, c5: i32, c6: i32, c7: i32,
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    // INSERT_COMPONENT side arrays: parallel pt/pv cap-8
+    pt0: i32, pt1: i32, pt2: i32, pt3: i32, pt4: i32, pt5: i32, pt6: i32, pt7: i32,
+    pv0: i32, pv1: i32, pv2: i32, pv3: i32, pv4: i32, pv5: i32, pv6: i32, pv7: i32,
+    pcomp_count: i32,
+    // resource side array cap-8
+    r0: i32, r1: i32, r2: i32, r3: i32, r4: i32, r5: i32, r6: i32, r7: i32,
+    pres_count: i32,
+    // message side array cap-8
+    m0: i32, m1: i32, m2: i32, m3: i32, m4: i32, m5: i32, m6: i32, m7: i32,
+    pmsg_count: i32,
+    // bundle2 batch side storage: cap-2 batches, each batch has cap-2 entries.
+    // Per batch slot k, be_k = entity for bundle i; bft_k_i, bst_k_i, bfv_k_i, bsv_k_i.
+    be00: i32, be01: i32,
+    be10: i32, be11: i32,
+    bft00: i32, bft01: i32, bst00: i32, bst01: i32, bfv00: i32, bfv01: i32, bsv00: i32, bsv01: i32,
+    bft10: i32, bft11: i32, bst10: i32, bst11: i32, bfv10: i32, bfv11: i32, bsv10: i32, bsv11: i32,
+    b2c0: i32, b2c1: i32,
+    b2_count: i32,
+    // bundle3 batch side storage: cap-2 batches, each batch has cap-2 entries.
+    // Per batch slot k: ce_k = entity for bundle i (cap-2); cft_k_i, cst_k_i, ctt_k_i,
+    // cfv_k_i, csv_k_i, ctv_k_i.
+    ce00: i32, ce01: i32,
+    ce10: i32, ce11: i32,
+    cft00: i32, cft01: i32, cst00: i32, cst01: i32, ctt00: i32, ctt01: i32,
+    cfv00: i32, cfv01: i32, csv00: i32, csv01: i32, ctv00: i32, ctv01: i32,
+    cft10: i32, cft11: i32, cst10: i32, cst11: i32, ctt10: i32, ctt11: i32,
+    cfv10: i32, cfv11: i32, csv10: i32, csv11: i32, ctv10: i32, ctv11: i32,
+    b3c0: i32, b3c1: i32,
+    b3_count: i32,
+    count: i32,
+}
+
+fn ecs_tbl_erased_commands_new() -> EcsTblErasedCommandsDeep {
+    let c = EcsTblErasedCommandsDeep {
+        k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, c4: 0, c5: 0, c6: 0, c7: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        pt0: 0, pt1: 0, pt2: 0, pt3: 0, pt4: 0, pt5: 0, pt6: 0, pt7: 0,
+        pv0: 0, pv1: 0, pv2: 0, pv3: 0, pv4: 0, pv5: 0, pv6: 0, pv7: 0,
+        pcomp_count: 0,
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0,
+        pres_count: 0,
+        m0: 0, m1: 0, m2: 0, m3: 0, m4: 0, m5: 0, m6: 0, m7: 0,
+        pmsg_count: 0,
+        be00: 0, be01: 0, be10: 0, be11: 0,
+        bft00: 0, bft01: 0, bst00: 0, bst01: 0, bfv00: 0, bfv01: 0, bsv00: 0, bsv01: 0,
+        bft10: 0, bft11: 0, bst10: 0, bst11: 0, bfv10: 0, bfv11: 0, bsv10: 0, bsv11: 0,
+        b2c0: 0, b2c1: 0,
+        b2_count: 0,
+        ce00: 0, ce01: 0, ce10: 0, ce11: 0,
+        cft00: 0, cft01: 0, cst00: 0, cst01: 0, ctt00: 0, ctt01: 0,
+        cfv00: 0, cfv01: 0, csv00: 0, csv01: 0, ctv00: 0, ctv01: 0,
+        cft10: 0, cft11: 0, cst10: 0, cst11: 0, ctt10: 0, ctt11: 0,
+        cfv10: 0, cfv11: 0, csv10: 0, csv11: 0, ctv10: 0, ctv11: 0,
+        b3c0: 0, b3c1: 0,
+        b3_count: 0,
+        count: 0,
+    };
+    return c;
+}
+
+fn ecs_tbl_erased_commands_len(c: EcsTblErasedCommandsDeep) -> i32 { return c.count; }
+
+// per-slot command read accessors
+fn ecs_tbl_erased_commands_kind_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.k0; };
+    if idx == 1 { return c.k1; };
+    if idx == 2 { return c.k2; };
+    if idx == 3 { return c.k3; };
+    if idx == 4 { return c.k4; };
+    if idx == 5 { return c.k5; };
+    if idx == 6 { return c.k6; };
+    if idx == 7 { return c.k7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_entity_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.e0; };
+    if idx == 1 { return c.e1; };
+    if idx == 2 { return c.e2; };
+    if idx == 3 { return c.e3; };
+    if idx == 4 { return c.e4; };
+    if idx == 5 { return c.e5; };
+    if idx == 6 { return c.e6; };
+    if idx == 7 { return c.e7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_cmp_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.c0; };
+    if idx == 1 { return c.c1; };
+    if idx == 2 { return c.c2; };
+    if idx == 3 { return c.c3; };
+    if idx == 4 { return c.c4; };
+    if idx == 5 { return c.c5; };
+    if idx == 6 { return c.c6; };
+    if idx == 7 { return c.c7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_idx_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.v0; };
+    if idx == 1 { return c.v1; };
+    if idx == 2 { return c.v2; };
+    if idx == 3 { return c.v3; };
+    if idx == 4 { return c.v4; };
+    if idx == 5 { return c.v5; };
+    if idx == 6 { return c.v6; };
+    if idx == 7 { return c.v7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_set_slot(c: EcsTblErasedCommandsDeep, idx: i32, k: i32, e: i32, cmp: i32, v: i32) -> EcsTblErasedCommandsDeep {
+    if idx == 0 { c.k0 = k; c.e0 = e; c.c0 = cmp; c.v0 = v; };
+    if idx == 1 { c.k1 = k; c.e1 = e; c.c1 = cmp; c.v1 = v; };
+    if idx == 2 { c.k2 = k; c.e2 = e; c.c2 = cmp; c.v2 = v; };
+    if idx == 3 { c.k3 = k; c.e3 = e; c.c3 = cmp; c.v3 = v; };
+    if idx == 4 { c.k4 = k; c.e4 = e; c.c4 = cmp; c.v4 = v; };
+    if idx == 5 { c.k5 = k; c.e5 = e; c.c5 = cmp; c.v5 = v; };
+    if idx == 6 { c.k6 = k; c.e6 = e; c.c6 = cmp; c.v6 = v; };
+    if idx == 7 { c.k7 = k; c.e7 = e; c.c7 = cmp; c.v7 = v; };
+    return c;
+}
+
+// pt/pv setters/readers (cap-8)
+fn ecs_tbl_erased_commands_set_pt(c: EcsTblErasedCommandsDeep, idx: i32, value: i32) -> EcsTblErasedCommandsDeep {
+    if idx == 0 { c.pt0 = value; };
+    if idx == 1 { c.pt1 = value; };
+    if idx == 2 { c.pt2 = value; };
+    if idx == 3 { c.pt3 = value; };
+    if idx == 4 { c.pt4 = value; };
+    if idx == 5 { c.pt5 = value; };
+    if idx == 6 { c.pt6 = value; };
+    if idx == 7 { c.pt7 = value; };
+    return c;
+}
+
+fn ecs_tbl_erased_commands_pt_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.pt0; };
+    if idx == 1 { return c.pt1; };
+    if idx == 2 { return c.pt2; };
+    if idx == 3 { return c.pt3; };
+    if idx == 4 { return c.pt4; };
+    if idx == 5 { return c.pt5; };
+    if idx == 6 { return c.pt6; };
+    if idx == 7 { return c.pt7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_set_pv(c: EcsTblErasedCommandsDeep, idx: i32, value: i32) -> EcsTblErasedCommandsDeep {
+    if idx == 0 { c.pv0 = value; };
+    if idx == 1 { c.pv1 = value; };
+    if idx == 2 { c.pv2 = value; };
+    if idx == 3 { c.pv3 = value; };
+    if idx == 4 { c.pv4 = value; };
+    if idx == 5 { c.pv5 = value; };
+    if idx == 6 { c.pv6 = value; };
+    if idx == 7 { c.pv7 = value; };
+    return c;
+}
+
+fn ecs_tbl_erased_commands_pv_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.pv0; };
+    if idx == 1 { return c.pv1; };
+    if idx == 2 { return c.pv2; };
+    if idx == 3 { return c.pv3; };
+    if idx == 4 { return c.pv4; };
+    if idx == 5 { return c.pv5; };
+    if idx == 6 { return c.pv6; };
+    if idx == 7 { return c.pv7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_set_pres(c: EcsTblErasedCommandsDeep, idx: i32, value: i32) -> EcsTblErasedCommandsDeep {
+    if idx == 0 { c.r0 = value; };
+    if idx == 1 { c.r1 = value; };
+    if idx == 2 { c.r2 = value; };
+    if idx == 3 { c.r3 = value; };
+    if idx == 4 { c.r4 = value; };
+    if idx == 5 { c.r5 = value; };
+    if idx == 6 { c.r6 = value; };
+    if idx == 7 { c.r7 = value; };
+    return c;
+}
+
+fn ecs_tbl_erased_commands_pres_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.r0; };
+    if idx == 1 { return c.r1; };
+    if idx == 2 { return c.r2; };
+    if idx == 3 { return c.r3; };
+    if idx == 4 { return c.r4; };
+    if idx == 5 { return c.r5; };
+    if idx == 6 { return c.r6; };
+    if idx == 7 { return c.r7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_set_pmsg(c: EcsTblErasedCommandsDeep, idx: i32, value: i32) -> EcsTblErasedCommandsDeep {
+    if idx == 0 { c.m0 = value; };
+    if idx == 1 { c.m1 = value; };
+    if idx == 2 { c.m2 = value; };
+    if idx == 3 { c.m3 = value; };
+    if idx == 4 { c.m4 = value; };
+    if idx == 5 { c.m5 = value; };
+    if idx == 6 { c.m6 = value; };
+    if idx == 7 { c.m7 = value; };
+    return c;
+}
+
+fn ecs_tbl_erased_commands_pmsg_at(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.m0; };
+    if idx == 1 { return c.m1; };
+    if idx == 2 { return c.m2; };
+    if idx == 3 { return c.m3; };
+    if idx == 4 { return c.m4; };
+    if idx == 5 { return c.m5; };
+    if idx == 6 { return c.m6; };
+    if idx == 7 { return c.m7; };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_pcomp_count(c: EcsTblErasedCommandsDeep) -> i32 { return c.pcomp_count; }
+fn ecs_tbl_erased_commands_pres_count(c: EcsTblErasedCommandsDeep) -> i32 { return c.pres_count; }
+fn ecs_tbl_erased_commands_pmsg_count(c: EcsTblErasedCommandsDeep) -> i32 { return c.pmsg_count; }
+fn ecs_tbl_erased_commands_b2_count(c: EcsTblErasedCommandsDeep) -> i32 { return c.b2_count; }
+fn ecs_tbl_erased_commands_b3_count(c: EcsTblErasedCommandsDeep) -> i32 { return c.b3_count; }
+
+// populate bundle2 batch slot k with two bundles (cap-2 each). entities0/1, ft0/1, st0/1, fv0/1,
+// sv0/1, count. We spread the five-bundle-field groups across the per-batch structured slots
+// using scalar-by-scalar assignment by branch (no struct reuse).
+fn ecs_tbl_erased_commands_set_b2_slot(
+    c: EcsTblErasedCommandsDeep, k: i32,
+    be0: i32, be1: i32,
+    ft0: i32, st0: i32, fv0: i32, sv0: i32,
+    ft1: i32, st1: i32, fv1: i32, sv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if k == 0 {
+        c.be00 = be0; c.be01 = be1;
+        c.bft00 = ft0; c.bst00 = st0; c.bfv00 = fv0; c.bsv00 = sv0;
+        c.bft01 = ft1; c.bst01 = st1; c.bfv01 = fv1; c.bsv01 = sv1;
+        c.b2c0 = count;
+    };
+    if k == 1 {
+        c.be10 = be0; c.be11 = be1;
+        c.bft10 = ft0; c.bst10 = st0; c.bfv10 = fv0; c.bsv10 = sv0;
+        c.bft11 = ft1; c.bst11 = st1; c.bfv11 = fv1; c.bsv11 = sv1;
+        c.b2c1 = count;
+    };
+    return c;
+}
+
+fn ecs_tbl_erased_commands_b2c_at(c: EcsTblErasedCommandsDeep, k: i32) -> i32 {
+    if k == 0 { return c.b2c0; };
+    if k == 1 { return c.b2c1; };
+    return 0;
+}
+
+// read bundle2 fields from batch slot k bundle i
+struct EcsTblErasedBundle2Deep { entity: i32, first_type: i32, second_type: i32, first_value: i32, second_value: i32 }
+
+fn ecs_tbl_erased_commands_b2_at(c: EcsTblErasedCommandsDeep, k: i32, i: i32) -> EcsTblErasedBundle2Deep {
+    if k == 0 {
+        if i == 0 { return EcsTblErasedBundle2Deep { entity: c.be00, first_type: c.bft00, second_type: c.bst00, first_value: c.bfv00, second_value: c.bsv00 }; };
+        if i == 1 { return EcsTblErasedBundle2Deep { entity: c.be01, first_type: c.bft01, second_type: c.bst01, first_value: c.bfv01, second_value: c.bsv01 }; };
+    };
+    if k == 1 {
+        if i == 0 { return EcsTblErasedBundle2Deep { entity: c.be10, first_type: c.bft10, second_type: c.bst10, first_value: c.bfv10, second_value: c.bsv10 }; };
+        if i == 1 { return EcsTblErasedBundle2Deep { entity: c.be11, first_type: c.bft11, second_type: c.bst11, first_value: c.bfv11, second_value: c.bsv11 }; };
+    };
+    return EcsTblErasedBundle2Deep { entity: 0, first_type: 0, second_type: 0, first_value: 0, second_value: 0 };
+}
+
+fn ecs_tbl_erased_b2_entity(b: EcsTblErasedBundle2Deep) -> i32 { return b.entity; }
+fn ecs_tbl_erased_b2_first_type(b: EcsTblErasedBundle2Deep) -> i32 { return b.first_type; }
+fn ecs_tbl_erased_b2_second_type(b: EcsTblErasedBundle2Deep) -> i32 { return b.second_type; }
+fn ecs_tbl_erased_b2_first_value(b: EcsTblErasedBundle2Deep) -> i32 { return b.first_value; }
+fn ecs_tbl_erased_b2_second_value(b: EcsTblErasedBundle2Deep) -> i32 { return b.second_value; }
+
+// populate bundle3 batch slot k with two bundles each carrying 6 fields.
+fn ecs_tbl_erased_commands_set_b3_slot(
+    c: EcsTblErasedCommandsDeep, k: i32,
+    ce0: i32, ce1: i32,
+    ft0: i32, st0: i32, tt0: i32, fv0: i32, sv0: i32, tv0: i32,
+    ft1: i32, st1: i32, tt1: i32, fv1: i32, sv1: i32, tv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if k == 0 {
+        c.ce00 = ce0; c.ce01 = ce1;
+        c.cft00 = ft0; c.cst00 = st0; c.ctt00 = tt0; c.cfv00 = fv0; c.csv00 = sv0; c.ctv00 = tv0;
+        c.cft01 = ft1; c.cst01 = st1; c.ctt01 = tt1; c.cfv01 = fv1; c.csv01 = sv1; c.ctv01 = tv1;
+        c.b3c0 = count;
+    };
+    if k == 1 {
+        c.ce10 = ce0; c.ce11 = ce1;
+        c.cft10 = ft0; c.cst10 = st0; c.ctt10 = tt0; c.cfv10 = fv0; c.csv10 = sv0; c.ctv10 = tv0;
+        c.cft11 = ft1; c.cst11 = st1; c.ctt11 = tt1; c.cfv11 = fv1; c.csv11 = sv1; c.ctv11 = tv1;
+        c.b3c1 = count;
+    };
+    return c;
+}
+
+struct EcsTblErasedBundle3Deep { entity: i32, first_type: i32, second_type: i32, third_type: i32, first_value: i32, second_value: i32, third_value: i32 }
+
+fn ecs_tbl_erased_commands_b3_at(c: EcsTblErasedCommandsDeep, k: i32, i: i32) -> EcsTblErasedBundle3Deep {
+    // Capture scalar fields by reading then building a result struct; reading multiple fields
+    // is fine — only reassign across branches triggers moves (here we copy out per branch).
+    if k == 0 {
+        if i == 0 {
+            let e: i32 = c.ce00; let ft: i32 = c.cft00; let st: i32 = c.cst00; let tt: i32 = c.ctt00; let fv: i32 = c.cfv00; let sv: i32 = c.csv00; let tv: i32 = c.ctv00;
+            return EcsTblErasedBundle3Deep { entity: e, first_type: ft, second_type: st, third_type: tt, first_value: fv, second_value: sv, third_value: tv };
+        };
+        if i == 1 {
+            let e: i32 = c.ce01; let ft: i32 = c.cft01; let st: i32 = c.cst01; let tt: i32 = c.ctt01; let fv: i32 = c.cfv01; let sv: i32 = c.csv01; let tv: i32 = c.ctv01;
+            return EcsTblErasedBundle3Deep { entity: e, first_type: ft, second_type: st, third_type: tt, first_value: fv, second_value: sv, third_value: tv };
+        };
+    };
+    if k == 1 {
+        if i == 0 {
+            let e: i32 = c.ce10; let ft: i32 = c.cft10; let st: i32 = c.cst10; let tt: i32 = c.ctt10; let fv: i32 = c.cfv10; let sv: i32 = c.csv10; let tv: i32 = c.ctv10;
+            return EcsTblErasedBundle3Deep { entity: e, first_type: ft, second_type: st, third_type: tt, first_value: fv, second_value: sv, third_value: tv };
+        };
+        if i == 1 {
+            let e: i32 = c.ce11; let ft: i32 = c.cft11; let st: i32 = c.cst11; let tt: i32 = c.ctt11; let fv: i32 = c.cfv11; let sv: i32 = c.csv11; let tv: i32 = c.ctv11;
+            return EcsTblErasedBundle3Deep { entity: e, first_type: ft, second_type: st, third_type: tt, first_value: fv, second_value: sv, third_value: tv };
+        };
+    };
+    return EcsTblErasedBundle3Deep { entity: 0, first_type: 0, second_type: 0, third_type: 0, first_value: 0, second_value: 0, third_value: 0 };
+}
+
+fn ecs_tbl_erased_commands_b3c_at(c: EcsTblErasedCommandsDeep, k: i32) -> i32 {
+    if k == 0 { return c.b3c0; };
+    if k == 1 { return c.b3c1; };
+    return 0;
+}
+
+fn ecs_tbl_erased_b3_entity(b: EcsTblErasedBundle3Deep) -> i32 { return b.entity; }
+fn ecs_tbl_erased_b3_first_type(b: EcsTblErasedBundle3Deep) -> i32 { return b.first_type; }
+fn ecs_tbl_erased_b3_second_type(b: EcsTblErasedBundle3Deep) -> i32 { return b.second_type; }
+fn ecs_tbl_erased_b3_third_type(b: EcsTblErasedBundle3Deep) -> i32 { return b.third_type; }
+fn ecs_tbl_erased_b3_first_value(b: EcsTblErasedBundle3Deep) -> i32 { return b.first_value; }
+fn ecs_tbl_erased_b3_second_value(b: EcsTblErasedBundle3Deep) -> i32 { return b.second_value; }
+fn ecs_tbl_erased_b3_third_value(b: EcsTblErasedBundle3Deep) -> i32 { return b.third_value; }
+
+fn ecs_tbl_erased_commands_reserve_entity(c: EcsTblErasedCommandsDeep) -> (EcsTblErasedCommandsDeep, i32) {
+    return (c, 0);
+}
+
+fn ecs_tbl_erased_commands_insert(c: EcsTblErasedCommandsDeep, entity_id: i32, component_id: i32, type_id: i32, value: i32) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.pcomp_count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    let slot: i32 = c.pcomp_count;
+    c = ecs_tbl_erased_commands_set_pt(c, slot, type_id);
+    c = ecs_tbl_erased_commands_set_pv(c, slot, value);
+    c.pcomp_count = c.pcomp_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_INSERT_COMPONENT, entity_id, component_id, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_despawn(c: EcsTblErasedCommandsDeep, entity_id: i32) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_DESPAWN, entity_id, 0, -1);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_insert_resource(c: EcsTblErasedCommandsDeep, value: i32) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.pres_count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    let slot: i32 = c.pres_count;
+    c = ecs_tbl_erased_commands_set_pres(c, slot, value);
+    c.pres_count = c.pres_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_INSERT_RESOURCE, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_write_message(c: EcsTblErasedCommandsDeep, value: i32) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.pmsg_count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    let slot: i32 = c.pmsg_count;
+    c = ecs_tbl_erased_commands_set_pmsg(c, slot, value);
+    c.pmsg_count = c.pmsg_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_WRITE_MESSAGE, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+// spawn_batch_bundle2(bundles): the deep variant pushes one batch slot (cap-2 batches) recording
+// cap-2 bundles; entities stays 0 for spawn (mirrors shallow entities:-unused). Returns the queue;
+// the batch side index is stored in the command slot v.
+fn ecs_tbl_erased_commands_spawn_batch_bundle2(
+    c: EcsTblErasedCommandsDeep,
+    ft0: i32, st0: i32, fv0: i32, sv0: i32,
+    ft1: i32, st1: i32, fv1: i32, sv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.b2_count >= ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP { return c; };
+    let slot: i32 = c.b2_count;
+    c = ecs_tbl_erased_commands_set_b2_slot(c, slot, 0, 0, ft0, st0, fv0, sv0, ft1, st1, fv1, sv1, count);
+    c.b2_count = c.b2_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_SPAWN_BATCH_BUNDLE2, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_spawn_batch_bundle3(
+    c: EcsTblErasedCommandsDeep,
+    ft0: i32, st0: i32, tt0: i32, fv0: i32, sv0: i32, tv0: i32,
+    ft1: i32, st1: i32, tt1: i32, fv1: i32, sv1: i32, tv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.b3_count >= ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP { return c; };
+    let slot: i32 = c.b3_count;
+    c = ecs_tbl_erased_commands_set_b3_slot(c, slot, 0, 0, ft0, st0, tt0, fv0, sv0, tv0, ft1, st1, tt1, fv1, sv1, tv1, count);
+    c.b3_count = c.b3_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_SPAWN_BATCH_BUNDLE3, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+// insert_batch_bundle2: same bundle storage as spawn, but with parallel entity ids.
+fn ecs_tbl_erased_commands_insert_batch_bundle2(
+    c: EcsTblErasedCommandsDeep,
+    be0: i32, be1: i32,
+    ft0: i32, st0: i32, fv0: i32, sv0: i32,
+    ft1: i32, st1: i32, fv1: i32, sv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.b2_count >= ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP { return c; };
+    let slot: i32 = c.b2_count;
+    c = ecs_tbl_erased_commands_set_b2_slot(c, slot, be0, be1, ft0, st0, fv0, sv0, ft1, st1, fv1, sv1, count);
+    c.b2_count = c.b2_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE2, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_insert_batch_bundle3(
+    c: EcsTblErasedCommandsDeep,
+    ce0: i32, ce1: i32,
+    ft0: i32, st0: i32, tt0: i32, fv0: i32, sv0: i32, tv0: i32,
+    ft1: i32, st1: i32, tt1: i32, fv1: i32, sv1: i32, tv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.b3_count >= ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP { return c; };
+    let slot: i32 = c.b3_count;
+    c = ecs_tbl_erased_commands_set_b3_slot(c, slot, ce0, ce1, ft0, st0, tt0, fv0, sv0, tv0, ft1, st1, tt1, fv1, sv1, tv1, count);
+    c.b3_count = c.b3_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE3, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_insert_batch_bundle2_if_new(
+    c: EcsTblErasedCommandsDeep,
+    be0: i32, be1: i32,
+    ft0: i32, st0: i32, fv0: i32, sv0: i32,
+    ft1: i32, st1: i32, fv1: i32, sv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.b2_count >= ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP { return c; };
+    let slot: i32 = c.b2_count;
+    c = ecs_tbl_erased_commands_set_b2_slot(c, slot, be0, be1, ft0, st0, fv0, sv0, ft1, st1, fv1, sv1, count);
+    c.b2_count = c.b2_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE2_IF_NEW, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_insert_batch_bundle3_if_new(
+    c: EcsTblErasedCommandsDeep,
+    ce0: i32, ce1: i32,
+    ft0: i32, st0: i32, tt0: i32, fv0: i32, sv0: i32, tv0: i32,
+    ft1: i32, st1: i32, tt1: i32, fv1: i32, sv1: i32, tv1: i32,
+    count: i32
+) -> EcsTblErasedCommandsDeep {
+    if c.count >= ECS_CMD_TBL_ERASED_CAP_DEEP { return c; };
+    if c.b3_count >= ECS_CMD_TBL_ERASED_BATCH_CAP_DEEP { return c; };
+    let slot: i32 = c.b3_count;
+    c = ecs_tbl_erased_commands_set_b3_slot(c, slot, ce0, ce1, ft0, st0, tt0, fv0, sv0, tv0, ft1, st1, tt1, fv1, sv1, tv1, count);
+    c.b3_count = c.b3_count + 1;
+    c = ecs_tbl_erased_commands_set_slot(c, c.count, ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE3_IF_NEW, 0, 0, slot);
+    c.count = c.count + 1;
+    return c;
+}
+
+fn ecs_tbl_erased_commands_count_by_kind(c: EcsTblErasedCommandsDeep, kind: i32) -> i32 {
+    let i: i32 = 0;
+    let out: i32 = 0;
+    while i < c.count {
+        if ecs_tbl_erased_commands_kind_at(c, i) == kind { out = out + 1; };
+        i = i + 1;
+    }
+    return out;
+}
+
+// resolve_value: scalar payload for INSERT_COMPONENT (pv), INSERT_RESOURCE (pres),
+// WRITE_MESSAGE (pmsg); otherwise 0 (DESPAWN and all batch kinds).
+fn ecs_tbl_erased_commands_resolve_value(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    let kind: i32 = ecs_tbl_erased_commands_kind_at(c, idx);
+    let vidx: i32 = ecs_tbl_erased_commands_idx_at(c, idx);
+    if kind == ECS_CMD_TBL_ERASED_INSERT_COMPONENT {
+        return ecs_tbl_erased_commands_pv_at(c, vidx);
+    };
+    if kind == ECS_CMD_TBL_ERASED_INSERT_RESOURCE {
+        return ecs_tbl_erased_commands_pres_at(c, vidx);
+    };
+    if kind == ECS_CMD_TBL_ERASED_WRITE_MESSAGE {
+        return ecs_tbl_erased_commands_pmsg_at(c, vidx);
+    };
+    return 0;
+}
+
+fn ecs_tbl_erased_commands_resolve_type(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    let kind: i32 = ecs_tbl_erased_commands_kind_at(c, idx);
+    if kind == ECS_CMD_TBL_ERASED_INSERT_COMPONENT {
+        let vidx: i32 = ecs_tbl_erased_commands_idx_at(c, idx);
+        return ecs_tbl_erased_commands_pt_at(c, vidx);
+    };
+    return 0;
+}
+
+// batch slot lookup: For a batch command (kinds 5..10) recover the batch slot tag.
+fn ecs_tbl_erased_commands_batch_slot(c: EcsTblErasedCommandsDeep, idx: i32) -> i32 {
+    let kind: i32 = ecs_tbl_erased_commands_kind_at(c, idx);
+    let is_bundle2: i32 = 0;
+    if kind == ECS_CMD_TBL_ERASED_SPAWN_BATCH_BUNDLE2 { is_bundle2 = 1; };
+    if kind == ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE2 { is_bundle2 = 1; };
+    if kind == ECS_CMD_TBL_ERASED_INSERT_BATCH_BUNDLE2_IF_NEW { is_bundle2 = 1; };
+    if is_bundle2 == 1 {
+        return ecs_tbl_erased_commands_idx_at(c, idx);
+    };
+    return ecs_tbl_erased_commands_idx_at(c, idx);
+}
+
+fn ecs_tbl_erased_commands_clear(c: EcsTblErasedCommandsDeep) -> EcsTblErasedCommandsDeep {
+    return ecs_tbl_erased_commands_new();
+}

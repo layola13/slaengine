@@ -1,0 +1,556 @@
+// Deepened Bevy ECS schedule::config + graph GraphInfo surface.
+// Mirrors src/schedule/config.rs and the GraphInfo/Dependency/Ambiguity/Chain types in
+// src/schedule/graph/mod.rs and schedule.rs. Shallow lib/schedule_config.sla and
+// lib/schedule_configs_extras.sla stay as the simple value slices; this file models the
+// real nested ScheduleConfigs enum, typed Dependency edges, Ambiguity detection state,
+// Chain metadata, and the IntoScheduleConfigs inner methods.
+
+// === DependencyKind (graph/mod.rs) ===
+const ECS_DEP_KIND_BEFORE: i32 = 0;
+const ECS_DEP_KIND_AFTER: i32 = 1;
+
+fn ecs_dep_kind_is_before(k: i32) -> bool { return k == ECS_DEP_KIND_BEFORE; }
+fn ecs_dep_kind_is_after(k: i32) -> bool { return k == ECS_DEP_KIND_AFTER; }
+
+// === Dependency ===
+// Bevy: kind + InternedSystemSet + TypeIdMap of edge options (e.g. IgnoreDeferred).
+struct EcsDependency {
+    kind: i32,
+    set_id: i64,
+    ignore_deferred: bool,   // presence of IgnoreDeferred in options map
+}
+
+fn ecs_dependency_new(kind: i32, set_id: i64) -> EcsDependency {
+    return EcsDependency { kind: kind, set_id: set_id, ignore_deferred: false };
+}
+
+fn ecs_dependency_before(set_id: i64) -> EcsDependency {
+    return ecs_dependency_new(ECS_DEP_KIND_BEFORE, set_id);
+}
+
+fn ecs_dependency_after(set_id: i64) -> EcsDependency {
+    return ecs_dependency_new(ECS_DEP_KIND_AFTER, set_id);
+}
+
+fn ecs_dependency_add_ignore_deferred(d: EcsDependency) -> EcsDependency {
+    d.ignore_deferred = true;
+    return d;
+}
+
+fn ecs_dependency_kind(d: EcsDependency) -> i32 { return d.kind; }
+fn ecs_dependency_set_id(d: EcsDependency) -> i64 { return d.set_id; }
+fn ecs_dependency_ignores_deferred(d: EcsDependency) -> bool { return d.ignore_deferred; }
+fn ecs_dependency_is_before(d: EcsDependency) -> bool { return d.kind == ECS_DEP_KIND_BEFORE; }
+fn ecs_dependency_is_after(d: EcsDependency) -> bool { return d.kind == ECS_DEP_KIND_AFTER; }
+
+// === Ambiguity (graph/mod.rs) ===
+// Check | IgnoreWithSet(Vec) | IgnoreAll
+const ECS_AMBIGUITY_CHECK: i32 = 0;
+const ECS_AMBIGUITY_IGNORE_WITH_SET: i32 = 1;
+const ECS_AMBIGUITY_IGNORE_ALL: i32 = 2;
+
+struct EcsAmbiguity {
+    kind: i32,
+    ignore_sets: Vec<i64>,
+}
+
+fn ecs_ambiguity_check() -> EcsAmbiguity {
+    return EcsAmbiguity { kind: ECS_AMBIGUITY_CHECK, ignore_sets: Vec::new() };
+}
+
+fn ecs_ambiguity_ignore_all() -> EcsAmbiguity {
+    return EcsAmbiguity { kind: ECS_AMBIGUITY_IGNORE_ALL, ignore_sets: Vec::new() };
+}
+
+fn ecs_ambiguity_ignore_with_set(set_id: i64) -> EcsAmbiguity {
+    let sets: Vec<i64> = Vec::new();
+    sets.push(set_id);
+    return EcsAmbiguity { kind: ECS_AMBIGUITY_IGNORE_WITH_SET, ignore_sets: sets };
+}
+
+fn ecs_ambiguity_is_check(a: EcsAmbiguity) -> bool { return a.kind == ECS_AMBIGUITY_CHECK; }
+fn ecs_ambiguity_is_ignore_all(a: EcsAmbiguity) -> bool { return a.kind == ECS_AMBIGUITY_IGNORE_ALL; }
+fn ecs_ambiguity_is_ignore_with_set(a: EcsAmbiguity) -> bool { return a.kind == ECS_AMBIGUITY_IGNORE_WITH_SET; }
+fn ecs_ambiguity_ignore_sets_count(a: EcsAmbiguity) -> i64 { return len(a.ignore_sets) as i64; }
+fn ecs_ambiguity_ignore_set_at(a: EcsAmbiguity, i: i64) -> i64 {
+    if i < 0 || i >= (len(a.ignore_sets) as i64) { return -1; };
+    return a.ignore_sets[i];
+}
+
+// Bevy `ambiguous_with(graph_info, set)` helper:
+// Check -> IgnoreWithSet([set])
+// IgnoreWithSet -> push set
+// IgnoreAll -> no-op
+fn ecs_ambiguity_with(a: EcsAmbiguity, set_id: i64) -> EcsAmbiguity {
+    if a.kind == ECS_AMBIGUITY_IGNORE_ALL { return a; };
+    if a.kind == ECS_AMBIGUITY_CHECK {
+        return ecs_ambiguity_ignore_with_set(set_id);
+    };
+    a.ignore_sets.push(set_id);
+    return a;
+}
+
+// === GraphInfo ===
+// hierarchy: sets the node belongs to
+// dependencies: typed Before/After edges (with optional IgnoreDeferred)
+// ambiguous_with: Ambiguity detection state
+struct EcsGraphInfoDeep {
+    hierarchy: Vec<i64>,
+    deps_kind: Vec<i32>,
+    deps_set: Vec<i64>,
+    deps_ignore_deferred: Vec<bool>,
+    ambiguous: EcsAmbiguity,
+}
+
+fn ecs_graph_info_deep_new() -> EcsGraphInfoDeep {
+    return EcsGraphInfoDeep {
+        hierarchy: Vec::new(),
+        deps_kind: Vec::new(),
+        deps_set: Vec::new(),
+        deps_ignore_deferred: Vec::new(),
+        ambiguous: ecs_ambiguity_check(),
+    };
+}
+
+fn ecs_graph_info_deep_hierarchy_push(g: EcsGraphInfoDeep, set_id: i64) -> EcsGraphInfoDeep {
+    g.hierarchy.push(set_id);
+    return g;
+}
+
+fn ecs_graph_info_deep_hierarchy_count(g: EcsGraphInfoDeep) -> i64 { return len(g.hierarchy) as i64; }
+fn ecs_graph_info_deep_hierarchy_at(g: EcsGraphInfoDeep, i: i64) -> i64 {
+    if i < 0 || i >= (len(g.hierarchy) as i64) { return -1; };
+    return g.hierarchy[i];
+}
+
+fn ecs_graph_info_deep_push_dependency(g: EcsGraphInfoDeep, d: EcsDependency) -> EcsGraphInfoDeep {
+    g.deps_kind.push(d.kind);
+    g.deps_set.push(d.set_id);
+    g.deps_ignore_deferred.push(d.ignore_deferred);
+    return g;
+}
+
+fn ecs_graph_info_deep_dependency_count(g: EcsGraphInfoDeep) -> i64 { return len(g.deps_kind) as i64; }
+
+fn ecs_graph_info_deep_dependency_at(g: EcsGraphInfoDeep, i: i64) -> EcsDependency {
+    if i < 0 || i >= (len(g.deps_kind) as i64) {
+        return ecs_dependency_new(-1, -1);
+    };
+    return EcsDependency {
+        kind: g.deps_kind[i],
+        set_id: g.deps_set[i],
+        ignore_deferred: g.deps_ignore_deferred[i],
+    };
+}
+
+fn ecs_graph_info_deep_before(g: EcsGraphInfoDeep, set_id: i64) -> EcsGraphInfoDeep {
+    return ecs_graph_info_deep_push_dependency(g, ecs_dependency_before(set_id));
+}
+
+fn ecs_graph_info_deep_after(g: EcsGraphInfoDeep, set_id: i64) -> EcsGraphInfoDeep {
+    return ecs_graph_info_deep_push_dependency(g, ecs_dependency_after(set_id));
+}
+
+fn ecs_graph_info_deep_before_ignore_deferred(g: EcsGraphInfoDeep, set_id: i64) -> EcsGraphInfoDeep {
+    let d = ecs_dependency_add_ignore_deferred(ecs_dependency_before(set_id));
+    return ecs_graph_info_deep_push_dependency(g, d);
+}
+
+fn ecs_graph_info_deep_after_ignore_deferred(g: EcsGraphInfoDeep, set_id: i64) -> EcsGraphInfoDeep {
+    let d = ecs_dependency_add_ignore_deferred(ecs_dependency_after(set_id));
+    return ecs_graph_info_deep_push_dependency(g, d);
+}
+
+fn ecs_graph_info_deep_ambiguous_with(g: EcsGraphInfoDeep, set_id: i64) -> EcsGraphInfoDeep {
+    g.ambiguous = ecs_ambiguity_with(g.ambiguous, set_id);
+    return g;
+}
+
+fn ecs_graph_info_deep_ambiguous_with_all(g: EcsGraphInfoDeep) -> EcsGraphInfoDeep {
+    g.ambiguous = ecs_ambiguity_ignore_all();
+    return g;
+}
+
+fn ecs_graph_info_deep_ambiguity(g: EcsGraphInfoDeep) -> EcsAmbiguity { return g.ambiguous; }
+
+// === Chain (schedule.rs) ===
+// Unchained | Chained(TypeIdMap of edge configs). We model presence of IgnoreDeferred on the chain.
+const ECS_CHAIN_UNCHAINED: i32 = 0;
+const ECS_CHAIN_CHAINED: i32 = 1;
+
+struct EcsChain {
+    kind: i32,
+    ignore_deferred: bool,
+}
+
+fn ecs_chain_unchained() -> EcsChain {
+    return EcsChain { kind: ECS_CHAIN_UNCHAINED, ignore_deferred: false };
+}
+
+fn ecs_chain_is_unchained(c: EcsChain) -> bool { return c.kind == ECS_CHAIN_UNCHAINED; }
+fn ecs_chain_is_chained(c: EcsChain) -> bool { return c.kind == ECS_CHAIN_CHAINED; }
+fn ecs_chain_ignores_deferred(c: EcsChain) -> bool { return c.ignore_deferred; }
+
+// set_chained: if Unchained -> Chained(empty map); if already Chained, keep configs.
+fn ecs_chain_set_chained(c: EcsChain) -> EcsChain {
+    if c.kind == ECS_CHAIN_UNCHAINED {
+        return EcsChain { kind: ECS_CHAIN_CHAINED, ignore_deferred: false };
+    };
+    return c;
+}
+
+// set_chained_with_config(IgnoreDeferred): set_chained then insert IgnoreDeferred.
+fn ecs_chain_set_chained_with_ignore_deferred(c: EcsChain) -> EcsChain {
+    c = ecs_chain_set_chained(c);
+    c.ignore_deferred = true;
+    return c;
+}
+
+// === ScheduleConfig<T> ===
+// node kind: 0 = system, 1 = system set
+// conditions: run-condition ids attached to this single node
+// system_type_set_forbidden: for InternedSystemSet into_config assertion
+const ECS_NODE_SYSTEM: i32 = 0;
+const ECS_NODE_SYSTEM_SET: i32 = 1;
+
+struct EcsScheduleConfigDeep {
+    node_kind: i32,
+    node_id: i64,
+    metadata: EcsGraphInfoDeep,
+    conditions: Vec<i64>,
+    is_system_type_set: bool,
+}
+
+fn ecs_schedule_config_deep_system(system_id: i64) -> EcsScheduleConfigDeep {
+    return EcsScheduleConfigDeep {
+        node_kind: ECS_NODE_SYSTEM,
+        node_id: system_id,
+        metadata: ecs_graph_info_deep_new(),
+        conditions: Vec::new(),
+        is_system_type_set: false,
+    };
+}
+
+// Schedulable for ScheduleSystem: default_system_sets go into hierarchy.
+fn ecs_schedule_config_deep_system_with_default_sets(system_id: i64, default_sets: Vec<i64>) -> EcsScheduleConfigDeep {
+    let c = ecs_schedule_config_deep_system(system_id);
+    let i: i64 = 0;
+    let n: i64 = len(default_sets) as i64;
+    while i < n {
+        c.metadata = ecs_graph_info_deep_hierarchy_push(c.metadata, default_sets[i]);
+        i = i + 1;
+    }
+    return c;
+}
+
+// Schedulable for InternedSystemSet: asserting system_type is None.
+// Returns (ok, config). ok=false when configuring a system type set (Bevy assert!).
+fn ecs_schedule_config_deep_system_set(set_id: i64, is_system_type_set: bool) -> (bool, EcsScheduleConfigDeep) {
+    if is_system_type_set {
+        let dummy = ecs_schedule_config_deep_system(0);
+        return (false, dummy);
+    };
+    let c = EcsScheduleConfigDeep {
+        node_kind: ECS_NODE_SYSTEM_SET,
+        node_id: set_id,
+        metadata: ecs_graph_info_deep_new(),
+        conditions: Vec::new(),
+        is_system_type_set: false,
+    };
+    return (true, c);
+}
+
+fn ecs_schedule_config_deep_node_kind(c: EcsScheduleConfigDeep) -> i32 { return c.node_kind; }
+fn ecs_schedule_config_deep_node_id(c: EcsScheduleConfigDeep) -> i64 { return c.node_id; }
+fn ecs_schedule_config_deep_is_system(c: EcsScheduleConfigDeep) -> bool { return c.node_kind == ECS_NODE_SYSTEM; }
+fn ecs_schedule_config_deep_is_set(c: EcsScheduleConfigDeep) -> bool { return c.node_kind == ECS_NODE_SYSTEM_SET; }
+fn ecs_schedule_config_deep_condition_count(c: EcsScheduleConfigDeep) -> i64 { return len(c.conditions) as i64; }
+fn ecs_schedule_config_deep_condition_at(c: EcsScheduleConfigDeep, i: i64) -> i64 {
+    if i < 0 || i >= (len(c.conditions) as i64) { return -1; };
+    return c.conditions[i];
+}
+fn ecs_schedule_config_deep_metadata(c: EcsScheduleConfigDeep) -> EcsGraphInfoDeep { return c.metadata; }
+
+fn ecs_schedule_config_deep_push_condition(c: EcsScheduleConfigDeep, condition_id: i64) -> EcsScheduleConfigDeep {
+    c.conditions.push(condition_id);
+    return c;
+}
+
+// === Nested ScheduleConfigs enum ===
+// 0 = ScheduleConfig (single leaf)
+// 1 = Configs { configs, collective_conditions, metadata: Chain }
+const ECS_CONFIGS_SINGLE: i32 = 0;
+const ECS_CONFIGS_GROUP: i32 = 1;
+
+// Flat arena encoding for nested configs:
+// - nodes store kind + leaf ScheduleConfigDeep OR group payload
+// - group children are indices into the same arena (flattened after construction helpers)
+// For the deep model we keep a recursive-friendly structure of leaf configs in a tree via
+// explicit group children lists (indices into `leaves` for single, and nested groups via
+// a group table). Practical surface: one level of nesting is the common Bevy path; we still
+// model recursive in_set_inner via leaf walk.
+struct EcsScheduleConfigsDeep {
+    kind: i32,
+    // Single payload (valid when kind == SINGLE)
+    single: EcsScheduleConfigDeep,
+    // Group payload
+    children: Vec<EcsScheduleConfigsDeep>,
+    collective_conditions: Vec<i64>,
+    chain: EcsChain,
+}
+
+fn ecs_schedule_configs_deep_single(config: EcsScheduleConfigDeep) -> EcsScheduleConfigsDeep {
+    return EcsScheduleConfigsDeep {
+        kind: ECS_CONFIGS_SINGLE,
+        single: config,
+        children: Vec::new(),
+        collective_conditions: Vec::new(),
+        chain: ecs_chain_unchained(),
+    };
+}
+
+fn ecs_schedule_configs_deep_group(children: Vec<EcsScheduleConfigsDeep>) -> EcsScheduleConfigsDeep {
+    return EcsScheduleConfigsDeep {
+        kind: ECS_CONFIGS_GROUP,
+        single: ecs_schedule_config_deep_system(0),
+        children: children,
+        collective_conditions: Vec::new(),
+        chain: ecs_chain_unchained(),
+    };
+}
+
+fn ecs_schedule_configs_deep_is_single(c: EcsScheduleConfigsDeep) -> bool { return c.kind == ECS_CONFIGS_SINGLE; }
+fn ecs_schedule_configs_deep_is_group(c: EcsScheduleConfigsDeep) -> bool { return c.kind == ECS_CONFIGS_GROUP; }
+fn ecs_schedule_configs_deep_child_count(c: EcsScheduleConfigsDeep) -> i64 { return len(c.children) as i64; }
+fn ecs_schedule_configs_deep_collective_count(c: EcsScheduleConfigsDeep) -> i64 { return len(c.collective_conditions) as i64; }
+fn ecs_schedule_configs_deep_get_chain(c: EcsScheduleConfigsDeep) -> EcsChain { return c.chain; }
+fn ecs_schedule_configs_deep_single_config(c: EcsScheduleConfigsDeep) -> EcsScheduleConfigDeep { return c.single; }
+
+// in_set_inner: push set into hierarchy for every leaf. Bevy asserts set.system_type().is_none()
+// at the IntoScheduleConfigs::in_set boundary; we accept a flag and reject system type sets.
+fn ecs_schedule_configs_deep_in_set(c: EcsScheduleConfigsDeep, set_id: i64, set_is_system_type: bool) -> (bool, EcsScheduleConfigsDeep) {
+    if set_is_system_type { return (false, c); };
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_hierarchy_push(c.single.metadata, set_id);
+        return (true, c);
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        let r = ecs_schedule_configs_deep_in_set(c.children[i], set_id, false);
+        c.children[i] = r.1;
+        i = i + 1;
+    }
+    return (true, c);
+}
+
+fn ecs_schedule_configs_deep_before(c: EcsScheduleConfigsDeep, set_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_before(c.single.metadata, set_id);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_before(c.children[i], set_id);
+        i = i + 1;
+    }
+    return c;
+}
+
+fn ecs_schedule_configs_deep_after(c: EcsScheduleConfigsDeep, set_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_after(c.single.metadata, set_id);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_after(c.children[i], set_id);
+        i = i + 1;
+    }
+    return c;
+}
+
+fn ecs_schedule_configs_deep_before_ignore_deferred(c: EcsScheduleConfigsDeep, set_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_before_ignore_deferred(c.single.metadata, set_id);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_before_ignore_deferred(c.children[i], set_id);
+        i = i + 1;
+    }
+    return c;
+}
+
+fn ecs_schedule_configs_deep_after_ignore_deferred(c: EcsScheduleConfigsDeep, set_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_after_ignore_deferred(c.single.metadata, set_id);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_after_ignore_deferred(c.children[i], set_id);
+        i = i + 1;
+    }
+    return c;
+}
+
+// distributive_run_if: push condition onto every leaf config.conditions
+fn ecs_schedule_configs_deep_distributive_run_if(c: EcsScheduleConfigsDeep, condition_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single = ecs_schedule_config_deep_push_condition(c.single, condition_id);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_distributive_run_if(c.children[i], condition_id);
+        i = i + 1;
+    }
+    return c;
+}
+
+// run_if_dyn: single leaf -> push condition; group -> push collective_conditions
+fn ecs_schedule_configs_deep_run_if(c: EcsScheduleConfigsDeep, condition_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single = ecs_schedule_config_deep_push_condition(c.single, condition_id);
+        return c;
+    };
+    c.collective_conditions.push(condition_id);
+    return c;
+}
+
+fn ecs_schedule_configs_deep_ambiguous_with(c: EcsScheduleConfigsDeep, set_id: i64) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_ambiguous_with(c.single.metadata, set_id);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_ambiguous_with(c.children[i], set_id);
+        i = i + 1;
+    }
+    return c;
+}
+
+fn ecs_schedule_configs_deep_ambiguous_with_all(c: EcsScheduleConfigsDeep) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        c.single.metadata = ecs_graph_info_deep_ambiguous_with_all(c.single.metadata);
+        return c;
+    };
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        c.children[i] = ecs_schedule_configs_deep_ambiguous_with_all(c.children[i]);
+        i = i + 1;
+    }
+    return c;
+}
+
+// chain_inner: no-op on Single; set_chained on group metadata
+fn ecs_schedule_configs_deep_chain(c: EcsScheduleConfigsDeep) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE { return c; };
+    c.chain = ecs_chain_set_chained(c.chain);
+    return c;
+}
+
+// chain_ignore_deferred_inner
+fn ecs_schedule_configs_deep_chain_ignore_deferred(c: EcsScheduleConfigsDeep) -> EcsScheduleConfigsDeep {
+    if c.kind == ECS_CONFIGS_SINGLE { return c; };
+    c.chain = ecs_chain_set_chained_with_ignore_deferred(c.chain);
+    return c;
+}
+
+// into_configs identity (IntoScheduleConfigs for ScheduleConfigs)
+fn ecs_schedule_configs_deep_into_configs(c: EcsScheduleConfigsDeep) -> EcsScheduleConfigsDeep {
+    return c;
+}
+
+// Count leaf conditions across the tree (for distributive_run_if verification).
+fn ecs_schedule_configs_deep_leaf_condition_total(c: EcsScheduleConfigsDeep) -> i64 {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        return len(c.single.conditions) as i64;
+    };
+    let total: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        total = total + ecs_schedule_configs_deep_leaf_condition_total(c.children[i]);
+        i = i + 1;
+    }
+    return total;
+}
+
+// Count leaf hierarchy membership of a given set across the tree.
+fn ecs_schedule_configs_deep_leaf_hierarchy_membership_count(c: EcsScheduleConfigsDeep, set_id: i64) -> i64 {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        let g = c.single.metadata;
+        let i: i64 = 0;
+        let n: i64 = len(g.hierarchy) as i64;
+        let count: i64 = 0;
+        while i < n {
+            if g.hierarchy[i] == set_id { count = count + 1; };
+            i = i + 1;
+        }
+        return count;
+    };
+    let total: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        total = total + ecs_schedule_configs_deep_leaf_hierarchy_membership_count(c.children[i], set_id);
+        i = i + 1;
+    }
+    return total;
+}
+
+// Count leaf dependencies of a given kind/set across the tree.
+fn ecs_schedule_configs_deep_leaf_dep_count(c: EcsScheduleConfigsDeep, kind: i32, set_id: i64, require_ignore_deferred: bool) -> i64 {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        let g = c.single.metadata;
+        let i: i64 = 0;
+        let n: i64 = len(g.deps_kind) as i64;
+        let count: i64 = 0;
+        while i < n {
+            if g.deps_kind[i] == kind && g.deps_set[i] == set_id {
+                if require_ignore_deferred {
+                    if g.deps_ignore_deferred[i] { count = count + 1; };
+                } else {
+                    if g.deps_ignore_deferred[i] == false { count = count + 1; };
+                };
+            };
+            i = i + 1;
+        }
+        return count;
+    };
+    let total: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        total = total + ecs_schedule_configs_deep_leaf_dep_count(c.children[i], kind, set_id, require_ignore_deferred);
+        i = i + 1;
+    }
+    return total;
+}
+
+// Count leaves whose Ambiguity is IgnoreAll.
+fn ecs_schedule_configs_deep_leaf_ignore_all_count(c: EcsScheduleConfigsDeep) -> i64 {
+    if c.kind == ECS_CONFIGS_SINGLE {
+        if ecs_ambiguity_is_ignore_all(c.single.metadata.ambiguous) { return 1; };
+        return 0;
+    };
+    let total: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(c.children) as i64;
+    while i < n {
+        total = total + ecs_schedule_configs_deep_leaf_ignore_all_count(c.children[i]);
+        i = i + 1;
+    }
+    return total;
+}

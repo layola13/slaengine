@@ -1,0 +1,174 @@
+// Bevy ThreadExecutor-shaped synchronous task ticker model.
+//
+// SLA does not have Rust Future polling, so this module models the observable
+// executor surface with queued i32 task results: spawn enqueues work, and the
+// owner ticker must try_tick before a task handle can observe completion.
+@import "sa_std/vec.sa"
+
+struct EcsThreadTask {
+    executor_id: i64,
+    task_id: i64,
+    detached: bool,
+}
+
+struct EcsThreadExecutor {
+    executor_id: i64,
+    owner_thread_id: i64,
+    next_task_id: i64,
+    queued_task_ids: Vec<i64>,
+    queued_values: Vec<i32>,
+    completed_task_ids: Vec<i64>,
+    completed_values: Vec<i32>,
+    tick_count: i64,
+}
+
+struct EcsThreadExecutorTicker {
+    has_ticker: bool,
+    executor_id: i64,
+    owner_thread_id: i64,
+}
+
+struct EcsThreadExecutorTickResult {
+    executor: EcsThreadExecutor,
+    ticked: bool,
+    task_id: i64,
+    value: i32,
+}
+
+fn ecs_thread_task_new(executor_id: i64, task_id: i64, detached: bool) -> EcsThreadTask {
+    return EcsThreadTask { executor_id: executor_id, task_id: task_id, detached: detached };
+}
+
+fn ecs_thread_executor_new_with_id(owner_thread_id: i64, executor_id: i64) -> EcsThreadExecutor {
+    let queued_task_ids: Vec<i64> = Vec::new();
+    let queued_values: Vec<i32> = Vec::new();
+    let completed_task_ids: Vec<i64> = Vec::new();
+    let completed_values: Vec<i32> = Vec::new();
+    return EcsThreadExecutor { executor_id: executor_id, owner_thread_id: owner_thread_id, next_task_id: 0, queued_task_ids: queued_task_ids, queued_values: queued_values, completed_task_ids: completed_task_ids, completed_values: completed_values, tick_count: 0 };
+}
+
+fn ecs_thread_executor_new(owner_thread_id: i64) -> EcsThreadExecutor {
+    return ecs_thread_executor_new_with_id(owner_thread_id, 1);
+}
+
+fn ecs_thread_executor_ticker(executor: EcsThreadExecutor, current_thread_id: i64) -> EcsThreadExecutorTicker {
+    let has = current_thread_id == executor.owner_thread_id;
+    return EcsThreadExecutorTicker { has_ticker: has, executor_id: executor.executor_id, owner_thread_id: executor.owner_thread_id };
+}
+
+fn ecs_thread_executor_is_same_id(first: EcsThreadExecutor, second: EcsThreadExecutor) -> bool {
+    return first.executor_id == second.executor_id;
+}
+
+fn ecs_thread_executor_spawn_value(executor: EcsThreadExecutor, value: i32) -> (EcsThreadExecutor, EcsThreadTask) {
+    let task_id = executor.next_task_id;
+    executor.next_task_id = executor.next_task_id + 1;
+    executor.queued_task_ids.push(task_id);
+    executor.queued_values.push(value);
+    return (executor, ecs_thread_task_new(executor.executor_id, task_id, false));
+}
+
+fn ecs_thread_executor_spawn_detached_value(executor: EcsThreadExecutor, value: i32) -> (EcsThreadExecutor, EcsThreadTask) {
+    let task_id = executor.next_task_id;
+    executor.next_task_id = executor.next_task_id + 1;
+    executor.queued_task_ids.push(task_id);
+    executor.queued_values.push(value);
+    return (executor, ecs_thread_task_new(executor.executor_id, task_id, true));
+}
+
+fn ecs_thread_executor_tick_result(executor: EcsThreadExecutor, ticked: bool, task_id: i64, value: i32) -> EcsThreadExecutorTickResult {
+    return EcsThreadExecutorTickResult { executor: executor, ticked: ticked, task_id: task_id, value: value };
+}
+
+fn ecs_thread_executor_try_tick(executor: EcsThreadExecutor, ticker: EcsThreadExecutorTicker) -> EcsThreadExecutorTickResult {
+    if ticker.has_ticker != true { return ecs_thread_executor_tick_result(executor, false, -1, 0); };
+    if ticker.executor_id != executor.executor_id { return ecs_thread_executor_tick_result(executor, false, -1, 0); };
+    if len(executor.queued_task_ids) == 0 { return ecs_thread_executor_tick_result(executor, false, -1, 0); };
+    let task_id = executor.queued_task_ids[0];
+    let value = executor.queued_values[0];
+    let next_ids: Vec<i64> = Vec::new();
+    let next_values: Vec<i32> = Vec::new();
+    let i: i64 = 1;
+    let n = len(executor.queued_task_ids) as i64;
+    while i < n {
+        next_ids.push(executor.queued_task_ids[i]);
+        next_values.push(executor.queued_values[i]);
+        i = i + 1;
+    }
+    executor.queued_task_ids = next_ids;
+    executor.queued_values = next_values;
+    executor.completed_task_ids.push(task_id);
+    executor.completed_values.push(value);
+    executor.tick_count = executor.tick_count + 1;
+    return ecs_thread_executor_tick_result(executor, true, task_id, value);
+}
+
+fn ecs_thread_task_completed_slot(executor: EcsThreadExecutor, task: EcsThreadTask) -> i64 {
+    if task.executor_id != executor.executor_id { return -1; };
+    let i: i64 = 0;
+    let n = len(executor.completed_task_ids) as i64;
+    while i < n {
+        if executor.completed_task_ids[i] == task.task_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_thread_task_is_finished(executor: EcsThreadExecutor, task: EcsThreadTask) -> bool {
+    return ecs_thread_task_completed_slot(executor, task) >= 0;
+}
+
+fn ecs_thread_task_value_or(executor: EcsThreadExecutor, task: EcsThreadTask, default_value: i32) -> i32 {
+    let slot = ecs_thread_task_completed_slot(executor, task);
+    if slot < 0 { return default_value; };
+    return executor.completed_values[slot];
+}
+
+@test "thread executor ticker only exists on owner thread"() {
+    let executor = ecs_thread_executor_new_with_id(10, 99);
+    let owner = ecs_thread_executor_ticker(executor, 10);
+    let other = ecs_thread_executor_ticker(executor, 11);
+    if owner.has_ticker != true { panic(31310); };
+    if other.has_ticker { panic(31311); };
+    if owner.executor_id != 99 { panic(31312); };
+}
+
+@test "thread executor spawn waits for explicit tick"() {
+    let e0 = ecs_thread_executor_new(0);
+    let (e1, task) = ecs_thread_executor_spawn_value(e0, 42);
+    if ecs_thread_task_is_finished(e1, task) { panic(31320); };
+    let ticker = ecs_thread_executor_ticker(e1, 0);
+    let ticked = ecs_thread_executor_try_tick(e1, ticker);
+    if ticked.ticked != true { panic(31321); };
+    if ticked.task_id != task.task_id { panic(31322); };
+    if ecs_thread_task_is_finished(ticked.executor, task) != true { panic(31323); };
+    if ecs_thread_task_value_or(ticked.executor, task, -1) != 42 { panic(31324); };
+}
+
+@test "thread executor try tick drains one queued task"() {
+    let e0 = ecs_thread_executor_new(0);
+    let (e1, first) = ecs_thread_executor_spawn_value(e0, 7);
+    let (e2, second) = ecs_thread_executor_spawn_value(e1, 9);
+    let ticker = ecs_thread_executor_ticker(e2, 0);
+    let r1 = ecs_thread_executor_try_tick(e2, ticker);
+    if r1.ticked != true { panic(31330); };
+    if ecs_thread_task_is_finished(r1.executor, first) != true { panic(31331); };
+    if ecs_thread_task_is_finished(r1.executor, second) { panic(31332); };
+    let ticker2 = ecs_thread_executor_ticker(r1.executor, 0);
+    let r2 = ecs_thread_executor_try_tick(r1.executor, ticker2);
+    if ecs_thread_task_value_or(r2.executor, second, -1) != 9 { panic(31333); };
+    if r2.executor.tick_count != 2 { panic(31334); };
+}
+
+@test "thread executor detached task still runs and identity is explicit"() {
+    let a = ecs_thread_executor_new_with_id(0, 5);
+    let b = ecs_thread_executor_new_with_id(0, 5);
+    let c = ecs_thread_executor_new_with_id(0, 6);
+    if ecs_thread_executor_is_same_id(a, b) != true { panic(31340); };
+    if ecs_thread_executor_is_same_id(a, c) { panic(31341); };
+    let (e1, task) = ecs_thread_executor_spawn_detached_value(a, 33);
+    if task.detached != true { panic(31342); };
+    let ticker = ecs_thread_executor_ticker(e1, 0);
+    let r = ecs_thread_executor_try_tick(e1, ticker);
+    if ecs_thread_task_value_or(r.executor, task, -1) != 33 { panic(31343); };
+}

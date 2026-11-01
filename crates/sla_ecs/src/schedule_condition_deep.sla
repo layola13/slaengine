@@ -1,0 +1,287 @@
+// Deepened Bevy ECS schedule::condition combinator + stateful common_conditions surface.
+// Mirrors src/schedule/condition.rs SystemCondition combinators (AndThen/AndEager/.../Xnor/Xor)
+// and the Local-backed resource trackers (resource_changed_or_removed / resource_removed).
+// Shallow lib/schedule_condition.sla and lib/schedule_condition_advanced.sla stay as the
+// simple bool helpers; this file models evaluation order, short-circuiting, Result unwrap_or
+// (false), and Local-state resource trackers faithfully.
+
+// === Condition evaluation outcome ===
+// Bevy combinators use Result<bool, RunSystemError> and unwrap_or(false) on each arm.
+const ECS_COND_OK: i32 = 0;
+const ECS_COND_ERR: i32 = 1;
+
+struct EcsCondOutcome {
+    kind: i32,
+    value: bool,
+}
+
+fn ecs_cond_outcome_ok(value: bool) -> EcsCondOutcome {
+    return EcsCondOutcome { kind: ECS_COND_OK, value: value };
+}
+
+fn ecs_cond_outcome_err() -> EcsCondOutcome {
+    return EcsCondOutcome { kind: ECS_COND_ERR, value: false };
+}
+
+fn ecs_cond_outcome_is_ok(o: EcsCondOutcome) -> bool { return o.kind == ECS_COND_OK; }
+fn ecs_cond_outcome_is_err(o: EcsCondOutcome) -> bool { return o.kind == ECS_COND_ERR; }
+fn ecs_cond_outcome_value(o: EcsCondOutcome) -> bool { return o.value; }
+
+// Bevy: a(input, data).unwrap_or(false)
+fn ecs_cond_outcome_unwrap_or_false(o: EcsCondOutcome) -> bool {
+    if o.kind == ECS_COND_ERR { return false; };
+    return o.value;
+}
+
+// === Combinator kind markers (condition.rs lines 1439-1667) ===
+const ECS_COMB_DEEP_AND_THEN: i32 = 0;
+const ECS_COMB_DEEP_AND_EAGER: i32 = 1;
+const ECS_COMB_DEEP_NAND_THEN: i32 = 2;
+const ECS_COMB_DEEP_NAND_EAGER: i32 = 3;
+const ECS_COMB_DEEP_NOR_ELSE: i32 = 4;
+const ECS_COMB_DEEP_NOR_EAGER: i32 = 5;
+const ECS_COMB_DEEP_OR_ELSE: i32 = 6;
+const ECS_COMB_DEEP_OR_EAGER: i32 = 7;
+const ECS_COMB_DEEP_XNOR: i32 = 8;
+const ECS_COMB_DEEP_XOR: i32 = 9;
+
+fn ecs_comb_deep_is_then(kind: i32) -> bool {
+    if kind == ECS_COMB_DEEP_AND_THEN { return true; };
+    if kind == ECS_COMB_DEEP_NAND_THEN { return true; };
+    if kind == ECS_COMB_DEEP_NOR_ELSE { return true; };
+    if kind == ECS_COMB_DEEP_OR_ELSE { return true; };
+    return false;
+}
+
+fn ecs_comb_deep_is_eager(kind: i32) -> bool {
+    return ecs_comb_deep_is_then(kind) != true;
+}
+
+// Evaluation result: final bool + whether B was actually invoked + A/B unwrap values.
+struct EcsCombEval {
+    result: bool,
+    a_ran: bool,
+    b_ran: bool,
+    a_unwrapped: bool,
+    b_unwrapped: bool,
+}
+
+fn ecs_comb_eval_new(result: bool, a_ran: bool, b_ran: bool, a_unwrapped: bool, b_unwrapped: bool) -> EcsCombEval {
+    return EcsCombEval {
+        result: result,
+        a_ran: a_ran,
+        b_ran: b_ran,
+        a_unwrapped: a_unwrapped,
+        b_unwrapped: b_unwrapped,
+    };
+}
+
+fn ecs_comb_eval_result(e: EcsCombEval) -> bool { return e.result; }
+fn ecs_comb_eval_a_ran(e: EcsCombEval) -> bool { return e.a_ran; }
+fn ecs_comb_eval_b_ran(e: EcsCombEval) -> bool { return e.b_ran; }
+fn ecs_comb_eval_a_unwrapped(e: EcsCombEval) -> bool { return e.a_unwrapped; }
+fn ecs_comb_eval_b_unwrapped(e: EcsCombEval) -> bool { return e.b_unwrapped; }
+
+// Short-circuit policy (Bevy AndThen uses && which short-circuits; AndEager uses & which does not).
+// For Then variants we only invoke B when needed:
+//   AndThen / NandThen: run B only if A_unwrapped == true
+//   OrElse / NorElse:   run B only if A_unwrapped == false
+// Eager variants always run both.
+// When B is skipped, b_unwrapped is treated as false (never observed).
+fn ecs_comb_deep_should_run_b(kind: i32, a_unwrapped: bool) -> bool {
+    if kind == ECS_COMB_DEEP_AND_THEN { return a_unwrapped; };
+    if kind == ECS_COMB_DEEP_NAND_THEN { return a_unwrapped; };
+    if kind == ECS_COMB_DEEP_OR_ELSE { return a_unwrapped != true; };
+    if kind == ECS_COMB_DEEP_NOR_ELSE { return a_unwrapped != true; };
+    // Eager + Xor/Xnor always run both
+    return true;
+}
+
+fn ecs_comb_deep_combine_bools(kind: i32, a: bool, b: bool) -> bool {
+    if kind == ECS_COMB_DEEP_AND_THEN { return a && b; };
+    if kind == ECS_COMB_DEEP_AND_EAGER { return a && b; };
+    if kind == ECS_COMB_DEEP_NAND_THEN { return (a && b) != true; };
+    if kind == ECS_COMB_DEEP_NAND_EAGER { return (a && b) != true; };
+    if kind == ECS_COMB_DEEP_NOR_ELSE { return (a || b) != true; };
+    if kind == ECS_COMB_DEEP_NOR_EAGER { return (a || b) != true; };
+    if kind == ECS_COMB_DEEP_OR_ELSE { return a || b; };
+    if kind == ECS_COMB_DEEP_OR_EAGER { return a || b; };
+    if kind == ECS_COMB_DEEP_XNOR { return (a != b) != true; };
+    if kind == ECS_COMB_DEEP_XOR { return a != b; };
+    return false;
+}
+
+// Evaluate combinator given outcomes for A and B.
+// If B would not run under short-circuit, pass any B outcome (it is ignored) and b_ran=false.
+fn ecs_comb_deep_eval(kind: i32, a: EcsCondOutcome, b: EcsCondOutcome) -> EcsCombEval {
+    let a_u = ecs_cond_outcome_unwrap_or_false(a);
+    let run_b = ecs_comb_deep_should_run_b(kind, a_u);
+    let b_u = false;
+    if run_b {
+        b_u = ecs_cond_outcome_unwrap_or_false(b);
+    };
+    let result = ecs_comb_deep_combine_bools(kind, a_u, b_u);
+    return ecs_comb_eval_new(result, true, run_b, a_u, b_u);
+}
+
+// Convenience: evaluate from plain bools (both always available; short-circuit still tracked).
+fn ecs_comb_deep_eval_bools(kind: i32, a: bool, b: bool) -> EcsCombEval {
+    return ecs_comb_deep_eval(kind, ecs_cond_outcome_ok(a), ecs_cond_outcome_ok(b));
+}
+
+// NotSystem / NotMarker: negate a condition outcome (err -> false, then !).
+fn ecs_comb_deep_not(a: EcsCondOutcome) -> bool {
+    let u = ecs_cond_outcome_unwrap_or_false(a);
+    return u != true;
+}
+
+// === SystemCondition trait method surface (kind builders) ===
+// Models the trait methods that return CombinatorSystem wrappers.
+fn ecs_system_condition_and_then() -> i32 { return ECS_COMB_DEEP_AND_THEN; }
+fn ecs_system_condition_and_eager() -> i32 { return ECS_COMB_DEEP_AND_EAGER; }
+fn ecs_system_condition_nand_then() -> i32 { return ECS_COMB_DEEP_NAND_THEN; }
+fn ecs_system_condition_nand_eager() -> i32 { return ECS_COMB_DEEP_NAND_EAGER; }
+fn ecs_system_condition_nor_else() -> i32 { return ECS_COMB_DEEP_NOR_ELSE; }
+fn ecs_system_condition_nor_eager() -> i32 { return ECS_COMB_DEEP_NOR_EAGER; }
+fn ecs_system_condition_or_else() -> i32 { return ECS_COMB_DEEP_OR_ELSE; }
+fn ecs_system_condition_or_eager() -> i32 { return ECS_COMB_DEEP_OR_EAGER; }
+fn ecs_system_condition_xnor() -> i32 { return ECS_COMB_DEEP_XNOR; }
+fn ecs_system_condition_xor() -> i32 { return ECS_COMB_DEEP_XOR; }
+
+// === Stateful resource trackers (Local<bool> existed) ===
+// Bevy resource_changed_or_removed / resource_removed use Local<bool> existed.
+struct EcsResTrackDeep {
+    existed: bool,
+}
+
+fn ecs_res_track_deep_new() -> EcsResTrackDeep {
+    return EcsResTrackDeep { existed: false };
+}
+
+fn ecs_res_track_deep_existed(t: EcsResTrackDeep) -> bool { return t.existed; }
+
+// resource_changed_or_removed:
+//   Some(res) => { *existed = true; res.is_changed() }
+//   None if *existed => { *existed = false; true }
+//   None else => false
+fn ecs_res_changed_or_removed(t: EcsResTrackDeep, present: bool, is_changed: bool) -> (bool, EcsResTrackDeep) {
+    if present {
+        t.existed = true;
+        return (is_changed, t);
+    };
+    if t.existed {
+        t.existed = false;
+        return (true, t);
+    };
+    return (false, t);
+}
+
+// resource_removed:
+//   Some(_) => { *existed = true; false }
+//   None if *existed => { *existed = false; true }
+//   None else => false
+fn ecs_res_removed(t: EcsResTrackDeep, present: bool) -> (bool, EcsResTrackDeep) {
+    if present {
+        t.existed = true;
+        return (false, t);
+    };
+    if t.existed {
+        t.existed = false;
+        return (true, t);
+    };
+    return (false, t);
+}
+
+// resource_exists / resource_added / resource_changed / resource_exists_and_changed facades
+// matching Bevy Option/Res detect-changes inputs (value-level).
+fn ecs_cond_deep_resource_exists(present: bool) -> bool { return present; }
+
+fn ecs_cond_deep_resource_added(present: bool, is_added: bool) -> bool {
+    if present != true { return false; };
+    return is_added;
+}
+
+// resource_changed panics if missing in Bevy (Res<T>); model as requires present.
+fn ecs_cond_deep_resource_changed(present: bool, is_changed: bool) -> (bool, bool) {
+    // (ok, value) — ok=false means missing resource (would panic in Bevy)
+    if present != true { return (false, false); };
+    return (true, is_changed);
+}
+
+fn ecs_cond_deep_resource_exists_and_changed(present: bool, is_changed: bool) -> bool {
+    if present != true { return false; };
+    return is_changed;
+}
+
+// resource_equals panics if missing; resource_exists_and_equals returns false if missing.
+fn ecs_cond_deep_resource_equals(present: bool, current: i64, expected: i64) -> (bool, bool) {
+    if present != true { return (false, false); };
+    return (true, current == expected);
+}
+
+fn ecs_cond_deep_resource_exists_and_equals(present: bool, current: i64, expected: i64) -> bool {
+    if present != true { return false; };
+    return current == expected;
+}
+
+fn ecs_cond_deep_resource_exists_and(present: bool, predicate: bool) -> bool {
+    if present != true { return false; };
+    return predicate;
+}
+
+// on_message: consume unread count (>0). Bevy MessageReader::read().count() > 0.
+fn ecs_cond_deep_on_message(unread_count: i64) -> bool {
+    return unread_count > 0;
+}
+
+// any_with_component / any_component_removed / any_match_filter
+fn ecs_cond_deep_any_with_component(count: i64) -> bool { return count > 0; }
+fn ecs_cond_deep_any_component_removed(removal_count: i64) -> bool { return removal_count > 0; }
+fn ecs_cond_deep_any_match_filter(matched_count: i64) -> bool { return matched_count > 0; }
+
+// === condition_changed / condition_changed_to (Local<bool> prev, default false) ===
+// Bevy condition_changed:
+//   let changed = *prev != new; *prev = new; changed
+// First call assumes prev=false (Local default).
+struct EcsCondChangedDeep {
+    prev: bool,
+}
+
+fn ecs_cond_changed_deep_new() -> EcsCondChangedDeep {
+    return EcsCondChangedDeep { prev: false };
+}
+
+fn ecs_cond_changed_deep_prev(s: EcsCondChangedDeep) -> bool { return s.prev; }
+
+fn ecs_cond_changed_deep(s: EcsCondChangedDeep, new_result: bool) -> (bool, EcsCondChangedDeep) {
+    let changed = s.prev != new_result;
+    s.prev = new_result;
+    return (changed, s);
+}
+
+// condition_changed_to(to, ...):
+//   let now_true = *prev != new && new == to; *prev = new; now_true
+fn ecs_cond_changed_to_deep(s: EcsCondChangedDeep, to: bool, new_result: bool) -> (bool, EcsCondChangedDeep) {
+    let now_true = s.prev != new_result && new_result == to;
+    s.prev = new_result;
+    return (now_true, s);
+}
+
+// run_once (Local<bool> has_run)
+struct EcsRunOnceDeep {
+    has_run: bool,
+}
+
+fn ecs_run_once_deep_new() -> EcsRunOnceDeep {
+    return EcsRunOnceDeep { has_run: false };
+}
+
+fn ecs_run_once_deep(s: EcsRunOnceDeep) -> (bool, EcsRunOnceDeep) {
+    if s.has_run != true {
+        s.has_run = true;
+        return (true, s);
+    };
+    return (false, s);
+}
+
+fn ecs_run_once_deep_has_run(s: EcsRunOnceDeep) -> bool { return s.has_run; }

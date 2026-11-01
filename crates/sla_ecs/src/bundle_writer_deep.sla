@@ -1,0 +1,382 @@
+// Deepened Bevy ECS bundle writer surface.
+// Mirrors src/bundle/writer.rs:
+//   BundleScratch { component_ids, component_ptrs/values, alloc }
+//   BundleWriter push_component / push_component_by_id / write / write_with_relationship_hook
+//   manual_drop drops pending components and resets alloc
+//   RelationshipHookMode passed through write
+// Shallow lib/bundle_writer.sla retained.
+
+// === RelationshipHookMode (minimal mirror) ===
+const ECS_BW_REL_RUN: i32 = 0;
+const ECS_BW_REL_SKIP: i32 = 1;
+const ECS_BW_REL_RUN_IF_REPLACING: i32 = 2;
+
+fn ecs_bw_rel_run() -> i32 { return ECS_BW_REL_RUN; }
+fn ecs_bw_rel_skip() -> i32 { return ECS_BW_REL_SKIP; }
+fn ecs_bw_rel_run_if_replacing() -> i32 { return ECS_BW_REL_RUN_IF_REPLACING; }
+
+// === Component registry (id by type_id) ===
+struct EcsBwComponentsDeep {
+    // registered type_id -> component_id (capacity 8)
+    t0: i64, id0: i32,
+    t1: i64, id1: i32,
+    t2: i64, id2: i32,
+    t3: i64, id3: i32,
+    t4: i64, id4: i32,
+    t5: i64, id5: i32,
+    t6: i64, id6: i32,
+    t7: i64, id7: i32,
+    len: i32,
+    next_id: i32,
+    // droppable flags by component_id index (1..8)
+    drop0: bool, drop1: bool, drop2: bool, drop3: bool,
+    drop4: bool, drop5: bool, drop6: bool, drop7: bool,
+}
+
+fn ecs_bw_components_new() -> EcsBwComponentsDeep {
+    return EcsBwComponentsDeep {
+        t0: 0, id0: 0, t1: 0, id1: 0, t2: 0, id2: 0, t3: 0, id3: 0,
+        t4: 0, id4: 0, t5: 0, id5: 0, t6: 0, id6: 0, t7: 0, id7: 0,
+        len: 0, next_id: 1,
+        drop0: false, drop1: false, drop2: false, drop3: false,
+        drop4: false, drop5: false, drop6: false, drop7: false,
+    };
+}
+
+fn ecs_bw_components_len(c: EcsBwComponentsDeep) -> i32 { return c.len; }
+fn ecs_bw_components_next_id(c: EcsBwComponentsDeep) -> i32 { return c.next_id; }
+
+fn ecs_bw_components_find(c: EcsBwComponentsDeep, type_id: i64) -> (bool, i32) {
+    if c.len >= 1 && c.t0 == type_id { return (true, c.id0); };
+    if c.len >= 2 && c.t1 == type_id { return (true, c.id1); };
+    if c.len >= 3 && c.t2 == type_id { return (true, c.id2); };
+    if c.len >= 4 && c.t3 == type_id { return (true, c.id3); };
+    if c.len >= 5 && c.t4 == type_id { return (true, c.id4); };
+    if c.len >= 6 && c.t5 == type_id { return (true, c.id5); };
+    if c.len >= 7 && c.t6 == type_id { return (true, c.id6); };
+    if c.len >= 8 && c.t7 == type_id { return (true, c.id7); };
+    return (false, 0);
+}
+
+fn ecs_bw_components_register(c: EcsBwComponentsDeep, type_id: i64, droppable: bool) -> (EcsBwComponentsDeep, i32) {
+    let found = ecs_bw_components_find(c, type_id);
+    if found.0 { return (c, found.1); };
+    let id = c.next_id;
+    let n = c.len;
+    // set drop flag for id-1 if id in 1..8
+    let d0=c.drop0; let d1=c.drop1; let d2=c.drop2; let d3=c.drop3;
+    let d4=c.drop4; let d5=c.drop5; let d6=c.drop6; let d7=c.drop7;
+    let nd0 = if id == 1 { droppable } else { d0 };
+    let nd1 = if id == 2 { droppable } else { d1 };
+    let nd2 = if id == 3 { droppable } else { d2 };
+    let nd3 = if id == 4 { droppable } else { d3 };
+    let nd4 = if id == 5 { droppable } else { d4 };
+    let nd5 = if id == 6 { droppable } else { d5 };
+    let nd6 = if id == 7 { droppable } else { d6 };
+    let nd7 = if id == 8 { droppable } else { d7 };
+    if n == 0 {
+        return (EcsBwComponentsDeep {
+            t0: type_id, id0: id, t1: c.t1, id1: c.id1, t2: c.t2, id2: c.id2, t3: c.t3, id3: c.id3,
+            t4: c.t4, id4: c.id4, t5: c.t5, id5: c.id5, t6: c.t6, id6: c.id6, t7: c.t7, id7: c.id7,
+            len: 1, next_id: id + 1,
+            drop0: nd0, drop1: nd1, drop2: nd2, drop3: nd3, drop4: nd4, drop5: nd5, drop6: nd6, drop7: nd7,
+        }, id);
+    };
+    if n == 1 {
+        return (EcsBwComponentsDeep {
+            t0: c.t0, id0: c.id0, t1: type_id, id1: id, t2: c.t2, id2: c.id2, t3: c.t3, id3: c.id3,
+            t4: c.t4, id4: c.id4, t5: c.t5, id5: c.id5, t6: c.t6, id6: c.id6, t7: c.t7, id7: c.id7,
+            len: 2, next_id: id + 1,
+            drop0: nd0, drop1: nd1, drop2: nd2, drop3: nd3, drop4: nd4, drop5: nd5, drop6: nd6, drop7: nd7,
+        }, id);
+    };
+    if n == 2 {
+        return (EcsBwComponentsDeep {
+            t0: c.t0, id0: c.id0, t1: c.t1, id1: c.id1, t2: type_id, id2: id, t3: c.t3, id3: c.id3,
+            t4: c.t4, id4: c.id4, t5: c.t5, id5: c.id5, t6: c.t6, id6: c.id6, t7: c.t7, id7: c.id7,
+            len: 3, next_id: id + 1,
+            drop0: nd0, drop1: nd1, drop2: nd2, drop3: nd3, drop4: nd4, drop5: nd5, drop6: nd6, drop7: nd7,
+        }, id);
+    };
+    if n == 3 {
+        return (EcsBwComponentsDeep {
+            t0: c.t0, id0: c.id0, t1: c.t1, id1: c.id1, t2: c.t2, id2: c.id2, t3: type_id, id3: id,
+            t4: c.t4, id4: c.id4, t5: c.t5, id5: c.id5, t6: c.t6, id6: c.id6, t7: c.t7, id7: c.id7,
+            len: 4, next_id: id + 1,
+            drop0: nd0, drop1: nd1, drop2: nd2, drop3: nd3, drop4: nd4, drop5: nd5, drop6: nd6, drop7: nd7,
+        }, id);
+    };
+    return (c, 0);
+}
+
+fn ecs_bw_components_has_drop(c: EcsBwComponentsDeep, id: i32) -> bool {
+    if id == 1 { return c.drop0; };
+    if id == 2 { return c.drop1; };
+    if id == 3 { return c.drop2; };
+    if id == 4 { return c.drop3; };
+    if id == 5 { return c.drop4; };
+    if id == 6 { return c.drop5; };
+    if id == 7 { return c.drop6; };
+    if id == 8 { return c.drop7; };
+    return false;
+}
+
+// === BundleScratch (capacity 4 pending components) ===
+struct EcsBwScratchDeep {
+    id0: i32, v0: i64,
+    id1: i32, v1: i64,
+    id2: i32, v2: i64,
+    id3: i32, v3: i64,
+    len: i32,
+    // alloc model: bytes used, reset on manual_drop/write
+    alloc_used: i64,
+    alloc_total_ever: i64,
+    drop_count: i32,
+}
+
+fn ecs_bw_scratch_new() -> EcsBwScratchDeep {
+    return EcsBwScratchDeep {
+        id0: 0, v0: 0, id1: 0, v1: 0, id2: 0, v2: 0, id3: 0, v3: 0,
+        len: 0, alloc_used: 0, alloc_total_ever: 0, drop_count: 0,
+    };
+}
+
+fn ecs_bw_scratch_is_empty(s: EcsBwScratchDeep) -> bool { return s.len == 0; }
+fn ecs_bw_scratch_len(s: EcsBwScratchDeep) -> i32 { return s.len; }
+fn ecs_bw_scratch_alloc_used(s: EcsBwScratchDeep) -> i64 { return s.alloc_used; }
+fn ecs_bw_scratch_alloc_total(s: EcsBwScratchDeep) -> i64 { return s.alloc_total_ever; }
+fn ecs_bw_scratch_drop_count(s: EcsBwScratchDeep) -> i32 { return s.drop_count; }
+
+fn ecs_bw_scratch_component_at(s: EcsBwScratchDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.id0; };
+    if idx == 1 { return s.id1; };
+    if idx == 2 { return s.id2; };
+    if idx == 3 { return s.id3; };
+    return 0;
+}
+
+fn ecs_bw_scratch_value_at(s: EcsBwScratchDeep, idx: i32) -> i64 {
+    if idx == 0 { return s.v0; };
+    if idx == 1 { return s.v1; };
+    if idx == 2 { return s.v2; };
+    if idx == 3 { return s.v3; };
+    return 0;
+}
+
+// writer() clears component lists but keeps allocator (Bevy note)
+fn ecs_bw_scratch_writer(s: EcsBwScratchDeep) -> EcsBwScratchDeep {
+    return EcsBwScratchDeep {
+        id0: 0, v0: 0, id1: 0, v1: 0, id2: 0, v2: 0, id3: 0, v3: 0,
+        len: 0,
+        alloc_used: s.alloc_used,
+        alloc_total_ever: s.alloc_total_ever,
+        drop_count: s.drop_count,
+    };
+}
+
+fn ecs_bw_scratch_push_by_id(s: EcsBwScratchDeep, id: i32, value: i64, layout_size: i64) -> EcsBwScratchDeep {
+    let n = s.len;
+    let used = s.alloc_used + layout_size;
+    let total = s.alloc_total_ever + layout_size;
+    if n == 0 {
+        return EcsBwScratchDeep {
+            id0: id, v0: value, id1: s.id1, v1: s.v1, id2: s.id2, v2: s.v2, id3: s.id3, v3: s.v3,
+            len: 1, alloc_used: used, alloc_total_ever: total, drop_count: s.drop_count,
+        };
+    };
+    if n == 1 {
+        return EcsBwScratchDeep {
+            id0: s.id0, v0: s.v0, id1: id, v1: value, id2: s.id2, v2: s.v2, id3: s.id3, v3: s.v3,
+            len: 2, alloc_used: used, alloc_total_ever: total, drop_count: s.drop_count,
+        };
+    };
+    if n == 2 {
+        return EcsBwScratchDeep {
+            id0: s.id0, v0: s.v0, id1: s.id1, v1: s.v1, id2: id, v2: value, id3: s.id3, v3: s.v3,
+            len: 3, alloc_used: used, alloc_total_ever: total, drop_count: s.drop_count,
+        };
+    };
+    if n == 3 {
+        return EcsBwScratchDeep {
+            id0: s.id0, v0: s.v0, id1: s.id1, v1: s.v1, id2: s.id2, v2: s.v2, id3: id, v3: value,
+            len: 4, alloc_used: used, alloc_total_ever: total, drop_count: s.drop_count,
+        };
+    };
+    return s;
+}
+
+// push_component: register then push
+fn ecs_bw_scratch_push_component(s: EcsBwScratchDeep, comps: EcsBwComponentsDeep, type_id: i64, value: i64, layout_size: i64, droppable: bool) -> (EcsBwScratchDeep, EcsBwComponentsDeep) {
+    let r = ecs_bw_components_register(comps, type_id, droppable);
+    let s2 = ecs_bw_scratch_push_by_id(s, r.1, value, layout_size);
+    return (s2, r.0);
+}
+
+// manual_drop: drop each with drop fn, drain lists, reset alloc
+fn ecs_bw_scratch_manual_drop(s: EcsBwScratchDeep, comps: EcsBwComponentsDeep) -> EcsBwScratchDeep {
+    let drops: i32 = 0;
+    if s.len >= 1 && ecs_bw_components_has_drop(comps, s.id0) { drops = drops + 1; };
+    if s.len >= 2 && ecs_bw_components_has_drop(comps, s.id1) { drops = drops + 1; };
+    if s.len >= 3 && ecs_bw_components_has_drop(comps, s.id2) { drops = drops + 1; };
+    if s.len >= 4 && ecs_bw_components_has_drop(comps, s.id3) { drops = drops + 1; };
+    return EcsBwScratchDeep {
+        id0: 0, v0: 0, id1: 0, v1: 0, id2: 0, v2: 0, id3: 0, v3: 0,
+        len: 0,
+        alloc_used: 0,
+        alloc_total_ever: s.alloc_total_ever,
+        drop_count: s.drop_count + drops,
+    };
+}
+
+// === Entity write log (dynamic insert) ===
+struct EcsBwEntityDeep {
+    entity: i64,
+    // inserted components capacity 8
+    c0: i32, v0: i64,
+    c1: i32, v1: i64,
+    c2: i32, v2: i64,
+    c3: i32, v3: i64,
+    c4: i32, v4: i64,
+    c5: i32, v5: i64,
+    c6: i32, v6: i64,
+    c7: i32, v7: i64,
+    len: i32,
+    last_rel_mode: i32,
+    write_count: i32,
+}
+
+fn ecs_bw_entity_new(entity: i64) -> EcsBwEntityDeep {
+    return EcsBwEntityDeep {
+        entity: entity,
+        c0: 0, v0: 0, c1: 0, v1: 0, c2: 0, v2: 0, c3: 0, v3: 0,
+        c4: 0, v4: 0, c5: 0, v5: 0, c6: 0, v6: 0, c7: 0, v7: 0,
+        len: 0, last_rel_mode: ECS_BW_REL_RUN, write_count: 0,
+    };
+}
+
+fn ecs_bw_entity_len(e: EcsBwEntityDeep) -> i32 { return e.len; }
+fn ecs_bw_entity_write_count(e: EcsBwEntityDeep) -> i32 { return e.write_count; }
+fn ecs_bw_entity_last_rel_mode(e: EcsBwEntityDeep) -> i32 { return e.last_rel_mode; }
+
+fn ecs_bw_entity_has(e: EcsBwEntityDeep, id: i32) -> bool {
+    if e.len >= 1 && e.c0 == id { return true; };
+    if e.len >= 2 && e.c1 == id { return true; };
+    if e.len >= 3 && e.c2 == id { return true; };
+    if e.len >= 4 && e.c3 == id { return true; };
+    if e.len >= 5 && e.c4 == id { return true; };
+    if e.len >= 6 && e.c5 == id { return true; };
+    if e.len >= 7 && e.c6 == id { return true; };
+    if e.len >= 8 && e.c7 == id { return true; };
+    return false;
+}
+
+fn ecs_bw_entity_value(e: EcsBwEntityDeep, id: i32) -> i64 {
+    if e.len >= 1 && e.c0 == id { return e.v0; };
+    if e.len >= 2 && e.c1 == id { return e.v1; };
+    if e.len >= 3 && e.c2 == id { return e.v2; };
+    if e.len >= 4 && e.c3 == id { return e.v3; };
+    if e.len >= 5 && e.c4 == id { return e.v4; };
+    if e.len >= 6 && e.c5 == id { return e.v5; };
+    if e.len >= 7 && e.c6 == id { return e.v6; };
+    if e.len >= 8 && e.c7 == id { return e.v7; };
+    return 0;
+}
+
+fn ecs_bw_entity_insert_one(e: EcsBwEntityDeep, id: i32, value: i64) -> EcsBwEntityDeep {
+    // replace if exists
+    if e.len >= 1 && e.c0 == id {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: id, v0: value, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: e.len, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if e.len >= 2 && e.c1 == id {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: id, v1: value, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: e.len, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if e.len >= 3 && e.c2 == id {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: id, v2: value, c3: e.c3, v3: e.v3,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: e.len, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if e.len >= 4 && e.c3 == id {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: id, v3: value,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: e.len, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    let n = e.len;
+    if n == 0 {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: id, v0: value, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: 1, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if n == 1 {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: id, v1: value, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: 2, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if n == 2 {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: id, v2: value, c3: e.c3, v3: e.v3,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: 3, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if n == 3 {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: id, v3: value,
+            c4: e.c4, v4: e.v4, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: 4, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    if n == 4 {
+        return EcsBwEntityDeep {
+            entity: e.entity, c0: e.c0, v0: e.v0, c1: e.c1, v1: e.v1, c2: e.c2, v2: e.v2, c3: e.c3, v3: e.v3,
+            c4: id, v4: value, c5: e.c5, v5: e.v5, c6: e.c6, v6: e.v6, c7: e.c7, v7: e.v7,
+            len: 5, last_rel_mode: e.last_rel_mode, write_count: e.write_count,
+        };
+    };
+    return e;
+}
+
+// write: insert_by_ids dynamic bundle then clear scratch lists + reset alloc (like after write)
+fn ecs_bw_write(s: EcsBwScratchDeep, e: EcsBwEntityDeep, rel_mode: i32) -> (EcsBwScratchDeep, EcsBwEntityDeep) {
+    let ent = e;
+    if s.len >= 1 { ent = ecs_bw_entity_insert_one(ent, s.id0, s.v0); };
+    if s.len >= 2 { ent = ecs_bw_entity_insert_one(ent, s.id1, s.v1); };
+    if s.len >= 3 { ent = ecs_bw_entity_insert_one(ent, s.id2, s.v2); };
+    if s.len >= 4 { ent = ecs_bw_entity_insert_one(ent, s.id3, s.v3); };
+    let ent2 = EcsBwEntityDeep {
+        entity: ent.entity,
+        c0: ent.c0, v0: ent.v0, c1: ent.c1, v1: ent.v1, c2: ent.c2, v2: ent.v2, c3: ent.c3, v3: ent.v3,
+        c4: ent.c4, v4: ent.v4, c5: ent.c5, v5: ent.v5, c6: ent.c6, v6: ent.v6, c7: ent.c7, v7: ent.v7,
+        len: ent.len, last_rel_mode: rel_mode, write_count: ent.write_count + 1,
+    };
+    // after write, scratch component lists cleared and alloc reset (ownership transferred)
+    let s2 = EcsBwScratchDeep {
+        id0: 0, v0: 0, id1: 0, v1: 0, id2: 0, v2: 0, id3: 0, v3: 0,
+        len: 0, alloc_used: 0, alloc_total_ever: s.alloc_total_ever, drop_count: s.drop_count,
+    };
+    return (s2, ent2);
+}
+
+fn ecs_bw_write_default(s: EcsBwScratchDeep, e: EcsBwEntityDeep) -> (EcsBwScratchDeep, EcsBwEntityDeep) {
+    return ecs_bw_write(s, e, ECS_BW_REL_RUN);
+}
+
+// reuse: writer after write keeps total alloc history but used is 0
+fn ecs_bw_scratch_can_reuse(s: EcsBwScratchDeep) -> bool {
+    return s.len == 0;
+}

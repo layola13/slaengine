@@ -1,0 +1,445 @@
+// Deepened Bevy ECS MessageMutIterator / MessageMutIteratorWithId / MessageMutParIter.
+// Mirrors src/message/mut_iterators.rs:
+//   MessageMutIteratorWithId::new (clamp last, chain A then B)
+//   next / count / last / nth / len / without_id
+//   MessageMutIterator wraps without_id path
+//   MessageMutParIter batching_strategy + for_each (no TaskPool)
+// Fixed dual-buffer capacity 4 per sequence. Shallow message_iterators retained.
+
+struct EcsMmiMessagesDeep {
+    message_count: i64,
+    a_start: i64,
+    a0: i64, a1: i64, a2: i64, a3: i64, a_len: i32,
+    b_start: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64, b_len: i32,
+}
+
+fn ecs_mmi_messages_new() -> EcsMmiMessagesDeep {
+    return EcsMmiMessagesDeep {
+        message_count: 0,
+        a_start: 0, a0: 0, a1: 0, a2: 0, a3: 0, a_len: 0,
+        b_start: 0, b0: 0, b1: 0, b2: 0, b3: 0, b_len: 0,
+    };
+}
+
+fn ecs_mmi_messages_message_count(m: EcsMmiMessagesDeep) -> i64 { return m.message_count; }
+fn ecs_mmi_messages_len(m: EcsMmiMessagesDeep) -> i64 {
+    return (m.a_len as i64) + (m.b_len as i64);
+}
+
+fn ecs_mmi_rebuild(
+    message_count: i64,
+    a_start: i64, a0: i64, a1: i64, a2: i64, a3: i64, a_len: i32,
+    b_start: i64, b0: i64, b1: i64, b2: i64, b3: i64, b_len: i32
+) -> EcsMmiMessagesDeep {
+    return EcsMmiMessagesDeep {
+        message_count: message_count,
+        a_start: a_start, a0: a0, a1: a1, a2: a2, a3: a3, a_len: a_len,
+        b_start: b_start, b0: b0, b1: b1, b2: b2, b3: b3, b_len: b_len,
+    };
+}
+
+fn ecs_mmi_messages_write(m: EcsMmiMessagesDeep, value: i64) -> EcsMmiMessagesDeep {
+    let bl = m.b_len;
+    if bl >= 4 {
+        return ecs_mmi_rebuild(
+            m.message_count + 1,
+            m.a_start, m.a0, m.a1, m.a2, m.a3, m.a_len,
+            m.b_start, m.b0, m.b1, m.b2, m.b3, m.b_len
+        );
+    };
+    let b0 = m.b0; let b1 = m.b1; let b2 = m.b2; let b3 = m.b3;
+    if bl == 0 { b0 = value; };
+    if bl == 1 { b1 = value; };
+    if bl == 2 { b2 = value; };
+    if bl == 3 { b3 = value; };
+    return ecs_mmi_rebuild(
+        m.message_count + 1,
+        m.a_start, m.a0, m.a1, m.a2, m.a3, m.a_len,
+        m.b_start, b0, b1, b2, b3, bl + 1
+    );
+}
+
+fn ecs_mmi_messages_update(m: EcsMmiMessagesDeep) -> EcsMmiMessagesDeep {
+    return ecs_mmi_rebuild(
+        m.message_count,
+        m.b_start, m.b0, m.b1, m.b2, m.b3, m.b_len,
+        m.message_count, 0, 0, 0, 0, 0
+    );
+}
+
+fn ecs_mmi_b_get(m: EcsMmiMessagesDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.b0; };
+    if idx == 1 { return m.b1; };
+    if idx == 2 { return m.b2; };
+    if idx == 3 { return m.b3; };
+    return 0;
+}
+
+fn ecs_mmi_a_get(m: EcsMmiMessagesDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.a0; };
+    if idx == 1 { return m.a1; };
+    if idx == 2 { return m.a2; };
+    if idx == 3 { return m.a3; };
+    return 0;
+}
+
+fn ecs_mmi_set_slot(m: EcsMmiMessagesDeep, global_id: i64, value: i64) -> EcsMmiMessagesDeep {
+    // set by message id if still present
+    if global_id < m.b_start {
+        let ai = global_id - m.a_start;
+        if ai < 0 { return m; };
+        if ai >= (m.a_len as i64) { return m; };
+        let a0 = m.a0; let a1 = m.a1; let a2 = m.a2; let a3 = m.a3;
+        if ai == 0 { a0 = value; };
+        if ai == 1 { a1 = value; };
+        if ai == 2 { a2 = value; };
+        if ai == 3 { a3 = value; };
+        return ecs_mmi_rebuild(
+            m.message_count, m.a_start, a0, a1, a2, a3, m.a_len,
+            m.b_start, m.b0, m.b1, m.b2, m.b3, m.b_len
+        );
+    };
+    let bi = global_id - m.b_start;
+    if bi < 0 { return m; };
+    if bi >= (m.b_len as i64) { return m; };
+    let b0 = m.b0; let b1 = m.b1; let b2 = m.b2; let b3 = m.b3;
+    if bi == 0 { b0 = value; };
+    if bi == 1 { b1 = value; };
+    if bi == 2 { b2 = value; };
+    if bi == 3 { b3 = value; };
+    return ecs_mmi_rebuild(
+        m.message_count, m.a_start, m.a0, m.a1, m.a2, m.a3, m.a_len,
+        m.b_start, b0, b1, b2, b3, m.b_len
+    );
+}
+
+// Cursor
+struct EcsMmiCursorDeep {
+    last_message_count: i64,
+}
+
+fn ecs_mmi_cursor_new() -> EcsMmiCursorDeep {
+    return EcsMmiCursorDeep { last_message_count: 0 };
+}
+fn ecs_mmi_cursor_last(c: EcsMmiCursorDeep) -> i64 { return c.last_message_count; }
+
+// Mut iterator state: flattened unread payloads (cap 8)
+struct EcsMmiIterDeep {
+    last_message_count: i64,
+    unread: i64,
+    pos: i64,
+    is_mut: bool,
+    without_id: bool,
+    p0: i64, id0: i64,
+    p1: i64, id1: i64,
+    p2: i64, id2: i64,
+    p3: i64, id3: i64,
+    p4: i64, id4: i64,
+    p5: i64, id5: i64,
+    p6: i64, id6: i64,
+    p7: i64, id7: i64,
+}
+
+fn ecs_mmi_iter_unread(it: EcsMmiIterDeep) -> i64 { return it.unread; }
+fn ecs_mmi_iter_len(it: EcsMmiIterDeep) -> i64 { return it.unread; }
+fn ecs_mmi_iter_is_mut(it: EcsMmiIterDeep) -> bool { return it.is_mut; }
+fn ecs_mmi_iter_without_id_flag(it: EcsMmiIterDeep) -> bool { return it.without_id; }
+fn ecs_mmi_iter_last_count(it: EcsMmiIterDeep) -> i64 { return it.last_message_count; }
+
+fn ecs_mmi_iter_empty(is_mut: bool) -> EcsMmiIterDeep {
+    return EcsMmiIterDeep {
+        last_message_count: 0, unread: 0, pos: 0, is_mut: is_mut, without_id: false,
+        p0: 0, id0: 0, p1: 0, id1: 0, p2: 0, id2: 0, p3: 0, id3: 0,
+        p4: 0, id4: 0, p5: 0, id5: 0, p6: 0, id6: 0, p7: 0, id7: 0,
+    };
+}
+
+fn ecs_mmi_sat_sub(a: i64, b: i64) -> i64 {
+    if a < b { return 0; };
+    return a - b;
+}
+
+fn ecs_mmi_iter_set(it: EcsMmiIterDeep, idx: i64, value: i64, id: i64) -> EcsMmiIterDeep {
+    let p0 = it.p0; let id0 = it.id0;
+    let p1 = it.p1; let id1 = it.id1;
+    let p2 = it.p2; let id2 = it.id2;
+    let p3 = it.p3; let id3 = it.id3;
+    let p4 = it.p4; let id4 = it.id4;
+    let p5 = it.p5; let id5 = it.id5;
+    let p6 = it.p6; let id6 = it.id6;
+    let p7 = it.p7; let id7 = it.id7;
+    if idx == 0 { p0 = value; id0 = id; };
+    if idx == 1 { p1 = value; id1 = id; };
+    if idx == 2 { p2 = value; id2 = id; };
+    if idx == 3 { p3 = value; id3 = id; };
+    if idx == 4 { p4 = value; id4 = id; };
+    if idx == 5 { p5 = value; id5 = id; };
+    if idx == 6 { p6 = value; id6 = id; };
+    if idx == 7 { p7 = value; id7 = id; };
+    return EcsMmiIterDeep {
+        last_message_count: it.last_message_count, unread: it.unread, pos: it.pos,
+        is_mut: it.is_mut, without_id: it.without_id,
+        p0: p0, id0: id0, p1: p1, id1: id1, p2: p2, id2: id2, p3: p3, id3: id3,
+        p4: p4, id4: id4, p5: p5, id5: id5, p6: p6, id6: id6, p7: p7, id7: id7,
+    };
+}
+
+fn ecs_mmi_iter_get_p(it: EcsMmiIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return it.p0; };
+    if idx == 1 { return it.p1; };
+    if idx == 2 { return it.p2; };
+    if idx == 3 { return it.p3; };
+    if idx == 4 { return it.p4; };
+    if idx == 5 { return it.p5; };
+    if idx == 6 { return it.p6; };
+    if idx == 7 { return it.p7; };
+    return 0;
+}
+
+fn ecs_mmi_iter_get_id(it: EcsMmiIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return it.id0; };
+    if idx == 1 { return it.id1; };
+    if idx == 2 { return it.id2; };
+    if idx == 3 { return it.id3; };
+    if idx == 4 { return it.id4; };
+    if idx == 5 { return it.id5; };
+    if idx == 6 { return it.id6; };
+    if idx == 7 { return it.id7; };
+    return 0;
+}
+
+// MessageMutIteratorWithId::new
+struct EcsMmiNewResult {
+    cursor: EcsMmiCursorDeep,
+    iter: EcsMmiIterDeep,
+}
+
+fn ecs_mmi_new_cursor(r: EcsMmiNewResult) -> EcsMmiCursorDeep { return r.cursor; }
+fn ecs_mmi_new_iter(r: EcsMmiNewResult) -> EcsMmiIterDeep { return r.iter; }
+
+fn ecs_mmi_append_if(it: EcsMmiIterDeep, w: i64, enabled: bool, value: i64, id: i64) -> (EcsMmiIterDeep, i64) {
+    if enabled != true {
+        return (it, w);
+    };
+    if w >= 8 {
+        return (it, w);
+    };
+    let it2 = ecs_mmi_iter_set(it, w, value, id);
+    return (it2, w + 1);
+}
+
+fn ecs_mmi_mut_iter_with_id_new(c: EcsMmiCursorDeep, m: EcsMmiMessagesDeep) -> EcsMmiNewResult {
+    let a_index = ecs_mmi_sat_sub(c.last_message_count, m.a_start);
+    let b_index = ecs_mmi_sat_sub(c.last_message_count, m.b_start);
+    let it = ecs_mmi_iter_empty(true);
+    let w: i64 = 0;
+    // A slots 0..4 if idx >= a_index
+    let r0 = ecs_mmi_append_if(it, w, (0 as i64) >= a_index && 0 < (m.a_len as i64), ecs_mmi_a_get(m, 0), m.a_start + 0);
+    it = r0.0; w = r0.1;
+    let r1 = ecs_mmi_append_if(it, w, (1 as i64) >= a_index && 1 < (m.a_len as i64), ecs_mmi_a_get(m, 1), m.a_start + 1);
+    it = r1.0; w = r1.1;
+    let r2 = ecs_mmi_append_if(it, w, (2 as i64) >= a_index && 2 < (m.a_len as i64), ecs_mmi_a_get(m, 2), m.a_start + 2);
+    it = r2.0; w = r2.1;
+    let r3 = ecs_mmi_append_if(it, w, (3 as i64) >= a_index && 3 < (m.a_len as i64), ecs_mmi_a_get(m, 3), m.a_start + 3);
+    it = r3.0; w = r3.1;
+    // B slots
+    let s0 = ecs_mmi_append_if(it, w, (0 as i64) >= b_index && 0 < (m.b_len as i64), ecs_mmi_b_get(m, 0), m.b_start + 0);
+    it = s0.0; w = s0.1;
+    let s1 = ecs_mmi_append_if(it, w, (1 as i64) >= b_index && 1 < (m.b_len as i64), ecs_mmi_b_get(m, 1), m.b_start + 1);
+    it = s1.0; w = s1.1;
+    let s2 = ecs_mmi_append_if(it, w, (2 as i64) >= b_index && 2 < (m.b_len as i64), ecs_mmi_b_get(m, 2), m.b_start + 2);
+    it = s2.0; w = s2.1;
+    let s3 = ecs_mmi_append_if(it, w, (3 as i64) >= b_index && 3 < (m.b_len as i64), ecs_mmi_b_get(m, 3), m.b_start + 3);
+    it = s3.0; w = s3.1;
+    let last = m.message_count - w;
+    let c2 = EcsMmiCursorDeep { last_message_count: last };
+    let it2 = EcsMmiIterDeep {
+        last_message_count: last, unread: w, pos: 0, is_mut: true, without_id: false,
+        p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+        p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+    };
+    return EcsMmiNewResult { cursor: c2, iter: it2 };
+}
+
+fn ecs_mmi_without_id(it: EcsMmiIterDeep) -> EcsMmiIterDeep {
+    return EcsMmiIterDeep {
+        last_message_count: it.last_message_count, unread: it.unread, pos: it.pos,
+        is_mut: it.is_mut, without_id: true,
+        p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+        p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+    };
+}
+
+struct EcsMmiNext {
+    has: bool,
+    value: i64,
+    id: i64,
+    iter: EcsMmiIterDeep,
+}
+
+fn ecs_mmi_next_has(r: EcsMmiNext) -> bool { return r.has; }
+fn ecs_mmi_next_value(r: EcsMmiNext) -> i64 { return r.value; }
+fn ecs_mmi_next_id(r: EcsMmiNext) -> i64 { return r.id; }
+fn ecs_mmi_next_iter(r: EcsMmiNext) -> EcsMmiIterDeep { return r.iter; }
+
+fn ecs_mmi_iter_next(it: EcsMmiIterDeep) -> EcsMmiNext {
+    if it.unread <= 0 {
+        return EcsMmiNext { has: false, value: 0, id: 0, iter: it };
+    };
+    let value = ecs_mmi_iter_get_p(it, it.pos);
+    let id = ecs_mmi_iter_get_id(it, it.pos);
+    let it2 = EcsMmiIterDeep {
+        last_message_count: it.last_message_count + 1,
+        unread: it.unread - 1,
+        pos: it.pos + 1,
+        is_mut: it.is_mut, without_id: it.without_id,
+        p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+        p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+    };
+    return EcsMmiNext { has: true, value: value, id: id, iter: it2 };
+}
+
+// mutate current payload in messages via id after next (model set)
+fn ecs_mmi_apply_mut(m: EcsMmiMessagesDeep, id: i64, value: i64) -> EcsMmiMessagesDeep {
+    return ecs_mmi_set_slot(m, id, value);
+}
+
+struct EcsMmiCount {
+    count: i64,
+    iter: EcsMmiIterDeep,
+}
+
+fn ecs_mmi_count_n(r: EcsMmiCount) -> i64 { return r.count; }
+fn ecs_mmi_count_iter(r: EcsMmiCount) -> EcsMmiIterDeep { return r.iter; }
+
+fn ecs_mmi_iter_count(it: EcsMmiIterDeep) -> EcsMmiCount {
+    let n = it.unread;
+    let it2 = EcsMmiIterDeep {
+        last_message_count: it.last_message_count + n,
+        unread: 0,
+        pos: it.pos + n,
+        is_mut: it.is_mut, without_id: it.without_id,
+        p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+        p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+    };
+    return EcsMmiCount { count: n, iter: it2 };
+}
+
+fn ecs_mmi_iter_last(it: EcsMmiIterDeep) -> EcsMmiNext {
+    if it.unread <= 0 {
+        return EcsMmiNext { has: false, value: 0, id: 0, iter: it };
+    };
+    let last_idx = it.pos + it.unread - 1;
+    let value = ecs_mmi_iter_get_p(it, last_idx);
+    let id = ecs_mmi_iter_get_id(it, last_idx);
+    let it2 = EcsMmiIterDeep {
+        last_message_count: it.last_message_count + it.unread,
+        unread: 0,
+        pos: last_idx + 1,
+        is_mut: it.is_mut, without_id: it.without_id,
+        p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+        p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+    };
+    return EcsMmiNext { has: true, value: value, id: id, iter: it2 };
+}
+
+fn ecs_mmi_iter_nth(it: EcsMmiIterDeep, n: i64) -> EcsMmiNext {
+    if n < 0 {
+        return EcsMmiNext { has: false, value: 0, id: 0, iter: it };
+    };
+    if n >= it.unread {
+        let it2 = EcsMmiIterDeep {
+            last_message_count: it.last_message_count + it.unread,
+            unread: 0,
+            pos: it.pos + it.unread,
+            is_mut: it.is_mut, without_id: it.without_id,
+            p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+            p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+        };
+        return EcsMmiNext { has: false, value: 0, id: 0, iter: it2 };
+    };
+    let it3 = EcsMmiIterDeep {
+        last_message_count: it.last_message_count + n,
+        unread: it.unread - n,
+        pos: it.pos + n,
+        is_mut: it.is_mut, without_id: it.without_id,
+        p0: it.p0, id0: it.id0, p1: it.p1, id1: it.id1, p2: it.p2, id2: it.id2, p3: it.p3, id3: it.id3,
+        p4: it.p4, id4: it.id4, p5: it.p5, id5: it.id5, p6: it.p6, id6: it.id6, p7: it.p7, id7: it.id7,
+    };
+    return ecs_mmi_iter_next(it3);
+}
+
+fn ecs_mmi_cursor_from_iter(it: EcsMmiIterDeep) -> EcsMmiCursorDeep {
+    return EcsMmiCursorDeep { last_message_count: it.last_message_count };
+}
+
+// MessageMutParIter
+struct EcsMmiParDeep {
+    unread: i64,
+    batch_size: i64,
+    is_mut: bool,
+}
+
+fn ecs_mmi_par_new(c: EcsMmiCursorDeep, m: EcsMmiMessagesDeep) -> EcsMmiNewResult {
+    // reuses mut iter construction; par is just unread + batching
+    return ecs_mmi_mut_iter_with_id_new(c, m);
+}
+
+fn ecs_mmi_par_from_iter(it: EcsMmiIterDeep) -> EcsMmiParDeep {
+    return EcsMmiParDeep { unread: it.unread, batch_size: 128, is_mut: true };
+}
+
+fn ecs_mmi_par_batching_strategy(p: EcsMmiParDeep, batch_size: i64) -> EcsMmiParDeep {
+    return EcsMmiParDeep { unread: p.unread, batch_size: batch_size, is_mut: p.is_mut };
+}
+
+fn ecs_mmi_par_unread(p: EcsMmiParDeep) -> i64 { return p.unread; }
+fn ecs_mmi_par_batch_size(p: EcsMmiParDeep) -> i64 { return p.batch_size; }
+
+fn ecs_mmi_par_batch_count(p: EcsMmiParDeep) -> i64 {
+    if p.unread <= 0 { return 0; };
+    if p.batch_size <= 0 { return p.unread; };
+    let n = p.unread / p.batch_size;
+    if p.unread % p.batch_size != 0 { return n + 1; };
+    return n;
+}
+
+// for_each: sequential fold returning sum (mut path marker)
+fn ecs_mmi_par_for_each_sum(it: EcsMmiIterDeep) -> i64 {
+    let sum: i64 = 0;
+    let cur = it;
+    let cont = true;
+    // unrolled up to 8
+    if cur.unread > 0 {
+        sum = sum + ecs_mmi_iter_get_p(cur, cur.pos);
+        cur = EcsMmiIterDeep {
+            last_message_count: cur.last_message_count + 1, unread: cur.unread - 1, pos: cur.pos + 1,
+            is_mut: cur.is_mut, without_id: cur.without_id,
+            p0: cur.p0, id0: cur.id0, p1: cur.p1, id1: cur.id1, p2: cur.p2, id2: cur.id2, p3: cur.p3, id3: cur.id3,
+            p4: cur.p4, id4: cur.id4, p5: cur.p5, id5: cur.id5, p6: cur.p6, id6: cur.id6, p7: cur.p7, id7: cur.id7,
+        };
+    };
+    if cur.unread > 0 {
+        sum = sum + ecs_mmi_iter_get_p(cur, cur.pos);
+        cur = EcsMmiIterDeep {
+            last_message_count: cur.last_message_count + 1, unread: cur.unread - 1, pos: cur.pos + 1,
+            is_mut: cur.is_mut, without_id: cur.without_id,
+            p0: cur.p0, id0: cur.id0, p1: cur.p1, id1: cur.id1, p2: cur.p2, id2: cur.id2, p3: cur.p3, id3: cur.id3,
+            p4: cur.p4, id4: cur.id4, p5: cur.p5, id5: cur.id5, p6: cur.p6, id6: cur.id6, p7: cur.p7, id7: cur.id7,
+        };
+    };
+    if cur.unread > 0 {
+        sum = sum + ecs_mmi_iter_get_p(cur, cur.pos);
+        cur = EcsMmiIterDeep {
+            last_message_count: cur.last_message_count + 1, unread: cur.unread - 1, pos: cur.pos + 1,
+            is_mut: cur.is_mut, without_id: cur.without_id,
+            p0: cur.p0, id0: cur.id0, p1: cur.p1, id1: cur.id1, p2: cur.p2, id2: cur.id2, p3: cur.p3, id3: cur.id3,
+            p4: cur.p4, id4: cur.id4, p5: cur.p5, id5: cur.id5, p6: cur.p6, id6: cur.id6, p7: cur.p7, id7: cur.id7,
+        };
+    };
+    if cur.unread > 0 {
+        sum = sum + ecs_mmi_iter_get_p(cur, cur.pos);
+    };
+    return sum;
+}

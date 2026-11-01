@@ -1,0 +1,225 @@
+// Deepened Bevy-style generic exclusive (one-to-one) relationship adapter
+// (lib/relationship_one_adapter.sla deep). Self-contained: own cap-8 entity
+// allocator (sequential ids 1..8) + an exclusive map (source_id -> target_id).
+// Invariants:
+//   - sources map holds at most one target per source.
+//   - targets retain the most recent source (replace-previous-source behavior).
+//   - despawning the target despawns its source (linked_spawn behaviour; allow_self
+//     controls rejecting self-relation).
+// Deep variant is not a thin wrapper; it provides the operations from
+// generic_exclusive_relationship_world directly.
+
+const ECS_ONE_REL_CAP_DEEP: i32 = 8;
+
+struct EcsOneRelEntityDeep { id: i32, alive: i32 }
+
+fn ecs_one_rel_entity_new(id: i32) -> EcsOneRelEntityDeep {
+    return EcsOneRelEntityDeep { id: id, alive: 1 };
+}
+fn ecs_one_rel_entity_id(e: EcsOneRelEntityDeep) -> i32 { return e.id; }
+fn ecs_one_rel_entity_alive(e: EcsOneRelEntityDeep) -> i32 { return e.alive; }
+
+fn ecs_one_rel_entity_eq(a: EcsOneRelEntityDeep, b: EcsOneRelEntityDeep) -> bool {
+    return a.id == b.id;
+}
+
+struct EcsOneRelWorldDeep {
+    // alive slot per entity id (indices 0..7 hold id+1 entities, i.e. entity id = idx+1)
+    a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32,
+    // exclusive map: source_entity_id -> target_entity_id (target 0 = no relation).
+    t0: i32, t1: i32, t2: i32, t3: i32, t4: i32, t5: i32, t6: i32, t7: i32,
+    allow_self: i32,
+    next_id: i32,
+    count: i32,
+}
+
+fn ecs_one_rel_world_new(allow_self: i32) -> EcsOneRelWorldDeep {
+    let w = EcsOneRelWorldDeep {
+        a0: 0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+        t0: 0, t1: 0, t2: 0, t3: 0, t4: 0, t5: 0, t6: 0, t7: 0,
+        allow_self: allow_self,
+        next_id: 1,
+        count: 0,
+    };
+    return w;
+}
+
+// Helpers: alive slot access for entity_id returned by spawn (id is 1..8; idx = id-1).
+fn ecs_one_rel_alive_at(w: EcsOneRelWorldDeep, id: i32) -> i32 {
+    let idx = id - 1;
+    if idx == 0 { return w.a0; };
+    if idx == 1 { return w.a1; };
+    if idx == 2 { return w.a2; };
+    if idx == 3 { return w.a3; };
+    if idx == 4 { return w.a4; };
+    if idx == 5 { return w.a5; };
+    if idx == 6 { return w.a6; };
+    if idx == 7 { return w.a7; };
+    return 0;
+}
+
+fn ecs_one_rel_set_alive(w: EcsOneRelWorldDeep, id: i32, val: i32) -> EcsOneRelWorldDeep {
+    let idx = id - 1;
+    if idx == 0 { w.a0 = val; };
+    if idx == 1 { w.a1 = val; };
+    if idx == 2 { w.a2 = val; };
+    if idx == 3 { w.a3 = val; };
+    if idx == 4 { w.a4 = val; };
+    if idx == 5 { w.a5 = val; };
+    if idx == 6 { w.a6 = val; };
+    if idx == 7 { w.a7 = val; };
+    return w;
+}
+
+fn ecs_one_rel_target_at(w: EcsOneRelWorldDeep, id: i32) -> i32 {
+    let idx = id - 1;
+    if idx == 0 { return w.t0; };
+    if idx == 1 { return w.t1; };
+    if idx == 2 { return w.t2; };
+    if idx == 3 { return w.t3; };
+    if idx == 4 { return w.t4; };
+    if idx == 5 { return w.t5; };
+    if idx == 6 { return w.t6; };
+    if idx == 7 { return w.t7; };
+    return 0;
+}
+
+fn ecs_one_rel_set_target(w: EcsOneRelWorldDeep, id: i32, val: i32) -> EcsOneRelWorldDeep {
+    let idx = id - 1;
+    if idx == 0 { w.t0 = val; };
+    if idx == 1 { w.t1 = val; };
+    if idx == 2 { w.t2 = val; };
+    if idx == 3 { w.t3 = val; };
+    if idx == 4 { w.t4 = val; };
+    if idx == 5 { w.t5 = val; };
+    if idx == 6 { w.t6 = val; };
+    if idx == 7 { w.t7 = val; };
+    return w;
+}
+
+fn ecs_one_rel_count(w: EcsOneRelWorldDeep) -> i32 { return w.count; }
+fn ecs_one_rel_allow_self(w: EcsOneRelWorldDeep) -> i32 { return w.allow_self; }
+
+struct EcsOneRelSpawnResultDeep {
+    world: EcsOneRelWorldDeep,
+    entity: EcsOneRelEntityDeep,
+}
+
+fn ecs_one_rel_spawn_result_new(w: EcsOneRelWorldDeep, e: EcsOneRelEntityDeep) -> EcsOneRelSpawnResultDeep {
+    return EcsOneRelSpawnResultDeep { world: w, entity: e };
+}
+fn ecs_one_rel_spawn_result_world(r: EcsOneRelSpawnResultDeep) -> EcsOneRelWorldDeep { return r.world; }
+fn ecs_one_rel_spawn_result_entity(r: EcsOneRelSpawnResultDeep) -> EcsOneRelEntityDeep { return r.entity; }
+
+// spawn returns a new entity with id next_id from 1..8. Rejects cap when next_id > cap.
+fn ecs_one_rel_spawn(w: EcsOneRelWorldDeep) -> EcsOneRelSpawnResultDeep {
+    let id = w.next_id;
+    if id > ECS_ONE_REL_CAP_DEEP { panic(137000); };
+    w = ecs_one_rel_set_alive(w, id, 1);
+    w.next_id = w.next_id + 1;
+    w.count = w.count + 1;
+    return ecs_one_rel_spawn_result_new(w, ecs_one_rel_entity_new(id));
+}
+
+fn ecs_one_rel_is_alive(w: EcsOneRelWorldDeep, e: EcsOneRelEntityDeep) -> bool {
+    let id = ecs_one_rel_entity_id(e);
+    if id < 1 { return false; };
+    if id > ECS_ONE_REL_CAP_DEEP { return false; };
+    if id >= w.next_id { return false; };
+    return ecs_one_rel_alive_at(w, id) == 1;
+}
+
+// set: source -> target. Carries "exclusive" semantics:
+// if target already had a different source, that previous source -> 0 (target removes previous source).
+// Self-relations allowed only when w.allow_self != 0.
+fn ecs_one_rel_set(w: EcsOneRelWorldDeep, source: EcsOneRelEntityDeep, target: EcsOneRelEntityDeep) -> EcsOneRelWorldDeep {
+    let sid = ecs_one_rel_entity_id(source);
+    let tid = ecs_one_rel_entity_id(target);
+    if ecs_one_rel_is_alive(w, source) != true { return w; };
+    if ecs_one_rel_is_alive(w, target) != true { return w; };
+    if sid == tid {
+        if w.allow_self == 0 { return w; };
+    };
+    // Remove any previous source pointing at this target (exclusive replace).
+    let i: i32 = 1;
+    while i < w.next_id {
+        if ecs_one_rel_alive_at(w, i) == 1 {
+            let existing_target = ecs_one_rel_target_at(w, i);
+            if existing_target == tid {
+                w = ecs_one_rel_set_target(w, i, 0);
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_one_rel_set_target(w, sid, tid);
+}
+
+// remove: source's relation dropped.
+fn ecs_one_rel_remove(w: EcsOneRelWorldDeep, source: EcsOneRelEntityDeep) -> EcsOneRelWorldDeep {
+    let sid = ecs_one_rel_entity_id(source);
+    if ecs_one_rel_is_alive(w, source) != true { return w; };
+    return ecs_one_rel_set_target(w, sid, 0);
+}
+
+fn ecs_one_rel_has_target(w: EcsOneRelWorldDeep, source: EcsOneRelEntityDeep) -> bool {
+    if ecs_one_rel_is_alive(w, source) != true { return false; };
+    return ecs_one_rel_target_at(w, ecs_one_rel_entity_id(source)) != 0;
+}
+
+fn ecs_one_rel_target(w: EcsOneRelWorldDeep, source: EcsOneRelEntityDeep) -> EcsOneRelEntityDeep {
+    // Target placeholder id 0 means no relation; returned as entity id 0 for parity.
+    if ecs_one_rel_has_target(w, source) != true { return ecs_one_rel_entity_new(0); };
+    return ecs_one_rel_entity_new(ecs_one_rel_target_at(w, ecs_one_rel_entity_id(source)));
+}
+
+// has_source: any alive source that points at target.
+fn ecs_one_rel_has_source(w: EcsOneRelWorldDeep, target: EcsOneRelEntityDeep) -> bool {
+    if ecs_one_rel_is_alive(w, target) != true { return false; };
+    let tid = ecs_one_rel_entity_id(target);
+    let i: i32 = 1;
+    while i < w.next_id {
+        if ecs_one_rel_alive_at(w, i) == 1 {
+            if ecs_one_rel_target_at(w, i) == tid { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// source: return the (sole) source entity for a target. Returns placeholder id 0 if none.
+fn ecs_one_rel_source(w: EcsOneRelWorldDeep, target: EcsOneRelEntityDeep) -> EcsOneRelEntityDeep {
+    if ecs_one_rel_is_alive(w, target) != true { return ecs_one_rel_entity_new(0); };
+    let tid = ecs_one_rel_entity_id(target);
+    let i: i32 = 1;
+    while i < w.next_id {
+        if ecs_one_rel_alive_at(w, i) == 1 {
+            if ecs_one_rel_target_at(w, i) == tid { return ecs_one_rel_entity_new(i); };
+        };
+        i = i + 1;
+    }
+    return ecs_one_rel_entity_new(0);
+}
+
+// despawn: marks entity not alive; if despawning a target that has a source
+// (linked_spawn behaviour), the source is also despawned.
+fn ecs_one_rel_despawn(w: EcsOneRelWorldDeep, e: EcsOneRelEntityDeep) -> EcsOneRelWorldDeep {
+    if ecs_one_rel_is_alive(w, e) != true { return w; };
+    let id = ecs_one_rel_entity_id(e);
+    // If `id` is a target of some alive source, also despawn that source (linked).
+    let i: i32 = 1;
+    while i < w.next_id {
+        if ecs_one_rel_alive_at(w, i) == 1 {
+            let rel_to = ecs_one_rel_target_at(w, i);
+            if rel_to == id {
+                w = ecs_one_rel_set_target(w, i, 0);
+                w = ecs_one_rel_set_alive(w, i, 0);
+                w.count = w.count - 1;
+            };
+        };
+        i = i + 1;
+    }
+    w = ecs_one_rel_set_target(w, id, 0);
+    w = ecs_one_rel_set_alive(w, id, 0);
+    w.count = w.count - 1;
+    return w;
+}

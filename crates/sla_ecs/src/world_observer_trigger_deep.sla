@@ -1,0 +1,287 @@
+// Deepened Bevy ECS World observer trigger surface.
+// Mirrors src/observer/mod.rs World::{add_observer, trigger, trigger_with, trigger_ref, trigger_ref_with}
+// plus trigger_ref_with_caller / DeferredWorld::trigger_raw matching:
+//   event_key + target matching (global -1 watches all targets for event)
+//   last_trigger_id bump once per trigger
+//   first error_handler_id from failing observers (handler_id != 0)
+//   payload mutation when any fired observer mutates_payload
+//   caller location recorded on trigger
+// Fixed capacity: 4 observers. Shallow lib/world_observer_trigger.sla retained.
+
+struct EcsWotObsDeep {
+    event_id: i32,
+    target_entity: i32, // -1 = global
+    error_handler_id: i32, // 0 = ok
+    runs: i32,
+    mutates_payload: bool,
+    // mutation delta applied to payload when mutates
+    mutate_delta: i32,
+}
+
+fn ecs_wot_obs_deep_new(event_id: i32, target_entity: i32, error_handler_id: i32, mutates_payload: bool, mutate_delta: i32) -> EcsWotObsDeep {
+    return EcsWotObsDeep {
+        event_id: event_id, target_entity: target_entity, error_handler_id: error_handler_id,
+        runs: 0, mutates_payload: mutates_payload, mutate_delta: mutate_delta,
+    };
+}
+
+fn ecs_wot_obs_deep_event_id(o: EcsWotObsDeep) -> i32 { return o.event_id; }
+fn ecs_wot_obs_deep_target(o: EcsWotObsDeep) -> i32 { return o.target_entity; }
+fn ecs_wot_obs_deep_handler(o: EcsWotObsDeep) -> i32 { return o.error_handler_id; }
+fn ecs_wot_obs_deep_runs(o: EcsWotObsDeep) -> i32 { return o.runs; }
+fn ecs_wot_obs_deep_mutates(o: EcsWotObsDeep) -> bool { return o.mutates_payload; }
+fn ecs_wot_obs_deep_delta(o: EcsWotObsDeep) -> i32 { return o.mutate_delta; }
+
+struct EcsWotWorldDeep {
+    // observers 0..3
+    o0: EcsWotObsDeep, u0: bool,
+    o1: EcsWotObsDeep, u1: bool,
+    o2: EcsWotObsDeep, u2: bool,
+    o3: EcsWotObsDeep, u3: bool,
+    count: i32,
+    last_trigger_id: i32,
+    next_observer_entity: i32,
+    last_caller: i64, // MaybeLocation id; 0 = none
+    last_event_key: i32,
+    last_payload: i32,
+    last_trigger_data: i32,
+}
+
+fn ecs_wot_empty_obs() -> EcsWotObsDeep {
+    return EcsWotObsDeep {
+        event_id: 0, target_entity: -1, error_handler_id: 0, runs: 0,
+        mutates_payload: false, mutate_delta: 0,
+    };
+}
+
+fn ecs_wot_world_deep_new() -> EcsWotWorldDeep {
+    let e = ecs_wot_empty_obs();
+    return EcsWotWorldDeep {
+        o0: e, u0: false, o1: e, u1: false, o2: e, u2: false, o3: e, u3: false,
+        count: 0, last_trigger_id: 0, next_observer_entity: 1,
+        last_caller: 0, last_event_key: 0, last_payload: 0, last_trigger_data: 0,
+    };
+}
+
+fn ecs_wot_world_deep_count(w: EcsWotWorldDeep) -> i32 { return w.count; }
+fn ecs_wot_world_deep_last_trigger_id(w: EcsWotWorldDeep) -> i32 { return w.last_trigger_id; }
+fn ecs_wot_world_deep_next_entity(w: EcsWotWorldDeep) -> i32 { return w.next_observer_entity; }
+fn ecs_wot_world_deep_last_caller(w: EcsWotWorldDeep) -> i64 { return w.last_caller; }
+fn ecs_wot_world_deep_last_event_key(w: EcsWotWorldDeep) -> i32 { return w.last_event_key; }
+fn ecs_wot_world_deep_last_payload(w: EcsWotWorldDeep) -> i32 { return w.last_payload; }
+fn ecs_wot_world_deep_last_trigger_data(w: EcsWotWorldDeep) -> i32 { return w.last_trigger_data; }
+
+fn ecs_wot_world_deep_observer_at(w: EcsWotWorldDeep, idx: i32) -> EcsWotObsDeep {
+    if idx == 0 { return w.o0; };
+    if idx == 1 { return w.o1; };
+    if idx == 2 { return w.o2; };
+    if idx == 3 { return w.o3; };
+    return ecs_wot_empty_obs();
+}
+
+fn ecs_wot_world_deep_used_at(w: EcsWotWorldDeep, idx: i32) -> bool {
+    if idx == 0 { return w.u0; };
+    if idx == 1 { return w.u1; };
+    if idx == 2 { return w.u2; };
+    if idx == 3 { return w.u3; };
+    return false;
+}
+
+struct EcsWotAddDeep {
+    world: EcsWotWorldDeep,
+    entity: i32,
+    ok: bool,
+}
+
+fn ecs_wot_add_deep_world(r: EcsWotAddDeep) -> EcsWotWorldDeep { return r.world; }
+fn ecs_wot_add_deep_entity(r: EcsWotAddDeep) -> i32 { return r.entity; }
+fn ecs_wot_add_deep_ok(r: EcsWotAddDeep) -> bool { return r.ok; }
+
+fn ecs_wot_world_deep_add_observer(
+    w: EcsWotWorldDeep, event_id: i32, target_entity: i32,
+    error_handler_id: i32, mutates_payload: bool, mutate_delta: i32
+) -> EcsWotAddDeep {
+    let o = ecs_wot_obs_deep_new(event_id, target_entity, error_handler_id, mutates_payload, mutate_delta);
+    let ent = w.next_observer_entity;
+    if w.count == 0 {
+        let w2 = EcsWotWorldDeep {
+            o0: o, u0: true, o1: w.o1, u1: w.u1, o2: w.o2, u2: w.u2, o3: w.o3, u3: w.u3,
+            count: 1, last_trigger_id: w.last_trigger_id, next_observer_entity: ent + 1,
+            last_caller: w.last_caller, last_event_key: w.last_event_key,
+            last_payload: w.last_payload, last_trigger_data: w.last_trigger_data,
+        };
+        return EcsWotAddDeep { world: w2, entity: ent, ok: true };
+    };
+    if w.count == 1 {
+        let w2 = EcsWotWorldDeep {
+            o0: w.o0, u0: w.u0, o1: o, u1: true, o2: w.o2, u2: w.u2, o3: w.o3, u3: w.u3,
+            count: 2, last_trigger_id: w.last_trigger_id, next_observer_entity: ent + 1,
+            last_caller: w.last_caller, last_event_key: w.last_event_key,
+            last_payload: w.last_payload, last_trigger_data: w.last_trigger_data,
+        };
+        return EcsWotAddDeep { world: w2, entity: ent, ok: true };
+    };
+    if w.count == 2 {
+        let w2 = EcsWotWorldDeep {
+            o0: w.o0, u0: w.u0, o1: w.o1, u1: w.u1, o2: o, u2: true, o3: w.o3, u3: w.u3,
+            count: 3, last_trigger_id: w.last_trigger_id, next_observer_entity: ent + 1,
+            last_caller: w.last_caller, last_event_key: w.last_event_key,
+            last_payload: w.last_payload, last_trigger_data: w.last_trigger_data,
+        };
+        return EcsWotAddDeep { world: w2, entity: ent, ok: true };
+    };
+    if w.count == 3 {
+        let w2 = EcsWotWorldDeep {
+            o0: w.o0, u0: w.u0, o1: w.o1, u1: w.u1, o2: w.o2, u2: w.u2, o3: o, u3: true,
+            count: 4, last_trigger_id: w.last_trigger_id, next_observer_entity: ent + 1,
+            last_caller: w.last_caller, last_event_key: w.last_event_key,
+            last_payload: w.last_payload, last_trigger_data: w.last_trigger_data,
+        };
+        return EcsWotAddDeep { world: w2, entity: ent, ok: true };
+    };
+    return EcsWotAddDeep { world: w, entity: 0, ok: false };
+}
+
+// Match: event_id equal AND (observer global OR target equal)
+fn ecs_wot_obs_matches(o: EcsWotObsDeep, event_id: i32, target_entity: i32) -> bool {
+    if o.event_id != event_id { return false; };
+    if o.target_entity == -1 { return true; };
+    if o.target_entity == target_entity { return true; };
+    return false;
+}
+
+fn ecs_wot_bump_runs(o: EcsWotObsDeep) -> EcsWotObsDeep {
+    return EcsWotObsDeep {
+        event_id: o.event_id, target_entity: o.target_entity, error_handler_id: o.error_handler_id,
+        runs: o.runs + 1, mutates_payload: o.mutates_payload, mutate_delta: o.mutate_delta,
+    };
+}
+
+struct EcsWotRunDeep {
+    world: EcsWotWorldDeep,
+    fired: i32,
+    first_error_handler_id: i32,
+    payload: i32,
+    payload_mutated: bool,
+    trigger_data: i32,
+}
+
+fn ecs_wot_run_deep_world(r: EcsWotRunDeep) -> EcsWotWorldDeep { return r.world; }
+fn ecs_wot_run_deep_fired(r: EcsWotRunDeep) -> i32 { return r.fired; }
+fn ecs_wot_run_deep_first_err(r: EcsWotRunDeep) -> i32 { return r.first_error_handler_id; }
+fn ecs_wot_run_deep_payload(r: EcsWotRunDeep) -> i32 { return r.payload; }
+fn ecs_wot_run_deep_payload_mutated(r: EcsWotRunDeep) -> bool { return r.payload_mutated; }
+fn ecs_wot_run_deep_trigger_data(r: EcsWotRunDeep) -> i32 { return r.trigger_data; }
+fn ecs_wot_run_deep_last_trigger_id(r: EcsWotRunDeep) -> i32 { return r.world.last_trigger_id; }
+
+// Core: trigger_ref_with_caller
+fn ecs_wot_world_deep_trigger_raw(
+    w: EcsWotWorldDeep, event_id: i32, target_entity: i32,
+    payload: i32, trigger_data: i32, caller: i64
+) -> EcsWotRunDeep {
+    let tid = w.last_trigger_id + 1;
+    let fired: i32 = 0;
+    let first_err: i32 = -1;
+    let payload2 = payload;
+    let mutated = false;
+    let o0 = w.o0; let o1 = w.o1; let o2 = w.o2; let o3 = w.o3;
+    let u0 = w.u0; let u1 = w.u1; let u2 = w.u2; let u3 = w.u3;
+    if u0 {
+        if ecs_wot_obs_matches(o0, event_id, target_entity) {
+            o0 = ecs_wot_bump_runs(o0);
+            fired = fired + 1;
+            if o0.error_handler_id != 0 {
+                if first_err == -1 { first_err = o0.error_handler_id; };
+            };
+            if o0.mutates_payload {
+                payload2 = payload2 + o0.mutate_delta;
+                mutated = true;
+            };
+        };
+    };
+    if u1 {
+        if ecs_wot_obs_matches(o1, event_id, target_entity) {
+            o1 = ecs_wot_bump_runs(o1);
+            fired = fired + 1;
+            if o1.error_handler_id != 0 {
+                if first_err == -1 { first_err = o1.error_handler_id; };
+            };
+            if o1.mutates_payload {
+                payload2 = payload2 + o1.mutate_delta;
+                mutated = true;
+            };
+        };
+    };
+    if u2 {
+        if ecs_wot_obs_matches(o2, event_id, target_entity) {
+            o2 = ecs_wot_bump_runs(o2);
+            fired = fired + 1;
+            if o2.error_handler_id != 0 {
+                if first_err == -1 { first_err = o2.error_handler_id; };
+            };
+            if o2.mutates_payload {
+                payload2 = payload2 + o2.mutate_delta;
+                mutated = true;
+            };
+        };
+    };
+    if u3 {
+        if ecs_wot_obs_matches(o3, event_id, target_entity) {
+            o3 = ecs_wot_bump_runs(o3);
+            fired = fired + 1;
+            if o3.error_handler_id != 0 {
+                if first_err == -1 { first_err = o3.error_handler_id; };
+            };
+            if o3.mutates_payload {
+                payload2 = payload2 + o3.mutate_delta;
+                mutated = true;
+            };
+        };
+    };
+    let w2 = EcsWotWorldDeep {
+        o0: o0, u0: u0, o1: o1, u1: u1, o2: o2, u2: u2, o3: o3, u3: u3,
+        count: w.count, last_trigger_id: tid, next_observer_entity: w.next_observer_entity,
+        last_caller: caller, last_event_key: event_id,
+        last_payload: payload2, last_trigger_data: trigger_data,
+    };
+    return EcsWotRunDeep {
+        world: w2, fired: fired, first_error_handler_id: first_err,
+        payload: payload2, payload_mutated: mutated, trigger_data: trigger_data,
+    };
+}
+
+// World::trigger(event) — Default trigger, consume event (payload unused beyond event_id)
+fn ecs_wot_world_deep_trigger(w: EcsWotWorldDeep, event_id: i32) -> EcsWotRunDeep {
+    return ecs_wot_world_deep_trigger_raw(w, event_id, -1, 0, 0, 0);
+}
+
+// World::trigger_with(event, trigger)
+fn ecs_wot_world_deep_trigger_with(w: EcsWotWorldDeep, event_id: i32, trigger_data: i32) -> EcsWotRunDeep {
+    return ecs_wot_world_deep_trigger_raw(w, event_id, -1, trigger_data, trigger_data, 0);
+}
+
+// World::trigger_ref(&mut event)
+fn ecs_wot_world_deep_trigger_ref(w: EcsWotWorldDeep, event_id: i32, payload: i32) -> EcsWotRunDeep {
+    return ecs_wot_world_deep_trigger_raw(w, event_id, -1, payload, 0, 0);
+}
+
+// World::trigger_ref_with(&mut event, &mut trigger)
+fn ecs_wot_world_deep_trigger_ref_with(
+    w: EcsWotWorldDeep, event_id: i32, payload: i32, trigger_data: i32
+) -> EcsWotRunDeep {
+    return ecs_wot_world_deep_trigger_raw(w, event_id, -1, payload, trigger_data, 0);
+}
+
+// trigger_ref_with_caller
+fn ecs_wot_world_deep_trigger_ref_with_caller(
+    w: EcsWotWorldDeep, event_id: i32, payload: i32, trigger_data: i32, caller: i64
+) -> EcsWotRunDeep {
+    return ecs_wot_world_deep_trigger_raw(w, event_id, -1, payload, trigger_data, caller);
+}
+
+// Entity-targeted trigger (EntityEvent path)
+fn ecs_wot_world_deep_trigger_entity(
+    w: EcsWotWorldDeep, event_id: i32, target_entity: i32, payload: i32
+) -> EcsWotRunDeep {
+    return ecs_wot_world_deep_trigger_raw(w, event_id, target_entity, payload, 0, 0);
+}

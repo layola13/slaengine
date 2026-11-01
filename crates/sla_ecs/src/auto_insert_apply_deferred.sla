@@ -1,0 +1,195 @@
+// Bevy ECS AutoInsertApplyDeferredPass + IgnoreDeferred — mirrors
+// src/schedule/auto_insert_apply_deferred.rs.
+//
+//   pub struct AutoInsertApplyDeferredPass {
+//       no_sync_edges: BTreeSet<(NodeId, NodeId)>,
+//       auto_sync_node_ids: HashMap<u32, SystemKey>,
+//   }
+//   pub struct IgnoreDeferred;
+//   impl AutoInsertApplyDeferredPass {
+//       fn get_sync_point(distance) -> SystemKey   (cached per distance)
+//       fn add_auto_sync() -> SystemKey             (inserts ApplyDeferred system)
+//   }
+//   impl ScheduleBuildPass for AutoInsertApplyDeferredPass {
+//       type EdgeOptions = IgnoreDeferred;
+//       fn add_dependency(from, to, options: Option<&IgnoreDeferred>) — when ignore present,
+//           the (from, to) edge is added to no_sync_edges (no auto ApplyDeferred insertion).
+//       fn build(...) — toposort, compute per-system distances (number of sync points between
+//           node and graph start), insert sync points on edges whose endpoints differ in distance.
+//   }
+//
+// We model the **outer observable state** + the **distance-computation pass** (the core of the
+// build). Sync points are inserted as integer keys; the distance vector is returned per system.
+
+// === Result struct for build's distance map (single-field per-entry accessors) ===
+struct AidDistanceEntry {
+    system_key: i32,
+    distance: i32,
+}
+
+fn ecs_aid_de_key(r: AidDistanceEntry) -> i32 { return r.system_key; }
+fn ecs_aid_de_distance(r: AidDistanceEntry) -> i32 { return r.distance; }
+
+// === EcsAutoInsertApplyDeferredPass model ===
+// no_sync_edges: parallel Vecs of (from, to) node-ids (edges that ignore auto-sync insertion)
+// auto_sync_node_ids: parallel Vecs of (distance, system_key) — the sync-point cache
+// next_sync_key: counter minted by add_auto_sync (mirrors graph.systems.insert)
+struct EcsAutoInsertApplyDeferredPass {
+    no_sync_from: Vec<i32>,
+    no_sync_to: Vec<i32>,
+    sync_distance: Vec<i32>,
+    sync_key: Vec<i32>,
+    next_sync_key: i32,
+}
+
+fn ecs_auto_insert_pass_new() -> EcsAutoInsertApplyDeferredPass {
+    return EcsAutoInsertApplyDeferredPass {
+        no_sync_from: Vec::new(), no_sync_to: Vec::new(),
+        sync_distance: Vec::new(), sync_key: Vec::new(),
+        next_sync_key: 1,
+    };
+}
+
+// === IgnoreDeferred option: when present, the edge is no_sync ===
+// We model the "present" flag as ignore_edge=true; the (from, to) is added to no_sync_edges.
+fn ecs_auto_insert_add_dependency(p: EcsAutoInsertApplyDeferredPass, from: i32, to: i32, ignore_edge: bool) -> EcsAutoInsertApplyDeferredPass {
+    if ignore_edge {
+        p.no_sync_from.push(from);
+        p.no_sync_to.push(to);
+    };
+    return p;
+}
+
+fn ecs_auto_insert_no_sync_edge_count(p: EcsAutoInsertApplyDeferredPass) -> i32 {
+    return len(p.no_sync_from) as i32;
+}
+
+fn ecs_auto_insert_is_no_sync(p: EcsAutoInsertApplyDeferredPass, from: i32, to: i32) -> bool {
+    let i = 0;
+    while i < len(p.no_sync_from) as i32 {
+        if p.no_sync_from[i] == from && p.no_sync_to[i] == to { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === get_sync_point(distance) — cached per-distance; mint a new key on cache miss ===
+struct SyncPointResult {
+    pass: EcsAutoInsertApplyDeferredPass,
+    key: i32,
+    cache_hit: bool,
+}
+
+fn ecs_spr_pass(r: SyncPointResult) -> EcsAutoInsertApplyDeferredPass { return r.pass; }
+fn ecs_spr_key(r: SyncPointResult) -> i32 { return r.key; }
+fn ecs_spr_hit(r: SyncPointResult) -> bool { return r.cache_hit; }
+
+fn ecs_auto_insert_get_sync_point(p: EcsAutoInsertApplyDeferredPass, distance: i32) -> SyncPointResult {
+    let i = 0;
+    while i < len(p.sync_distance) as i32 {
+        if p.sync_distance[i] == distance {
+            return SyncPointResult { pass: p, key: p.sync_key[i], cache_hit: true };
+        };
+        i = i + 1;
+    }
+    // miss -> add_auto_sync: mint a new key and record at distance.
+    let new_key = p.next_sync_key;
+    p.sync_distance.push(distance);
+    p.sync_key.push(new_key);
+    p.next_sync_key = new_key + 1;
+    return SyncPointResult { pass: p, key: new_key, cache_hit: false };
+}
+
+fn ecs_auto_insert_sync_point_count(p: EcsAutoInsertApplyDeferredPass) -> i32 {
+    return len(p.sync_distance) as i32;
+}
+
+// === distance-computation: build-pass core ===
+// Inputs: the topo-ordered system keys; per-system has_deferred / is_exclusive / is_apply_deferred
+// / has_conditions flags; the flat-dependency edges (from, to) pairs (post-flatten, no set-col
+// collapse — modelled here directly).
+// Output: a Vec<AidDistanceEntry> of (system_key, distance) for each system in topo order.
+//
+// Algorithm (mirrors build()): node_needs_sync = is_valid_explicit_sync_point(target) OR
+//   has_deferred of source. For each (from, to) edge: if from has deferred AND not ignored AND target
+//   not exclusive -> the edge needs a sync point -> weight 1; else weight 0. target_distance =
+//   max(target_distance, from_distance + weight). Sync points that are themselves ApplyDeferred
+//   raise the distance.
+fn ecs_auto_insert_compute_distances(p: EcsAutoInsertApplyDeferredPass, topo: Vec<i32>, has_deferred: Vec<bool>, is_exclusive: Vec<bool>, is_apply_deferred: Vec<bool>, edges_from: Vec<i32>, edges_to: Vec<i32>) -> Vec<AidDistanceEntry> {
+    // distance for each system at topo[i] — index keyed by position in topo.
+    let dist = Vec::new();
+    let di = 0;
+    while di < len(topo) as i32 {
+        dist.push(0);
+        di = di + 1;
+    }
+    // Walk topo; for each system, propagate distance along edges.
+    let tw = 0;
+    while tw < len(topo) as i32 {
+        let from = topo[tw];
+        let from_dist = dist[tw];
+        // node_needs_sync: the system has deferred params -> needs a sync point downstream.
+        let from_has_def = has_deferred[tw];
+        // also: an explicit sync point (is_apply_deferred) raises the distance by 1 — modelled as
+        // adding 1 to outgoing weights here is dual; we follow the "weight = 1 if edge_needs_sync
+        // OR is_valid_explicit_sync_point(target)" rule.
+        // iterate edges originating from `from`.
+        let e = 0;
+        while e < len(edges_from) as i32 {
+            if edges_from[e] == from {
+                let to = edges_to[e];
+                // resolve target topo index.
+                let to_idx = _ecs_aid_index_of(topo, to);
+                if to_idx >= 0 {
+                    let edge_ignored = ecs_auto_insert_is_no_sync(p, from, to);
+                    let target_exclusive = is_exclusive[to_idx];
+                    let target_is_apply = is_apply_deferred[to_idx];
+                    let edge_needs_sync = from_has_def;
+                    // If the from is deferred but the edge is ignored and target is not exclusive,
+                    // the sync point is delayed (target_pending_sync) but THIS edge weight is 0.
+                    let effective = edge_needs_sync;
+                    if edge_needs_sync && edge_ignored && !target_exclusive {
+                        effective = false;
+                    };
+                    let weight = 0;
+                    if effective || target_is_apply {
+                        weight = 1;
+                    };
+                    let new_dist = from_dist + weight;
+                    if new_dist > dist[to_idx] {
+                        dist[to_idx] = new_dist;
+                    };
+                };
+            };
+            e = e + 1;
+        }
+        tw = tw + 1;
+    }
+    // Emit AidDistanceEntry per topo system.
+    let out = Vec::new();
+    let j = 0;
+    while j < len(topo) as i32 {
+        out.push(AidDistanceEntry { system_key: topo[j], distance: dist[j] });
+        j = j + 1;
+    }
+    return out;
+}
+
+// helper: linear index-of in topo (returns -1 if not found)
+fn _ecs_aid_index_of(topo: Vec<i32>, key: i32) -> i32 {
+    let i = 0;
+    while i < len(topo) as i32 {
+        if topo[i] == key { return i; };
+        i = i + 1;
+    }
+    return (0 - 1);
+}
+
+// === has_deferred / is_apply_deferred / is_exclusive / has_conditions mirrors ===
+// Bevy's is_apply_deferred(system): true iff the system is exactly ApplyDeferred. We model the
+// "is a sync point" predicate as a direct flag for the distance pass (see compute_distances above)
+// plus an explicit helper for tests.
+fn ecs_auto_insert_is_apply_deferred_by_id(is_apply_flags: Vec<bool>, system: i32) -> bool {
+    if system < 0 || system >= len(is_apply_flags) as i32 { return false; };
+    return is_apply_flags[system];
+}

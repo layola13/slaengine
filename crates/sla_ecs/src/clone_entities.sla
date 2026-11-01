@@ -1,0 +1,246 @@
+// Bevy ECS entity (src/entity/clone_entities.rs):
+// SourceComponent + ComponentCloneCtx + EntityMapper trait + EntityClonerState
+// These provide the context for cloning components between entities.
+
+// === SourceComponent ===
+// Provides read access to the source component being cloned.
+struct EcsSourceComponent {
+    component_id: i32,
+    component_size: i64,
+    // In SLA we model the component data as an opaque i64 handle
+    data_handle: i64,
+}
+
+fn ecs_source_component_new(component_id: i32, component_size: i64, data_handle: i64) -> EcsSourceComponent {
+    return EcsSourceComponent { component_id: component_id, component_size: component_size, data_handle: data_handle };
+}
+
+fn ecs_source_component_id(sc: EcsSourceComponent) -> i32 { return sc.component_id; }
+fn ecs_source_component_size(sc: EcsSourceComponent) -> i64 { return sc.component_size; }
+fn ecs_source_component_ptr(sc: EcsSourceComponent) -> i64 { return sc.data_handle; }
+
+// read: returns Some(data) if component_id matches requested, None otherwise
+fn ecs_source_component_read(sc: EcsSourceComponent, requested_id: i32) -> (bool, i64) {
+    if sc.component_id != requested_id { return (false, 0); };
+    return (true, sc.data_handle);
+}
+
+// === EntityMapper ===
+// Maps source entities to target entities during cloning.
+struct EcsEntityMapper {
+    // Maps source entity index -> target entity index
+    source_keys: Vec<i64>,
+    target_values: Vec<i64>,
+    next_target: i64,
+}
+
+fn ecs_entity_mapper_new(start_target: i64) -> EcsEntityMapper {
+    return EcsEntityMapper { source_keys: Vec::new(), target_values: Vec::new(), next_target: start_target };
+}
+
+fn ecs_entity_mapper_get_or_alloc(m: EcsEntityMapper, source: i64) -> (EcsEntityMapper, i64) {
+    // Check if already mapped
+    let i: i64 = 0;
+    let n: i64 = len(m.source_keys) as i64;
+    while i < n {
+        if m.source_keys[i] == source { return (m, m.target_values[i]); };
+        i = i + 1;
+    }
+    // Allocate new target
+    let target = m.next_target;
+    m.next_target = m.next_target + 1;
+    m.source_keys.push(source);
+    m.target_values.push(target);
+    return (m, target);
+}
+
+fn ecs_entity_mapper_get(m: EcsEntityMapper, source: i64) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(m.source_keys) as i64;
+    while i < n {
+        if m.source_keys[i] == source { return (true, m.target_values[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn ecs_entity_mapper_len(m: EcsEntityMapper) -> i64 { return len(m.source_keys) as i64; }
+
+fn ecs_entity_mapper_has(m: EcsEntityMapper, source: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(m.source_keys) as i64;
+    while i < n {
+        if m.source_keys[i] == source { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_entity_mapper_resolve(m: EcsEntityMapper, entity: i64) -> i64 {
+    // If mapped, return target; otherwise return the entity itself
+    let r = ecs_entity_mapper_get(m, entity);
+    if r.0 { return r.1; };
+    return entity;
+}
+
+// === ComponentCloneCtx ===
+// Context passed to component clone handlers.
+struct EcsComponentCloneCtx {
+    component_id: i32,
+    source: i64,
+    target: i64,
+    target_component_written: bool,
+    target_component_moved: bool,
+    moving: bool,
+    linked_cloning: bool,
+    component_size: i64,
+    queued_entities: Vec<i64>,
+}
+
+fn ecs_clone_ctx_new(component_id: i32, source: i64, target: i64, component_size: i64, moving: bool) -> EcsComponentCloneCtx {
+    return EcsComponentCloneCtx {
+        component_id: component_id, source: source, target: target,
+        target_component_written: false, target_component_moved: false,
+        moving: moving, linked_cloning: false, component_size: component_size,
+        queued_entities: Vec::new()
+    };
+}
+
+fn ecs_clone_ctx_target_component_written(ctx: EcsComponentCloneCtx) -> bool { return ctx.target_component_written; }
+fn ecs_clone_ctx_moving(ctx: EcsComponentCloneCtx) -> bool { return ctx.moving; }
+fn ecs_clone_ctx_linked_cloning(ctx: EcsComponentCloneCtx) -> bool { return ctx.linked_cloning; }
+fn ecs_clone_ctx_source(ctx: EcsComponentCloneCtx) -> i64 { return ctx.source; }
+fn ecs_clone_ctx_target(ctx: EcsComponentCloneCtx) -> i64 { return ctx.target; }
+fn ecs_clone_ctx_component_id(ctx: EcsComponentCloneCtx) -> i32 { return ctx.component_id; }
+fn ecs_clone_ctx_component_size(ctx: EcsComponentCloneCtx) -> i64 { return ctx.component_size; }
+
+fn ecs_clone_ctx_set_linked_cloning(ctx: EcsComponentCloneCtx, linked: bool) -> EcsComponentCloneCtx {
+    ctx.linked_cloning = linked;
+    return ctx;
+}
+
+// write_target_component: mark that a component was written to the target
+fn ecs_clone_ctx_write_target_component(ctx: EcsComponentCloneCtx) -> EcsComponentCloneCtx {
+    ctx.target_component_written = true;
+    return ctx;
+}
+
+// write_target_component_moved: mark that a component was moved (not copied)
+fn ecs_clone_ctx_write_target_component_moved(ctx: EcsComponentCloneCtx) -> EcsComponentCloneCtx {
+    ctx.target_component_written = true;
+    ctx.target_component_moved = true;
+    return ctx;
+}
+
+fn ecs_clone_ctx_target_component_moved(ctx: EcsComponentCloneCtx) -> bool { return ctx.target_component_moved; }
+
+// queue_entity_clone: queue an entity for cloning
+fn ecs_clone_ctx_queue_entity_clone(ctx: EcsComponentCloneCtx, entity: i64) -> EcsComponentCloneCtx {
+    ctx.queued_entities.push(entity);
+    return ctx;
+}
+
+fn ecs_clone_ctx_queued_count(ctx: EcsComponentCloneCtx) -> i64 { return len(ctx.queued_entities) as i64; }
+
+fn ecs_clone_ctx_queued_at(ctx: EcsComponentCloneCtx, index: i64) -> (bool, i64) {
+    if index < 0 { return (false, 0); };
+    if index >= len(ctx.queued_entities) as i64 { return (false, 0); };
+    return (true, ctx.queued_entities[index]);
+}
+
+// === EntityClonerState ===
+// Internal state of EntityCloner during cloning
+struct EcsEntityClonerState {
+    move_components: bool,
+    linked_cloning: bool,
+    insert_mode: i32,
+    filter_mode: i32,  // 0 = opt_out, 1 = opt_in
+    allowed: Vec<i32>,
+    denied: Vec<i32>,
+    allow_if_new: Vec<i32>,
+    components_cloned: i64,
+}
+
+fn ecs_cloner_state_new() -> EcsEntityClonerState {
+    return EcsEntityClonerState {
+        move_components: false, linked_cloning: false, insert_mode: 0,
+        filter_mode: 0, allowed: Vec::new(), denied: Vec::new(),
+        allow_if_new: Vec::new(), components_cloned: 0
+    };
+}
+
+fn ecs_cloner_state_move_components(s: EcsEntityClonerState) -> bool { return s.move_components; }
+fn ecs_cloner_state_linked_cloning(s: EcsEntityClonerState) -> bool { return s.linked_cloning; }
+fn ecs_cloner_state_insert_mode(s: EcsEntityClonerState) -> i32 { return s.insert_mode; }
+fn ecs_cloner_state_filter_mode(s: EcsEntityClonerState) -> i32 { return s.filter_mode; }
+fn ecs_cloner_state_components_cloned(s: EcsEntityClonerState) -> i64 { return s.components_cloned; }
+
+fn ecs_cloner_state_set_move_components(s: EcsEntityClonerState, enable: bool) -> EcsEntityClonerState {
+    s.move_components = enable;
+    return s;
+}
+
+fn ecs_cloner_state_set_linked_cloning(s: EcsEntityClonerState, linked: bool) -> EcsEntityClonerState {
+    s.linked_cloning = linked;
+    return s;
+}
+
+fn ecs_cloner_state_set_insert_mode(s: EcsEntityClonerState, mode: i32) -> EcsEntityClonerState {
+    s.insert_mode = mode;
+    return s;
+}
+
+fn ecs_cloner_state_set_filter_mode(s: EcsEntityClonerState, mode: i32) -> EcsEntityClonerState {
+    s.filter_mode = mode;
+    return s;
+}
+
+fn ecs_cloner_state_should_clone(s: EcsEntityClonerState, component_id: i32) -> bool {
+    // OptOut mode: clone unless explicitly denied
+    if s.filter_mode == 0 {
+        // Check denied list
+        let i: i64 = 0;
+        let n: i64 = len(s.denied) as i64;
+        while i < n {
+            if s.denied[i] == component_id { return false; };
+            i = i + 1;
+        }
+        return true;
+    };
+    // OptIn mode: clone only if explicitly allowed
+    let i: i64 = 0;
+    let n: i64 = len(s.allowed) as i64;
+    while i < n {
+        if s.allowed[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_cloner_state_allow(s: EcsEntityClonerState, component_id: i32) -> EcsEntityClonerState {
+    s.allowed.push(component_id);
+    return s;
+}
+
+fn ecs_cloner_state_deny(s: EcsEntityClonerState, component_id: i32) -> EcsEntityClonerState {
+    s.denied.push(component_id);
+    return s;
+}
+
+fn ecs_cloner_state_allow_if_new(s: EcsEntityClonerState, component_id: i32) -> EcsEntityClonerState {
+    s.allow_if_new.push(component_id);
+    return s;
+}
+
+fn ecs_cloner_state_increment_cloned(s: EcsEntityClonerState) -> EcsEntityClonerState {
+    s.components_cloned = s.components_cloned + 1;
+    return s;
+}
+
+fn ecs_cloner_state_allowed_len(s: EcsEntityClonerState) -> i64 { return len(s.allowed) as i64; }
+fn ecs_cloner_state_denied_len(s: EcsEntityClonerState) -> i64 { return len(s.denied) as i64; }
+fn ecs_cloner_state_allow_if_new_len(s: EcsEntityClonerState) -> i64 { return len(s.allow_if_new) as i64; }
+
+// === InsertMode constants ===
+const ECS_CLONE_INSERT_MODE_KEEP: i32 = 0;
+const ECS_CLONE_INSERT_MODE_REPLACE: i32 = 1;

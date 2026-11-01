@@ -1,0 +1,150 @@
+// Deepened Bevy ECS name surface.
+// Mirrors src/name.rs: Name wraps Cow<str> with precomputed hash; set/mutate;
+// as_str; NameOrEntity debug helper; equality by string content (hash cached).
+// Shallow lib/name_hashed.sla retained.
+
+// Ownership of string storage
+const ECS_NM_BORROWED: i32 = 0;
+const ECS_NM_OWNED: i32 = 1;
+
+// NameOrEntity kinds
+const ECS_NM_KIND_NAME: i32 = 0;
+const ECS_NM_KIND_ENTITY: i32 = 1;
+
+// Hash helper (FNV-ish on i64 payload stand-in for str)
+fn ecs_nm_hash(value: i64) -> i64 {
+    // avoid overflow issues: keep moderate
+    let h: i64 = 2166136261;
+    let v = value;
+    if v < 0 { v = 0 - v; };
+    // mix bytes of value
+    let i: i32 = 0;
+    while i < 8 {
+        let byte = v - (v / 256) * 256;
+        h = h * 16777619;
+        h = h + byte;
+        // keep h in reasonable range
+        if h < 0 { h = 0 - h; };
+        h = h - (h / 1000000007) * 1000000007;
+        v = v / 256;
+        i = i + 1;
+    }
+    return h;
+}
+
+struct EcsNameDeep {
+    value: i64,       // string id / content stand-in
+    hash: i64,        // precomputed
+    ownership: i32,   // borrowed vs owned
+    mutate_count: i64,
+    set_count: i64,
+}
+
+fn ecs_nm_deep_new(value: i64) -> EcsNameDeep {
+    // Name::new allocates owned string
+    return EcsNameDeep {
+        value: value,
+        hash: ecs_nm_hash(value),
+        ownership: ECS_NM_OWNED,
+        mutate_count: 0,
+        set_count: 0,
+    };
+}
+
+// from static/borrowed
+fn ecs_nm_deep_from_static(value: i64) -> EcsNameDeep {
+    return EcsNameDeep {
+        value: value,
+        hash: ecs_nm_hash(value),
+        ownership: ECS_NM_BORROWED,
+        mutate_count: 0,
+        set_count: 0,
+    };
+}
+
+fn ecs_nm_deep_as_str(n: EcsNameDeep) -> i64 { return n.value; }
+fn ecs_nm_deep_hash(n: EcsNameDeep) -> i64 { return n.hash; }
+fn ecs_nm_deep_ownership(n: EcsNameDeep) -> i32 { return n.ownership; }
+fn ecs_nm_deep_is_owned(n: EcsNameDeep) -> bool { return n.ownership == ECS_NM_OWNED; }
+fn ecs_nm_deep_is_borrowed(n: EcsNameDeep) -> bool { return n.ownership == ECS_NM_BORROWED; }
+fn ecs_nm_deep_mutate_count(n: EcsNameDeep) -> i64 { return n.mutate_count; }
+fn ecs_nm_deep_set_count(n: EcsNameDeep) -> i64 { return n.set_count; }
+
+// set: replaces name; becomes owned
+fn ecs_nm_deep_set(n: EcsNameDeep, value: i64) -> EcsNameDeep {
+    n.value = value;
+    n.hash = ecs_nm_hash(value);
+    n.ownership = ECS_NM_OWNED;
+    n.set_count = n.set_count + 1;
+    return n;
+}
+
+// mutate: if borrowed, allocate owned copy first then apply transform
+// transform modeled as adding offset to value id
+fn ecs_nm_deep_mutate(n: EcsNameDeep, offset: i64) -> EcsNameDeep {
+    if n.ownership == ECS_NM_BORROWED {
+        // allocate owned copy of current value
+        n.ownership = ECS_NM_OWNED;
+    };
+    n.value = n.value + offset;
+    n.hash = ecs_nm_hash(n.value);
+    n.mutate_count = n.mutate_count + 1;
+    return n;
+}
+
+// equality by string content (not ownership)
+fn ecs_nm_deep_eq(a: EcsNameDeep, b: EcsNameDeep) -> bool {
+    return a.value == b.value;
+}
+
+// hash consistency: equal names share hash
+fn ecs_nm_deep_hash_consistent(a: EcsNameDeep, b: EcsNameDeep) -> bool {
+    if ecs_nm_deep_eq(a, b) {
+        return a.hash == b.hash;
+    };
+    return true;
+}
+
+// Display/Debug stand-in code
+fn ecs_nm_deep_display_code(n: EcsNameDeep) -> i64 {
+    return n.value;
+}
+
+// === NameOrEntity ===
+struct EcsNameOrEntityDeep {
+    kind: i32,
+    name_value: i64,
+    entity: i64,
+}
+
+fn ecs_nm_or_name(value: i64) -> EcsNameOrEntityDeep {
+    return EcsNameOrEntityDeep { kind: ECS_NM_KIND_NAME, name_value: value, entity: 0 };
+}
+
+fn ecs_nm_or_entity(entity: i64) -> EcsNameOrEntityDeep {
+    return EcsNameOrEntityDeep { kind: ECS_NM_KIND_ENTITY, name_value: 0, entity: entity };
+}
+
+// From Name
+fn ecs_nm_or_from_name(n: EcsNameDeep) -> EcsNameOrEntityDeep {
+    return ecs_nm_or_name(n.value);
+}
+
+fn ecs_nm_or_is_name(n: EcsNameOrEntityDeep) -> bool { return n.kind == ECS_NM_KIND_NAME; }
+fn ecs_nm_or_is_entity(n: EcsNameOrEntityDeep) -> bool { return n.kind == ECS_NM_KIND_ENTITY; }
+fn ecs_nm_or_name_value(n: EcsNameOrEntityDeep) -> i64 { return n.name_value; }
+fn ecs_nm_or_entity_id(n: EcsNameOrEntityDeep) -> i64 { return n.entity; }
+
+// Display: name uses value; entity uses entity id with marker
+fn ecs_nm_or_display_code(n: EcsNameOrEntityDeep) -> i64 {
+    if n.kind == ECS_NM_KIND_NAME { return n.name_value; };
+    return 1000000000 + n.entity;
+}
+
+// QueryData-like: build NameOrEntity preferring Name if present
+fn ecs_nm_or_prefer_name(has_name: bool, name_value: i64, entity: i64) -> EcsNameOrEntityDeep {
+    if has_name {
+        return ecs_nm_or_name(name_value);
+    };
+    return ecs_nm_or_entity(entity);
+}

@@ -1,0 +1,673 @@
+// Deepened Bevy ECS ScheduleGraph surface (src/schedule/schedule.rs ScheduleGraph).
+// Models process_configs chaining (densely_chained), anonymous sets for collective
+// conditions, transitive hierarchy/dependency bridging, systems_in_set error gates,
+// ambiguous_with undirected edges, and graph changed flags.
+// Shallow lib/schedule_graph.sla covers DiGraph/DAG/Tarjan primitives.
+
+// === NodeId (system vs set) ===
+const ECS_SG_NODE_SYSTEM: i32 = 0;
+const ECS_SG_NODE_SET: i32 = 1;
+
+struct EcsSgNode {
+    kind: i32,
+    key: i64,
+}
+
+fn ecs_sg_node_system(key: i64) -> EcsSgNode {
+    return EcsSgNode { kind: ECS_SG_NODE_SYSTEM, key: key };
+}
+
+fn ecs_sg_node_set(key: i64) -> EcsSgNode {
+    return EcsSgNode { kind: ECS_SG_NODE_SET, key: key };
+}
+
+fn ecs_sg_node_is_system(n: EcsSgNode) -> bool { return n.kind == ECS_SG_NODE_SYSTEM; }
+fn ecs_sg_node_is_set(n: EcsSgNode) -> bool { return n.kind == ECS_SG_NODE_SET; }
+fn ecs_sg_node_key(n: EcsSgNode) -> i64 { return n.key; }
+
+fn ecs_sg_node_eq(a: EcsSgNode, b: EcsSgNode) -> bool {
+    return a.kind == b.kind && a.key == b.key;
+}
+
+// === Directed edge store (NodeId as kind+key pairs) ===
+struct EcsSgEdgeStore {
+    from_kind: Vec<i32>,
+    from_key: Vec<i64>,
+    to_kind: Vec<i32>,
+    to_key: Vec<i64>,
+}
+
+fn ecs_sg_edge_store_new() -> EcsSgEdgeStore {
+    return EcsSgEdgeStore {
+        from_kind: Vec::new(),
+        from_key: Vec::new(),
+        to_kind: Vec::new(),
+        to_key: Vec::new(),
+    };
+}
+
+fn ecs_sg_edge_store_len(e: EcsSgEdgeStore) -> i64 {
+    return len(e.from_kind) as i64;
+}
+
+fn ecs_sg_edge_store_add(e: EcsSgEdgeStore, from: EcsSgNode, to: EcsSgNode) -> EcsSgEdgeStore {
+    // skip duplicate
+    if ecs_sg_edge_store_contains(e, from, to) { return e; };
+    e.from_kind.push(from.kind);
+    e.from_key.push(from.key);
+    e.to_kind.push(to.kind);
+    e.to_key.push(to.key);
+    return e;
+}
+
+fn ecs_sg_edge_store_contains(e: EcsSgEdgeStore, from: EcsSgNode, to: EcsSgNode) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(e.from_kind) as i64;
+    while i < n {
+        if e.from_kind[i] == from.kind && e.from_key[i] == from.key
+            && e.to_kind[i] == to.kind && e.to_key[i] == to.key {
+            return true;
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_sg_edge_store_remove(e: EcsSgEdgeStore, from: EcsSgNode, to: EcsSgNode) -> (EcsSgEdgeStore, bool) {
+    let fk: Vec<i32> = Vec::new();
+    let fkey: Vec<i64> = Vec::new();
+    let tk: Vec<i32> = Vec::new();
+    let tkey: Vec<i64> = Vec::new();
+    let found = false;
+    let i: i64 = 0;
+    let n: i64 = len(e.from_kind) as i64;
+    while i < n {
+        if e.from_kind[i] == from.kind && e.from_key[i] == from.key
+            && e.to_kind[i] == to.kind && e.to_key[i] == to.key {
+            found = true;
+        } else {
+            fk.push(e.from_kind[i]);
+            fkey.push(e.from_key[i]);
+            tk.push(e.to_kind[i]);
+            tkey.push(e.to_key[i]);
+        };
+        i = i + 1;
+    }
+    e.from_kind = fk;
+    e.from_key = fkey;
+    e.to_kind = tk;
+    e.to_key = tkey;
+    return (e, found);
+}
+
+// neighbors_directed: Outgoing = edges from node; Incoming = edges to node
+fn ecs_sg_edge_store_neighbors_out(e: EcsSgEdgeStore, node: EcsSgNode) -> Vec<EcsSgNode> {
+    let out: Vec<EcsSgNode> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(e.from_kind) as i64;
+    while i < n {
+        if e.from_kind[i] == node.kind && e.from_key[i] == node.key {
+            out.push(EcsSgNode { kind: e.to_kind[i], key: e.to_key[i] });
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_sg_edge_store_neighbors_in(e: EcsSgEdgeStore, node: EcsSgNode) -> Vec<EcsSgNode> {
+    let out: Vec<EcsSgNode> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(e.to_kind) as i64;
+    while i < n {
+        if e.to_kind[i] == node.kind && e.to_key[i] == node.key {
+            out.push(EcsSgNode { kind: e.from_kind[i], key: e.from_key[i] });
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// Undirected ambiguous_with store
+struct EcsSgUndirected {
+    a_kind: Vec<i32>,
+    a_key: Vec<i64>,
+    b_kind: Vec<i32>,
+    b_key: Vec<i64>,
+}
+
+fn ecs_sg_undirected_new() -> EcsSgUndirected {
+    return EcsSgUndirected {
+        a_kind: Vec::new(),
+        a_key: Vec::new(),
+        b_kind: Vec::new(),
+        b_key: Vec::new(),
+    };
+}
+
+fn ecs_sg_undirected_add(u: EcsSgUndirected, a: EcsSgNode, b: EcsSgNode) -> EcsSgUndirected {
+    if ecs_sg_undirected_contains(u, a, b) { return u; };
+    u.a_kind.push(a.kind);
+    u.a_key.push(a.key);
+    u.b_kind.push(b.kind);
+    u.b_key.push(b.key);
+    return u;
+}
+
+fn ecs_sg_undirected_contains(u: EcsSgUndirected, a: EcsSgNode, b: EcsSgNode) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(u.a_kind) as i64;
+    while i < n {
+        let a_match = u.a_kind[i] == a.kind && u.a_key[i] == a.key
+            && u.b_kind[i] == b.kind && u.b_key[i] == b.key;
+        let b_match = u.a_kind[i] == b.kind && u.a_key[i] == b.key
+            && u.b_kind[i] == a.kind && u.b_key[i] == a.key;
+        if a_match || b_match { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_sg_undirected_len(u: EcsSgUndirected) -> i64 {
+    return len(u.a_kind) as i64;
+}
+
+// === ProcessConfigsResult ===
+struct EcsProcessConfigsResult {
+    // flattened nodes (kind,key pairs as parallel vecs)
+    node_kinds: Vec<i32>,
+    node_keys: Vec<i64>,
+    densely_chained: bool,
+}
+
+fn ecs_process_configs_result_empty(densely_chained: bool) -> EcsProcessConfigsResult {
+    return EcsProcessConfigsResult {
+        node_kinds: Vec::new(),
+        node_keys: Vec::new(),
+        densely_chained: densely_chained,
+    };
+}
+
+fn ecs_process_configs_result_single(node: EcsSgNode) -> EcsProcessConfigsResult {
+    let r = ecs_process_configs_result_empty(true);
+    r.node_kinds.push(node.kind);
+    r.node_keys.push(node.key);
+    return r;
+}
+
+fn ecs_process_configs_result_node_count(r: EcsProcessConfigsResult) -> i64 {
+    return len(r.node_kinds) as i64;
+}
+
+fn ecs_process_configs_result_densely_chained(r: EcsProcessConfigsResult) -> bool {
+    return r.densely_chained;
+}
+
+fn ecs_process_configs_result_node_at(r: EcsProcessConfigsResult, i: i64) -> EcsSgNode {
+    if i < 0 || i >= (len(r.node_kinds) as i64) {
+        return EcsSgNode { kind: -1, key: -1 };
+    };
+    return EcsSgNode { kind: r.node_kinds[i], key: r.node_keys[i] };
+}
+
+fn ecs_process_configs_result_append(dst: EcsProcessConfigsResult, src: EcsProcessConfigsResult) -> EcsProcessConfigsResult {
+    let i: i64 = 0;
+    let n: i64 = len(src.node_kinds) as i64;
+    while i < n {
+        dst.node_kinds.push(src.node_kinds[i]);
+        dst.node_keys.push(src.node_keys[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+// === ScheduleGraph deep ===
+struct EcsScheduleGraphDeep {
+    // systems: key -> system_id meta
+    system_keys: Vec<i64>,
+    system_ids: Vec<i64>,
+    // sets: key -> set_id, is_system_type
+    set_keys: Vec<i64>,
+    set_ids: Vec<i64>,
+    // set membership: system keys per set key (flattened set_key + system_key streams)
+    set_sys_set_keys: Vec<i64>,
+    set_sys_sys_keys: Vec<i64>,
+    hierarchy: EcsSgEdgeStore,
+    dependency: EcsSgEdgeStore,
+    ambiguous_with: EcsSgUndirected,
+    // ambiguous_with_all node keys stored as kind+key
+    awa_kind: Vec<i32>,
+    awa_key: Vec<i64>,
+    anonymous_sets: i64,
+    changed: bool,
+    // condition counts per set key (for collective conditions applied to set)
+    set_condition_counts: Vec<i64>,
+    next_system_key: i64,
+    next_set_key: i64,
+    // pass dependency recording (chain_options ignore_deferred counts)
+    pass_dep_count: i64,
+    pass_ignore_deferred_count: i64,
+}
+
+fn ecs_schedule_graph_deep_new() -> EcsScheduleGraphDeep {
+    return EcsScheduleGraphDeep {
+        system_keys: Vec::new(),
+        system_ids: Vec::new(),
+        set_keys: Vec::new(),
+        set_ids: Vec::new(),
+        set_sys_set_keys: Vec::new(),
+        set_sys_sys_keys: Vec::new(),
+        hierarchy: ecs_sg_edge_store_new(),
+        dependency: ecs_sg_edge_store_new(),
+        ambiguous_with: ecs_sg_undirected_new(),
+        awa_kind: Vec::new(),
+        awa_key: Vec::new(),
+        anonymous_sets: 0,
+        changed: false,
+        set_condition_counts: Vec::new(),
+        next_system_key: 0,
+        next_set_key: 0,
+        pass_dep_count: 0,
+        pass_ignore_deferred_count: 0,
+    };
+}
+
+fn ecs_schedule_graph_deep_is_changed(g: EcsScheduleGraphDeep) -> bool { return g.changed; }
+fn ecs_schedule_graph_deep_mark_changed(g: EcsScheduleGraphDeep) -> EcsScheduleGraphDeep {
+    g.changed = true;
+    return g;
+}
+fn ecs_schedule_graph_deep_clear_changed(g: EcsScheduleGraphDeep) -> EcsScheduleGraphDeep {
+    g.changed = false;
+    return g;
+}
+fn ecs_schedule_graph_deep_anonymous_sets(g: EcsScheduleGraphDeep) -> i64 { return g.anonymous_sets; }
+fn ecs_schedule_graph_deep_system_count(g: EcsScheduleGraphDeep) -> i64 { return len(g.system_keys) as i64; }
+fn ecs_schedule_graph_deep_set_count(g: EcsScheduleGraphDeep) -> i64 { return len(g.set_keys) as i64; }
+fn ecs_schedule_graph_deep_hierarchy_edge_count(g: EcsScheduleGraphDeep) -> i64 {
+    return ecs_sg_edge_store_len(g.hierarchy);
+}
+fn ecs_schedule_graph_deep_dependency_edge_count(g: EcsScheduleGraphDeep) -> i64 {
+    return ecs_sg_edge_store_len(g.dependency);
+}
+fn ecs_schedule_graph_deep_ambiguous_with_count(g: EcsScheduleGraphDeep) -> i64 {
+    return ecs_sg_undirected_len(g.ambiguous_with);
+}
+fn ecs_schedule_graph_deep_pass_dep_count(g: EcsScheduleGraphDeep) -> i64 { return g.pass_dep_count; }
+
+// create_anonymous_set
+fn ecs_schedule_graph_deep_create_anonymous_set(g: EcsScheduleGraphDeep) -> (EcsScheduleGraphDeep, i64) {
+    let id = g.anonymous_sets;
+    g.anonymous_sets = g.anonymous_sets + 1;
+    // also insert as a set node with set_id = - (id+1) to mark anonymous
+    let r = ecs_schedule_graph_deep_insert_set(g, -(id + 1), false);
+    return (r.0, r.1);
+}
+
+fn ecs_schedule_graph_deep_insert_system(g: EcsScheduleGraphDeep, system_id: i64) -> (EcsScheduleGraphDeep, i64) {
+    let key = g.next_system_key;
+    g.next_system_key = g.next_system_key + 1;
+    g.system_keys.push(key);
+    g.system_ids.push(system_id);
+    g = ecs_schedule_graph_deep_mark_changed(g);
+    return (g, key);
+}
+
+fn ecs_schedule_graph_deep_insert_set(g: EcsScheduleGraphDeep, set_id: i64, is_system_type: bool) -> (EcsScheduleGraphDeep, i64) {
+    // reuse existing set_id if present
+    let i: i64 = 0;
+    let n: i64 = len(g.set_ids) as i64;
+    while i < n {
+        if g.set_ids[i] == set_id { return (g, g.set_keys[i]); };
+        i = i + 1;
+    }
+    let key = g.next_set_key;
+    g.next_set_key = g.next_set_key + 1;
+    g.set_keys.push(key);
+    g.set_ids.push(set_id);
+    g.set_condition_counts.push(0);
+    let _ = is_system_type;
+    g = ecs_schedule_graph_deep_mark_changed(g);
+    return (g, key);
+}
+
+fn ecs_schedule_graph_deep_find_set_key(g: EcsScheduleGraphDeep, set_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(g.set_ids) as i64;
+    while i < n {
+        if g.set_ids[i] == set_id { return g.set_keys[i]; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// add_system_inner: insert system + update graphs from GraphInfo-like inputs
+// hierarchy_sets: set keys to join; before_nodes/after_nodes as dependency edges
+fn ecs_schedule_graph_deep_add_system_inner(
+    g: EcsScheduleGraphDeep,
+    system_id: i64,
+    hierarchy_set_keys: Vec<i64>,
+    before_nodes: Vec<EcsSgNode>,
+    after_nodes: Vec<EcsSgNode>,
+    ambiguous_with_nodes: Vec<EcsSgNode>,
+    ambiguous_with_all: bool
+) -> (EcsScheduleGraphDeep, i64) {
+    let ins = ecs_schedule_graph_deep_insert_system(g, system_id);
+    g = ins.0;
+    let key = ins.1;
+    let node = ecs_sg_node_system(key);
+    // hierarchy: set -> system (child of set)
+    let hi: i64 = 0;
+    let hn: i64 = len(hierarchy_set_keys) as i64;
+    while hi < hn {
+        let set_node = ecs_sg_node_set(hierarchy_set_keys[hi]);
+        g.hierarchy = ecs_sg_edge_store_add(g.hierarchy, set_node, node);
+        g.set_sys_set_keys.push(hierarchy_set_keys[hi]);
+        g.set_sys_sys_keys.push(key);
+        hi = hi + 1;
+    }
+    // before: node -> target (node runs before target)
+    let bi: i64 = 0;
+    let bn: i64 = len(before_nodes) as i64;
+    while bi < bn {
+        g.dependency = ecs_sg_edge_store_add(g.dependency, node, before_nodes[bi]);
+        bi = bi + 1;
+    }
+    // after: target -> node
+    let ai: i64 = 0;
+    let an: i64 = len(after_nodes) as i64;
+    while ai < an {
+        g.dependency = ecs_sg_edge_store_add(g.dependency, after_nodes[ai], node);
+        ai = ai + 1;
+    }
+    let aw: i64 = 0;
+    let awn: i64 = len(ambiguous_with_nodes) as i64;
+    while aw < awn {
+        g.ambiguous_with = ecs_sg_undirected_add(g.ambiguous_with, node, ambiguous_with_nodes[aw]);
+        aw = aw + 1;
+    }
+    if ambiguous_with_all {
+        g.awa_kind.push(node.kind);
+        g.awa_key.push(node.key);
+    };
+    return (g, key);
+}
+
+// apply_collective_conditions:
+// if configs len == 1: push conditions onto that config (modeled as increment on the single node set conditions)
+// else: create anonymous set, put each config in_set, attach conditions to set
+// Returns (graph, anonymous_set_key_or_-1, applied_to_single)
+fn ecs_schedule_graph_deep_apply_collective_conditions(
+    g: EcsScheduleGraphDeep,
+    config_node_keys: Vec<i64>,
+    config_is_system: Vec<bool>,
+    collective_condition_count: i64
+) -> (EcsScheduleGraphDeep, i64, bool) {
+    if collective_condition_count <= 0 {
+        return (g, -1, false);
+    };
+    let n: i64 = len(config_node_keys) as i64;
+    if n == 1 {
+        // attach conditions to the single config — if system, no set condition store;
+        // model as no anonymous set, applied_to_single=true
+        return (g, -1, true);
+    };
+    let anon = ecs_schedule_graph_deep_create_anonymous_set(g);
+    g = anon.0;
+    let set_key = anon.1;
+    // bump set condition count
+    let si: i64 = 0;
+    let sn: i64 = len(g.set_keys) as i64;
+    while si < sn {
+        if g.set_keys[si] == set_key {
+            g.set_condition_counts[si] = g.set_condition_counts[si] + collective_condition_count;
+        };
+        si = si + 1;
+    }
+    // each config in_set(anonymous)
+    let i: i64 = 0;
+    while i < n {
+        let node = EcsSgNode {
+            kind: if config_is_system[i] { ECS_SG_NODE_SYSTEM } else { ECS_SG_NODE_SET },
+            key: config_node_keys[i],
+        };
+        let set_node = ecs_sg_node_set(set_key);
+        g.hierarchy = ecs_sg_edge_store_add(g.hierarchy, set_node, node);
+        if config_is_system[i] {
+            g.set_sys_set_keys.push(set_key);
+            g.set_sys_sys_keys.push(config_node_keys[i]);
+        };
+        i = i + 1;
+    }
+    g = ecs_schedule_graph_deep_mark_changed(g);
+    return (g, set_key, false);
+}
+
+// process_configs for a chain of already-processed node groups.
+// Each group is a ProcessConfigsResult (nodes + densely_chained).
+// is_chained: Chain::Chained
+// chain_ignore_deferred: whether chain options include IgnoreDeferred
+//
+// Bevy densely_chained:
+//   start = is_chained || configs.len()==1
+//   each result densely_chained &= result.densely_chained
+// When chaining: if current densely_chained use only first node;
+// if previous densely_chained use only last previous node;
+// add dependency edges previous->current for all pairs; notify passes.
+fn ecs_schedule_graph_deep_chain_process_results(
+    g: EcsScheduleGraphDeep,
+    results: Vec<EcsProcessConfigsResult>,
+    is_chained: bool,
+    chain_ignore_deferred: bool,
+    collect_nodes: bool
+) -> (EcsScheduleGraphDeep, EcsProcessConfigsResult) {
+    let n: i64 = len(results) as i64;
+    if n == 0 {
+        return (g, ecs_process_configs_result_empty(is_chained || true));
+    };
+    let densely_chained = is_chained || n == 1;
+    let out = ecs_process_configs_result_empty(densely_chained);
+    // seed with first
+    let prev = results[0];
+    densely_chained = densely_chained && prev.densely_chained;
+    let i: i64 = 1;
+    while i < n {
+        let cur = results[i];
+        densely_chained = densely_chained && cur.densely_chained;
+        if is_chained {
+            // select previous_nodes slice
+            let prev_start: i64 = 0;
+            let prev_end: i64 = len(prev.node_kinds) as i64;
+            if prev.densely_chained && prev_end > 0 {
+                prev_start = prev_end - 1;
+            };
+            let cur_start: i64 = 0;
+            let cur_end: i64 = len(cur.node_kinds) as i64;
+            if cur.densely_chained && cur_end > 0 {
+                // only first
+                // cur_start stays 0, cur_end becomes 1
+            };
+            let cur_limit = cur_end;
+            if cur.densely_chained && cur_end > 0 {
+                cur_limit = 1;
+            };
+            let pi: i64 = prev_start;
+            while pi < prev_end {
+                let ci: i64 = 0;
+                while ci < cur_limit {
+                    let pn = EcsSgNode { kind: prev.node_kinds[pi], key: prev.node_keys[pi] };
+                    let cn = EcsSgNode { kind: cur.node_kinds[ci], key: cur.node_keys[ci] };
+                    g.dependency = ecs_sg_edge_store_add(g.dependency, pn, cn);
+                    g.pass_dep_count = g.pass_dep_count + 1;
+                    if chain_ignore_deferred {
+                        g.pass_ignore_deferred_count = g.pass_ignore_deferred_count + 1;
+                    };
+                    ci = ci + 1;
+                }
+                pi = pi + 1;
+            }
+        };
+        if collect_nodes {
+            out = ecs_process_configs_result_append(out, prev);
+        };
+        prev = cur;
+        i = i + 1;
+    }
+    if collect_nodes {
+        out = ecs_process_configs_result_append(out, prev);
+    };
+    out.densely_chained = densely_chained;
+    g = ecs_schedule_graph_deep_mark_changed(g);
+    return (g, out);
+}
+
+// Convenience: process a list of single-node configs (each densely_chained=true) with optional chain.
+fn ecs_schedule_graph_deep_process_system_list(
+    g: EcsScheduleGraphDeep,
+    system_ids: Vec<i64>,
+    is_chained: bool,
+    chain_ignore_deferred: bool
+) -> (EcsScheduleGraphDeep, EcsProcessConfigsResult) {
+    let results: Vec<EcsProcessConfigsResult> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(system_ids) as i64;
+    while i < n {
+        let ins = ecs_schedule_graph_deep_insert_system(g, system_ids[i]);
+        g = ins.0;
+        results.push(ecs_process_configs_result_single(ecs_sg_node_system(ins.1)));
+        i = i + 1;
+    }
+    return ecs_schedule_graph_deep_chain_process_results(g, results, is_chained, chain_ignore_deferred, true);
+}
+
+// add_edges_for_transitive_dependencies(node):
+// for hierarchy and dependency: cross product of incoming x outgoing neighbors, add edges
+fn ecs_schedule_graph_deep_add_edges_for_transitive_dependencies(
+    g: EcsScheduleGraphDeep,
+    node: EcsSgNode
+) -> EcsScheduleGraphDeep {
+    // hierarchy
+    let hin = ecs_sg_edge_store_neighbors_in(g.hierarchy, node);
+    let hout = ecs_sg_edge_store_neighbors_out(g.hierarchy, node);
+    let i: i64 = 0;
+    let ni: i64 = len(hin) as i64;
+    while i < ni {
+        let j: i64 = 0;
+        let no: i64 = len(hout) as i64;
+        while j < no {
+            g.hierarchy = ecs_sg_edge_store_add(g.hierarchy, hin[i], hout[j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    // dependency
+    let din = ecs_sg_edge_store_neighbors_in(g.dependency, node);
+    let dout = ecs_sg_edge_store_neighbors_out(g.dependency, node);
+    let i2: i64 = 0;
+    let ni2: i64 = len(din) as i64;
+    while i2 < ni2 {
+        let j2: i64 = 0;
+        let no2: i64 = len(dout) as i64;
+        while j2 < no2 {
+            g.dependency = ecs_sg_edge_store_add(g.dependency, din[i2], dout[j2]);
+            j2 = j2 + 1;
+        }
+        i2 = i2 + 1;
+    }
+    g = ecs_schedule_graph_deep_mark_changed(g);
+    return g;
+}
+
+// systems_in_set errors
+const ECS_SG_ERR_OK: i32 = 0;
+const ECS_SG_ERR_UNINITIALIZED: i32 = 1;
+const ECS_SG_ERR_SET_NOT_FOUND: i32 = 2;
+
+// returns (err_kind, system_keys...)
+fn ecs_schedule_graph_deep_systems_in_set(g: EcsScheduleGraphDeep, set_id: i64) -> (i32, Vec<i64>) {
+    if g.changed {
+        return (ECS_SG_ERR_UNINITIALIZED, Vec::new());
+    };
+    let set_key = ecs_schedule_graph_deep_find_set_key(g, set_id);
+    if set_key < 0 {
+        return (ECS_SG_ERR_SET_NOT_FOUND, Vec::new());
+    };
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(g.set_sys_set_keys) as i64;
+    while i < n {
+        if g.set_sys_set_keys[i] == set_key {
+            out.push(g.set_sys_sys_keys[i]);
+        };
+        i = i + 1;
+    }
+    return (ECS_SG_ERR_OK, out);
+}
+
+fn ecs_schedule_graph_deep_register_system_in_set(g: EcsScheduleGraphDeep, set_key: i64, system_key: i64) -> EcsScheduleGraphDeep {
+    g.set_sys_set_keys.push(set_key);
+    g.set_sys_sys_keys.push(system_key);
+    let set_node = ecs_sg_node_set(set_key);
+    let sys_node = ecs_sg_node_system(system_key);
+    g.hierarchy = ecs_sg_edge_store_add(g.hierarchy, set_node, sys_node);
+    g = ecs_schedule_graph_deep_mark_changed(g);
+    return g;
+}
+
+// ambiguous_with_all contains
+fn ecs_schedule_graph_deep_is_ambiguous_with_all(g: EcsScheduleGraphDeep, node: EcsSgNode) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(g.awa_kind) as i64;
+    while i < n {
+        if g.awa_kind[i] == node.kind && g.awa_key[i] == node.key { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_schedule_graph_deep_add_ambiguous_with(g: EcsScheduleGraphDeep, a: EcsSgNode, b: EcsSgNode) -> EcsScheduleGraphDeep {
+    g.ambiguous_with = ecs_sg_undirected_add(g.ambiguous_with, a, b);
+    return g;
+}
+
+fn ecs_schedule_graph_deep_has_dependency_edge(g: EcsScheduleGraphDeep, from: EcsSgNode, to: EcsSgNode) -> bool {
+    return ecs_sg_edge_store_contains(g.dependency, from, to);
+}
+
+fn ecs_schedule_graph_deep_has_hierarchy_edge(g: EcsScheduleGraphDeep, from: EcsSgNode, to: EcsSgNode) -> bool {
+    return ecs_sg_edge_store_contains(g.hierarchy, from, to);
+}
+
+fn ecs_schedule_graph_deep_set_condition_count(g: EcsScheduleGraphDeep, set_key: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(g.set_keys) as i64;
+    while i < n {
+        if g.set_keys[i] == set_key { return g.set_condition_counts[i]; };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// helper: build EcsSgNode list from parallel kind/key vecs (for tests)
+fn ecs_sg_nodes_from_keys(kinds: Vec<i32>, keys: Vec<i64>) -> Vec<EcsSgNode> {
+    let out: Vec<EcsSgNode> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(keys) as i64;
+    while i < n {
+        out.push(EcsSgNode { kind: kinds[i], key: keys[i] });
+        i = i + 1;
+    }
+    return out;
+}
+
+// densly chained single-node result factory used by nested group simulation
+fn ecs_process_configs_result_from_nodes(nodes: Vec<EcsSgNode>, densely_chained: bool) -> EcsProcessConfigsResult {
+    let r = ecs_process_configs_result_empty(densely_chained);
+    let i: i64 = 0;
+    let n: i64 = len(nodes) as i64;
+    while i < n {
+        r.node_kinds.push(nodes[i].kind);
+        r.node_keys.push(nodes[i].key);
+        i = i + 1;
+    }
+    return r;
+}

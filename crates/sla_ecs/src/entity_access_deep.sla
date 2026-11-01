@@ -1,0 +1,834 @@
+// Deepened Bevy ECS entity_access composite facade.
+// Mirrors src/world/entity_access/ as a unified surface:
+//   EntityRef / EntityWorldMut shared entity bag
+//   ComponentEntry (Occupied/Vacant): or_insert, or_default, and_modify, take, insert
+//   into_readonly / as_readonly / into_filtered / reborrow
+//   insert / insert_if_new / remove / retain / clear / despawn
+//   contains / get / get_mut / set + change ticks
+// Fixed capacity: 4 component slots + bit Access for filtered view.
+// Shallow lib/entity_access.sla retained. Piece deep modules remain.
+
+const ECS_EA_OCCUPIED: i32 = 0;
+const ECS_EA_VACANT: i32 = 1;
+
+const ECS_EA_ERR_OK: i32 = 0;
+const ECS_EA_ERR_MISSING: i32 = 1;
+const ECS_EA_ERR_NO_READ: i32 = 2;
+const ECS_EA_ERR_NO_WRITE: i32 = 3;
+const ECS_EA_ERR_DESPAWNED: i32 = 4;
+const ECS_EA_ERR_FULL: i32 = 5;
+
+// Access bitmasks for component ids 0..30 + all flags (FilteredEntity*)
+struct EcsEaAccessDeep {
+    read_bits: i64,
+    write_bits: i64,
+    read_all: bool,
+    write_all: bool,
+}
+
+fn ecs_ea_access_new() -> EcsEaAccessDeep {
+    return EcsEaAccessDeep {
+        read_bits: 0, write_bits: 0, read_all: false, write_all: false,
+    };
+}
+
+fn ecs_ea_access_read_all() -> EcsEaAccessDeep {
+    return EcsEaAccessDeep {
+        read_bits: 0, write_bits: 0, read_all: true, write_all: false,
+    };
+}
+
+fn ecs_ea_access_write_all() -> EcsEaAccessDeep {
+    return EcsEaAccessDeep {
+        read_bits: 0, write_bits: 0, read_all: true, write_all: true,
+    };
+}
+
+fn ecs_ea_bit_for(id: i32) -> i64 {
+    if id < 0 { return 0; };
+    if id > 30 { return 0; };
+    let b: i64 = 1;
+    let i: i32 = 0;
+    while i < id {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ecs_ea_bits_or(bits: i64, bit: i64) -> i64 {
+    // if already set, keep; else add (bit is power of two, bits + bit when unset)
+    let t: i64 = bits / bit;
+    let rem: i64 = t - ((t / 2) * 2);
+    if rem == 1 { return bits; };
+    return bits + bit;
+}
+
+fn ecs_ea_bits_has(bits: i64, bit: i64) -> bool {
+    if bit == 0 { return false; };
+    let t: i64 = bits / bit;
+    let rem: i64 = t - ((t / 2) * 2);
+    return rem == 1;
+}
+
+fn ecs_ea_access_allow_read(a: EcsEaAccessDeep, cid: i32) -> EcsEaAccessDeep {
+    let bit = ecs_ea_bit_for(cid);
+    return EcsEaAccessDeep {
+        read_bits: ecs_ea_bits_or(a.read_bits, bit),
+        write_bits: a.write_bits,
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+}
+
+fn ecs_ea_access_allow_write(a: EcsEaAccessDeep, cid: i32) -> EcsEaAccessDeep {
+    let bit = ecs_ea_bit_for(cid);
+    return EcsEaAccessDeep {
+        read_bits: ecs_ea_bits_or(a.read_bits, bit),
+        write_bits: ecs_ea_bits_or(a.write_bits, bit),
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+}
+
+fn ecs_ea_access_can_read(a: EcsEaAccessDeep, cid: i32) -> bool {
+    if a.read_all { return true; };
+    if a.write_all { return true; };
+    let bit = ecs_ea_bit_for(cid);
+    if ecs_ea_bits_has(a.read_bits, bit) { return true; };
+    if ecs_ea_bits_has(a.write_bits, bit) { return true; };
+    return false;
+}
+
+fn ecs_ea_access_can_write(a: EcsEaAccessDeep, cid: i32) -> bool {
+    if a.write_all { return true; };
+    let bit = ecs_ea_bit_for(cid);
+    return ecs_ea_bits_has(a.write_bits, bit);
+}
+
+// Unified entity bag (EntityRef + EntityWorldMut storage)
+struct EcsEaDeep {
+    entity: i64,
+    archetype_id: i64,
+    location_row: i64,
+    spawned_by: i64,
+    spawn_tick: i64,
+    spawned: bool,
+    c0: i32, v0: i64, add0: i64, ch0: i64,
+    c1: i32, v1: i64, add1: i64, ch1: i64,
+    c2: i32, v2: i64, add2: i64, ch2: i64,
+    c3: i32, v3: i64, add3: i64, ch3: i64,
+    len: i32,
+    readonly: bool,
+    filtered: bool,
+    access: EcsEaAccessDeep,
+    change_tick: i64,
+}
+
+fn ecs_ea_deep_new(entity: i64) -> EcsEaDeep {
+    return EcsEaDeep {
+        entity: entity,
+        archetype_id: 0,
+        location_row: 0,
+        spawned_by: 0,
+        spawn_tick: 0,
+        spawned: true,
+        c0: -1, v0: 0, add0: 0, ch0: 0,
+        c1: -1, v1: 0, add1: 0, ch1: 0,
+        c2: -1, v2: 0, add2: 0, ch2: 0,
+        c3: -1, v3: 0, add3: 0, ch3: 0,
+        len: 0,
+        readonly: false,
+        filtered: false,
+        access: ecs_ea_access_write_all(),
+        change_tick: 0,
+    };
+}
+
+fn ecs_ea_deep_id(e: EcsEaDeep) -> i64 { return e.entity; }
+fn ecs_ea_deep_archetype(e: EcsEaDeep) -> i64 { return e.archetype_id; }
+fn ecs_ea_deep_location_row(e: EcsEaDeep) -> i64 { return e.location_row; }
+fn ecs_ea_deep_spawned_by(e: EcsEaDeep) -> i64 { return e.spawned_by; }
+fn ecs_ea_deep_spawn_tick(e: EcsEaDeep) -> i64 { return e.spawn_tick; }
+fn ecs_ea_deep_len(e: EcsEaDeep) -> i32 { return e.len; }
+fn ecs_ea_deep_is_spawned(e: EcsEaDeep) -> bool { return e.spawned; }
+fn ecs_ea_deep_is_despawned(e: EcsEaDeep) -> bool {
+    if e.spawned { return false; };
+    return true;
+}
+fn ecs_ea_deep_is_readonly(e: EcsEaDeep) -> bool { return e.readonly; }
+fn ecs_ea_deep_is_filtered(e: EcsEaDeep) -> bool { return e.filtered; }
+fn ecs_ea_deep_change_tick(e: EcsEaDeep) -> i64 { return e.change_tick; }
+
+fn ecs_ea_deep_rebuild(
+    entity: i64, archetype_id: i64, location_row: i64, spawned_by: i64, spawn_tick: i64, spawned: bool,
+    c0: i32, v0: i64, add0: i64, ch0: i64,
+    c1: i32, v1: i64, add1: i64, ch1: i64,
+    c2: i32, v2: i64, add2: i64, ch2: i64,
+    c3: i32, v3: i64, add3: i64, ch3: i64,
+    len: i32, readonly: bool, filtered: bool,
+    access: EcsEaAccessDeep, change_tick: i64
+) -> EcsEaDeep {
+    return EcsEaDeep {
+        entity: entity, archetype_id: archetype_id, location_row: location_row,
+        spawned_by: spawned_by, spawn_tick: spawn_tick, spawned: spawned,
+        c0: c0, v0: v0, add0: add0, ch0: ch0,
+        c1: c1, v1: v1, add1: add1, ch1: ch1,
+        c2: c2, v2: v2, add2: add2, ch2: ch2,
+        c3: c3, v3: v3, add3: add3, ch3: ch3,
+        len: len, readonly: readonly, filtered: filtered,
+        access: access, change_tick: change_tick,
+    };
+}
+
+fn ecs_ea_deep_copy(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c2, e.v2, e.add2, e.ch2,
+        e.c3, e.v3, e.add3, e.ch3,
+        e.len, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_with_meta(e: EcsEaDeep, archetype_id: i64, location_row: i64, spawned_by: i64, spawn_tick: i64) -> EcsEaDeep {
+    return ecs_ea_deep_rebuild(
+        e.entity, archetype_id, location_row, spawned_by, spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c2, e.v2, e.add2, e.ch2,
+        e.c3, e.v3, e.add3, e.ch3,
+        e.len, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_reborrow(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_copy(e);
+}
+
+fn ecs_ea_deep_into_readonly(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c2, e.v2, e.add2, e.ch2,
+        e.c3, e.v3, e.add3, e.ch3,
+        e.len, true, e.filtered, ecs_ea_access_read_all(), e.change_tick
+    );
+}
+
+fn ecs_ea_deep_as_readonly(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_into_readonly(e);
+}
+
+fn ecs_ea_deep_into_filtered(e: EcsEaDeep, access: EcsEaAccessDeep) -> EcsEaDeep {
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c2, e.v2, e.add2, e.ch2,
+        e.c3, e.v3, e.add3, e.ch3,
+        e.len, e.readonly, true, access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_into_filtered_write_all(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_into_filtered(e, ecs_ea_access_write_all());
+}
+
+fn ecs_ea_deep_eq(a: EcsEaDeep, b: EcsEaDeep) -> bool {
+    return a.entity == b.entity;
+}
+
+fn ecs_ea_deep_cmp(a: EcsEaDeep, b: EcsEaDeep) -> i32 {
+    if a.entity < b.entity { return -1; };
+    if a.entity > b.entity { return 1; };
+    return 0;
+}
+
+fn ecs_ea_deep_contains(e: EcsEaDeep, cid: i32) -> bool {
+    if e.len >= 1 {
+        if e.c0 == cid { return true; };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return true; };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return true; };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return true; };
+    };
+    return false;
+}
+
+struct EcsEaGetDeep {
+    ok: bool,
+    err: i32,
+    value: i64,
+    add_tick: i64,
+    ch_tick: i64,
+}
+
+fn ecs_ea_get_ok(g: EcsEaGetDeep) -> bool { return g.ok; }
+fn ecs_ea_get_err(g: EcsEaGetDeep) -> i32 { return g.err; }
+fn ecs_ea_get_value(g: EcsEaGetDeep) -> i64 { return g.value; }
+fn ecs_ea_get_add(g: EcsEaGetDeep) -> i64 { return g.add_tick; }
+fn ecs_ea_get_ch(g: EcsEaGetDeep) -> i64 { return g.ch_tick; }
+
+fn ecs_ea_get_fail(err: i32) -> EcsEaGetDeep {
+    return EcsEaGetDeep { ok: false, err: err, value: 0, add_tick: 0, ch_tick: 0 };
+}
+
+fn ecs_ea_get_ok_val(value: i64, add_tick: i64, ch_tick: i64) -> EcsEaGetDeep {
+    return EcsEaGetDeep { ok: true, err: ECS_EA_ERR_OK, value: value, add_tick: add_tick, ch_tick: ch_tick };
+}
+
+fn ecs_ea_deep_get_raw(e: EcsEaDeep, cid: i32) -> EcsEaGetDeep {
+    if e.spawned != true { return ecs_ea_get_fail(ECS_EA_ERR_DESPAWNED); };
+    if e.len >= 1 {
+        if e.c0 == cid { return ecs_ea_get_ok_val(e.v0, e.add0, e.ch0); };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return ecs_ea_get_ok_val(e.v1, e.add1, e.ch1); };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return ecs_ea_get_ok_val(e.v2, e.add2, e.ch2); };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return ecs_ea_get_ok_val(e.v3, e.add3, e.ch3); };
+    };
+    return ecs_ea_get_fail(ECS_EA_ERR_MISSING);
+}
+
+fn ecs_ea_deep_get(e: EcsEaDeep, cid: i32) -> EcsEaGetDeep {
+    if e.filtered {
+        if ecs_ea_access_can_read(e.access, cid) != true {
+            return ecs_ea_get_fail(ECS_EA_ERR_NO_READ);
+        };
+    };
+    return ecs_ea_deep_get_raw(e, cid);
+}
+
+fn ecs_ea_deep_get_mut(e: EcsEaDeep, cid: i32) -> EcsEaGetDeep {
+    if e.readonly { return ecs_ea_get_fail(ECS_EA_ERR_NO_WRITE); };
+    if e.filtered {
+        if ecs_ea_access_can_write(e.access, cid) != true {
+            return ecs_ea_get_fail(ECS_EA_ERR_NO_WRITE);
+        };
+    };
+    return ecs_ea_deep_get_raw(e, cid);
+}
+
+struct EcsEaSetDeep {
+    ok: bool,
+    err: i32,
+    entity: EcsEaDeep,
+}
+
+fn ecs_ea_set_ok(s: EcsEaSetDeep) -> bool { return s.ok; }
+fn ecs_ea_set_err(s: EcsEaSetDeep) -> i32 { return s.err; }
+fn ecs_ea_set_entity(s: EcsEaSetDeep) -> EcsEaDeep { return s.entity; }
+
+fn ecs_ea_set_fail(e: EcsEaDeep, err: i32) -> EcsEaSetDeep {
+    return EcsEaSetDeep { ok: false, err: err, entity: e };
+}
+
+fn ecs_ea_set_ok_ent(e: EcsEaDeep) -> EcsEaSetDeep {
+    return EcsEaSetDeep { ok: true, err: ECS_EA_ERR_OK, entity: e };
+}
+
+fn ecs_ea_deep_set(e: EcsEaDeep, cid: i32, value: i64) -> EcsEaSetDeep {
+    if e.spawned != true { return ecs_ea_set_fail(e, ECS_EA_ERR_DESPAWNED); };
+    if e.readonly { return ecs_ea_set_fail(e, ECS_EA_ERR_NO_WRITE); };
+    if e.filtered {
+        if ecs_ea_access_can_write(e.access, cid) != true {
+            return ecs_ea_set_fail(e, ECS_EA_ERR_NO_WRITE);
+        };
+    };
+    let tick = e.change_tick + 1;
+    if e.len >= 1 {
+        if e.c0 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, value, e.add0, tick,
+                e.c1, e.v1, e.add1, e.ch1,
+                e.c2, e.v2, e.add2, e.ch2,
+                e.c3, e.v3, e.add3, e.ch3,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, e.v0, e.add0, e.ch0,
+                e.c1, value, e.add1, tick,
+                e.c2, e.v2, e.add2, e.ch2,
+                e.c3, e.v3, e.add3, e.ch3,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, e.v0, e.add0, e.ch0,
+                e.c1, e.v1, e.add1, e.ch1,
+                e.c2, value, e.add2, tick,
+                e.c3, e.v3, e.add3, e.ch3,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, e.v0, e.add0, e.ch0,
+                e.c1, e.v1, e.add1, e.ch1,
+                e.c2, e.v2, e.add2, e.ch2,
+                e.c3, value, e.add3, tick,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    return ecs_ea_set_fail(e, ECS_EA_ERR_MISSING);
+}
+
+fn ecs_ea_deep_insert(e: EcsEaDeep, cid: i32, value: i64) -> EcsEaSetDeep {
+    if e.spawned != true { return ecs_ea_set_fail(e, ECS_EA_ERR_DESPAWNED); };
+    if e.readonly { return ecs_ea_set_fail(e, ECS_EA_ERR_NO_WRITE); };
+    let tick = e.change_tick + 1;
+    // update existing
+    if e.len >= 1 {
+        if e.c0 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, value, e.add0, tick,
+                e.c1, e.v1, e.add1, e.ch1,
+                e.c2, e.v2, e.add2, e.ch2,
+                e.c3, e.v3, e.add3, e.ch3,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, e.v0, e.add0, e.ch0,
+                e.c1, value, e.add1, tick,
+                e.c2, e.v2, e.add2, e.ch2,
+                e.c3, e.v3, e.add3, e.ch3,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, e.v0, e.add0, e.ch0,
+                e.c1, e.v1, e.add1, e.ch1,
+                e.c2, value, e.add2, tick,
+                e.c3, e.v3, e.add3, e.ch3,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid {
+            return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+                e.c0, e.v0, e.add0, e.ch0,
+                e.c1, e.v1, e.add1, e.ch1,
+                e.c2, e.v2, e.add2, e.ch2,
+                e.c3, value, e.add3, tick,
+                e.len, e.readonly, e.filtered, e.access, tick
+            ));
+        };
+    };
+    // append
+    if e.len == 0 {
+        return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            cid, value, tick, tick,
+            e.c1, e.v1, e.add1, e.ch1,
+            e.c2, e.v2, e.add2, e.ch2,
+            e.c3, e.v3, e.add3, e.ch3,
+            1, e.readonly, e.filtered, e.access, tick
+        ));
+    };
+    if e.len == 1 {
+        return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c0, e.v0, e.add0, e.ch0,
+            cid, value, tick, tick,
+            e.c2, e.v2, e.add2, e.ch2,
+            e.c3, e.v3, e.add3, e.ch3,
+            2, e.readonly, e.filtered, e.access, tick
+        ));
+    };
+    if e.len == 2 {
+        return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c0, e.v0, e.add0, e.ch0,
+            e.c1, e.v1, e.add1, e.ch1,
+            cid, value, tick, tick,
+            e.c3, e.v3, e.add3, e.ch3,
+            3, e.readonly, e.filtered, e.access, tick
+        ));
+    };
+    if e.len == 3 {
+        return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c0, e.v0, e.add0, e.ch0,
+            e.c1, e.v1, e.add1, e.ch1,
+            e.c2, e.v2, e.add2, e.ch2,
+            cid, value, tick, tick,
+            4, e.readonly, e.filtered, e.access, tick
+        ));
+    };
+    return ecs_ea_set_fail(e, ECS_EA_ERR_FULL);
+}
+
+fn ecs_ea_deep_insert_if_new(e: EcsEaDeep, cid: i32, value: i64) -> EcsEaSetDeep {
+    if ecs_ea_deep_contains(e, cid) {
+        return ecs_ea_set_ok_ent(e);
+    };
+    return ecs_ea_deep_insert(e, cid, value);
+}
+
+fn ecs_ea_deep_remove_slot0(e: EcsEaDeep) -> EcsEaDeep {
+    if e.len == 1 {
+        return ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+            0, e.readonly, e.filtered, e.access, e.change_tick
+        );
+    };
+    if e.len == 2 {
+        return ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c1, e.v1, e.add1, e.ch1,
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+            1, e.readonly, e.filtered, e.access, e.change_tick
+        );
+    };
+    if e.len == 3 {
+        return ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c2, e.v2, e.add2, e.ch2,
+            e.c1, e.v1, e.add1, e.ch1,
+            -1, 0, 0, 0, -1, 0, 0, 0,
+            2, e.readonly, e.filtered, e.access, e.change_tick
+        );
+    };
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c3, e.v3, e.add3, e.ch3,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c2, e.v2, e.add2, e.ch2,
+        -1, 0, 0, 0,
+        3, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_remove_slot1(e: EcsEaDeep) -> EcsEaDeep {
+    if e.len == 2 {
+        return ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c0, e.v0, e.add0, e.ch0,
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+            1, e.readonly, e.filtered, e.access, e.change_tick
+        );
+    };
+    if e.len == 3 {
+        return ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c0, e.v0, e.add0, e.ch0,
+            e.c2, e.v2, e.add2, e.ch2,
+            -1, 0, 0, 0, -1, 0, 0, 0,
+            2, e.readonly, e.filtered, e.access, e.change_tick
+        );
+    };
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c3, e.v3, e.add3, e.ch3,
+        e.c2, e.v2, e.add2, e.ch2,
+        -1, 0, 0, 0,
+        3, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_remove_slot2(e: EcsEaDeep) -> EcsEaDeep {
+    if e.len == 3 {
+        return ecs_ea_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+            e.c0, e.v0, e.add0, e.ch0,
+            e.c1, e.v1, e.add1, e.ch1,
+            -1, 0, 0, 0, -1, 0, 0, 0,
+            2, e.readonly, e.filtered, e.access, e.change_tick
+        );
+    };
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c3, e.v3, e.add3, e.ch3,
+        -1, 0, 0, 0,
+        3, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_remove_slot3(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        e.c0, e.v0, e.add0, e.ch0,
+        e.c1, e.v1, e.add1, e.ch1,
+        e.c2, e.v2, e.add2, e.ch2,
+        -1, 0, 0, 0,
+        3, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+fn ecs_ea_deep_remove(e: EcsEaDeep, cid: i32) -> EcsEaSetDeep {
+    if e.spawned != true { return ecs_ea_set_fail(e, ECS_EA_ERR_DESPAWNED); };
+    if e.readonly { return ecs_ea_set_fail(e, ECS_EA_ERR_NO_WRITE); };
+    if e.len >= 1 {
+        if e.c0 == cid { return ecs_ea_set_ok_ent(ecs_ea_deep_remove_slot0(e)); };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return ecs_ea_set_ok_ent(ecs_ea_deep_remove_slot1(e)); };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return ecs_ea_set_ok_ent(ecs_ea_deep_remove_slot2(e)); };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return ecs_ea_set_ok_ent(ecs_ea_deep_remove_slot3(e)); };
+    };
+    return ecs_ea_set_ok_ent(e);
+}
+
+fn ecs_ea_deep_clear(e: EcsEaDeep) -> EcsEaSetDeep {
+    if e.spawned != true { return ecs_ea_set_fail(e, ECS_EA_ERR_DESPAWNED); };
+    if e.readonly { return ecs_ea_set_fail(e, ECS_EA_ERR_NO_WRITE); };
+    return ecs_ea_set_ok_ent(ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+        0, e.readonly, e.filtered, e.access, e.change_tick
+    ));
+}
+
+// retain: keep only components whose cid is in keep mask (bit per cid 0..30)
+fn ecs_ea_deep_retain(e: EcsEaDeep, keep_bits: i64) -> EcsEaSetDeep {
+    if e.spawned != true { return ecs_ea_set_fail(e, ECS_EA_ERR_DESPAWNED); };
+    if e.readonly { return ecs_ea_set_fail(e, ECS_EA_ERR_NO_WRITE); };
+    let nc0: i32 = -1; let nv0: i64 = 0; let na0: i64 = 0; let nch0: i64 = 0;
+    let nc1: i32 = -1; let nv1: i64 = 0; let na1: i64 = 0; let nch1: i64 = 0;
+    let nc2: i32 = -1; let nv2: i64 = 0; let na2: i64 = 0; let nch2: i64 = 0;
+    let nc3: i32 = -1; let nv3: i64 = 0; let na3: i64 = 0; let nch3: i64 = 0;
+    let nlen: i32 = 0;
+    // slot0
+    if e.len >= 1 {
+        let bit0 = ecs_ea_bit_for(e.c0);
+        if ecs_ea_bits_has(keep_bits, bit0) {
+            // place at nlen==0
+            return ecs_ea_deep_retain_cont(e, keep_bits, e.c0, e.v0, e.add0, e.ch0, 1);
+        };
+    };
+    return ecs_ea_deep_retain_cont(e, keep_bits, -1, 0, 0, 0, 0);
+}
+
+// helper continues retain after deciding slot0 keep; uses rebuild path for simplicity via sequential insert
+fn ecs_ea_deep_retain_cont(
+    e: EcsEaDeep, keep_bits: i64,
+    c0: i32, v0: i64, a0: i64, ch0: i64, nlen: i32
+) -> EcsEaSetDeep {
+    let out = ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, e.spawned,
+        c0, v0, a0, ch0,
+        -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+        nlen, e.readonly, e.filtered, e.access, e.change_tick
+    );
+    // re-scan original slots 1..3 (and 0 if skipped) via original e fields
+    let cur = out;
+    // process original slots in order
+    let cur2 = ecs_ea_deep_retain_push_if(cur, e, 0, keep_bits, c0);
+    let cur3 = ecs_ea_deep_retain_push_if(cur2, e, 1, keep_bits, c0);
+    let cur4 = ecs_ea_deep_retain_push_if(cur3, e, 2, keep_bits, c0);
+    let cur5 = ecs_ea_deep_retain_push_if(cur4, e, 3, keep_bits, c0);
+    return ecs_ea_set_ok_ent(cur5);
+}
+
+// if slot already placed as c0 seed, skip re-add of same; otherwise push if keep
+fn ecs_ea_deep_retain_push_if(cur: EcsEaDeep, src: EcsEaDeep, slot: i32, keep_bits: i64, seed_c: i32) -> EcsEaDeep {
+    let cid: i32 = -1;
+    let val: i64 = 0;
+    let ad: i64 = 0;
+    let ch: i64 = 0;
+    let present = false;
+    if slot == 0 {
+        if src.len >= 1 {
+            cid = src.c0; val = src.v0; ad = src.add0; ch = src.ch0; // present
+            // mark present via cid >= 0
+        };
+    };
+    if slot == 1 {
+        if src.len >= 2 {
+            cid = src.c1; val = src.v1; ad = src.add1; ch = src.ch1;
+        };
+    };
+    if slot == 2 {
+        if src.len >= 3 {
+            cid = src.c2; val = src.v2; ad = src.add2; ch = src.ch2;
+        };
+    };
+    if slot == 3 {
+        if src.len >= 4 {
+            cid = src.c3; val = src.v3; ad = src.add3; ch = src.ch3;
+        };
+    };
+    if cid < 0 { return cur; };
+    // if this was the seed already in cur, skip
+    if seed_c == cid {
+        if cur.len >= 1 {
+            if cur.c0 == cid { return cur; };
+        };
+    };
+    let bit = ecs_ea_bit_for(cid);
+    if ecs_ea_bits_has(keep_bits, bit) != true { return cur; };
+    // append into cur
+    if cur.len == 0 {
+        return ecs_ea_deep_rebuild(
+            cur.entity, cur.archetype_id, cur.location_row, cur.spawned_by, cur.spawn_tick, cur.spawned,
+            cid, val, ad, ch,
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+            1, cur.readonly, cur.filtered, cur.access, cur.change_tick
+        );
+    };
+    if cur.len == 1 {
+        return ecs_ea_deep_rebuild(
+            cur.entity, cur.archetype_id, cur.location_row, cur.spawned_by, cur.spawn_tick, cur.spawned,
+            cur.c0, cur.v0, cur.add0, cur.ch0,
+            cid, val, ad, ch,
+            -1, 0, 0, 0, -1, 0, 0, 0,
+            2, cur.readonly, cur.filtered, cur.access, cur.change_tick
+        );
+    };
+    if cur.len == 2 {
+        return ecs_ea_deep_rebuild(
+            cur.entity, cur.archetype_id, cur.location_row, cur.spawned_by, cur.spawn_tick, cur.spawned,
+            cur.c0, cur.v0, cur.add0, cur.ch0,
+            cur.c1, cur.v1, cur.add1, cur.ch1,
+            cid, val, ad, ch,
+            -1, 0, 0, 0,
+            3, cur.readonly, cur.filtered, cur.access, cur.change_tick
+        );
+    };
+    if cur.len == 3 {
+        return ecs_ea_deep_rebuild(
+            cur.entity, cur.archetype_id, cur.location_row, cur.spawned_by, cur.spawn_tick, cur.spawned,
+            cur.c0, cur.v0, cur.add0, cur.ch0,
+            cur.c1, cur.v1, cur.add1, cur.ch1,
+            cur.c2, cur.v2, cur.add2, cur.ch2,
+            cid, val, ad, ch,
+            4, cur.readonly, cur.filtered, cur.access, cur.change_tick
+        );
+    };
+    return cur;
+}
+
+fn ecs_ea_deep_despawn(e: EcsEaDeep) -> EcsEaDeep {
+    return ecs_ea_deep_rebuild(
+        e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick, false,
+        -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0,
+        0, e.readonly, e.filtered, e.access, e.change_tick
+    );
+}
+
+// ComponentEntry view over entity bag
+struct EcsEaEntryDeep {
+    kind: i32,
+    component_id: i32,
+    value: i64,
+    entity: EcsEaDeep,
+}
+
+fn ecs_ea_entry_kind(en: EcsEaEntryDeep) -> i32 { return en.kind; }
+fn ecs_ea_entry_is_occupied(en: EcsEaEntryDeep) -> bool { return en.kind == ECS_EA_OCCUPIED; }
+fn ecs_ea_entry_is_vacant(en: EcsEaEntryDeep) -> bool { return en.kind == ECS_EA_VACANT; }
+fn ecs_ea_entry_component_id(en: EcsEaEntryDeep) -> i32 { return en.component_id; }
+fn ecs_ea_entry_value(en: EcsEaEntryDeep) -> i64 { return en.value; }
+fn ecs_ea_entry_entity(en: EcsEaEntryDeep) -> EcsEaDeep { return en.entity; }
+
+fn ecs_ea_deep_entry(e: EcsEaDeep, cid: i32) -> EcsEaEntryDeep {
+    let g = ecs_ea_deep_get_raw(e, cid);
+    if g.ok {
+        return EcsEaEntryDeep {
+            kind: ECS_EA_OCCUPIED, component_id: cid, value: g.value, entity: e,
+        };
+    };
+    return EcsEaEntryDeep {
+        kind: ECS_EA_VACANT, component_id: cid, value: 0, entity: e,
+    };
+}
+
+fn ecs_ea_entry_or_insert(en: EcsEaEntryDeep, default: i64) -> EcsEaEntryDeep {
+    if en.kind == ECS_EA_OCCUPIED {
+        return en;
+    };
+    let r = ecs_ea_deep_insert(en.entity, en.component_id, default);
+    let e2 = r.entity;
+    return EcsEaEntryDeep {
+        kind: ECS_EA_OCCUPIED, component_id: en.component_id, value: default, entity: e2,
+    };
+}
+
+fn ecs_ea_entry_or_default(en: EcsEaEntryDeep) -> EcsEaEntryDeep {
+    return ecs_ea_entry_or_insert(en, 0);
+}
+
+fn ecs_ea_entry_insert(en: EcsEaEntryDeep, value: i64) -> EcsEaEntryDeep {
+    let r = ecs_ea_deep_insert(en.entity, en.component_id, value);
+    let e2 = r.entity;
+    return EcsEaEntryDeep {
+        kind: ECS_EA_OCCUPIED, component_id: en.component_id, value: value, entity: e2,
+    };
+}
+
+fn ecs_ea_entry_and_modify(en: EcsEaEntryDeep, delta: i64) -> EcsEaEntryDeep {
+    if en.kind != ECS_EA_OCCUPIED {
+        return en;
+    };
+    let nv = en.value + delta;
+    let r = ecs_ea_deep_set(en.entity, en.component_id, nv);
+    let e2 = r.entity;
+    return EcsEaEntryDeep {
+        kind: ECS_EA_OCCUPIED, component_id: en.component_id, value: nv, entity: e2,
+    };
+}
+
+struct EcsEaTakeDeep {
+    ok: bool,
+    value: i64,
+    entity: EcsEaDeep,
+}
+
+fn ecs_ea_take_ok(t: EcsEaTakeDeep) -> bool { return t.ok; }
+fn ecs_ea_take_value(t: EcsEaTakeDeep) -> i64 { return t.value; }
+fn ecs_ea_take_entity(t: EcsEaTakeDeep) -> EcsEaDeep { return t.entity; }
+
+fn ecs_ea_entry_take(en: EcsEaEntryDeep) -> EcsEaTakeDeep {
+    if en.kind != ECS_EA_OCCUPIED {
+        return EcsEaTakeDeep { ok: false, value: 0, entity: en.entity };
+    };
+    let val = en.value;
+    let r = ecs_ea_deep_remove(en.entity, en.component_id);
+    return EcsEaTakeDeep { ok: true, value: val, entity: r.entity };
+}

@@ -1,0 +1,241 @@
+// Deepened Bevy-style metadata identity helpers (explicit TypeId stand-in).
+// Fixed capacity-4 registry slots (avoid oversized rebuild arg lists).
+// Shallow lib/metadata_identity.sla retained.
+
+const ECS_MID_COMPONENT: i32 = 1;
+const ECS_MID_RESOURCE: i32 = 2;
+const ECS_MID_MESSAGE: i32 = 3;
+const ECS_MID_EVENT: i32 = 4;
+const ECS_MID_RELATIONSHIP: i32 = 5;
+
+struct EcsMidDeep {
+    kind: i32,
+    namespace_digest: i64,
+    local_digest: i64,
+    type_path_digest: i64,
+    stable_type_id: i64,
+}
+
+// Slot stores one identity (scalar fields only).
+struct EcsMidSlotDeep {
+    used: i32,
+    kind: i32,
+    ns: i64,
+    local: i64,
+    path: i64,
+    id: i64,
+}
+
+struct EcsMidRegDeep {
+    s0: EcsMidSlotDeep,
+    s1: EcsMidSlotDeep,
+    s2: EcsMidSlotDeep,
+    s3: EcsMidSlotDeep,
+    len: i32,
+}
+
+struct EcsMidRegResultDeep {
+    registry: EcsMidRegDeep,
+    inserted: bool,
+    duplicate: bool,
+    collision: bool,
+    existing_index: i32,
+}
+
+fn ecs_mid_abs(value: i64) -> i64 {
+    if value < 0 { return 0 - value; };
+    return value;
+}
+
+fn ecs_mid_normalize(value: i64) -> i64 {
+    let v = ecs_mid_abs(value);
+    if v == 0 { return 1; };
+    return v;
+}
+
+fn ecs_mid_mix(seed: i64, value: i64) -> i64 {
+    let mixed = (seed * 1103515245) + (ecs_mid_normalize(value) * 12345) + 97;
+    let bounded = mixed % 2147480000;
+    if bounded < 0 { return 0 - bounded; };
+    if bounded == 0 { return 1; };
+    return bounded;
+}
+
+fn ecs_mid_kind_seed(kind: i32) -> i64 {
+    if kind == ECS_MID_COMPONENT { return 1009; };
+    if kind == ECS_MID_RESOURCE { return 2003; };
+    if kind == ECS_MID_MESSAGE { return 3001; };
+    if kind == ECS_MID_EVENT { return 4001; };
+    if kind == ECS_MID_RELATIONSHIP { return 5003; };
+    return 1;
+}
+
+fn ecs_mid_new(kind: i32, namespace_digest: i64, local_digest: i64, type_path_digest: i64) -> EcsMidDeep {
+    let ns = ecs_mid_normalize(namespace_digest);
+    let local = ecs_mid_normalize(local_digest);
+    let path = ecs_mid_normalize(type_path_digest);
+    let h0 = ecs_mid_kind_seed(kind);
+    let h1 = ecs_mid_mix(h0, ns);
+    let h2 = ecs_mid_mix(h1, local);
+    let h3 = ecs_mid_mix(h2, path);
+    let type_id = (kind as i64 * 2147480000) + h3;
+    return EcsMidDeep {
+        kind: kind,
+        namespace_digest: ns,
+        local_digest: local,
+        type_path_digest: path,
+        stable_type_id: type_id,
+    };
+}
+
+fn ecs_mid_component(ns: i64, local: i64, path: i64) -> EcsMidDeep {
+    return ecs_mid_new(ECS_MID_COMPONENT, ns, local, path);
+}
+fn ecs_mid_resource(ns: i64, local: i64, path: i64) -> EcsMidDeep {
+    return ecs_mid_new(ECS_MID_RESOURCE, ns, local, path);
+}
+fn ecs_mid_message(ns: i64, local: i64, path: i64) -> EcsMidDeep {
+    return ecs_mid_new(ECS_MID_MESSAGE, ns, local, path);
+}
+fn ecs_mid_event(ns: i64, local: i64, path: i64) -> EcsMidDeep {
+    return ecs_mid_new(ECS_MID_EVENT, ns, local, path);
+}
+fn ecs_mid_relationship(ns: i64, local: i64, path: i64) -> EcsMidDeep {
+    return ecs_mid_new(ECS_MID_RELATIONSHIP, ns, local, path);
+}
+
+fn ecs_mid_kind(m: EcsMidDeep) -> i32 { return m.kind; }
+fn ecs_mid_ns(m: EcsMidDeep) -> i64 { return m.namespace_digest; }
+fn ecs_mid_local(m: EcsMidDeep) -> i64 { return m.local_digest; }
+fn ecs_mid_path(m: EcsMidDeep) -> i64 { return m.type_path_digest; }
+fn ecs_mid_type_id(m: EcsMidDeep) -> i64 { return m.stable_type_id; }
+
+fn ecs_mid_i32_type_id(m: EcsMidDeep) -> i32 {
+    let bounded = m.stable_type_id % 2147480000;
+    if bounded <= 0 { return 1; };
+    return bounded as i32;
+}
+
+fn ecs_mid_with_type_id(m: EcsMidDeep, stable_type_id: i64) -> EcsMidDeep {
+    return EcsMidDeep {
+        kind: m.kind,
+        namespace_digest: m.namespace_digest,
+        local_digest: m.local_digest,
+        type_path_digest: m.type_path_digest,
+        stable_type_id: stable_type_id,
+    };
+}
+
+fn ecs_mid_same_source(left: EcsMidDeep, right: EcsMidDeep) -> bool {
+    if left.kind != right.kind { return false; };
+    if left.namespace_digest != right.namespace_digest { return false; };
+    if left.local_digest != right.local_digest { return false; };
+    if left.type_path_digest != right.type_path_digest { return false; };
+    return true;
+}
+
+fn ecs_mid_slot_empty() -> EcsMidSlotDeep {
+    return EcsMidSlotDeep { used: 0, kind: 0, ns: 0, local: 0, path: 0, id: 0 };
+}
+
+fn ecs_mid_slot_from(m: EcsMidDeep) -> EcsMidSlotDeep {
+    return EcsMidSlotDeep {
+        used: 1,
+        kind: m.kind,
+        ns: m.namespace_digest,
+        local: m.local_digest,
+        path: m.type_path_digest,
+        id: m.stable_type_id,
+    };
+}
+
+fn ecs_mid_slot_to_identity(s: EcsMidSlotDeep) -> EcsMidDeep {
+    return EcsMidDeep {
+        kind: s.kind,
+        namespace_digest: s.ns,
+        local_digest: s.local,
+        type_path_digest: s.path,
+        stable_type_id: s.id,
+    };
+}
+
+fn ecs_mid_reg_new() -> EcsMidRegDeep {
+    return EcsMidRegDeep {
+        s0: ecs_mid_slot_empty(),
+        s1: ecs_mid_slot_empty(),
+        s2: ecs_mid_slot_empty(),
+        s3: ecs_mid_slot_empty(),
+        len: 0,
+    };
+}
+
+fn ecs_mid_reg_len(r: EcsMidRegDeep) -> i32 { return r.len; }
+
+fn ecs_mid_reg_rebuild(s0: EcsMidSlotDeep, s1: EcsMidSlotDeep, s2: EcsMidSlotDeep, s3: EcsMidSlotDeep, len: i32) -> EcsMidRegDeep {
+    return EcsMidRegDeep { s0: s0, s1: s1, s2: s2, s3: s3, len: len };
+}
+
+fn ecs_mid_reg_find_type_id(r: EcsMidRegDeep, stable_type_id: i64) -> i32 {
+    if r.len >= 1 { if r.s0.id == stable_type_id { return 0; }; };
+    if r.len >= 2 { if r.s1.id == stable_type_id { return 1; }; };
+    if r.len >= 3 { if r.s2.id == stable_type_id { return 2; }; };
+    if r.len >= 4 { if r.s3.id == stable_type_id { return 3; }; };
+    return -1;
+}
+
+fn ecs_mid_reg_get(r: EcsMidRegDeep, idx: i32) -> EcsMidDeep {
+    if idx == 0 { return ecs_mid_slot_to_identity(r.s0); };
+    if idx == 1 { return ecs_mid_slot_to_identity(r.s1); };
+    if idx == 2 { return ecs_mid_slot_to_identity(r.s2); };
+    if idx == 3 { return ecs_mid_slot_to_identity(r.s3); };
+    return EcsMidDeep { kind: 0, namespace_digest: 0, local_digest: 0, type_path_digest: 0, stable_type_id: 0 };
+}
+
+fn ecs_mid_reg_push(r: EcsMidRegDeep, m: EcsMidDeep) -> EcsMidRegDeep {
+    let slot = ecs_mid_slot_from(m);
+    let ln = r.len;
+    if ln >= 4 { return r; };
+    if ln == 0 {
+        return ecs_mid_reg_rebuild(slot, ecs_mid_slot_empty(), ecs_mid_slot_empty(), ecs_mid_slot_empty(), 1);
+    };
+    if ln == 1 {
+        return ecs_mid_reg_rebuild(r.s0, slot, ecs_mid_slot_empty(), ecs_mid_slot_empty(), 2);
+    };
+    if ln == 2 {
+        return ecs_mid_reg_rebuild(r.s0, r.s1, slot, ecs_mid_slot_empty(), 3);
+    };
+    if ln == 3 {
+        return ecs_mid_reg_rebuild(r.s0, r.s1, r.s2, slot, 4);
+    };
+    return r;
+}
+
+fn ecs_mid_res_inserted(r: EcsMidRegResultDeep) -> bool { return r.inserted; }
+fn ecs_mid_res_duplicate(r: EcsMidRegResultDeep) -> bool { return r.duplicate; }
+fn ecs_mid_res_collision(r: EcsMidRegResultDeep) -> bool { return r.collision; }
+fn ecs_mid_res_index(r: EcsMidRegResultDeep) -> i32 { return r.existing_index; }
+fn ecs_mid_res_registry(r: EcsMidRegResultDeep) -> EcsMidRegDeep { return r.registry; }
+
+fn ecs_mid_reg_register(r: EcsMidRegDeep, identity: EcsMidDeep) -> EcsMidRegResultDeep {
+    let existing_index = ecs_mid_reg_find_type_id(r, identity.stable_type_id);
+    if existing_index >= 0 {
+        let existing = ecs_mid_reg_get(r, existing_index);
+        if ecs_mid_same_source(existing, identity) {
+            return EcsMidRegResultDeep {
+                registry: r, inserted: false, duplicate: true, collision: false, existing_index: existing_index,
+            };
+        };
+        return EcsMidRegResultDeep {
+            registry: r, inserted: false, duplicate: false, collision: true, existing_index: existing_index,
+        };
+    };
+    if r.len >= 4 {
+        return EcsMidRegResultDeep {
+            registry: r, inserted: false, duplicate: false, collision: false, existing_index: -1,
+        };
+    };
+    let next = ecs_mid_reg_push(r, identity);
+    return EcsMidRegResultDeep {
+        registry: next, inserted: true, duplicate: false, collision: false, existing_index: -1,
+    };
+}

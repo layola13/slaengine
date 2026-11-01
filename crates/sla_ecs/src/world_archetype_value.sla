@@ -1,0 +1,473 @@
+// Archetype-backed homogeneous component value world.
+// This connects RegistryArchetypeWorld entity locations to real value columns:
+// adding/removing components migrates archetype signatures, while replacing an
+// existing component or writing through Mut<T> only updates changed ticks.
+@import "archetype_registry.sla"
+@import "dyn_store.sla"
+@import "resource.sla"
+@import "messages.sla"
+@import "query_dynamic.sla"
+
+struct ArchetypeValueColumn<T> {
+    component_id: i32,
+    values: DynamicComponentStore<T>,
+}
+
+struct ArchetypeValueWorld<T, R, M> {
+    archetypes: RegistryArchetypeWorld,
+    value_columns: Vec<ArchetypeValueColumn<T>>,
+    resource: ResourceSlot<R>,
+    messages: Messages<M>,
+    resource_added_tick: i32,
+    resource_changed_tick: i32,
+}
+
+struct ArchetypeValueMut<T> {
+    entity: Entity,
+    component_id: i32,
+    slot: i64,
+    archetype_id: i32,
+    row: i64,
+    value: T,
+}
+
+struct ArchetypeValuePair<T> {
+    entity: Entity,
+    first: T,
+    second: T,
+}
+
+struct ArchetypeValuePairMut<T> {
+    first: ArchetypeValueMut<T>,
+    second_component_id: i32,
+    second: T,
+}
+
+fn archetype_value_column_new<T>(component_id: i32) -> ArchetypeValueColumn<T> {
+    return ArchetypeValueColumn<T> { component_id: component_id, values: dyn_store_new<T>() };
+}
+
+fn archetype_value_world_new<T, R, M>(default_r: R, default_m: M) -> ArchetypeValueWorld<T, R, M> {
+    let value_columns: Vec<ArchetypeValueColumn<T>> = Vec::new();
+    return ArchetypeValueWorld<T, R, M> {
+        archetypes: registry_archetype_world_new(),
+        value_columns: value_columns,
+        resource: resource_slot_new<R>(default_r),
+        messages: messages_new<M>(default_m),
+        resource_added_tick: 0,
+        resource_changed_tick: 0,
+    };
+}
+
+fn archetype_value_world_column_slot<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.value_columns) as i64;
+    while i < cnt {
+        if world.value_columns[i].component_id == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn archetype_value_world_register_table<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> (ArchetypeValueWorld<T, R, M>, ComponentInfo) {
+    let (archetypes, info) = registry_archetype_world_register_table(world.archetypes);
+    world.archetypes = archetypes;
+    world.value_columns.push(archetype_value_column_new<T>(info.id));
+    return (world, info);
+}
+
+fn archetype_value_world_register_sparse_set<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> (ArchetypeValueWorld<T, R, M>, ComponentInfo) {
+    let (archetypes, info) = registry_archetype_world_register_sparse_set(world.archetypes);
+    world.archetypes = archetypes;
+    world.value_columns.push(archetype_value_column_new<T>(info.id));
+    return (world, info);
+}
+
+fn archetype_value_world_spawn<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> (ArchetypeValueWorld<T, R, M>, Entity) {
+    let (archetypes, entity) = registry_archetype_world_spawn(world.archetypes);
+    world.archetypes = archetypes;
+    return (world, entity);
+}
+
+fn archetype_value_world_increment_tick<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> ArchetypeValueWorld<T, R, M> {
+    world.archetypes.registry = registry_world_increment_tick(world.archetypes.registry);
+    return world;
+}
+
+fn archetype_value_world_is_alive<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity) -> bool {
+    return registry_archetype_world_is_alive(world.archetypes, entity);
+}
+
+fn archetype_value_world_has<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity, component_id: i32) -> bool {
+    return registry_world_has_component(world.archetypes.registry, entity, component_id);
+}
+
+fn archetype_value_world_entity_archetype_id<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity) -> i32 {
+    return registry_archetype_world_entity_archetype_id(world.archetypes, entity);
+}
+
+fn archetype_value_world_entity_row<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity) -> i64 {
+    return registry_archetype_world_entity_row(world.archetypes, entity);
+}
+
+fn archetype_value_world_insert<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity, component_id: i32, value: T) -> ArchetypeValueWorld<T, R, M> {
+    let had_component = archetype_value_world_has<T, R, M>(world, entity, component_id);
+    let column_slot = archetype_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { panic(9900); };
+    if had_component {
+        let value_slot = dyn_store_slot_of<T>(world.value_columns[column_slot].values, entity.id);
+        world.value_columns[column_slot].values = dyn_store_write<T>(world.value_columns[column_slot].values, value_slot, value);
+        world.archetypes.registry = registry_world_insert_component(world.archetypes.registry, entity, component_id);
+        return world;
+    };
+    world.value_columns[column_slot].values = dyn_store_insert<T>(world.value_columns[column_slot].values, entity.id, value);
+    world.archetypes = registry_archetype_world_insert_component(world.archetypes, entity, component_id);
+    return world;
+}
+
+fn archetype_value_world_remove<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity, component_id: i32) -> ArchetypeValueWorld<T, R, M> {
+    if archetype_value_world_has<T, R, M>(world, entity, component_id) != true { return world; };
+    let column_slot = archetype_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot >= 0 {
+        world.value_columns[column_slot].values = dyn_store_remove<T>(world.value_columns[column_slot].values, entity.id);
+    };
+    world.archetypes = registry_archetype_world_remove_component(world.archetypes, entity, component_id);
+    return world;
+}
+
+fn archetype_value_world_get<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity, component_id: i32) -> T {
+    if archetype_value_world_has<T, R, M>(world, entity, component_id) != true { panic(9901); };
+    let column_slot = archetype_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { panic(9902); };
+    return dyn_store_get<T>(world.value_columns[column_slot].values, entity.id);
+}
+
+fn archetype_value_world_added_since<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity, component_id: i32, tick: i32) -> bool {
+    return registry_world_component_added_since(world.archetypes.registry, entity, component_id, tick);
+}
+
+fn archetype_value_world_changed_since<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity, component_id: i32, tick: i32) -> bool {
+    return registry_world_component_changed_since(world.archetypes.registry, entity, component_id, tick);
+}
+
+fn archetype_value_world_query<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: archetype_value_world_get<T, R, M>(world, entity, component_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_without<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, without_component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if archetype_value_world_has<T, R, M>(world, entity, without_component_id) != true {
+            query.items.push(EntityItem<T> { entity: entity, value: archetype_value_world_get<T, R, M>(world, entity, component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_with<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, with_component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if archetype_value_world_has<T, R, M>(world, entity, with_component_id) {
+            query.items.push(EntityItem<T> { entity: entity, value: archetype_value_world_get<T, R, M>(world, entity, component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_added<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if archetype_value_world_added_since<T, R, M>(world, entity, component_id, tick) {
+            query.items.push(EntityItem<T> { entity: entity, value: archetype_value_world_get<T, R, M>(world, entity, component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_changed<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if archetype_value_world_changed_since<T, R, M>(world, entity, component_id, tick) {
+            query.items.push(EntityItem<T> { entity: entity, value: archetype_value_world_get<T, R, M>(world, entity, component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_pair<T, R, M>(world: ArchetypeValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32) -> Query<ArchetypeValuePair<T>> {
+    let query = query_new<ArchetypeValuePair<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, first_component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if archetype_value_world_has<T, R, M>(world, entity, second_component_id) {
+            query.items.push(ArchetypeValuePair<T> {
+                entity: entity,
+                first: archetype_value_world_get<T, R, M>(world, entity, first_component_id),
+                second: archetype_value_world_get<T, R, M>(world, entity, second_component_id),
+            });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_pair_without<T, R, M>(world: ArchetypeValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32, without_component_id: i32) -> Query<ArchetypeValuePair<T>> {
+    let query = query_new<ArchetypeValuePair<T>>();
+    let pairs = archetype_value_world_query_pair<T, R, M>(world, first_component_id, second_component_id);
+    let i: i64 = 0;
+    let cnt = len(pairs.items) as i64;
+    while i < cnt {
+        let item = pairs.items[i];
+        if archetype_value_world_has<T, R, M>(world, item.entity, without_component_id) != true {
+            query.items.push(item);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_mut<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32) -> Query<ArchetypeValueMut<T>> {
+    let query = query_new<ArchetypeValueMut<T>>();
+    let entities = registry_archetype_world_query_component(world.archetypes, component_id);
+    let column_slot = archetype_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { return query; };
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        let value_slot = dyn_store_slot_of<T>(world.value_columns[column_slot].values, entity.id);
+        query.items.push(ArchetypeValueMut<T> {
+            entity: entity,
+            component_id: component_id,
+            slot: value_slot,
+            archetype_id: archetype_value_world_entity_archetype_id<T, R, M>(world, entity),
+            row: archetype_value_world_entity_row<T, R, M>(world, entity),
+            value: dyn_store_get<T>(world.value_columns[column_slot].values, entity.id),
+        });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_query_pair_mut_first<T, R, M>(world: ArchetypeValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32) -> Query<ArchetypeValuePairMut<T>> {
+    let query = query_new<ArchetypeValuePairMut<T>>();
+    let first_items = archetype_value_world_query_mut<T, R, M>(world, first_component_id);
+    let i: i64 = 0;
+    let cnt = len(first_items.items) as i64;
+    while i < cnt {
+        let item = first_items.items[i];
+        if archetype_value_world_has<T, R, M>(world, item.entity, second_component_id) {
+            query.items.push(ArchetypeValuePairMut<T> {
+                first: item,
+                second_component_id: second_component_id,
+                second: archetype_value_world_get<T, R, M>(world, item.entity, second_component_id),
+            });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_value_world_write<T, R, M>(world: ArchetypeValueWorld<T, R, M>, item: ArchetypeValueMut<T>, value: T) -> ArchetypeValueWorld<T, R, M> {
+    if archetype_value_world_is_alive<T, R, M>(world, item.entity) != true { return world; };
+    let column_slot = archetype_value_world_column_slot<T, R, M>(world, item.component_id);
+    if column_slot < 0 { return world; };
+    world.value_columns[column_slot].values = dyn_store_write<T>(world.value_columns[column_slot].values, item.slot, value);
+    world.archetypes.registry = registry_world_insert_component(world.archetypes.registry, item.entity, item.component_id);
+    return world;
+}
+
+fn archetype_value_world_pair_write_first<T, R, M>(world: ArchetypeValueWorld<T, R, M>, item: ArchetypeValuePairMut<T>, value: T) -> ArchetypeValueWorld<T, R, M> {
+    return archetype_value_world_write<T, R, M>(world, item.first, value);
+}
+
+fn archetype_value_world_despawn<T, R, M>(world: ArchetypeValueWorld<T, R, M>, entity: Entity) -> ArchetypeValueWorld<T, R, M> {
+    if archetype_value_world_is_alive<T, R, M>(world, entity) != true { return world; };
+    let i: i64 = 0;
+    let cnt = len(world.value_columns) as i64;
+    while i < cnt {
+        world.value_columns[i].values = dyn_store_remove<T>(world.value_columns[i].values, entity.id);
+        i = i + 1;
+    }
+    world.archetypes = registry_archetype_world_despawn(world.archetypes, entity);
+    return world;
+}
+
+fn archetype_value_world_insert_resource<T, R, M>(world: ArchetypeValueWorld<T, R, M>, value: R) -> ArchetypeValueWorld<T, R, M> {
+    if resource_has<R>(world.resource) != true {
+        world.resource_added_tick = world.archetypes.registry.change_tick;
+    };
+    world.resource = resource_insert<R>(world.resource, value);
+    world.resource_changed_tick = world.archetypes.registry.change_tick;
+    return world;
+}
+
+fn archetype_value_world_get_resource<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> R {
+    return resource_get<R>(world.resource);
+}
+
+fn archetype_value_world_has_resource<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> bool {
+    return resource_has<R>(world.resource);
+}
+
+fn archetype_value_world_res<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> Res<R> {
+    return Res<R> { value: archetype_value_world_get_resource<T, R, M>(world), added_tick: world.resource_added_tick, changed_tick: world.resource_changed_tick };
+}
+
+fn archetype_value_world_res_mut<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> ResMut<R> {
+    return ResMut<R> { value: archetype_value_world_get_resource<T, R, M>(world), added_tick: world.resource_added_tick, changed_tick: world.resource_changed_tick };
+}
+
+fn archetype_value_world_resource_added_since<T, R, M>(world: ArchetypeValueWorld<T, R, M>, tick: i32) -> bool {
+    if archetype_value_world_has_resource<T, R, M>(world) != true { return false; };
+    return world.resource_added_tick > tick;
+}
+
+fn archetype_value_world_resource_changed_since<T, R, M>(world: ArchetypeValueWorld<T, R, M>, tick: i32) -> bool {
+    if archetype_value_world_has_resource<T, R, M>(world) != true { return false; };
+    return world.resource_changed_tick > tick;
+}
+
+fn archetype_value_world_res_mut_write<T, R, M>(world: ArchetypeValueWorld<T, R, M>, res: ResMut<R>, value: R) -> ArchetypeValueWorld<T, R, M> {
+    if archetype_value_world_has_resource<T, R, M>(world) != true { return world; };
+    world.resource = resource_insert<R>(world.resource, value);
+    world.resource_changed_tick = world.archetypes.registry.change_tick;
+    return world;
+}
+
+fn archetype_value_world_remove_resource<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> ArchetypeValueWorld<T, R, M> {
+    world.resource = resource_remove<R>(world.resource);
+    world.resource_added_tick = 0;
+    world.resource_changed_tick = 0;
+    return world;
+}
+
+fn archetype_value_world_write_message<T, R, M>(world: ArchetypeValueWorld<T, R, M>, value: M) -> ArchetypeValueWorld<T, R, M> {
+    world.messages = messages_write<M>(world.messages, value);
+    return world;
+}
+
+fn archetype_value_world_read_message<T, R, M>(world: ArchetypeValueWorld<T, R, M>, reader: MessageReader, default_value: M) -> MessageRead<M> {
+    return messages_read_next<M>(world.messages, reader, default_value);
+}
+
+struct ArchetypeValueData { amount: i32 }
+struct ArchetypeValueTime { tick: i32 }
+struct ArchetypeValueEvent { amount: i32 }
+
+fn archetype_value_time_default() -> ArchetypeValueTime { return ArchetypeValueTime { tick: 0 }; }
+fn archetype_value_event_default() -> ArchetypeValueEvent { return ArchetypeValueEvent { amount: 0 }; }
+
+fn archetype_value_test_world_new() -> ArchetypeValueWorld<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent> {
+    return archetype_value_world_new<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(archetype_value_time_default(), archetype_value_event_default());
+}
+
+@test "archetype value world migrates value entities by signature"() {
+    let w0 = archetype_value_test_world_new();
+    let (w1, health) = archetype_value_world_register_table<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w0);
+    let (w2, mana) = archetype_value_world_register_table<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w1);
+    let (w3, selected) = archetype_value_world_register_sparse_set<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w2);
+    let (w4, e1) = archetype_value_world_spawn<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w3);
+    let (w5, e2) = archetype_value_world_spawn<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w4);
+    let w6 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w5, e1, health.id, ArchetypeValueData { amount: 10 });
+    let w7 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w6, e1, mana.id, ArchetypeValueData { amount: 4 });
+    let w8 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, e2, mana.id, ArchetypeValueData { amount: 2 });
+    let w9 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w8, e2, health.id, ArchetypeValueData { amount: 8 });
+    let shared = archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w9, e1);
+    if shared != archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w9, e2) { panic(9920); };
+    if registry_archetype_world_archetype_entity_count(w9.archetypes, shared) != 2 { panic(9921); };
+    let w10 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w9, e2, selected.id, ArchetypeValueData { amount: 1 });
+    if archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, e1) == archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, e2) { panic(9922); };
+    let unselected = archetype_value_world_query_pair_without<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, health.id, mana.id, selected.id);
+    if len(unselected.items) != 1 { panic(9923); };
+    if unselected.items[0].entity.id != e1.id { panic(9924); };
+    let selected_health = archetype_value_world_query_with<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, health.id, selected.id);
+    if len(selected_health.items) != 1 { panic(9926); };
+    if selected_health.items[0].entity.id != e2.id { panic(9927); };
+    let w11 = archetype_value_world_remove<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, e2, selected.id);
+    if archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w11, e1) != archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w11, e2) { panic(9925); };
+}
+
+@test "archetype value world writeback does not migrate archetype"() {
+    let w0 = archetype_value_test_world_new();
+    let (w1, health) = archetype_value_world_register_table<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w0);
+    let (w2, mana) = archetype_value_world_register_table<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w1);
+    let (w3, entity) = archetype_value_world_spawn<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w2);
+    let w4 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w3, entity, health.id, ArchetypeValueData { amount: 5 });
+    let w5 = archetype_value_world_insert<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w4, entity, mana.id, ArchetypeValueData { amount: 3 });
+    let before = w5.archetypes.registry.change_tick;
+    let original_group = archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w5, entity);
+    let original_row = archetype_value_world_entity_row<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w5, entity);
+    let w6 = archetype_value_world_increment_tick<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w5);
+    let q = archetype_value_world_query_pair_mut_first<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w6, health.id, mana.id);
+    if len(q.items) != 1 { panic(9930); };
+    let item = q.items[0];
+    let w7 = archetype_value_world_pair_write_first<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w6, item, ArchetypeValueData { amount: item.first.value.amount + item.second.amount });
+    if archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, entity) != original_group { panic(9931); };
+    if archetype_value_world_entity_row<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, entity) != original_row { panic(9932); };
+    let out = archetype_value_world_get<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, entity, health.id);
+    if out.amount != 8 { panic(9933); };
+    if archetype_value_world_added_since<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, entity, health.id, before) != false { panic(9934); };
+    if archetype_value_world_changed_since<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, entity, health.id, before) != true { panic(9935); };
+    let changed = archetype_value_world_query_changed<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, health.id, before);
+    if len(changed.items) != 1 { panic(9936); };
+    let w8 = archetype_value_world_insert_resource<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w7, ArchetypeValueTime { tick: w7.archetypes.registry.change_tick });
+    let w9 = archetype_value_world_write_message<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w8, ArchetypeValueEvent { amount: 6 });
+    let w10 = archetype_value_world_despawn<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w9, entity);
+    if archetype_value_world_is_alive<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, entity) != false { panic(9937); };
+    if archetype_value_world_entity_archetype_id<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, entity) != -1 { panic(9938); };
+    let time = archetype_value_world_get_resource<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10);
+    let event = archetype_value_world_read_message<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w10, message_reader_new(), archetype_value_event_default());
+    if time.tick != 2 { panic(9939); };
+    if event.value.amount != 6 { panic(9940); };
+}
+
+@test "archetype value world resmut tracks resource changes"() {
+    let w0 = archetype_value_test_world_new();
+    let w1 = archetype_value_world_insert_resource<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w0, ArchetypeValueTime { tick: 3 });
+    if archetype_value_world_resource_added_since<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w1, 0) != true { panic(9941); };
+    if archetype_value_world_resource_changed_since<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w1, 0) != true { panic(9942); };
+    let before = w1.archetypes.registry.change_tick;
+    let w2 = archetype_value_world_increment_tick<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w1);
+    let res = archetype_value_world_res_mut<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w2);
+    if res_mut_is_added_since<ArchetypeValueTime>(res, before) != false { panic(9943); };
+    if res_mut_is_changed_since<ArchetypeValueTime>(res, before) != false { panic(9944); };
+    let w3 = archetype_value_world_res_mut_write<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w2, res, ArchetypeValueTime { tick: res.value.tick + 2 });
+    let out = archetype_value_world_get_resource<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w3);
+    if out.tick != 5 { panic(9945); };
+    if archetype_value_world_resource_added_since<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w3, before) != false { panic(9946); };
+    if archetype_value_world_resource_changed_since<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w3, before) != true { panic(9947); };
+    let w4 = archetype_value_world_remove_resource<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w3);
+    if archetype_value_world_has_resource<ArchetypeValueData, ArchetypeValueTime, ArchetypeValueEvent>(w4) != false { panic(9948); };
+}

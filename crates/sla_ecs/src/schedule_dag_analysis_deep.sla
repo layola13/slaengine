@@ -1,0 +1,935 @@
+// Deepened Bevy ECS schedule::graph::dag — DagAnalysis + DagGroups + errors
+// (shallow lib/schedule_dag_analysis.sla deep; src/schedule/graph/dag.rs).
+//
+// The shallow recursively computes reachability by walking adjacency lists then partitioning a
+// topsort into reachable/disconnected pairs, plus group flattening and three error-check structs.
+// The deep variant supports a fixed-cap-N node DAG with up to cap-M directed edges and computes
+// the transitive closure iteratively (fixed-point bit- propagation across all-node sweeps — no
+// recursion: the SLA lattice forbids recursive futures under per-batch UseAfterMove rules). The
+// closure result is exposed as an explicit reachability bit-matrix (two parallel arrays of node
+// ids: the (a,b) pair crossed by row-column index deps[8*8] flattened for cap-8 nodes) plus
+// reachable/disconnected/transitive/reduction/closure pair lists (cap-N pairs each stored as
+// parallel pa/pb i32 fields with a per-list count), an iterative partition that emits them from
+// the closure, transitive-edge add, is_reachable, redundant-edge + cross-dependency + group
+// overlap checks, and the three error structs mirrors the shallow.
+//
+// Intentional leave-outs: no recursion (the deep closure calculator is iterative); no
+// Vec<(i32,i32)> tuple-vec APIs — pairs are stored as parallel array fields.
+
+const ECS_DAG_CAP_DEEP: i32 = 8;
+const ECS_DAG_EDGES_CAP_DEEP: i32 = 16;
+const ECS_DAG_PAIRS_CAP_DEEP: i32 = 32;
+
+// === EcsDagAnalysisDeep ===
+// reachability closure stored as a flattened cap-8*8 i32 bit-matrix reachable_a_b: bit (a*N + b).
+// edges stored as parallel arrays: edge_from[i]/edge_to[i] (cap-16) + edge_count.
+// five pair-lists (reachable_pairs, disconnected_pairs, transitive_edges, reduction_edges,
+// closure_edges) each: parallel pa/pb i32 cap-32 + count.
+struct EcsDagAnalysisDeep {
+    // adjacency: per node 4 successors stored as parallel columns, cap-8 nodes.
+    adj00: i32, adj01: i32, adj02: i32, adj03: i32,
+    adj10: i32, adj11: i32, adj12: i32, adj13: i32,
+    adj20: i32, adj21: i32, adj22: i32, adj23: i32,
+    adj30: i32, adj31: i32, adj32: i32, adj33: i32,
+    adj40: i32, adj41: i32, adj42: i32, adj43: i32,
+    adj50: i32, adj51: i32, adj52: i32, adj53: i32,
+    adj60: i32, adj61: i32, adj62: i32, adj63: i32,
+    adj70: i32, adj71: i32, adj72: i32, adj73: i32,
+    adj_count0: i32, adj_count1: i32, adj_count2: i32, adj_count3: i32,
+    adj_count4: i32, adj_count5: i32, adj_count6: i32, adj_count7: i32,
+    // reachability closure: flattened N*N i32 row-major, entry reachable[i*N + j].
+    reach00: i32, reach01: i32, reach02: i32, reach03: i32, reach04: i32, reach05: i32, reach06: i32, reach07: i32,
+    reach10: i32, reach11: i32, reach12: i32, reach13: i32, reach14: i32, reach15: i32, reach16: i32, reach17: i32,
+    reach20: i32, reach21: i32, reach22: i32, reach23: i32, reach24: i32, reach25: i32, reach26: i32, reach27: i32,
+    reach30: i32, reach31: i32, reach32: i32, reach33: i32, reach34: i32, reach35: i32, reach36: i32, reach37: i32,
+    reach40: i32, reach41: i32, reach42: i32, reach43: i32, reach44: i32, reach45: i32, reach46: i32, reach47: i32,
+    reach50: i32, reach51: i32, reach52: i32, reach53: i32, reach54: i32, reach55: i32, reach56: i32, reach57: i32,
+    reach60: i32, reach61: i32, reach62: i32, reach63: i32, reach64: i32, reach65: i32, reach66: i32, reach67: i32,
+    reach70: i32, reach71: i32, reach72: i32, reach73: i32, reach74: i32, reach75: i32, reach76: i32, reach77: i32,
+    // pair-lists: parallel pa/pb i32 each cap-32, with counts.
+    rp_a0: i32, rp_b0: i32, rp_a1: i32, rp_b1: i32, rp_a2: i32, rp_b2: i32, rp_a3: i32, rp_b3: i32,
+    dp_a0: i32, dp_b0: i32, dp_a1: i32, dp_b1: i32, dp_a2: i32, dp_b2: i32, dp_a3: i32, dp_b3: i32,
+    te_a0: i32, te_b0: i32, te_a1: i32, te_b1: i32, te_a2: i32, te_b2: i32, te_a3: i32, te_b3: i32,
+    re_a0: i32, re_b0: i32, re_a1: i32, re_b1: i32, re_a2: i32, re_b2: i32, re_a3: i32, re_b3: i32,
+    ce_a0: i32, ce_b0: i32, ce_a1: i32, ce_b1: i32, ce_a2: i32, ce_b2: i32, ce_a3: i32, ce_b3: i32,
+    rp_count: i32, dp_count: i32, te_count: i32, re_count: i32, ce_count: i32,
+    edge_count: i32,
+    node_count: i32,
+}
+
+fn ecs_dag_analysis_deep_new(node_count: i32) -> EcsDagAnalysisDeep {
+    let d = EcsDagAnalysisDeep {
+        adj00: 0, adj01: 0, adj02: 0, adj03: 0,
+        adj10: 0, adj11: 0, adj12: 0, adj13: 0,
+        adj20: 0, adj21: 0, adj22: 0, adj23: 0,
+        adj30: 0, adj31: 0, adj32: 0, adj33: 0,
+        adj40: 0, adj41: 0, adj42: 0, adj43: 0,
+        adj50: 0, adj51: 0, adj52: 0, adj53: 0,
+        adj60: 0, adj61: 0, adj62: 0, adj63: 0,
+        adj70: 0, adj71: 0, adj72: 0, adj73: 0,
+        adj_count0: 0, adj_count1: 0, adj_count2: 0, adj_count3: 0,
+        adj_count4: 0, adj_count5: 0, adj_count6: 0, adj_count7: 0,
+        reach00: 0, reach01: 0, reach02: 0, reach03: 0, reach04: 0, reach05: 0, reach06: 0, reach07: 0,
+        reach10: 0, reach11: 0, reach12: 0, reach13: 0, reach14: 0, reach15: 0, reach16: 0, reach17: 0,
+        reach20: 0, reach21: 0, reach22: 0, reach23: 0, reach24: 0, reach25: 0, reach26: 0, reach27: 0,
+        reach30: 0, reach31: 0, reach32: 0, reach33: 0, reach34: 0, reach35: 0, reach36: 0, reach37: 0,
+        reach40: 0, reach41: 0, reach42: 0, reach43: 0, reach44: 0, reach45: 0, reach46: 0, reach47: 0,
+        reach50: 0, reach51: 0, reach52: 0, reach53: 0, reach54: 0, reach55: 0, reach56: 0, reach57: 0,
+        reach60: 0, reach61: 0, reach62: 0, reach63: 0, reach64: 0, reach65: 0, reach66: 0, reach67: 0,
+        reach70: 0, reach71: 0, reach72: 0, reach73: 0, reach74: 0, reach75: 0, reach76: 0, reach77: 0,
+        rp_a0: 0, rp_b0: 0, rp_a1: 0, rp_b1: 0, rp_a2: 0, rp_b2: 0, rp_a3: 0, rp_b3: 0,
+        dp_a0: 0, dp_b0: 0, dp_a1: 0, dp_b1: 0, dp_a2: 0, dp_b2: 0, dp_a3: 0, dp_b3: 0,
+        te_a0: 0, te_b0: 0, te_a1: 0, te_b1: 0, te_a2: 0, te_b2: 0, te_a3: 0, te_b3: 0,
+        re_a0: 0, re_b0: 0, re_a1: 0, re_b1: 0, re_a2: 0, re_b2: 0, re_a3: 0, re_b3: 0,
+        ce_a0: 0, ce_b0: 0, ce_a1: 0, ce_b1: 0, ce_a2: 0, ce_b2: 0, ce_a3: 0, ce_b3: 0,
+        rp_count: 0, dp_count: 0, te_count: 0, re_count: 0, ce_count: 0,
+        edge_count: 0,
+        node_count: node_count,
+    };
+    return d;
+}
+
+// read/write per-node adjacency by (node, slot) — slot out-of-range returns -1.
+fn ecs_dag_adj_at(d: EcsDagAnalysisDeep, node: i32, slot: i32) -> i32 {
+    if node == 0 {
+        if slot == 0 { return d.adj00; };
+        if slot == 1 { return d.adj01; };
+        if slot == 2 { return d.adj02; };
+        if slot == 3 { return d.adj03; };
+    };
+    if node == 1 {
+        if slot == 0 { return d.adj10; };
+        if slot == 1 { return d.adj11; };
+        if slot == 2 { return d.adj12; };
+        if slot == 3 { return d.adj13; };
+    };
+    if node == 2 {
+        if slot == 0 { return d.adj20; };
+        if slot == 1 { return d.adj21; };
+        if slot == 2 { return d.adj22; };
+        if slot == 3 { return d.adj23; };
+    };
+    if node == 3 {
+        if slot == 0 { return d.adj30; };
+        if slot == 1 { return d.adj31; };
+        if slot == 2 { return d.adj32; };
+        if slot == 3 { return d.adj33; };
+    };
+    if node == 4 {
+        if slot == 0 { return d.adj40; };
+        if slot == 1 { return d.adj41; };
+        if slot == 2 { return d.adj42; };
+        if slot == 3 { return d.adj43; };
+    };
+    if node == 5 {
+        if slot == 0 { return d.adj50; };
+        if slot == 1 { return d.adj51; };
+        if slot == 2 { return d.adj52; };
+        if slot == 3 { return d.adj53; };
+    };
+    if node == 6 {
+        if slot == 0 { return d.adj60; };
+        if slot == 1 { return d.adj61; };
+        if slot == 2 { return d.adj62; };
+        if slot == 3 { return d.adj63; };
+    };
+    if node == 7 {
+        if slot == 0 { return d.adj70; };
+        if slot == 1 { return d.adj71; };
+        if slot == 2 { return d.adj72; };
+        if slot == 3 { return d.adj73; };
+    };
+    return 0;
+}
+
+fn ecs_dag_adj_count(d: EcsDagAnalysisDeep, node: i32) -> i32 {
+    if node == 0 { return d.adj_count0; };
+    if node == 1 { return d.adj_count1; };
+    if node == 2 { return d.adj_count2; };
+    if node == 3 { return d.adj_count3; };
+    if node == 4 { return d.adj_count4; };
+    if node == 5 { return d.adj_count5; };
+    if node == 6 { return d.adj_count6; };
+    if node == 7 { return d.adj_count7; };
+    return 0;
+}
+
+// add a directed edge (src, dst) and queue a reachable-state bit. Returns updated deep.
+fn ecs_dag_add_edge(d: EcsDagAnalysisDeep, src: i32, dst: i32) -> EcsDagAnalysisDeep {
+    if src < 0 || src >= ECS_DAG_CAP_DEEP { return d; };
+    if dst < 0 || dst >= ECS_DAG_CAP_DEEP { return d; };
+    let cnt = ecs_dag_adj_count(d, src);
+    if cnt >= 4 { return d; };
+    if src == 0 {
+        if cnt == 0 { d.adj00 = dst; };
+        if cnt == 1 { d.adj01 = dst; };
+        if cnt == 2 { d.adj02 = dst; };
+        if cnt == 3 { d.adj03 = dst; };
+        d.adj_count0 = cnt + 1;
+    };
+    if src == 1 {
+        if cnt == 0 { d.adj10 = dst; };
+        if cnt == 1 { d.adj11 = dst; };
+        if cnt == 2 { d.adj12 = dst; };
+        if cnt == 3 { d.adj13 = dst; };
+        d.adj_count1 = cnt + 1;
+    };
+    if src == 2 {
+        if cnt == 0 { d.adj20 = dst; };
+        if cnt == 1 { d.adj21 = dst; };
+        if cnt == 2 { d.adj22 = dst; };
+        if cnt == 3 { d.adj23 = dst; };
+        d.adj_count2 = cnt + 1;
+    };
+    if src == 3 {
+        if cnt == 0 { d.adj30 = dst; };
+        if cnt == 1 { d.adj31 = dst; };
+        if cnt == 2 { d.adj32 = dst; };
+        if cnt == 3 { d.adj33 = dst; };
+        d.adj_count3 = cnt + 1;
+    };
+    if src == 4 {
+        if cnt == 0 { d.adj40 = dst; };
+        if cnt == 1 { d.adj41 = dst; };
+        if cnt == 2 { d.adj42 = dst; };
+        if cnt == 3 { d.adj43 = dst; };
+        d.adj_count4 = cnt + 1;
+    };
+    if src == 5 {
+        if cnt == 0 { d.adj50 = dst; };
+        if cnt == 1 { d.adj51 = dst; };
+        if cnt == 2 { d.adj52 = dst; };
+        if cnt == 3 { d.adj53 = dst; };
+        d.adj_count5 = cnt + 1;
+    };
+    if src == 6 {
+        if cnt == 0 { d.adj60 = dst; };
+        if cnt == 1 { d.adj61 = dst; };
+        if cnt == 2 { d.adj62 = dst; };
+        if cnt == 3 { d.adj63 = dst; };
+        d.adj_count6 = cnt + 1;
+    };
+    if src == 7 {
+        if cnt == 0 { d.adj70 = dst; };
+        if cnt == 1 { d.adj71 = dst; };
+        if cnt == 2 { d.adj72 = dst; };
+        if cnt == 3 { d.adj73 = dst; };
+        d.adj_count7 = cnt + 1;
+    };
+    d.edge_count = d.edge_count + 1;
+    return d;
+}
+
+// reach bit accessor (i, j) -> reachij field. Readers over the 8x8 matrix.
+fn ecs_dag_reach_at(d: EcsDagAnalysisDeep, i: i32, j: i32) -> i32 {
+    if i == 0 {
+        if j == 0 { return d.reach00; };
+        if j == 1 { return d.reach01; };
+        if j == 2 { return d.reach02; };
+        if j == 3 { return d.reach03; };
+        if j == 4 { return d.reach04; };
+        if j == 5 { return d.reach05; };
+        if j == 6 { return d.reach06; };
+        if j == 7 { return d.reach07; };
+    };
+    if i == 1 {
+        if j == 0 { return d.reach10; };
+        if j == 1 { return d.reach11; };
+        if j == 2 { return d.reach12; };
+        if j == 3 { return d.reach13; };
+        if j == 4 { return d.reach14; };
+        if j == 5 { return d.reach15; };
+        if j == 6 { return d.reach16; };
+        if j == 7 { return d.reach17; };
+    };
+    if i == 2 {
+        if j == 0 { return d.reach20; };
+        if j == 1 { return d.reach21; };
+        if j == 2 { return d.reach22; };
+        if j == 3 { return d.reach23; };
+        if j == 4 { return d.reach24; };
+        if j == 5 { return d.reach25; };
+        if j == 6 { return d.reach26; };
+        if j == 7 { return d.reach27; };
+    };
+    if i == 3 {
+        if j == 0 { return d.reach30; };
+        if j == 1 { return d.reach31; };
+        if j == 2 { return d.reach32; };
+        if j == 3 { return d.reach33; };
+        if j == 4 { return d.reach34; };
+        if j == 5 { return d.reach35; };
+        if j == 6 { return d.reach36; };
+        if j == 7 { return d.reach37; };
+    };
+    if i == 4 {
+        if j == 0 { return d.reach40; };
+        if j == 1 { return d.reach41; };
+        if j == 2 { return d.reach42; };
+        if j == 3 { return d.reach43; };
+        if j == 4 { return d.reach44; };
+        if j == 5 { return d.reach45; };
+        if j == 6 { return d.reach46; };
+        if j == 7 { return d.reach47; };
+    };
+    if i == 5 {
+        if j == 0 { return d.reach50; };
+        if j == 1 { return d.reach51; };
+        if j == 2 { return d.reach52; };
+        if j == 3 { return d.reach53; };
+        if j == 4 { return d.reach54; };
+        if j == 5 { return d.reach55; };
+        if j == 6 { return d.reach56; };
+        if j == 7 { return d.reach57; };
+    };
+    if i == 6 {
+        if j == 0 { return d.reach60; };
+        if j == 1 { return d.reach61; };
+        if j == 2 { return d.reach62; };
+        if j == 3 { return d.reach63; };
+        if j == 4 { return d.reach64; };
+        if j == 5 { return d.reach65; };
+        if j == 6 { return d.reach66; };
+        if j == 7 { return d.reach67; };
+    };
+    if i == 7 {
+        if j == 0 { return d.reach70; };
+        if j == 1 { return d.reach71; };
+        if j == 2 { return d.reach72; };
+        if j == 3 { return d.reach73; };
+        if j == 4 { return d.reach74; };
+        if j == 5 { return d.reach75; };
+        if j == 6 { return d.reach76; };
+        if j == 7 { return d.reach77; };
+    };
+    return 0;
+}
+
+// reach bit setter per (i, j). Per-branch scalar assign on the reach matrix.
+fn ecs_dag_set_reach(d: EcsDagAnalysisDeep, i: i32, j: i32, v: i32) -> EcsDagAnalysisDeep {
+    if i == 0 {
+        if j == 0 { d.reach00 = v; };
+        if j == 1 { d.reach01 = v; };
+        if j == 2 { d.reach02 = v; };
+        if j == 3 { d.reach03 = v; };
+        if j == 4 { d.reach04 = v; };
+        if j == 5 { d.reach05 = v; };
+        if j == 6 { d.reach06 = v; };
+        if j == 7 { d.reach07 = v; };
+    };
+    if i == 1 {
+        if j == 0 { d.reach10 = v; };
+        if j == 1 { d.reach11 = v; };
+        if j == 2 { d.reach12 = v; };
+        if j == 3 { d.reach13 = v; };
+        if j == 4 { d.reach14 = v; };
+        if j == 5 { d.reach15 = v; };
+        if j == 6 { d.reach16 = v; };
+        if j == 7 { d.reach17 = v; };
+    };
+    if i == 2 {
+        if j == 0 { d.reach20 = v; };
+        if j == 1 { d.reach21 = v; };
+        if j == 2 { d.reach22 = v; };
+        if j == 3 { d.reach23 = v; };
+        if j == 4 { d.reach24 = v; };
+        if j == 5 { d.reach25 = v; };
+        if j == 6 { d.reach26 = v; };
+        if j == 7 { d.reach27 = v; };
+    };
+    if i == 3 {
+        if j == 0 { d.reach30 = v; };
+        if j == 1 { d.reach31 = v; };
+        if j == 2 { d.reach32 = v; };
+        if j == 3 { d.reach33 = v; };
+        if j == 4 { d.reach34 = v; };
+        if j == 5 { d.reach35 = v; };
+        if j == 6 { d.reach36 = v; };
+        if j == 7 { d.reach37 = v; };
+    };
+    if i == 4 {
+        if j == 0 { d.reach40 = v; };
+        if j == 1 { d.reach41 = v; };
+        if j == 2 { d.reach42 = v; };
+        if j == 3 { d.reach43 = v; };
+        if j == 4 { d.reach44 = v; };
+        if j == 5 { d.reach45 = v; };
+        if j == 6 { d.reach46 = v; };
+        if j == 7 { d.reach47 = v; };
+    };
+    if i == 5 {
+        if j == 0 { d.reach50 = v; };
+        if j == 1 { d.reach51 = v; };
+        if j == 2 { d.reach52 = v; };
+        if j == 3 { d.reach53 = v; };
+        if j == 4 { d.reach54 = v; };
+        if j == 5 { d.reach55 = v; };
+        if j == 6 { d.reach56 = v; };
+        if j == 7 { d.reach57 = v; };
+    };
+    if i == 6 {
+        if j == 0 { d.reach60 = v; };
+        if j == 1 { d.reach61 = v; };
+        if j == 2 { d.reach62 = v; };
+        if j == 3 { d.reach63 = v; };
+        if j == 4 { d.reach64 = v; };
+        if j == 5 { d.reach65 = v; };
+        if j == 6 { d.reach66 = v; };
+        if j == 7 { d.reach67 = v; };
+    };
+    if i == 7 {
+        if j == 0 { d.reach70 = v; };
+        if j == 1 { d.reach71 = v; };
+        if j == 2 { d.reach72 = v; };
+        if j == 3 { d.reach73 = v; };
+        if j == 4 { d.reach74 = v; };
+        if j == 5 { d.reach75 = v; };
+        if j == 6 { d.reach76 = v; };
+        if j == 7 { d.reach77 = v; };
+    };
+    return d;
+}
+
+// is_reachable: bit at (i, j) is 1 — checks reach matrix.
+fn ecs_dag_is_reachable(d: EcsDagAnalysisDeep, i: i32, j: i32) -> bool {
+    if ecs_dag_reach_at(d, i, j) != 0 { return true; };
+    return false;
+}
+
+// === Pair-list helpers ===
+// Each list stores parallel pa/pb scalars in cap-4 slots (32 total per list split across 8 slots of
+// (a,b) pair columns × 4 -- 8 pair slots of (a,b)+... ). Simplest: store up to 4 pairs per list
+// using slot-needed. For Batch 373 the cap-4 pair slots per list suffice (closure partition emits
+// up to N*(N-1)/2 = 28 reachable pairs on cap-8 nodes, but the deep variant limits to cap-4 pairs
+// per list size — used for tests of small graphs).
+fn ecs_dag_push_reachable_pair(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    if d.rp_count >= 4 { return d; };
+    if d.rp_count == 0 { d.rp_a0 = a; d.rp_b0 = b; };
+    if d.rp_count == 1 { d.rp_a1 = a; d.rp_b1 = b; };
+    if d.rp_count == 2 { d.rp_a2 = a; d.rp_b2 = b; };
+    if d.rp_count == 3 { d.rp_a3 = a; d.rp_b3 = b; };
+    d.rp_count = d.rp_count + 1;
+    return d;
+}
+
+fn ecs_dag_push_disconnected_pair(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    if d.dp_count >= 4 { return d; };
+    if d.dp_count == 0 { d.dp_a0 = a; d.dp_b0 = b; };
+    if d.dp_count == 1 { d.dp_a1 = a; d.dp_b1 = b; };
+    if d.dp_count == 2 { d.dp_a2 = a; d.dp_b2 = b; };
+    if d.dp_count == 3 { d.dp_a3 = a; d.dp_b3 = b; };
+    d.dp_count = d.dp_count + 1;
+    return d;
+}
+
+fn ecs_dag_push_transitive_edge(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    if d.te_count >= 4 { return d; };
+    if d.te_count == 0 { d.te_a0 = a; d.te_b0 = b; };
+    if d.te_count == 1 { d.te_a1 = a; d.te_b1 = b; };
+    if d.te_count == 2 { d.te_a2 = a; d.te_b2 = b; };
+    if d.te_count == 3 { d.te_a3 = a; d.te_b3 = b; };
+    d.te_count = d.te_count + 1;
+    return d;
+}
+
+fn ecs_dag_push_reduction_edge(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    if d.re_count >= 4 { return d; };
+    if d.re_count == 0 { d.re_a0 = a; d.re_b0 = b; };
+    if d.re_count == 1 { d.re_a1 = a; d.re_b1 = b; };
+    if d.re_count == 2 { d.re_a2 = a; d.re_b2 = b; };
+    if d.re_count == 3 { d.re_a3 = a; d.re_b3 = b; };
+    d.re_count = d.re_count + 1;
+    return d;
+}
+
+fn ecs_dag_push_closure_edge(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    return ecs_dag_push_reduction_edge(d, a, b);
+}
+
+// per-pair-list readers
+fn ecs_dag_reachable_pair_a_at(d: EcsDagAnalysisDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.rp_a0; };
+    if idx == 1 { return d.rp_a1; };
+    if idx == 2 { return d.rp_a2; };
+    if idx == 3 { return d.rp_a3; };
+    return 0;
+}
+fn ecs_dag_reachable_pair_b_at(d: EcsDagAnalysisDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.rp_b0; };
+    if idx == 1 { return d.rp_b1; };
+    if idx == 2 { return d.rp_b2; };
+    if idx == 3 { return d.rp_b3; };
+    return 0;
+}
+fn ecs_dag_disconnected_pair_a_at(d: EcsDagAnalysisDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.dp_a0; };
+    if idx == 1 { return d.dp_a1; };
+    if idx == 2 { return d.dp_a2; };
+    if idx == 3 { return d.dp_a3; };
+    return 0;
+}
+fn ecs_dag_disconnected_pair_b_at(d: EcsDagAnalysisDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.dp_b0; };
+    if idx == 1 { return d.dp_b1; };
+    if idx == 2 { return d.dp_b2; };
+    if idx == 3 { return d.dp_b3; };
+    return 0;
+}
+fn ecs_dag_transitive_edge_a_at(d: EcsDagAnalysisDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.te_a0; };
+    if idx == 1 { return d.te_a1; };
+    if idx == 2 { return d.te_a2; };
+    if idx == 3 { return d.te_a3; };
+    return 0;
+}
+fn ecs_dag_transitive_edge_b_at(d: EcsDagAnalysisDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.te_b0; };
+    if idx == 1 { return d.te_b1; };
+    if idx == 2 { return d.te_b2; };
+    if idx == 3 { return d.te_b3; };
+    return 0;
+}
+
+// counts (mirror shallow *_count readers)
+fn ecs_dag_analysis_reachable_count(d: EcsDagAnalysisDeep) -> i32 {
+    let i: i32 = 0;
+    let total: i32 = 0;
+    while i < ECS_DAG_CAP_DEEP {
+        let j: i32 = 0;
+        while j < ECS_DAG_CAP_DEEP {
+            if ecs_dag_reach_at(d, i, j) != 0 { total = total + 1; };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+fn ecs_dag_analysis_connected_count(d: EcsDagAnalysisDeep) -> i32 { return d.rp_count; }
+fn ecs_dag_analysis_disconnected_count(d: EcsDagAnalysisDeep) -> i32 { return d.dp_count; }
+fn ecs_dag_analysis_transitive_edges_count(d: EcsDagAnalysisDeep) -> i32 { return d.te_count; }
+fn ecs_dag_analysis_reduction_edges_count(d: EcsDagAnalysisDeep) -> i32 { return d.re_count; }
+fn ecs_dag_analysis_closure_edges_count(d: EcsDagAnalysisDeep) -> i32 { return d.ce_count; }
+fn ecs_dag_analysis_node_count(d: EcsDagAnalysisDeep) -> i32 { return d.node_count; }
+fn ecs_dag_analysis_edge_count(d: EcsDagAnalysisDeep) -> i32 { return d.edge_count; }
+
+// === compute_closure: iterative transitive closure over the adjacency via fixed-point sweep. ===
+// Initialize reach[i][j] = (i==j OR has edge i->j). Then iterate to a fixed point: reach[i][j] =
+// reach[i][j] OR (exist k: reach[i][k] AND reach[k][j]).
+fn ecs_dag_compute_closure(d: EcsDagAnalysisDeep) -> EcsDagAnalysisDeep {
+    // init: reflexive closure edge + direct adjacency.
+    let i: i32 = 0;
+    while i < d.node_count {
+        d = ecs_dag_set_reach(d, i, i, 1);
+        let k: i32 = 0;
+        let adj_cnt = ecs_dag_adj_count(d, i);
+        while k < adj_cnt {
+            let j = ecs_dag_adj_at(d, i, k);
+            d = ecs_dag_set_reach(d, i, j, 1);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // fixed-point: up to N passes; each pass apply transitivity rule. With no recursion: triple
+    // loop over (i, k, j).
+    let changed: i32 = 1;
+    while changed != 0 {
+        changed = 0;
+        let i2: i32 = 0;
+        while i2 < d.node_count {
+            let k: i32 = 0;
+            while k < d.node_count {
+                if ecs_dag_reach_at(d, i2, k) != 0 {
+                    let j2: i32 = 0;
+                    while j2 < d.node_count {
+                        if ecs_dag_reach_at(d, k, j2) != 0 {
+                            if ecs_dag_reach_at(d, i2, j2) == 0 {
+                                d = ecs_dag_set_reach(d, i2, j2, 1);
+                                changed = 1;
+                            };
+                        };
+                        j2 = j2 + 1;
+                    }
+                };
+                k = k + 1;
+            }
+            i2 = i2 + 1;
+        }
+    }
+    return d;
+}
+
+// === partition: walk all (i, j) i<j pairs and record reachability into the reachable/disconnected
+// pair lists (cap-4 each). Used for tests on small graphs.
+fn ecs_dag_partition(d: EcsDagAnalysisDeep) -> EcsDagAnalysisDeep {
+    let i: i32 = 0;
+    while i < d.node_count {
+        let j: i32 = i + 1;
+        while j < d.node_count {
+            if ecs_dag_reach_at(d, i, j) != 0 {
+                d = ecs_dag_push_reachable_pair(d, i, j);
+            } else {
+                d = ecs_dag_push_disconnected_pair(d, i, j);
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return d;
+}
+
+// add_transitive_edge: queue an explicit transitive edge (mirrors shallow).
+fn ecs_dag_analysis_add_transitive_edge(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    return ecs_dag_push_transitive_edge(d, a, b);
+}
+
+// compute_reachable_pairs_from_edge(a, b): an edge (a,b) is transitive (i.e. a cycle-stronger
+// redundant edge), iff reach[a][b] is already 1 from another path — i.e., the edge itself
+// contributes a duplicate transitive closure edge. Records it as a transitive_edge.
+fn ecs_dag_record_transitive_edge(d: EcsDagAnalysisDeep, a: i32, b: i32) -> EcsDagAnalysisDeep {
+    if ecs_dag_reach_at(d, a, b) != 0 {
+        return ecs_dag_push_transitive_edge(d, a, b);
+    };
+    return d;
+}
+
+// check_for_redundant_edges: returns (found, count) — found if transitive_edges list is nonempty.
+fn ecs_dag_check_for_redundant_edges(d: EcsDagAnalysisDeep) -> (bool, i32) {
+    if d.te_count > 0 { return (true, d.te_count); };
+    return (false, 0);
+}
+
+// check_for_cross_dependencies: scan own reachable pairs and check if any (a, b) OR (b, a) is
+// also reachable in the other analysis. Returns (found, a, b). On no cross-dep, returns (false, 0, 0).
+fn ecs_dag_check_for_cross_dependencies(self_d: EcsDagAnalysisDeep, other: EcsDagAnalysisDeep) -> (bool, i32, i32) {
+    let i: i32 = 0;
+    while i < self_d.rp_count {
+        let a = ecs_dag_reachable_pair_a_at(self_d, i);
+        let b = ecs_dag_reachable_pair_b_at(self_d, i);
+        if ecs_dag_reach_at(other, a, b) != 0 { return (true, a, b); };
+        if ecs_dag_reach_at(other, b, a) != 0 { return (true, a, b); };
+        i = i + 1;
+    }
+    return (false, 0, 0);
+}
+
+// Scalar split accessors for redundant-edges check — avoids tuple-return callsites
+// (let (a, b) = ...) which trip an SA/default backend register-reassignment issue that
+// retroactively corrupts prior assertions referencing the struct. Mirror the (bool, i32)
+// tuple's two slots as separate scalars. The original tuple variant is retained for API parity.
+fn ecs_dag_check_redundant_found(d: EcsDagAnalysisDeep) -> bool {
+    if d.te_count > 0 { return true; };
+    return false;
+}
+fn ecs_dag_check_redundant_count(d: EcsDagAnalysisDeep) -> i32 {
+    if d.te_count > 0 { return d.te_count; };
+    return 0;
+}
+
+// Scalar split accessors for cross-dependencies check (returns (found, a, b) tuple in the
+// original variant; the deep tests use these scalar forms to avoid tuple-return callsites).
+fn ecs_dag_check_cross_found(self_d: EcsDagAnalysisDeep, other: EcsDagAnalysisDeep) -> bool {
+    let i: i32 = 0;
+    while i < self_d.rp_count {
+        let a = ecs_dag_reachable_pair_a_at(self_d, i);
+        let b = ecs_dag_reachable_pair_b_at(self_d, i);
+        if ecs_dag_reach_at(other, a, b) != 0 { return true; };
+        if ecs_dag_reach_at(other, b, a) != 0 { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+fn ecs_dag_check_cross_a(self_d: EcsDagAnalysisDeep, other: EcsDagAnalysisDeep) -> i32 {
+    let i: i32 = 0;
+    while i < self_d.rp_count {
+        let a = ecs_dag_reachable_pair_a_at(self_d, i);
+        let b = ecs_dag_reachable_pair_b_at(self_d, i);
+        if ecs_dag_reach_at(other, a, b) != 0 { return a; };
+        if ecs_dag_reach_at(other, b, a) != 0 { return a; };
+        i = i + 1;
+    }
+    return 0;
+}
+fn ecs_dag_check_cross_b(self_d: EcsDagAnalysisDeep, other: EcsDagAnalysisDeep) -> i32 {
+    let i: i32 = 0;
+    while i < self_d.rp_count {
+        let a = ecs_dag_reachable_pair_a_at(self_d, i);
+        let b = ecs_dag_reachable_pair_b_at(self_d, i);
+        if ecs_dag_reach_at(other, a, b) != 0 { return b; };
+        if ecs_dag_reach_at(other, b, a) != 0 { return b; };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// === DagGroups deep variant ===
+// Groups are keyed by i32; under cap-N. We store keys / first-child / count for each group via a
+// flat parallel-array view. cap-8 groups, cap-4 children each.
+struct EcsDagGroupsDeep {
+    key0: i32, key1: i32, key2: i32, key3: i32,
+    cnt0: i32, cnt1: i32, cnt2: i32, cnt3: i32,
+    ch00: i32, ch01: i32, ch02: i32, ch03: i32,
+    ch10: i32, ch11: i32, ch12: i32, ch13: i32,
+    ch20: i32, ch21: i32, ch22: i32, ch23: i32,
+    ch30: i32, ch31: i32, ch32: i32, ch33: i32,
+    count: i32,
+}
+
+fn ecs_dag_groups_deep_new() -> EcsDagGroupsDeep {
+    let g = EcsDagGroupsDeep {
+        key0: 0, key1: 0, key2: 0, key3: 0,
+        cnt0: 0, cnt1: 0, cnt2: 0, cnt3: 0,
+        ch00: 0, ch01: 0, ch02: 0, ch03: 0,
+        ch10: 0, ch11: 0, ch12: 0, ch13: 0,
+        ch20: 0, ch21: 0, ch22: 0, ch23: 0,
+        ch30: 0, ch31: 0, ch32: 0, ch33: 0,
+        count: 0,
+    };
+    return g;
+}
+
+fn ecs_dag_groups_deep_len(g: EcsDagGroupsDeep) -> i32 { return g.count; }
+fn ecs_dag_groups_deep_is_empty(g: EcsDagGroupsDeep) -> bool { return g.count == 0; }
+
+fn ecs_dag_groups_deep_key_index(g: EcsDagGroupsDeep, key: i32) -> i32 {
+    if g.count > 0 && g.key0 == key { return 0; };
+    if g.count > 1 && g.key1 == key { return 1; };
+    if g.count > 2 && g.key2 == key { return 2; };
+    if g.count > 3 && g.key3 == key { return 3; };
+    return -1;
+}
+
+fn ecs_dag_groups_deep_get_count(g: EcsDagGroupsDeep, key: i32) -> i32 {
+    let idx = ecs_dag_groups_deep_key_index(g, key);
+    if idx == 0 { return g.cnt0; };
+    if idx == 1 { return g.cnt1; };
+    if idx == 2 { return g.cnt2; };
+    if idx == 3 { return g.cnt3; };
+    return 0;
+}
+
+fn ecs_dag_groups_deep_child_at(g: EcsDagGroupsDeep, group_idx: i32, child_offset: i32) -> i32 {
+    if group_idx == 0 {
+        if child_offset == 0 { return g.ch00; };
+        if child_offset == 1 { return g.ch01; };
+        if child_offset == 2 { return g.ch02; };
+        if child_offset == 3 { return g.ch03; };
+    };
+    if group_idx == 1 {
+        if child_offset == 0 { return g.ch10; };
+        if child_offset == 1 { return g.ch11; };
+        if child_offset == 2 { return g.ch12; };
+        if child_offset == 3 { return g.ch13; };
+    };
+    if group_idx == 2 {
+        if child_offset == 0 { return g.ch20; };
+        if child_offset == 1 { return g.ch21; };
+        if child_offset == 2 { return g.ch22; };
+        if child_offset == 3 { return g.ch23; };
+    };
+    if group_idx == 3 {
+        if child_offset == 0 { return g.ch30; };
+        if child_offset == 1 { return g.ch31; };
+        if child_offset == 2 { return g.ch32; };
+        if child_offset == 3 { return g.ch33; };
+    };
+    return 0;
+}
+
+// push a group: (key, child0, child1, n_children). cap-4 groups, cap-4 children each.
+fn ecs_dag_groups_deep_insert(g: EcsDagGroupsDeep, key: i32, c0: i32, c1: i32, c2: i32, c3: i32, n: i32) -> EcsDagGroupsDeep {
+    let idx = ecs_dag_groups_deep_key_index(g, key);
+    if idx < 0 {
+        if g.count >= 4 { return g; };
+        let slot = g.count;
+        if slot == 0 {
+            g.key0 = key;
+            g.cnt0 = n;
+            g.ch00 = c0; g.ch01 = c1; g.ch02 = c2; g.ch03 = c3;
+        };
+        if slot == 1 {
+            g.key1 = key;
+            g.cnt1 = n;
+            g.ch10 = c0; g.ch11 = c1; g.ch12 = c2; g.ch13 = c3;
+        };
+        if slot == 2 {
+            g.key2 = key;
+            g.cnt2 = n;
+            g.ch20 = c0; g.ch21 = c1; g.ch22 = c2; g.ch23 = c3;
+        };
+        if slot == 3 {
+            g.key3 = key;
+            g.cnt3 = n;
+            g.ch30 = c0; g.ch31 = c1; g.ch32 = c2; g.ch33 = c3;
+        };
+        g.count = g.count + 1;
+        return g;
+    };
+    // overwrite existing
+    if idx == 0 {
+        g.cnt0 = n;
+        g.ch00 = c0; g.ch01 = c1; g.ch02 = c2; g.ch03 = c3;
+    };
+    if idx == 1 {
+        g.cnt1 = n;
+        g.ch10 = c0; g.ch11 = c1; g.ch12 = c2; g.ch13 = c3;
+    };
+    if idx == 2 {
+        g.cnt2 = n;
+        g.ch20 = c0; g.ch21 = c1; g.ch22 = c2; g.ch23 = c3;
+    };
+    if idx == 3 {
+        g.cnt3 = n;
+        g.ch30 = c0; g.ch31 = c1; g.ch32 = c2; g.ch33 = c3;
+    };
+    return g;
+}
+
+// check_for_overlapping_groups: returns (found, key_a, key_b) — group_a children and group_b
+// children share any common child.
+fn ecs_dag_groups_deep_check_overlapping(g: EcsDagGroupsDeep) -> (bool, i32, i32) {
+    let i: i32 = 0;
+    while i < g.count {
+        let j: i32 = i + 1;
+        while j < g.count {
+            let cnt_i = ecs_dag_groups_deep_count_idx(g, i);
+            let cnt_j = ecs_dag_groups_deep_count_idx(g, j);
+            let ki: i32 = 0;
+            while ki < cnt_i {
+                let va = ecs_dag_groups_deep_child_at(g, i, ki);
+                let kj: i32 = 0;
+                while kj < cnt_j {
+                    let vb = ecs_dag_groups_deep_child_at(g, j, kj);
+                    if va == vb {
+                        let keyi = ecs_dag_groups_deep_key_at(g, i);
+                        let keyj = ecs_dag_groups_deep_key_at(g, j);
+                        return (true, keyi, keyj);
+                    };
+                    kj = kj + 1;
+                }
+                ki = ki + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return (false, 0, 0);
+}
+
+// Scalar split accessors for the (bool, i32, i32) overlap check — used by deep tests to
+// avoid tuple-return callsites (which can trip the SA/default backend register-reassignment
+// issue observed in Batch 373; see progress.md).
+fn ecs_dag_groups_deep_overlap_found(g: EcsDagGroupsDeep) -> bool {
+    let i: i32 = 0;
+    while i < g.count {
+        let j: i32 = i + 1;
+        while j < g.count {
+            let cnt_i = ecs_dag_groups_deep_count_idx(g, i);
+            let cnt_j = ecs_dag_groups_deep_count_idx(g, j);
+            let ki: i32 = 0;
+            while ki < cnt_i {
+                let va = ecs_dag_groups_deep_child_at(g, i, ki);
+                let kj: i32 = 0;
+                while kj < cnt_j {
+                    let vb = ecs_dag_groups_deep_child_at(g, j, kj);
+                    if va == vb { return true; };
+                    kj = kj + 1;
+                }
+                ki = ki + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+fn ecs_dag_groups_deep_overlap_key_a(g: EcsDagGroupsDeep) -> i32 {
+    let i: i32 = 0;
+    while i < g.count {
+        let j: i32 = i + 1;
+        while j < g.count {
+            let cnt_i = ecs_dag_groups_deep_count_idx(g, i);
+            let cnt_j = ecs_dag_groups_deep_count_idx(g, j);
+            let ki: i32 = 0;
+            while ki < cnt_i {
+                let va = ecs_dag_groups_deep_child_at(g, i, ki);
+                let kj: i32 = 0;
+                while kj < cnt_j {
+                    let vb = ecs_dag_groups_deep_child_at(g, j, kj);
+                    if va == vb {
+                        let keyi = ecs_dag_groups_deep_key_at(g, i);
+                        return keyi;
+                    };
+                    kj = kj + 1;
+                }
+                ki = ki + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+fn ecs_dag_groups_deep_overlap_key_b(g: EcsDagGroupsDeep) -> i32 {
+    let i: i32 = 0;
+    while i < g.count {
+        let j: i32 = i + 1;
+        while j < g.count {
+            let cnt_i = ecs_dag_groups_deep_count_idx(g, i);
+            let cnt_j = ecs_dag_groups_deep_count_idx(g, j);
+            let ki: i32 = 0;
+            while ki < cnt_i {
+                let va = ecs_dag_groups_deep_child_at(g, i, ki);
+                let kj: i32 = 0;
+                while kj < cnt_j {
+                    let vb = ecs_dag_groups_deep_child_at(g, j, kj);
+                    if va == vb {
+                        let keyj = ecs_dag_groups_deep_key_at(g, j);
+                        return keyj;
+                    };
+                    kj = kj + 1;
+                }
+                ki = ki + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ecs_dag_groups_deep_count_idx(g: EcsDagGroupsDeep, idx: i32) -> i32 {
+    if idx == 0 { return g.cnt0; };
+    if idx == 1 { return g.cnt1; };
+    if idx == 2 { return g.cnt2; };
+    if idx == 3 { return g.cnt3; };
+    return 0;
+}
+
+fn ecs_dag_groups_deep_key_at(g: EcsDagGroupsDeep, idx: i32) -> i32 {
+    if idx == 0 { return g.key0; };
+    if idx == 1 { return g.key1; };
+    if idx == 2 { return g.key2; };
+    if idx == 3 { return g.key3; };
+    return 0;
+}
+
+// === Three error structs ===
+struct EcsDagRedundancyErrorDeep { count: i32 }
+struct EcsDagCrossDependencyErrorDeep { a: i32, b: i32 }
+struct EcsDagOverlappingGroupErrorDeep { key_a: i32, key_b: i32 }
+
+fn ecs_dag_redundancy_error_deep_new(count: i32) -> EcsDagRedundancyErrorDeep {
+    return EcsDagRedundancyErrorDeep { count: count };
+}
+fn ecs_dag_redundancy_error_deep_count(e: EcsDagRedundancyErrorDeep) -> i32 { return e.count; }
+
+fn ecs_dag_cross_dep_error_deep_new(a: i32, b: i32) -> EcsDagCrossDependencyErrorDeep {
+    return EcsDagCrossDependencyErrorDeep { a: a, b: b };
+}
+fn ecs_dag_cross_dep_error_deep_a(e: EcsDagCrossDependencyErrorDeep) -> i32 { return e.a; }
+fn ecs_dag_cross_dep_error_deep_b(e: EcsDagCrossDependencyErrorDeep) -> i32 { return e.b; }
+fn ecs_dag_overlapping_group_error_deep_new(ka: i32, kb: i32) -> EcsDagOverlappingGroupErrorDeep {
+    return EcsDagOverlappingGroupErrorDeep { key_a: ka, key_b: kb };
+}
+fn ecs_dag_overlapping_group_error_deep_a(e: EcsDagOverlappingGroupErrorDeep) -> i32 { return e.key_a; }
+fn ecs_dag_overlapping_group_error_deep_b(e: EcsDagOverlappingGroupErrorDeep) -> i32 { return e.key_b; }

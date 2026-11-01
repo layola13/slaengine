@@ -1,0 +1,173 @@
+// Bevy ECS system::system_param (src/system/system_param.rs):
+// Special system param types — Deferred<T>, SystemBuffer, ExclusiveMarker, NonSendMarker,
+// RemovedComponents, RunSystemOnce.
+
+// === SystemBuffer trait (modeled as struct with apply/queue) ===
+struct EcsSystemBuffer {
+    data: Vec<i64>,
+    applied: bool,
+}
+
+fn ecs_system_buffer_new() -> EcsSystemBuffer {
+    return EcsSystemBuffer { data: Vec::new(), applied: false };
+}
+
+fn ecs_system_buffer_from_world() -> EcsSystemBuffer {
+    return ecs_system_buffer_new();
+}
+
+fn ecs_system_buffer_push(b: EcsSystemBuffer, value: i64) -> EcsSystemBuffer {
+    b.data.push(value);
+    return b;
+}
+
+fn ecs_system_buffer_len(b: EcsSystemBuffer) -> i64 { return len(b.data) as i64; }
+
+fn ecs_system_buffer_get(b: EcsSystemBuffer, index: i64) -> i64 {
+    return b.data[index];
+}
+
+fn ecs_system_buffer_apply(b: EcsSystemBuffer) -> EcsSystemBuffer {
+    b.applied = true;
+    return b;
+}
+
+fn ecs_system_buffer_is_applied(b: EcsSystemBuffer) -> bool { return b.applied; }
+
+fn ecs_system_buffer_queue(b: EcsSystemBuffer, value: i64) -> EcsSystemBuffer {
+    b.data.push(value);
+    return b;
+}
+
+fn ecs_system_buffer_clear(b: EcsSystemBuffer) -> EcsSystemBuffer {
+    b.data = Vec::new();
+    return b;
+}
+
+// === Deferred<T> ===
+// A system param that provides deferred access to a SystemBuffer.
+// Changes are buffered and applied later via apply().
+
+struct EcsDeferred {
+    buffer: EcsSystemBuffer,
+    has_deferred: bool,
+}
+
+fn ecs_deferred_new() -> EcsDeferred {
+    return EcsDeferred { buffer: ecs_system_buffer_new(), has_deferred: true };
+}
+
+fn ecs_deferred_push(d: EcsDeferred, value: i64) -> EcsDeferred {
+    d.buffer = ecs_system_buffer_push(d.buffer, value);
+    return d;
+}
+
+fn ecs_deferred_len(d: EcsDeferred) -> i64 { return ecs_system_buffer_len(d.buffer); }
+
+fn ecs_deferred_apply(d: EcsDeferred) -> EcsDeferred {
+    d.buffer = ecs_system_buffer_apply(d.buffer);
+    return d;
+}
+
+fn ecs_deferred_is_applied(d: EcsDeferred) -> bool { return ecs_system_buffer_is_applied(d.buffer); }
+
+fn ecs_deferred_has_deferred(d: EcsDeferred) -> bool { return d.has_deferred; }
+
+fn ecs_deferred_reborrow(d: EcsDeferred) -> EcsDeferred { return d; }
+
+fn ecs_deferred_clear(d: EcsDeferred) -> EcsDeferred {
+    d.buffer = ecs_system_buffer_clear(d.buffer);
+    return d;
+}
+
+// === ExclusiveMarker ===
+// A dummy type that tells the executor to run the system exclusively.
+struct EcsExclusiveMarker {}
+
+fn ecs_exclusive_marker_new() -> EcsExclusiveMarker { return EcsExclusiveMarker {}; }
+
+// === NonSendMarker ===
+// A dummy type that marks a system as needing NonSend access (not Send+Sync).
+struct EcsNonSendMarker {}
+
+fn ecs_non_send_marker_new() -> EcsNonSendMarker { return EcsNonSendMarker {}; }
+
+// === RemovedComponents ===
+// A system param that reads component removal events.
+struct EcsRemovedComponentsParam {
+    removed_entities: Vec<i64>,
+    read_index: i64,
+}
+
+fn ecs_removed_components_new() -> EcsRemovedComponentsParam {
+    return EcsRemovedComponentsParam { removed_entities: Vec::new(), read_index: 0 };
+}
+
+fn ecs_removed_components_add(r: EcsRemovedComponentsParam, entity: i64) -> EcsRemovedComponentsParam {
+    r.removed_entities.push(entity);
+    return r;
+}
+
+fn ecs_removed_components_next(r: EcsRemovedComponentsParam) -> (EcsRemovedComponentsParam, bool, i64) {
+    if r.read_index >= len(r.removed_entities) as i64 {
+        return (r, false, 0);
+    };
+    let entity = r.removed_entities[r.read_index];
+    r.read_index = r.read_index + 1;
+    return (r, true, entity);
+}
+
+fn ecs_removed_components_len(r: EcsRemovedComponentsParam) -> i64 { return len(r.removed_entities) as i64; }
+
+fn ecs_removed_components_is_empty(r: EcsRemovedComponentsParam) -> bool {
+    if len(r.removed_entities) as i64 <= r.read_index { return true; };
+    return false;
+}
+
+fn ecs_removed_components_clear(r: EcsRemovedComponentsParam) -> EcsRemovedComponentsParam {
+    r.removed_entities = Vec::new();
+    r.read_index = 0;
+    return r;
+}
+
+// === RunSystemOnce ===
+// Helper to run a system once on a world and get the output.
+struct EcsRunSystemOnceResult {
+    success: bool,
+    output: i64,
+}
+
+fn ecs_run_system_once_result_ok(output: i64) -> EcsRunSystemOnceResult {
+    return EcsRunSystemOnceResult { success: true, output: output };
+}
+
+fn ecs_run_system_once_result_err() -> EcsRunSystemOnceResult {
+    return EcsRunSystemOnceResult { success: false, output: 0 };
+}
+
+fn ecs_run_system_once_is_ok(r: EcsRunSystemOnceResult) -> bool { return r.success; }
+fn ecs_run_system_once_output(r: EcsRunSystemOnceResult) -> i64 { return r.output; }
+
+// === SystemParamValidationError ===
+const ECS_PARAM_VALIDATION_OK: i32 = 0;
+const ECS_PARAM_VALIDATION_SKIPPED: i32 = 1;
+
+struct EcsSystemParamValidationError {
+    code: i32,
+}
+
+fn ecs_system_param_validation_ok() -> EcsSystemParamValidationError {
+    return EcsSystemParamValidationError { code: ECS_PARAM_VALIDATION_OK };
+}
+
+fn ecs_system_param_validation_skipped() -> EcsSystemParamValidationError {
+    return EcsSystemParamValidationError { code: ECS_PARAM_VALIDATION_SKIPPED };
+}
+
+fn ecs_system_param_validation_is_ok(e: EcsSystemParamValidationError) -> bool {
+    return e.code == ECS_PARAM_VALIDATION_OK;
+}
+
+fn ecs_system_param_validation_is_skipped(e: EcsSystemParamValidationError) -> bool {
+    return e.code == ECS_PARAM_VALIDATION_SKIPPED;
+}

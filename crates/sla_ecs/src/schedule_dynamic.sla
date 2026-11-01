@@ -1,0 +1,170 @@
+// Sequential schedule for the current DynamicWorld<A, B, R, M> shape.
+// It stores real Sla function pointers and records component/resource access
+// conflicts for future parallel scheduling while executing systems in order.
+@import "query_dynamic.sla"
+
+struct DynamicSystemAccess {
+    reads_a: bool,
+    writes_a: bool,
+    reads_b: bool,
+    writes_b: bool,
+    reads_resource: bool,
+    writes_resource: bool,
+    reads_messages: bool,
+    writes_messages: bool,
+}
+
+struct DynamicSystem<A, B, R, M> {
+    run: fn(DynamicWorld<A, B, R, M>) -> DynamicWorld<A, B, R, M>,
+    access: DynamicSystemAccess,
+}
+
+struct Schedule<A, B, R, M> {
+    systems: Vec<DynamicSystem<A, B, R, M>>,
+    conflict_count: i32,
+}
+
+fn dynamic_system_access_none() -> DynamicSystemAccess {
+    return DynamicSystemAccess {
+        reads_a: false,
+        writes_a: false,
+        reads_b: false,
+        writes_b: false,
+        reads_resource: false,
+        writes_resource: false,
+        reads_messages: false,
+        writes_messages: false,
+    };
+}
+
+fn dynamic_system_access(reads_a: bool, writes_a: bool, reads_b: bool, writes_b: bool, reads_resource: bool, writes_resource: bool, reads_messages: bool, writes_messages: bool) -> DynamicSystemAccess {
+    return DynamicSystemAccess {
+        reads_a: reads_a,
+        writes_a: writes_a,
+        reads_b: reads_b,
+        writes_b: writes_b,
+        reads_resource: reads_resource,
+        writes_resource: writes_resource,
+        reads_messages: reads_messages,
+        writes_messages: writes_messages,
+    };
+}
+
+fn dynamic_system_new<A, B, R, M>(run: fn(DynamicWorld<A, B, R, M>) -> DynamicWorld<A, B, R, M>, access: DynamicSystemAccess) -> DynamicSystem<A, B, R, M> {
+    return DynamicSystem<A, B, R, M> { run: run, access: access };
+}
+
+fn schedule_default<A, B, R, M>() -> Schedule<A, B, R, M> {
+    let systems: Vec<DynamicSystem<A, B, R, M>> = Vec::new();
+    return Schedule<A, B, R, M> { systems: systems, conflict_count: 0 };
+}
+
+fn dynamic_access_conflicts(left: DynamicSystemAccess, right: DynamicSystemAccess) -> bool {
+    if left.writes_a { if right.reads_a { return true; }; if right.writes_a { return true; }; };
+    if right.writes_a { if left.reads_a { return true; }; if left.writes_a { return true; }; };
+    if left.writes_b { if right.reads_b { return true; }; if right.writes_b { return true; }; };
+    if right.writes_b { if left.reads_b { return true; }; if left.writes_b { return true; }; };
+    if left.writes_resource { if right.reads_resource { return true; }; if right.writes_resource { return true; }; };
+    if right.writes_resource { if left.reads_resource { return true; }; if left.writes_resource { return true; }; };
+    if left.writes_messages { if right.reads_messages { return true; }; if right.writes_messages { return true; }; };
+    if right.writes_messages { if left.reads_messages { return true; }; if left.writes_messages { return true; }; };
+    return false;
+}
+
+fn schedule_add_systems<A, B, R, M>(schedule: Schedule<A, B, R, M>, system: DynamicSystem<A, B, R, M>) -> Schedule<A, B, R, M> {
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        if dynamic_access_conflicts(schedule.systems[i].access, system.access) {
+            schedule.conflict_count = schedule.conflict_count + 1;
+        };
+        i = i + 1;
+    }
+    schedule.systems.push(system);
+    return schedule;
+}
+
+fn schedule_conflict_count<A, B, R, M>(schedule: Schedule<A, B, R, M>) -> i32 {
+    return schedule.conflict_count;
+}
+
+fn schedule_run<A, B, R, M>(schedule: Schedule<A, B, R, M>, world: DynamicWorld<A, B, R, M>) -> DynamicWorld<A, B, R, M> {
+    world = dynamic_world_increment_tick<A, B, R, M>(world);
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        let system = schedule.systems[i];
+        let run = system.run;
+        world = run(world);
+        i = i + 1;
+    }
+    return world;
+}
+
+struct ScheduleDynPos { x: i32, y: i32 }
+struct ScheduleDynVel { x: i32, y: i32 }
+struct ScheduleDynTime { tick: i32 }
+struct ScheduleDynEvent { amount: i32 }
+
+fn schedule_dyn_time_default() -> ScheduleDynTime { return ScheduleDynTime { tick: 0 }; }
+fn schedule_dyn_event_default() -> ScheduleDynEvent { return ScheduleDynEvent { amount: 0 }; }
+
+fn schedule_test_world_new() -> DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent> {
+    return dynamic_world_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_dyn_time_default(), schedule_dyn_event_default());
+}
+
+fn schedule_spawn_mover(world: DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>, x: i32, vx: i32) -> (DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>, Entity) {
+    let (w1, entity) = dynamic_world_spawn<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(world);
+    let w2 = dynamic_world_insert_a<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(w1, entity, ScheduleDynPos { x: x, y: 0 });
+    let w3 = dynamic_world_insert_b<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(w2, entity, ScheduleDynVel { x: vx, y: 0 });
+    return (w3, entity);
+}
+
+fn schedule_movement_system(world: DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>) -> DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent> {
+    let q = query_mut_a_b<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(world);
+    let i: i64 = 0;
+    while i < (len(q.items) as i64) {
+        let pair = q.items[i];
+        let moved = ScheduleDynPos { x: pair.a.value.x + pair.b.x, y: pair.a.value.y + pair.b.y };
+        world = query_pair_mut_a_write<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(world, pair, moved);
+        i = i + 1;
+    }
+    return world;
+}
+
+fn schedule_event_system(world: DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>) -> DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent> {
+    return dynamic_world_write_message<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(world, ScheduleDynEvent { amount: 7 });
+}
+
+fn schedule_resource_system(world: DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>) -> DynamicWorld<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent> {
+    return dynamic_world_insert_resource<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(world, ScheduleDynTime { tick: world.change_tick });
+}
+
+@test "schedule runs function pointer systems in order"() {
+    let w0 = schedule_test_world_new();
+    let (w1, e1) = schedule_spawn_mover(w0, 1, 3);
+    let move_access = dynamic_system_access(true, true, true, false, false, false, false, false);
+    let message_access = dynamic_system_access(false, false, false, false, false, false, false, true);
+    let resource_access = dynamic_system_access(false, false, false, false, false, true, false, false);
+    let s0 = schedule_default<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>();
+    let s1 = schedule_add_systems<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s0, dynamic_system_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_movement_system, move_access));
+    let s2 = schedule_add_systems<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s1, dynamic_system_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_event_system, message_access));
+    let s3 = schedule_add_systems<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s2, dynamic_system_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_resource_system, resource_access));
+    let w2 = schedule_run<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s3, w1);
+    let pos = dynamic_world_get_a<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(w2, e1);
+    let time = dynamic_world_get_resource<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(w2);
+    let read = dynamic_world_read_message<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(w2, message_reader_new(), schedule_dyn_event_default());
+    if pos.x != 4 { panic(7900); };
+    if time.tick != 2 { panic(7901); };
+    if read.value.amount != 7 { panic(7902); };
+}
+
+@test "schedule records write access conflicts"() {
+    let access = dynamic_system_access(true, true, true, false, false, false, false, false);
+    let read_only = dynamic_system_access(true, false, false, false, false, false, false, false);
+    let s0 = schedule_default<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>();
+    let s1 = schedule_add_systems<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s0, dynamic_system_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_movement_system, access));
+    let s2 = schedule_add_systems<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s1, dynamic_system_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_movement_system, access));
+    let s3 = schedule_add_systems<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s2, dynamic_system_new<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(schedule_resource_system, read_only));
+    if schedule_conflict_count<ScheduleDynPos, ScheduleDynVel, ScheduleDynTime, ScheduleDynEvent>(s3) != 3 { panic(7910); };
+}

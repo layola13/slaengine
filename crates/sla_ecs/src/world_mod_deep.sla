@@ -1,0 +1,1578 @@
+// Deep self-contained Bevy ECS World (world/mod.rs) — comprehensive semantic surface.
+// Mirrors lib/world_mod.sla (870 lines, no @import). All Vec<T> fields become cap-16 scalar
+// slot families (Vec<i32> → i32 slots, Vec<i64> → i64 slots). Three nested @derive(copy)
+// struct fields (id, last_check_change_ticks, spawn_batch) are flattened inline to dodge the
+// SA MemoryLeak (see docs/issue.md). Booleans stored as i32 (0/1). All structs carry
+// @derive(copy). Tuple-returning fns return the mutated container with last_* counterparts.
+
+const ECS_WM_DEEP_CAP: i32 = 16;
+
+// === EcsWorldIdDeep (flat scalar mirror) ===
+@derive(copy)
+struct EcsWorldIdDeep { value: i64 }
+fn ecs_world_id_deep_new(value: i64) -> EcsWorldIdDeep { return EcsWorldIdDeep { value: value }; }
+fn ecs_world_id_deep_get(id: EcsWorldIdDeep) -> i64 { return id.value; }
+fn ecs_world_id_deep_eq(a: EcsWorldIdDeep, b: EcsWorldIdDeep) -> bool { return a.value == b.value; }
+
+// === EcsEntityLocationDeep (flat scalar mirror) ===
+@derive(copy)
+struct EcsEntityLocationDeep { archetype_id: i64, table_id: i64, table_row: i64 }
+fn ecs_entity_location_deep_new(archetype_id: i64, table_id: i64, table_row: i64) -> EcsEntityLocationDeep {
+    return EcsEntityLocationDeep { archetype_id: archetype_id, table_id: table_id, table_row: table_row };
+}
+fn ecs_entity_location_deep_archetype(l: EcsEntityLocationDeep) -> i64 { return l.archetype_id; }
+fn ecs_entity_location_deep_table(l: EcsEntityLocationDeep) -> i64 { return l.table_id; }
+fn ecs_entity_location_deep_row(l: EcsEntityLocationDeep) -> i64 { return l.table_row; }
+
+// === EcsCheckChangeTicksDeep (flat scalar mirror) ===
+@derive(copy)
+struct EcsCheckChangeTicksDeep { max_age: i64, checked: i32 }
+fn ecs_check_change_ticks_deep_new(max_age: i64) -> EcsCheckChangeTicksDeep {
+    return EcsCheckChangeTicksDeep { max_age: max_age, checked: 1 };
+}
+fn ecs_check_change_ticks_deep_max_age(c: EcsCheckChangeTicksDeep) -> i64 { return c.max_age; }
+fn ecs_check_change_ticks_deep_checked(c: EcsCheckChangeTicksDeep) -> bool { return c.checked != 0; }
+
+// === EcsWorldScheduleEntryDeep (flat scalar mirror — used inside schedules slot family) ===
+@derive(copy)
+struct EcsWorldScheduleEntryDeep { label_id: i32, schedule_id: i64 }
+
+// === EcsSpawnBatchIterDeep header (cap-16 spawned + pos + total) — kept as separate struct,
+//     since it has its own accessor API and is returned by-value without nesting a wrapper. ===
+@derive(copy)
+struct EcsSpawnBatchIterDeep {
+    s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64,
+    s8: i64, s9: i64, s10: i64, s11: i64, s12: i64, s13: i64, s14: i64, s15: i64,
+    pos: i64, total: i64,
+    last_next_present: i32,
+    last_next_entity: i64,
+}
+fn ecs_spawn_batch_iter_deep_new() -> EcsSpawnBatchIterDeep {
+    return EcsSpawnBatchIterDeep {
+        s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0,
+        s8: 0, s9: 0, s10: 0, s11: 0, s12: 0, s13: 0, s14: 0, s15: 0,
+        pos: 0, total: 0,
+        last_next_present: 0, last_next_entity: 0,
+    };
+}
+fn _esbi_at(it: EcsSpawnBatchIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return it.s0; };
+    if idx == 1 { return it.s1; };
+    if idx == 2 { return it.s2; };
+    if idx == 3 { return it.s3; };
+    if idx == 4 { return it.s4; };
+    if idx == 5 { return it.s5; };
+    if idx == 6 { return it.s6; };
+    if idx == 7 { return it.s7; };
+    if idx == 8 { return it.s8; };
+    if idx == 9 { return it.s9; };
+    if idx == 10 { return it.s10; };
+    if idx == 11 { return it.s11; };
+    if idx == 12 { return it.s12; };
+    if idx == 13 { return it.s13; };
+    if idx == 14 { return it.s14; };
+    if idx == 15 { return it.s15; };
+    panic(147270);
+}
+fn _esbi_set(it: EcsSpawnBatchIterDeep, idx: i64, v: i64) -> EcsSpawnBatchIterDeep {
+    if idx == 0 { it.s0 = v; return it; };
+    if idx == 1 { it.s1 = v; return it; };
+    if idx == 2 { it.s2 = v; return it; };
+    if idx == 3 { it.s3 = v; return it; };
+    if idx == 4 { it.s4 = v; return it; };
+    if idx == 5 { it.s5 = v; return it; };
+    if idx == 6 { it.s6 = v; return it; };
+    if idx == 7 { it.s7 = v; return it; };
+    if idx == 8 { it.s8 = v; return it; };
+    if idx == 9 { it.s9 = v; return it; };
+    if idx == 10 { it.s10 = v; return it; };
+    if idx == 11 { it.s11 = v; return it; };
+    if idx == 12 { it.s12 = v; return it; };
+    if idx == 13 { it.s13 = v; return it; };
+    if idx == 14 { it.s14 = v; return it; };
+    if idx == 15 { it.s15 = v; return it; };
+    panic(147271);
+}
+fn ecs_spawn_batch_iter_deep_push(it: EcsSpawnBatchIterDeep, entity: i64) -> EcsSpawnBatchIterDeep {
+    if it.total < ECS_WM_DEEP_CAP as i64 {
+        it = _esbi_set(it, it.total, entity);
+        it.total = it.total + 1;
+    };
+    return it;
+}
+fn ecs_spawn_batch_iter_deep_len(it: EcsSpawnBatchIterDeep) -> i64 { return it.total; }
+fn ecs_spawn_batch_iter_deep_next(it: EcsSpawnBatchIterDeep) -> EcsSpawnBatchIterDeep {
+    if it.pos < it.total {
+        it.last_next_present = 1;
+        it.last_next_entity = _esbi_at(it, it.pos);
+        it.pos = it.pos + 1;
+    } else {
+        it.last_next_present = 0;
+        it.last_next_entity = 0;
+    };
+    return it;
+}
+fn ecs_spawn_batch_iter_deep_next_present(it: EcsSpawnBatchIterDeep) -> bool { return it.last_next_present != 0; }
+fn ecs_spawn_batch_iter_deep_next_entity(it: EcsSpawnBatchIterDeep) -> i64 { return it.last_next_entity; }
+
+// === EcsWorldDeep ===
+// Flatten id (i64 value), last_check_change_ticks (i64 max_age + i32 checked),
+// spawn_batch (cap-16 s slots + pos + total + last_next_* companions). Carry them inline.
+// Replace each Vec<i*> field with its cap-16 i32/i64 slot family plus a count.
+@derive(copy)
+struct EcsWorldDeep {
+    id_value: i64,
+    change_tick: i64,
+    last_change_tick: i64,
+    last_check_change_ticks_max_age: i64,
+    last_check_change_ticks_checked: i32,
+    entity_count: i64,
+    // entities (cap-16 i64 slot family)
+    e0: i64, e1: i64, e2: i64, e3: i64, e4: i64, e5: i64, e6: i64, e7: i64,
+    e8: i64, e9: i64, e10: i64, e11: i64, e12: i64, e13: i64, e14: i64, e15: i64,
+    en: i32,
+    // components (cap-16 i32 slot family)
+    c0: i32, c1: i32, c2: i32, c3: i32, c4: i32, c5: i32, c6: i32, c7: i32,
+    c8: i32, c9: i32, c10: i32, c11: i32, c12: i32, c13: i32, c14: i32, c15: i32,
+    cn: i32,
+    // resources (cap-16 i32 slot family)
+    r0: i32, r1: i32, r2: i32, r3: i32, r4: i32, r5: i32, r6: i32, r7: i32,
+    r8: i32, r9: i32, r10: i32, r11: i32, r12: i32, r13: i32, r14: i32, r15: i32,
+    rn: i32,
+    // resource_entities (cap-16 i64 slot family)
+    re0: i64, re1: i64, re2: i64, re3: i64, re4: i64, re5: i64, re6: i64, re7: i64,
+    re8: i64, re9: i64, re10: i64, re11: i64, re12: i64, re13: i64, re14: i64, re15: i64,
+    // non_sends (cap-16 i32 slot family)
+    ns0: i32, ns1: i32, ns2: i32, ns3: i32, ns4: i32, ns5: i32, ns6: i32, ns7: i32,
+    ns8: i32, ns9: i32, ns10: i32, ns11: i32, ns12: i32, ns13: i32, ns14: i32, ns15: i32,
+    nsn: i32,
+    // removed_components (cap-16 i32 slot family)
+    rm0: i32, rm1: i32, rm2: i32, rm3: i32, rm4: i32, rm5: i32, rm6: i32, rm7: i32,
+    rm8: i32, rm9: i32, rm10: i32, rm11: i32, rm12: i32, rm13: i32, rm14: i32, rm15: i32,
+    rmn: i32,
+    // removed_entities (cap-16 i64 slot family)
+    rme0: i64, rme1: i64, rme2: i64, rme3: i64, rme4: i64, rme5: i64, rme6: i64, rme7: i64,
+    rme8: i64, rme9: i64, rme10: i64, rme11: i64, rme12: i64, rme13: i64, rme14: i64, rme15: i64,
+    rmen: i32,
+    // observers (cap-16 i64 slot family)
+    ob0: i64, ob1: i64, ob2: i64, ob3: i64, ob4: i64, ob5: i64, ob6: i64, ob7: i64,
+    ob8: i64, ob9: i64, ob10: i64, ob11: i64, ob12: i64, ob13: i64, ob14: i64, ob15: i64,
+    obn: i32,
+    // schedules (cap-16 schedule label+id pairs)
+    sl0: i32, sl1: i32, sl2: i32, sl3: i32, sl4: i32, sl5: i32, sl6: i32, sl7: i32,
+    sl8: i32, sl9: i32, sl10: i32, sl11: i32, sl12: i32, sl13: i32, sl14: i32, sl15: i32,
+    sid0: i64, sid1: i64, sid2: i64, sid3: i64, sid4: i64, sid5: i64, sid6: i64, sid7: i64,
+    sid8: i64, sid9: i64, sid10: i64, sid11: i64, sid12: i64, sid13: i64, sid14: i64, sid15: i64,
+    sln: i32,
+    next_entity: i64,
+    last_clear: i64,
+    spawn_batch_s0: i64, spawn_batch_s1: i64, spawn_batch_s2: i64, spawn_batch_s3: i64,
+    spawn_batch_s4: i64, spawn_batch_s5: i64, spawn_batch_s6: i64, spawn_batch_s7: i64,
+    spawn_batch_s8: i64, spawn_batch_s9: i64, spawn_batch_s10: i64, spawn_batch_s11: i64,
+    spawn_batch_s12: i64, spawn_batch_s13: i64, spawn_batch_s14: i64, spawn_batch_s15: i64,
+    spawn_batch_pos: i64,
+    spawn_batch_total: i64,
+    apply_final_deferred: i32,
+    // Tuple-replacement companions for all the multi-result fns.
+    last_bool: i32,
+    last_int_value: i32,
+    last_i64_value: i64,
+    last_i64_2: i64,
+    // Despawn / spawn_at: result flag
+    last_despawn_found: i32,
+    last_spawn_at_created: i32,
+    last_spawn_at_entity: i64,
+    last_next_next_present: i32,
+    // resource change-ticks (bool, mt, lmt)
+    last_resource_change_found: i32,
+    last_resource_change_tick: i64,
+    last_resource_change_last: i64,
+    // resource get
+    last_resource_found: i32,
+    last_resource_entity: i64,
+    // modify_component/resource
+    last_modify_ok: i32,
+    last_modify_value: i64,
+    // non_send resource
+    last_non_send_found: i32,
+    last_non_send_id: i32,
+    // get (component lookup)
+    last_get_found: i32,
+    last_get_value: i64,
+    // entity get
+    last_entity_found: i32,
+    last_entity_value: i64,
+    // query (returns -1 opaque id)
+    last_query_value: i64,
+    last_query_found: i32,
+    // schedule-related
+    last_schedule_found: i32,
+    last_schedule_id: i64,
+    last_schedule_scope_run_ok: i32,
+    last_remove_resource_entity: i64,
+    last_register_component_id: i32,
+    last_register_resource_id: i32,
+    last_register_non_send_id: i32,
+    last_insert_resource_was_new: i32,
+    last_get_resource_or_insert_was_new: i32,
+    last_get_resource_or_insert_value: i64,
+    last_remove_resource_found: i32,
+    last_remove_non_send_found: i32,
+    last_insert_batch_count: i64,
+    last_register_bundle_id: i64,
+    last_register_dynamic_bundle_count: i64,
+    last_fallback_error_code: i32,
+    last_write_message_id: i64,
+    last_write_message_batch_count: i64,
+    last_write_message_default: i64,
+}
+
+fn ecs_world_mod_deep_new() -> EcsWorldDeep {
+    return EcsWorldDeep {
+        id_value: 0, change_tick: 1, last_change_tick: 0,
+        last_check_change_ticks_max_age: 0, last_check_change_ticks_checked: 0,
+        entity_count: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        e8: 0, e9: 0, e10: 0, e11: 0, e12: 0, e13: 0, e14: 0, e15: 0, en: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, c4: 0, c5: 0, c6: 0, c7: 0,
+        c8: 0, c9: 0, c10: 0, c11: 0, c12: 0, c13: 0, c14: 0, c15: 0, cn: 0,
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0,
+        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0, rn: 0,
+        re0: 0, re1: 0, re2: 0, re3: 0, re4: 0, re5: 0, re6: 0, re7: 0,
+        re8: 0, re9: 0, re10: 0, re11: 0, re12: 0, re13: 0, re14: 0, re15: 0,
+        ns0: 0, ns1: 0, ns2: 0, ns3: 0, ns4: 0, ns5: 0, ns6: 0, ns7: 0,
+        ns8: 0, ns9: 0, ns10: 0, ns11: 0, ns12: 0, ns13: 0, ns14: 0, ns15: 0, nsn: 0,
+        rm0: 0, rm1: 0, rm2: 0, rm3: 0, rm4: 0, rm5: 0, rm6: 0, rm7: 0,
+        rm8: 0, rm9: 0, rm10: 0, rm11: 0, rm12: 0, rm13: 0, rm14: 0, rm15: 0, rmn: 0,
+        rme0: 0, rme1: 0, rme2: 0, rme3: 0, rme4: 0, rme5: 0, rme6: 0, rme7: 0,
+        rme8: 0, rme9: 0, rme10: 0, rme11: 0, rme12: 0, rme13: 0, rme14: 0, rme15: 0, rmen: 0,
+        ob0: 0, ob1: 0, ob2: 0, ob3: 0, ob4: 0, ob5: 0, ob6: 0, ob7: 0,
+        ob8: 0, ob9: 0, ob10: 0, ob11: 0, ob12: 0, ob13: 0, ob14: 0, ob15: 0, obn: 0,
+        sl0: 0, sl1: 0, sl2: 0, sl3: 0, sl4: 0, sl5: 0, sl6: 0, sl7: 0,
+        sl8: 0, sl9: 0, sl10: 0, sl11: 0, sl12: 0, sl13: 0, sl14: 0, sl15: 0,
+        sid0: 0, sid1: 0, sid2: 0, sid3: 0, sid4: 0, sid5: 0, sid6: 0, sid7: 0,
+        sid8: 0, sid9: 0, sid10: 0, sid11: 0, sid12: 0, sid13: 0, sid14: 0, sid15: 0, sln: 0,
+        next_entity: 1, last_clear: 0,
+        spawn_batch_s0: 0, spawn_batch_s1: 0, spawn_batch_s2: 0, spawn_batch_s3: 0,
+        spawn_batch_s4: 0, spawn_batch_s5: 0, spawn_batch_s6: 0, spawn_batch_s7: 0,
+        spawn_batch_s8: 0, spawn_batch_s9: 0, spawn_batch_s10: 0, spawn_batch_s11: 0,
+        spawn_batch_s12: 0, spawn_batch_s13: 0, spawn_batch_s14: 0, spawn_batch_s15: 0,
+        spawn_batch_pos: 0, spawn_batch_total: 0,
+        apply_final_deferred: 1,
+        last_bool: 0, last_int_value: 0, last_i64_value: 0, last_i64_2: 0,
+        last_despawn_found: 0, last_spawn_at_created: 0, last_spawn_at_entity: 0, last_next_next_present: 0,
+        last_resource_change_found: 0, last_resource_change_tick: 0, last_resource_change_last: 0,
+        last_resource_found: 0, last_resource_entity: 0,
+        last_modify_ok: 0, last_modify_value: 0,
+        last_non_send_found: 0, last_non_send_id: 0,
+        last_get_found: 0, last_get_value: 0,
+        last_entity_found: 0, last_entity_value: 0,
+        last_query_value: (0 - 1), last_query_found: 0,
+        last_schedule_found: 0, last_schedule_id: 0, last_schedule_scope_run_ok: 0,
+        last_remove_resource_entity: 0,
+        last_register_component_id: 0, last_register_resource_id: 0, last_register_non_send_id: 0,
+        last_insert_resource_was_new: 0, last_get_resource_or_insert_was_new: 0, last_get_resource_or_insert_value: 0,
+        last_remove_resource_found: 0, last_remove_non_send_found: 0,
+        last_insert_batch_count: 0, last_register_bundle_id: 0, last_register_dynamic_bundle_count: 0, last_fallback_error_code: 0,
+        last_write_message_id: 0, last_write_message_batch_count: 0, last_write_message_default: 0,
+    };
+}
+
+// === slot-family helpers ===
+fn _e_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    if idx == 0 { return w.e0; };
+    if idx == 1 { return w.e1; };
+    if idx == 2 { return w.e2; };
+    if idx == 3 { return w.e3; };
+    if idx == 4 { return w.e4; };
+    if idx == 5 { return w.e5; };
+    if idx == 6 { return w.e6; };
+    if idx == 7 { return w.e7; };
+    if idx == 8 { return w.e8; };
+    if idx == 9 { return w.e9; };
+    if idx == 10 { return w.e10; };
+    if idx == 11 { return w.e11; };
+    if idx == 12 { return w.e12; };
+    if idx == 13 { return w.e13; };
+    if idx == 14 { return w.e14; };
+    if idx == 15 { return w.e15; };
+    panic(147272);
+}
+fn _e_set(w: EcsWorldDeep, idx: i32, v: i64) -> EcsWorldDeep {
+    if idx == 0 { w.e0 = v; return w; };
+    if idx == 1 { w.e1 = v; return w; };
+    if idx == 2 { w.e2 = v; return w; };
+    if idx == 3 { w.e3 = v; return w; };
+    if idx == 4 { w.e4 = v; return w; };
+    if idx == 5 { w.e5 = v; return w; };
+    if idx == 6 { w.e6 = v; return w; };
+    if idx == 7 { w.e7 = v; return w; };
+    if idx == 8 { w.e8 = v; return w; };
+    if idx == 9 { w.e9 = v; return w; };
+    if idx == 10 { w.e10 = v; return w; };
+    if idx == 11 { w.e11 = v; return w; };
+    if idx == 12 { w.e12 = v; return w; };
+    if idx == 13 { w.e13 = v; return w; };
+    if idx == 14 { w.e14 = v; return w; };
+    if idx == 15 { w.e15 = v; return w; };
+    panic(147273);
+}
+fn _e_push(w: EcsWorldDeep, v: i64) -> EcsWorldDeep {
+    if w.en < ECS_WM_DEEP_CAP {
+        w = _e_set(w, w.en, v);
+        w.en = w.en + 1;
+    };
+    return w;
+}
+
+fn _c_at(w: EcsWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.c0; };
+    if idx == 1 { return w.c1; };
+    if idx == 2 { return w.c2; };
+    if idx == 3 { return w.c3; };
+    if idx == 4 { return w.c4; };
+    if idx == 5 { return w.c5; };
+    if idx == 6 { return w.c6; };
+    if idx == 7 { return w.c7; };
+    if idx == 8 { return w.c8; };
+    if idx == 9 { return w.c9; };
+    if idx == 10 { return w.c10; };
+    if idx == 11 { return w.c11; };
+    if idx == 12 { return w.c12; };
+    if idx == 13 { return w.c13; };
+    if idx == 14 { return w.c14; };
+    if idx == 15 { return w.c15; };
+    panic(147274);
+}
+fn _c_set(w: EcsWorldDeep, idx: i32, v: i32) -> EcsWorldDeep {
+    if idx == 0 { w.c0 = v; return w; };
+    if idx == 1 { w.c1 = v; return w; };
+    if idx == 2 { w.c2 = v; return w; };
+    if idx == 3 { w.c3 = v; return w; };
+    if idx == 4 { w.c4 = v; return w; };
+    if idx == 5 { w.c5 = v; return w; };
+    if idx == 6 { w.c6 = v; return w; };
+    if idx == 7 { w.c7 = v; return w; };
+    if idx == 8 { w.c8 = v; return w; };
+    if idx == 9 { w.c9 = v; return w; };
+    if idx == 10 { w.c10 = v; return w; };
+    if idx == 11 { w.c11 = v; return w; };
+    if idx == 12 { w.c12 = v; return w; };
+    if idx == 13 { w.c13 = v; return w; };
+    if idx == 14 { w.c14 = v; return w; };
+    if idx == 15 { w.c15 = v; return w; };
+    panic(147275);
+}
+fn _c_push(w: EcsWorldDeep, v: i32) -> EcsWorldDeep {
+    if w.cn < ECS_WM_DEEP_CAP {
+        w = _c_set(w, w.cn, v);
+        w.cn = w.cn + 1;
+    };
+    return w;
+}
+
+fn _r_at(w: EcsWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.r0; };
+    if idx == 1 { return w.r1; };
+    if idx == 2 { return w.r2; };
+    if idx == 3 { return w.r3; };
+    if idx == 4 { return w.r4; };
+    if idx == 5 { return w.r5; };
+    if idx == 6 { return w.r6; };
+    if idx == 7 { return w.r7; };
+    if idx == 8 { return w.r8; };
+    if idx == 9 { return w.r9; };
+    if idx == 10 { return w.r10; };
+    if idx == 11 { return w.r11; };
+    if idx == 12 { return w.r12; };
+    if idx == 13 { return w.r13; };
+    if idx == 14 { return w.r14; };
+    if idx == 15 { return w.r15; };
+    panic(147276);
+}
+fn _r_set(w: EcsWorldDeep, idx: i32, v: i32) -> EcsWorldDeep {
+    if idx == 0 { w.r0 = v; return w; };
+    if idx == 1 { w.r1 = v; return w; };
+    if idx == 2 { w.r2 = v; return w; };
+    if idx == 3 { w.r3 = v; return w; };
+    if idx == 4 { w.r4 = v; return w; };
+    if idx == 5 { w.r5 = v; return w; };
+    if idx == 6 { w.r6 = v; return w; };
+    if idx == 7 { w.r7 = v; return w; };
+    if idx == 8 { w.r8 = v; return w; };
+    if idx == 9 { w.r9 = v; return w; };
+    if idx == 10 { w.r10 = v; return w; };
+    if idx == 11 { w.r11 = v; return w; };
+    if idx == 12 { w.r12 = v; return w; };
+    if idx == 13 { w.r13 = v; return w; };
+    if idx == 14 { w.r14 = v; return w; };
+    if idx == 15 { w.r15 = v; return w; };
+    panic(147277);
+}
+fn _r_push(w: EcsWorldDeep, v: i32) -> EcsWorldDeep {
+    if w.rn < ECS_WM_DEEP_CAP {
+        w = _r_set(w, w.rn, v);
+        w.rn = w.rn + 1;
+    };
+    return w;
+}
+
+fn _re_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    if idx == 0 { return w.re0; };
+    if idx == 1 { return w.re1; };
+    if idx == 2 { return w.re2; };
+    if idx == 3 { return w.re3; };
+    if idx == 4 { return w.re4; };
+    if idx == 5 { return w.re5; };
+    if idx == 6 { return w.re6; };
+    if idx == 7 { return w.re7; };
+    if idx == 8 { return w.re8; };
+    if idx == 9 { return w.re9; };
+    if idx == 10 { return w.re10; };
+    if idx == 11 { return w.re11; };
+    if idx == 12 { return w.re12; };
+    if idx == 13 { return w.re13; };
+    if idx == 14 { return w.re14; };
+    if idx == 15 { return w.re15; };
+    panic(147278);
+}
+fn _re_set(w: EcsWorldDeep, idx: i32, v: i64) -> EcsWorldDeep {
+    if idx == 0 { w.re0 = v; return w; };
+    if idx == 1 { w.re1 = v; return w; };
+    if idx == 2 { w.re2 = v; return w; };
+    if idx == 3 { w.re3 = v; return w; };
+    if idx == 4 { w.re4 = v; return w; };
+    if idx == 5 { w.re5 = v; return w; };
+    if idx == 6 { w.re6 = v; return w; };
+    if idx == 7 { w.re7 = v; return w; };
+    if idx == 8 { w.re8 = v; return w; };
+    if idx == 9 { w.re9 = v; return w; };
+    if idx == 10 { w.re10 = v; return w; };
+    if idx == 11 { w.re11 = v; return w; };
+    if idx == 12 { w.re12 = v; return w; };
+    if idx == 13 { w.re13 = v; return w; };
+    if idx == 14 { w.re14 = v; return w; };
+    if idx == 15 { w.re15 = v; return w; };
+    panic(147279);
+}
+
+fn _ns_at(w: EcsWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.ns0; };
+    if idx == 1 { return w.ns1; };
+    if idx == 2 { return w.ns2; };
+    if idx == 3 { return w.ns3; };
+    if idx == 4 { return w.ns4; };
+    if idx == 5 { return w.ns5; };
+    if idx == 6 { return w.ns6; };
+    if idx == 7 { return w.ns7; };
+    if idx == 8 { return w.ns8; };
+    if idx == 9 { return w.ns9; };
+    if idx == 10 { return w.ns10; };
+    if idx == 11 { return w.ns11; };
+    if idx == 12 { return w.ns12; };
+    if idx == 13 { return w.ns13; };
+    if idx == 14 { return w.ns14; };
+    if idx == 15 { return w.ns15; };
+    panic(147280);
+}
+fn _ns_set(w: EcsWorldDeep, idx: i32, v: i32) -> EcsWorldDeep {
+    if idx == 0 { w.ns0 = v; return w; };
+    if idx == 1 { w.ns1 = v; return w; };
+    if idx == 2 { w.ns2 = v; return w; };
+    if idx == 3 { w.ns3 = v; return w; };
+    if idx == 4 { w.ns4 = v; return w; };
+    if idx == 5 { w.ns5 = v; return w; };
+    if idx == 6 { w.ns6 = v; return w; };
+    if idx == 7 { w.ns7 = v; return w; };
+    if idx == 8 { w.ns8 = v; return w; };
+    if idx == 9 { w.ns9 = v; return w; };
+    if idx == 10 { w.ns10 = v; return w; };
+    if idx == 11 { w.ns11 = v; return w; };
+    if idx == 12 { w.ns12 = v; return w; };
+    if idx == 13 { w.ns13 = v; return w; };
+    if idx == 14 { w.ns14 = v; return w; };
+    if idx == 15 { w.ns15 = v; return w; };
+    panic(147281);
+}
+fn _ns_push(w: EcsWorldDeep, v: i32) -> EcsWorldDeep {
+    if w.nsn < ECS_WM_DEEP_CAP {
+        w = _ns_set(w, w.nsn, v);
+        w.nsn = w.nsn + 1;
+    };
+    return w;
+}
+
+fn _rme_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    if idx == 0 { return w.rme0; };
+    if idx == 1 { return w.rme1; };
+    if idx == 2 { return w.rme2; };
+    if idx == 3 { return w.rme3; };
+    if idx == 4 { return w.rme4; };
+    if idx == 5 { return w.rme5; };
+    if idx == 6 { return w.rme6; };
+    if idx == 7 { return w.rme7; };
+    if idx == 8 { return w.rme8; };
+    if idx == 9 { return w.rme9; };
+    if idx == 10 { return w.rme10; };
+    if idx == 11 { return w.rme11; };
+    if idx == 12 { return w.rme12; };
+    if idx == 13 { return w.rme13; };
+    if idx == 14 { return w.rme14; };
+    if idx == 15 { return w.rme15; };
+    panic(147282);
+}
+fn _rme_set(w: EcsWorldDeep, idx: i32, v: i64) -> EcsWorldDeep {
+    if idx == 0 { w.rme0 = v; return w; };
+    if idx == 1 { w.rme1 = v; return w; };
+    if idx == 2 { w.rme2 = v; return w; };
+    if idx == 3 { w.rme3 = v; return w; };
+    if idx == 4 { w.rme4 = v; return w; };
+    if idx == 5 { w.rme5 = v; return w; };
+    if idx == 6 { w.rme6 = v; return w; };
+    if idx == 7 { w.rme7 = v; return w; };
+    if idx == 8 { w.rme8 = v; return w; };
+    if idx == 9 { w.rme9 = v; return w; };
+    if idx == 10 { w.rme10 = v; return w; };
+    if idx == 11 { w.rme11 = v; return w; };
+    if idx == 12 { w.rme12 = v; return w; };
+    if idx == 13 { w.rme13 = v; return w; };
+    if idx == 14 { w.rme14 = v; return w; };
+    if idx == 15 { w.rme15 = v; return w; };
+    panic(147283);
+}
+fn _rme_push(w: EcsWorldDeep, v: i64) -> EcsWorldDeep {
+    if w.rmen < ECS_WM_DEEP_CAP {
+        w = _rme_set(w, w.rmen, v);
+        w.rmen = w.rmen + 1;
+    };
+    return w;
+}
+
+fn _ob_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    if idx == 0 { return w.ob0; };
+    if idx == 1 { return w.ob1; };
+    if idx == 2 { return w.ob2; };
+    if idx == 3 { return w.ob3; };
+    if idx == 4 { return w.ob4; };
+    if idx == 5 { return w.ob5; };
+    if idx == 6 { return w.ob6; };
+    if idx == 7 { return w.ob7; };
+    if idx == 8 { return w.ob8; };
+    if idx == 9 { return w.ob9; };
+    if idx == 10 { return w.ob10; };
+    if idx == 11 { return w.ob11; };
+    if idx == 12 { return w.ob12; };
+    if idx == 13 { return w.ob13; };
+    if idx == 14 { return w.ob14; };
+    if idx == 15 { return w.ob15; };
+    panic(147284);
+}
+fn _ob_push(w: EcsWorldDeep, v: i64) -> EcsWorldDeep {
+    if w.obn < ECS_WM_DEEP_CAP {
+        if w.obn == 0 { w.ob0 = v; };
+        if w.obn == 1 { w.ob1 = v; };
+        if w.obn == 2 { w.ob2 = v; };
+        if w.obn == 3 { w.ob3 = v; };
+        if w.obn == 4 { w.ob4 = v; };
+        if w.obn == 5 { w.ob5 = v; };
+        if w.obn == 6 { w.ob6 = v; };
+        if w.obn == 7 { w.ob7 = v; };
+        if w.obn == 8 { w.ob8 = v; };
+        if w.obn == 9 { w.ob9 = v; };
+        if w.obn == 10 { w.ob10 = v; };
+        if w.obn == 11 { w.ob11 = v; };
+        if w.obn == 12 { w.ob12 = v; };
+        if w.obn == 13 { w.ob13 = v; };
+        if w.obn == 14 { w.ob14 = v; };
+        if w.obn == 15 { w.ob15 = v; };
+        w.obn = w.obn + 1;
+    };
+    return w;
+}
+
+fn _sl_at(w: EcsWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.sl0; };
+    if idx == 1 { return w.sl1; };
+    if idx == 2 { return w.sl2; };
+    if idx == 3 { return w.sl3; };
+    if idx == 4 { return w.sl4; };
+    if idx == 5 { return w.sl5; };
+    if idx == 6 { return w.sl6; };
+    if idx == 7 { return w.sl7; };
+    if idx == 8 { return w.sl8; };
+    if idx == 9 { return w.sl9; };
+    if idx == 10 { return w.sl10; };
+    if idx == 11 { return w.sl11; };
+    if idx == 12 { return w.sl12; };
+    if idx == 13 { return w.sl13; };
+    if idx == 14 { return w.sl14; };
+    if idx == 15 { return w.sl15; };
+    panic(147285);
+}
+fn _sl_set(w: EcsWorldDeep, idx: i32, v: i32) -> EcsWorldDeep {
+    if idx == 0 { w.sl0 = v; return w; };
+    if idx == 1 { w.sl1 = v; return w; };
+    if idx == 2 { w.sl2 = v; return w; };
+    if idx == 3 { w.sl3 = v; return w; };
+    if idx == 4 { w.sl4 = v; return w; };
+    if idx == 5 { w.sl5 = v; return w; };
+    if idx == 6 { w.sl6 = v; return w; };
+    if idx == 7 { w.sl7 = v; return w; };
+    if idx == 8 { w.sl8 = v; return w; };
+    if idx == 9 { w.sl9 = v; return w; };
+    if idx == 10 { w.sl10 = v; return w; };
+    if idx == 11 { w.sl11 = v; return w; };
+    if idx == 12 { w.sl12 = v; return w; };
+    if idx == 13 { w.sl13 = v; return w; };
+    if idx == 14 { w.sl14 = v; return w; };
+    if idx == 15 { w.sl15 = v; return w; };
+    panic(147286);
+}
+fn _sid_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    if idx == 0 { return w.sid0; };
+    if idx == 1 { return w.sid1; };
+    if idx == 2 { return w.sid2; };
+    if idx == 3 { return w.sid3; };
+    if idx == 4 { return w.sid4; };
+    if idx == 5 { return w.sid5; };
+    if idx == 6 { return w.sid6; };
+    if idx == 7 { return w.sid7; };
+    if idx == 8 { return w.sid8; };
+    if idx == 9 { return w.sid9; };
+    if idx == 10 { return w.sid10; };
+    if idx == 11 { return w.sid11; };
+    if idx == 12 { return w.sid12; };
+    if idx == 13 { return w.sid13; };
+    if idx == 14 { return w.sid14; };
+    if idx == 15 { return w.sid15; };
+    panic(147287);
+}
+fn _sid_set(w: EcsWorldDeep, idx: i32, v: i64) -> EcsWorldDeep {
+    if idx == 0 { w.sid0 = v; return w; };
+    if idx == 1 { w.sid1 = v; return w; };
+    if idx == 2 { w.sid2 = v; return w; };
+    if idx == 3 { w.sid3 = v; return w; };
+    if idx == 4 { w.sid4 = v; return w; };
+    if idx == 5 { w.sid5 = v; return w; };
+    if idx == 6 { w.sid6 = v; return w; };
+    if idx == 7 { w.sid7 = v; return w; };
+    if idx == 8 { w.sid8 = v; return w; };
+    if idx == 9 { w.sid9 = v; return w; };
+    if idx == 10 { w.sid10 = v; return w; };
+    if idx == 11 { w.sid11 = v; return w; };
+    if idx == 12 { w.sid12 = v; return w; };
+    if idx == 13 { w.sid13 = v; return w; };
+    if idx == 14 { w.sid14 = v; return w; };
+    if idx == 15 { w.sid15 = v; return w; };
+    panic(147288);
+}
+
+// spawn_batch inline helpers — pushed onto spawn_batch_s* family directly on EcsWorldDeep.
+fn _esbi_world_set(w: EcsWorldDeep, idx: i64, v: i64) -> EcsWorldDeep {
+    if idx == 0 { w.spawn_batch_s0 = v; return w; };
+    if idx == 1 { w.spawn_batch_s1 = v; return w; };
+    if idx == 2 { w.spawn_batch_s2 = v; return w; };
+    if idx == 3 { w.spawn_batch_s3 = v; return w; };
+    if idx == 4 { w.spawn_batch_s4 = v; return w; };
+    if idx == 5 { w.spawn_batch_s5 = v; return w; };
+    if idx == 6 { w.spawn_batch_s6 = v; return w; };
+    if idx == 7 { w.spawn_batch_s7 = v; return w; };
+    if idx == 8 { w.spawn_batch_s8 = v; return w; };
+    if idx == 9 { w.spawn_batch_s9 = v; return w; };
+    if idx == 10 { w.spawn_batch_s10 = v; return w; };
+    if idx == 11 { w.spawn_batch_s11 = v; return w; };
+    if idx == 12 { w.spawn_batch_s12 = v; return w; };
+    if idx == 13 { w.spawn_batch_s13 = v; return w; };
+    if idx == 14 { w.spawn_batch_s14 = v; return w; };
+    if idx == 15 { w.spawn_batch_s15 = v; return w; };
+    return w;
+}
+fn _esbi_world_at_get(w: EcsWorldDeep, idx: i64) -> i64 {
+    if idx == 0 { return w.spawn_batch_s0; };
+    if idx == 1 { return w.spawn_batch_s1; };
+    if idx == 2 { return w.spawn_batch_s2; };
+    if idx == 3 { return w.spawn_batch_s3; };
+    if idx == 4 { return w.spawn_batch_s4; };
+    if idx == 5 { return w.spawn_batch_s5; };
+    if idx == 6 { return w.spawn_batch_s6; };
+    if idx == 7 { return w.spawn_batch_s7; };
+    if idx == 8 { return w.spawn_batch_s8; };
+    if idx == 9 { return w.spawn_batch_s9; };
+    if idx == 10 { return w.spawn_batch_s10; };
+    if idx == 11 { return w.spawn_batch_s11; };
+    if idx == 12 { return w.spawn_batch_s12; };
+    if idx == 13 { return w.spawn_batch_s13; };
+    if idx == 14 { return w.spawn_batch_s14; };
+    if idx == 15 { return w.spawn_batch_s15; };
+    return 0;
+}
+
+// id / counts / ticks
+fn ecs_world_mod_deep_id(w: EcsWorldDeep) -> EcsWorldIdDeep { return EcsWorldIdDeep { value: w.id_value }; }
+fn ecs_world_mod_deep_id_value(w: EcsWorldDeep) -> i64 { return w.id_value; }
+fn ecs_world_mod_deep_set_id(w: EcsWorldDeep, value: i64) -> EcsWorldDeep { w.id_value = value; return w; }
+fn ecs_world_mod_deep_entity_count(w: EcsWorldDeep) -> i64 { return w.entity_count; }
+fn ecs_world_mod_deep_components_count(w: EcsWorldDeep) -> i64 { return w.cn as i64; }
+fn ecs_world_mod_deep_resource_count(w: EcsWorldDeep) -> i64 { return w.rn as i64; }
+fn ecs_world_mod_deep_non_send_count(w: EcsWorldDeep) -> i64 { return w.nsn as i64; }
+fn ecs_world_mod_deep_schedule_count(w: EcsWorldDeep) -> i64 { return w.sln as i64; }
+fn ecs_world_mod_deep_observer_count(w: EcsWorldDeep) -> i64 { return w.obn as i64; }
+fn ecs_world_mod_deep_removed_components_count(w: EcsWorldDeep) -> i64 { return w.rmn as i64; }
+fn ecs_world_mod_deep_removed_entities_count(w: EcsWorldDeep) -> i64 { return w.rmen as i64; }
+
+// as_unsafe_world_cell / readonly (return ptr)
+fn ecs_world_mod_deep_as_unsafe_world_cell(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_i64_value = 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_as_unsafe_world_cell(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+fn ecs_world_mod_deep_as_unsafe_world_cell_readonly(w: EcsWorldDeep) -> i64 { return 1; }
+
+fn ecs_world_mod_deep_iter_entities_len(w: EcsWorldDeep) -> i64 { return w.en as i64; }
+
+// register_component / component_id / register_disabling / register_with_descriptor
+fn ecs_world_mod_deep_register_component(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    let already = ecs_world_mod_deep_component_id(w, component_id);
+    if already != (0 - 1) {
+        w.last_register_component_id = already;
+        return w;
+    };
+    let cid = w.cn;
+    w = _c_push(w, component_id);
+    w.last_register_component_id = cid;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_component_id(w: EcsWorldDeep) -> i32 { return w.last_register_component_id; }
+fn ecs_world_mod_deep_register_disabling_component(w: EcsWorldDeep) -> EcsWorldDeep { return w; }
+fn ecs_world_mod_deep_register_component_with_descriptor(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_component(w, component_id);
+}
+fn ecs_world_mod_deep_component_id(w: EcsWorldDeep, component_id: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.cn {
+        if _c_at(w, i) == component_id { return i; };
+        i = i + 1;
+    }
+    return (0 - 1);
+}
+
+// register_resource / resource_id / resource_entities / observers / removed_components list
+fn ecs_world_mod_deep_register_resource(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    let existing = ecs_world_mod_deep_resource_id(w, resource_id);
+    if existing != (0 - 1) {
+        w.last_register_resource_id = existing;
+        return w;
+    };
+    let cid = w.rn;
+    w = _r_push(w, resource_id);
+    // resource_entities parallel push.
+    if w.rn < ECS_WM_DEEP_CAP {
+        w = _re_set(w, w.rn - 1, w.next_entity);
+    };
+    w.next_entity = w.next_entity + 1;
+    w.last_register_resource_id = cid;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_resource_id(w: EcsWorldDeep) -> i32 { return w.last_register_resource_id; }
+fn ecs_world_mod_deep_resource_id(w: EcsWorldDeep, resource_id: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.rn {
+        if _r_at(w, i) == resource_id { return i; };
+        i = i + 1;
+    }
+    return (0 - 1);
+}
+fn ecs_world_mod_deep_resource_entities_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    return _re_at(w, idx - 1);
+}
+fn ecs_world_mod_deep_observers_at(w: EcsWorldDeep, idx: i32) -> i64 {
+    return _ob_at(w, idx);
+}
+fn ecs_world_mod_deep_removed_components_at(w: EcsWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.rm0; };
+    if idx == 1 { return w.rm1; };
+    return 0;
+}
+
+// spawn_empty / spawn / spawn_at / spawn_empty_at / spawn_batch
+fn ecs_world_mod_deep_spawn_empty(w: EcsWorldDeep) -> EcsWorldDeep {
+    let e = w.next_entity;
+    w.next_entity = w.next_entity + 1;
+    w = _e_push(w, e);
+    w.entity_count = w.entity_count + 1;
+    w.last_i64_value = e;
+    return w;
+}
+fn ecs_world_mod_deep_last_spawn_empty_entity(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+fn ecs_world_mod_deep_spawn(w: EcsWorldDeep, component_id: i32, value: i64) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_spawn_empty(w);
+    return w;
+}
+fn ecs_world_mod_deep_last_spawn_entity(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+fn ecs_world_mod_deep_spawn_at(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    let existing = ecs_world_mod_deep_entity_valid(w, entity);
+    if existing {
+        w.last_spawn_at_created = 0;
+        w.last_spawn_at_entity = entity;
+        return w;
+    };
+    w = _e_push(w, entity);
+    w.entity_count = w.entity_count + 1;
+    if entity >= w.next_entity {
+        w.next_entity = entity + 1;
+    };
+    w.last_spawn_at_created = 1;
+    w.last_spawn_at_entity = entity;
+    return w;
+}
+fn ecs_world_mod_deep_spawn_empty_at(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_spawn_at(w, entity);
+}
+fn ecs_world_mod_deep_last_spawn_at_created(w: EcsWorldDeep) -> bool { return w.last_spawn_at_created != 0; }
+fn ecs_world_mod_deep_last_spawn_at_entity(w: EcsWorldDeep) -> i64 { return w.last_spawn_at_entity; }
+
+fn ecs_world_mod_deep_spawn_batch_push(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    if w.spawn_batch_total < ECS_WM_DEEP_CAP as i64 {
+        w = _esbi_world_set(w, w.spawn_batch_total, entity);
+        w.spawn_batch_total = w.spawn_batch_total + 1;
+    };
+    w = _e_push(w, entity);
+    w.entity_count = w.entity_count + 1;
+    if entity >= w.next_entity {
+        w.next_entity = entity + 1;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_spawn_batch_len(w: EcsWorldDeep) -> i64 { return w.spawn_batch_total; }
+
+// get / get_mut / modify_component (with an entity)
+fn ecs_world_mod_deep_get(w: EcsWorldDeep, entity: i64, component_id: i32) -> EcsWorldDeep {
+    let cid = ecs_world_mod_deep_component_id(w, component_id);
+    if cid != (0 - 1) {
+        w.last_get_found = 1;
+        w.last_get_value = 42;
+    } else {
+        w.last_get_found = 0;
+        w.last_get_value = 0;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_last_get_found(w: EcsWorldDeep) -> bool { return w.last_get_found != 0; }
+fn ecs_world_mod_deep_last_get_value(w: EcsWorldDeep) -> i64 { return w.last_get_value; }
+fn ecs_world_mod_deep_get_mut(w: EcsWorldDeep, entity: i64, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_get(w, entity, component_id);
+}
+
+fn ecs_world_mod_deep_modify_component(w: EcsWorldDeep, component_id: i32, delta: i64) -> EcsWorldDeep {
+    let cid = ecs_world_mod_deep_component_id(w, component_id);
+    if cid == (0 - 1) {
+        w.last_modify_ok = 0;
+        w.last_modify_value = 0;
+        return w;
+    };
+    w.last_modify_ok = 1;
+    w.last_modify_value = delta;
+    return w;
+}
+fn ecs_world_mod_deep_last_modify_ok(w: EcsWorldDeep) -> bool { return w.last_modify_ok != 0; }
+fn ecs_world_mod_deep_last_modify_value(w: EcsWorldDeep) -> i64 { return w.last_modify_value; }
+fn ecs_world_mod_deep_modify_component_by_id(w: EcsWorldDeep, component_id: i32, delta: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_modify_component(w, component_id, delta);
+}
+
+fn ecs_world_mod_deep_modify_resource(w: EcsWorldDeep, resource_id: i32, delta: i64) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid == (0 - 1) {
+        w.last_modify_ok = 0;
+        w.last_modify_value = 0;
+        return w;
+    };
+    w.last_modify_ok = 1;
+    w.last_modify_value = delta;
+    return w;
+}
+fn ecs_world_mod_deep_modify_resource_by_id(w: EcsWorldDeep, resource_id: i32, delta: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_modify_resource(w, resource_id, delta);
+}
+
+// entity validity helpers
+fn ecs_world_mod_deep_entity_valid(w: EcsWorldDeep, entity: i64) -> bool {
+    let i: i32 = 0;
+    while i < w.en {
+        if _e_at(w, i) == entity { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+fn ecs_world_mod_deep_entity(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    if ecs_world_mod_deep_entity_valid(w, entity) {
+        w.last_entity_found = 1;
+    } else {
+        w.last_entity_found = 0;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_last_entity_found(w: EcsWorldDeep) -> bool { return w.last_entity_found != 0; }
+fn ecs_world_mod_deep_last_entity_value(w: EcsWorldDeep) -> i64 { return w.last_entity_value; }
+
+fn ecs_world_mod_deep_entity_mut(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    if ecs_world_mod_deep_entity_valid(w, entity) {
+        w.last_entity_found = 1;
+    } else {
+        w.last_entity_found = 0;
+    };
+    w.last_entity_value = entity;
+    return w;
+}
+fn ecs_world_mod_deep_get_entity(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_entity(w, entity);
+}
+fn ecs_world_mod_deep_get_entity_mut(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_entity_mut(w, entity);
+}
+fn ecs_world_mod_deep_entities_and_commands(w: EcsWorldDeep) -> EcsWorldDeep {
+    return w;
+}
+
+// despawn / try_despawn / despawn_no_free / try_despawn_no_free — backswap removal pattern.
+fn ecs_world_mod_deep_despawn(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    let i: i32 = 0;
+    while i < w.en {
+        if _e_at(w, i) == entity {
+            w = _e_set(w, i, (0 - 1));
+            w.entity_count = w.entity_count - 1;
+            w = _rme_push(w, entity);
+            w.last_despawn_found = 1;
+            return w;
+        };
+        i = i + 1;
+    }
+    w.last_despawn_found = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_despawn_found(w: EcsWorldDeep) -> bool { return w.last_despawn_found != 0; }
+fn ecs_world_mod_deep_try_despawn(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_despawn(w, entity);
+}
+fn ecs_world_mod_deep_despawn_no_free(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_despawn(w, entity);
+    if w.last_despawn_found != 0 {
+        w.last_entity_value = entity;
+    } else {
+        w.last_entity_value = (0 - 1);
+    };
+    return w;
+}
+fn ecs_world_mod_deep_try_despawn_no_free(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_despawn_no_free(w, entity);
+}
+
+// clear_trackers / last_clear
+fn ecs_world_mod_deep_clear_trackers(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.rmn = 0;
+    w.rmen = 0;
+    w.last_clear = ecs_world_mod_deep_change_tick(w);
+    return w;
+}
+fn ecs_world_mod_deep_last_clear(w: EcsWorldDeep) -> i64 { return w.last_clear; }
+
+// query / query_filtered / try_query / try_query_filtered — return -1 opaque id.
+fn ecs_world_mod_deep_query(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_query_value = (0 - 1);
+    w.last_query_found = 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_query_value(w: EcsWorldDeep) -> i64 { return w.last_query_value; }
+fn ecs_world_mod_deep_last_query_found(w: EcsWorldDeep) -> bool { return w.last_query_found != 0; }
+fn ecs_world_mod_deep_query_filtered(w: EcsWorldDeep) -> EcsWorldDeep {
+    return ecs_world_mod_deep_query(w);
+}
+fn ecs_world_mod_deep_try_query(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_query_value = (0 - 1);
+    w.last_query_found = 0;
+    return w;
+}
+fn ecs_world_mod_deep_try_query_filtered(w: EcsWorldDeep) -> EcsWorldDeep {
+    return ecs_world_mod_deep_try_query(w);
+}
+
+// removed / removed_with_id — return empty (removed_entities count).
+fn ecs_world_mod_deep_removed(w: EcsWorldDeep, component_id: i32) -> i64 {
+    let cid = ecs_world_mod_deep_component_id(w, component_id);
+    if cid == (0 - 1) { return 0; };
+    return w.rmen as i64;
+}
+fn ecs_world_mod_deep_removed_with_id(w: EcsWorldDeep, component_id: i32) -> i64 {
+    return ecs_world_mod_deep_removed(w, component_id);
+}
+fn ecs_world_mod_deep_removed_components_list(w: EcsWorldDeep) -> i64 { return w.rmn as i64; }
+
+// register_non_send_with_descriptor / init_resource / insert_resource / init_non_send_resource / init_non_send
+fn ecs_world_mod_deep_register_non_send_with_descriptor(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    let existing = ecs_world_mod_deep_contains_non_send(w, non_send_id);
+    if existing {
+        w.last_register_non_send_id = (0 - 1);
+        return w;
+    };
+    let cid = w.nsn;
+    w = _ns_push(w, non_send_id);
+    w.last_register_non_send_id = cid;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_non_send_id(w: EcsWorldDeep) -> i32 { return w.last_register_non_send_id; }
+
+fn ecs_world_mod_deep_init_resource(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_resource(w, resource_id);
+}
+fn ecs_world_mod_deep_insert_resource(w: EcsWorldDeep, resource_id: i32, value: i64) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid == (0 - 1) {
+        w = ecs_world_mod_deep_register_resource(w, resource_id);
+        w.last_insert_resource_was_new = 1;
+        return w;
+    };
+    w.last_insert_resource_was_new = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_insert_resource_was_new(w: EcsWorldDeep) -> bool { return w.last_insert_resource_was_new != 0; }
+fn ecs_world_mod_deep_init_non_send_resource(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_non_send_with_descriptor(w, non_send_id);
+}
+fn ecs_world_mod_deep_init_non_send(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_init_non_send_resource(w, non_send_id);
+}
+fn ecs_world_mod_deep_insert_non_send_resource(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    if ecs_world_mod_deep_contains_non_send(w, non_send_id) {
+        w.last_insert_resource_was_new = 0;
+        return w;
+    };
+    w = _ns_push(w, non_send_id);
+    w.last_insert_resource_was_new = 1;
+    return w;
+}
+fn ecs_world_mod_deep_insert_non_send(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_insert_non_send_resource(w, non_send_id);
+}
+
+// remove_resource / remove_non_send_resource / remove_non_send
+fn ecs_world_mod_deep_remove_resource(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid == (0 - 1) {
+        w.last_remove_resource_found = 0;
+        w.last_remove_resource_entity = 0;
+        return w;
+    };
+    w = _r_set(w, rid, (0 - 1));
+    w.last_remove_resource_found = 1;
+    w.last_remove_resource_entity = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_remove_resource_found(w: EcsWorldDeep) -> bool { return w.last_remove_resource_found != 0; }
+fn ecs_world_mod_deep_last_remove_resource_entity(w: EcsWorldDeep) -> i64 { return w.last_remove_resource_entity; }
+fn ecs_world_mod_deep_remove_non_send_resource(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    let i: i32 = 0;
+    while i < w.nsn {
+        if _ns_at(w, i) == non_send_id {
+            w = _ns_set(w, i, (0 - 1));
+            w.last_remove_non_send_found = 1;
+            return w;
+        };
+        i = i + 1;
+    }
+    w.last_remove_non_send_found = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_remove_non_send_found(w: EcsWorldDeep) -> bool { return w.last_remove_non_send_found != 0; }
+fn ecs_world_mod_deep_remove_non_send(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_remove_non_send_resource(w, non_send_id);
+}
+
+// contains_resource / contains_resource_by_id / contains_non_send / contains_non_send_by_id
+fn ecs_world_mod_deep_contains_resource(w: EcsWorldDeep, resource_id: i32) -> bool {
+    return ecs_world_mod_deep_resource_id(w, resource_id) != (0 - 1);
+}
+fn ecs_world_mod_deep_contains_resource_by_id(w: EcsWorldDeep, component_id: i32) -> bool {
+    return ecs_world_mod_deep_contains_resource(w, component_id);
+}
+fn ecs_world_mod_deep_contains_non_send(w: EcsWorldDeep, non_send_id: i32) -> bool {
+    let i: i32 = 0;
+    while i < w.nsn {
+        if _ns_at(w, i) == non_send_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+fn ecs_world_mod_deep_contains_non_send_by_id(w: EcsWorldDeep, component_id: i32) -> bool {
+    return ecs_world_mod_deep_contains_non_send(w, component_id);
+}
+
+// is_resource_added / is_resource_added_by_id
+fn ecs_world_mod_deep_is_resource_added(w: EcsWorldDeep, resource_id: i32) -> bool {
+    return ecs_world_mod_deep_contains_resource(w, resource_id);
+}
+fn ecs_world_mod_deep_is_resource_added_by_id(w: EcsWorldDeep, component_id: i32) -> bool {
+    return ecs_world_mod_deep_is_resource_added(w, component_id);
+}
+// is_resource_changed / is_resource_changed_by_id: based on mt comparison.
+fn ecs_world_mod_deep_is_resource_changed(w: EcsWorldDeep, resource_id: i32) -> bool {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    return rid != (0 - 1);
+}
+fn ecs_world_mod_deep_is_resource_changed_by_id(w: EcsWorldDeep, component_id: i32) -> bool {
+    return ecs_world_mod_deep_is_resource_changed(w, component_id);
+}
+
+// get_resource_change_ticks / by id
+fn ecs_world_mod_deep_get_resource_change_ticks(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid == (0 - 1) {
+        w.last_resource_change_found = 0;
+        w.last_resource_change_tick = 0;
+        w.last_resource_change_last = 0;
+        return w;
+    };
+    w.last_resource_change_found = 1;
+    w.last_resource_change_tick = w.change_tick;
+    w.last_resource_change_last = w.last_change_tick;
+    return w;
+}
+fn ecs_world_mod_deep_last_resource_change_found(w: EcsWorldDeep) -> bool { return w.last_resource_change_found != 0; }
+fn ecs_world_mod_deep_last_resource_change_tick(w: EcsWorldDeep) -> i64 { return w.last_resource_change_tick; }
+fn ecs_world_mod_deep_last_resource_change_last(w: EcsWorldDeep) -> i64 { return w.last_resource_change_last; }
+fn ecs_world_mod_deep_get_resource_change_ticks_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_get_resource_change_ticks(w, component_id);
+}
+
+// resource / resource_ref / resource_mut / get_resource / get_resource_ref / get_resource_mut
+fn ecs_world_mod_deep_resource(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid == (0 - 1) {
+        w.last_resource_found = 0;
+        w.last_resource_entity = 0;
+        return w;
+    };
+    w.last_resource_found = 1;
+    w.last_resource_entity = _re_at(w, rid);
+    return w;
+}
+fn ecs_world_mod_deep_last_resource_found(w: EcsWorldDeep) -> bool { return w.last_resource_found != 0; }
+fn ecs_world_mod_deep_last_resource_entity(w: EcsWorldDeep) -> i64 { return w.last_resource_entity; }
+fn ecs_world_mod_deep_resource_ref(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource(w, resource_id);
+}
+fn ecs_world_mod_deep_resource_mut(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource(w, resource_id);
+}
+fn ecs_world_mod_deep_get_resource(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource(w, resource_id);
+}
+fn ecs_world_mod_deep_get_resource_ref(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource_ref(w, resource_id);
+}
+fn ecs_world_mod_deep_get_resource_mut(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource_mut(w, resource_id);
+}
+fn ecs_world_mod_deep_resource_entities(w: EcsWorldDeep) -> i64 { return w.rn as i64; }
+fn ecs_world_mod_deep_observers(w: EcsWorldDeep) -> i64 { return w.obn as i64; }
+fn ecs_world_mod_deep_entities(w: EcsWorldDeep) -> i64 { return w.en as i64; }
+
+fn ecs_world_mod_deep_get_resource_or_insert_with(w: EcsWorldDeep, resource_id: i32, default_value: i64) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid != (0 - 1) {
+        w.last_get_resource_or_insert_was_new = 0;
+        w.last_get_resource_or_insert_value = _re_at(w, rid);
+        return w;
+    };
+    w = ecs_world_mod_deep_register_resource(w, resource_id);
+    w.last_get_resource_or_insert_was_new = 1;
+    w.last_get_resource_or_insert_value = default_value;
+    return w;
+}
+fn ecs_world_mod_deep_last_get_resource_or_insert_was_new(w: EcsWorldDeep) -> bool { return w.last_get_resource_or_insert_was_new != 0; }
+fn ecs_world_mod_deep_last_get_resource_or_insert_value(w: EcsWorldDeep) -> i64 { return w.last_get_resource_or_insert_value; }
+fn ecs_world_mod_deep_get_resource_or_init(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    let rid = ecs_world_mod_deep_resource_id(w, resource_id);
+    if rid != (0 - 1) {
+        w.last_get_resource_or_insert_was_new = 0;
+        w.last_get_resource_or_insert_value = _re_at(w, rid);
+        return w;
+    };
+    w = ecs_world_mod_deep_init_resource(w, resource_id);
+    w.last_get_resource_or_insert_was_new = 1;
+    w.last_get_resource_or_insert_value = 0;
+    return w;
+}
+
+// non_send_resource / non_send / non_send_resource_mut / non_send_mut / getters
+fn ecs_world_mod_deep_non_send_resource(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    if ecs_world_mod_deep_contains_non_send(w, non_send_id) {
+        w.last_non_send_found = 1;
+        w.last_non_send_id = non_send_id;
+    } else {
+        w.last_non_send_found = 0;
+        w.last_non_send_id = non_send_id;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_last_non_send_found(w: EcsWorldDeep) -> bool { return w.last_non_send_found != 0; }
+fn ecs_world_mod_deep_last_non_send_id(w: EcsWorldDeep) -> i32 { return w.last_non_send_id; }
+fn ecs_world_mod_deep_non_send(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource(w, non_send_id);
+}
+fn ecs_world_mod_deep_non_send_resource_mut(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource(w, non_send_id);
+}
+fn ecs_world_mod_deep_non_send_mut(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource_mut(w, non_send_id);
+}
+fn ecs_world_mod_deep_get_non_send_resource(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource(w, non_send_id);
+}
+fn ecs_world_mod_deep_get_non_send(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource(w, non_send_id);
+}
+fn ecs_world_mod_deep_get_non_send_resource_mut(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource_mut(w, non_send_id);
+}
+fn ecs_world_mod_deep_get_non_send_mut(w: EcsWorldDeep, non_send_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource_mut(w, non_send_id);
+}
+
+// insert_batch / insert_batch_if_new / try_insert_batch / try_insert_batch_if_new
+fn ecs_world_mod_deep_insert_batch(w: EcsWorldDeep, count: i64) -> EcsWorldDeep {
+    let i: i64 = 0;
+    while i < count {
+        w = ecs_world_mod_deep_spawn_empty(w);
+        i = i + 1;
+    }
+    w.last_insert_batch_count = count;
+    return w;
+}
+fn ecs_world_mod_deep_last_insert_batch_count(w: EcsWorldDeep) -> i64 { return w.last_insert_batch_count; }
+fn ecs_world_mod_deep_insert_batch_if_new(w: EcsWorldDeep, count: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_insert_batch(w, count);
+}
+fn ecs_world_mod_deep_try_insert_batch(w: EcsWorldDeep, count: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_insert_batch(w, count);
+}
+fn ecs_world_mod_deep_try_insert_batch_if_new(w: EcsWorldDeep, count: i64) -> EcsWorldDeep {
+    return ecs_world_mod_deep_insert_batch(w, count);
+}
+
+// resource_scope / try_resource_scope
+fn ecs_world_mod_deep_resource_scope(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource_mut(w, resource_id);
+}
+fn ecs_world_mod_deep_try_resource_scope(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_resource(w, resource_id);
+    if w.last_resource_found != 0 {
+        w.last_resource_found = 1;
+    } else {
+        w.last_resource_found = 0;
+    };
+    return w;
+}
+
+// write_message / write_message_default / write_message_batch
+fn ecs_world_mod_deep_write_message(w: EcsWorldDeep, message_id: i64) -> EcsWorldDeep {
+    w.last_write_message_id = message_id;
+    return w;
+}
+fn ecs_world_mod_deep_last_write_message_id(w: EcsWorldDeep) -> i64 { return w.last_write_message_id; }
+fn ecs_world_mod_deep_write_message_default(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_write_message_default = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_write_message_default(w: EcsWorldDeep) -> i64 { return w.last_write_message_default; }
+fn ecs_world_mod_deep_write_message_batch(w: EcsWorldDeep, messages: i64) -> EcsWorldDeep {
+    w.last_write_message_batch_count = messages;
+    return w;
+}
+fn ecs_world_mod_deep_last_write_message_batch_count(w: EcsWorldDeep) -> i64 { return w.last_write_message_batch_count; }
+
+// flush / increment_change_tick / read_change_tick / change_tick / last_change_tick / last_change_tick_scope
+fn ecs_world_mod_deep_flush(w: EcsWorldDeep) -> EcsWorldDeep {
+    return w;
+}
+fn ecs_world_mod_deep_increment_change_tick(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.change_tick = w.change_tick + 1;
+    w.last_i64_value = w.change_tick;
+    return w;
+}
+fn ecs_world_mod_deep_last_increment_change_tick(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+fn ecs_world_mod_deep_read_change_tick(w: EcsWorldDeep) -> i64 { return w.change_tick; }
+fn ecs_world_mod_deep_change_tick(w: EcsWorldDeep) -> i64 { return w.change_tick; }
+fn ecs_world_mod_deep_last_change_tick(w: EcsWorldDeep) -> i64 { return w.last_change_tick; }
+fn ecs_world_mod_deep_last_change_tick_scope(w: EcsWorldDeep, last: i64) -> EcsWorldDeep {
+    w.last_i64_2 = w.last_change_tick;
+    w.last_change_tick = last;
+    return w;
+}
+fn ecs_world_mod_deep_last_change_tick_scope_prev(w: EcsWorldDeep) -> i64 { return w.last_i64_2; }
+
+fn ecs_world_mod_deep_check_change_ticks(w: EcsWorldDeep, max_age: i64) -> EcsWorldDeep {
+    w.last_check_change_ticks_max_age = max_age;
+    w.last_check_change_ticks_checked = 1;
+    w.change_tick = w.change_tick + 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_check_change_ticks_max_age(w: EcsWorldDeep) -> i64 { return w.last_check_change_ticks_max_age; }
+fn ecs_world_mod_deep_last_check_change_ticks_checked(w: EcsWorldDeep) -> bool { return w.last_check_change_ticks_checked != 0; }
+
+// clear_all / clear_entities / clear_resources / clear_non_send — set counts to 0.
+fn ecs_world_mod_deep_clear_entities(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.en = 0;
+    w.entity_count = 0;
+    return w;
+}
+fn ecs_world_mod_deep_clear_resources(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.rn = 0;
+    return w;
+}
+fn ecs_world_mod_deep_clear_non_send(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.nsn = 0;
+    return w;
+}
+fn ecs_world_mod_deep_clear_all(w: EcsWorldDeep) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_clear_entities(w);
+    w = ecs_world_mod_deep_clear_resources(w);
+    w = ecs_world_mod_deep_clear_non_send(w);
+    return w;
+}
+
+// register_bundle / register_dynamic_bundle / fallback_error_handler
+fn ecs_world_mod_deep_register_bundle(w: EcsWorldDeep, bundle_id: i64) -> EcsWorldDeep {
+    w.last_register_bundle_id = bundle_id;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_bundle_id(w: EcsWorldDeep) -> i64 { return w.last_register_bundle_id; }
+fn ecs_world_mod_deep_register_dynamic_bundle(w: EcsWorldDeep, component_ids: i32) -> EcsWorldDeep {
+    w.last_register_dynamic_bundle_count = component_ids as i64;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_dynamic_bundle_count(w: EcsWorldDeep) -> i64 { return w.last_register_dynamic_bundle_count; }
+fn ecs_world_mod_deep_fallback_error_handler(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_fallback_error_code = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_fallback_error_code(w: EcsWorldDeep) -> i32 { return w.last_fallback_error_code; }
+
+// get_resource_by_id / get_resource_mut_by_id / iter_resources / iter_resources_mut
+fn ecs_world_mod_deep_get_resource_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource(w, component_id);
+}
+fn ecs_world_mod_deep_get_resource_mut_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_resource_mut(w, component_id);
+}
+fn ecs_world_mod_deep_iter_resources(w: EcsWorldDeep) -> i64 { return w.rn as i64; }
+fn ecs_world_mod_deep_iter_resources_mut(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_i64_value = w.rn as i64;
+    return w;
+}
+fn ecs_world_mod_deep_last_iter_resources_mut(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+
+// get_non_send_by_id / get_non_send_mut_by_id / remove_resource_by_id / remove_non_send_by_id
+fn ecs_world_mod_deep_get_non_send_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource(w, component_id);
+}
+fn ecs_world_mod_deep_get_non_send_mut_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_non_send_resource_mut(w, component_id);
+}
+fn ecs_world_mod_deep_get_by_id(w: EcsWorldDeep, entity: i64, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_get(w, entity, component_id);
+}
+fn ecs_world_mod_deep_get_mut_by_id(w: EcsWorldDeep, entity: i64, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_get_by_id(w, entity, component_id);
+}
+fn ecs_world_mod_deep_remove_resource_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_remove_resource(w, component_id);
+}
+fn ecs_world_mod_deep_remove_non_send_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_remove_non_send_resource(w, component_id);
+}
+
+// add_schedule / try_schedule_scope / schedule_scope / try_run_schedule / run_schedule / get_schedule / contains_schedule / remove_schedule
+fn ecs_world_mod_deep_add_schedule(w: EcsWorldDeep, label_id: i32, schedule_id: i64) -> EcsWorldDeep {
+    let i: i32 = 0;
+    while i < w.sln {
+        if _sl_at(w, i) == label_id {
+            w = _sl_set(w, i, label_id);
+            w = _sid_set(w, i, schedule_id);
+            w.last_schedule_found = 0;
+            return w;
+        };
+        i = i + 1;
+    }
+    if w.sln < ECS_WM_DEEP_CAP {
+        w = _sl_set(w, w.sln, label_id);
+        w = _sid_set(w, w.sln, schedule_id);
+        w.sln = w.sln + 1;
+    };
+    w.last_schedule_found = 1;
+    w.last_schedule_id = schedule_id;
+    return w;
+}
+fn ecs_world_mod_deep_last_add_schedule_found(w: EcsWorldDeep) -> bool { return w.last_schedule_found != 0; }
+fn ecs_world_mod_deep_last_schedule_id(w: EcsWorldDeep) -> i64 { return w.last_schedule_id; }
+
+fn ecs_world_mod_deep_get_schedule(w: EcsWorldDeep, label_id: i32) -> EcsWorldDeep {
+    let i: i32 = 0;
+    while i < w.sln {
+        if _sl_at(w, i) == label_id {
+            w.last_schedule_found = 1;
+            w.last_schedule_id = _sid_at(w, i);
+            return w;
+        };
+        i = i + 1;
+    }
+    w.last_schedule_found = 0;
+    w.last_schedule_id = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_schedule_found(w: EcsWorldDeep) -> bool { return w.last_schedule_found != 0; }
+
+fn ecs_world_mod_deep_contains_schedule(w: EcsWorldDeep, label_id: i32) -> bool {
+    let i: i32 = 0;
+    while i < w.sln {
+        if _sl_at(w, i) == label_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+fn ecs_world_mod_deep_try_schedule_scope(w: EcsWorldDeep, label_id: i32) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_get_schedule(w, label_id);
+    return w;
+}
+fn ecs_world_mod_deep_schedule_scope(w: EcsWorldDeep, label_id: i32) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_get_schedule(w, label_id);
+    return w;
+}
+fn ecs_world_mod_deep_try_run_schedule(w: EcsWorldDeep, label_id: i32) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_try_schedule_scope(w, label_id);
+    w.last_schedule_scope_run_ok = w.last_schedule_found;
+    return w;
+}
+fn ecs_world_mod_deep_last_schedule_scope_run_ok(w: EcsWorldDeep) -> bool { return w.last_schedule_scope_run_ok != 0; }
+fn ecs_world_mod_deep_run_schedule(w: EcsWorldDeep, label_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_try_run_schedule(w, label_id);
+}
+fn ecs_world_mod_deep_remove_schedule(w: EcsWorldDeep, label_id: i32) -> EcsWorldDeep {
+    let i: i32 = 0;
+    while i < w.sln {
+        if _sl_at(w, i) == label_id {
+            w = _sl_set(w, i, (0 - 1));
+            w = _sid_set(w, i, 0);
+            w.last_schedule_found = 1;
+            return w;
+        };
+        i = i + 1;
+    }
+    w.last_schedule_found = 0;
+    return w;
+}
+
+// allow_ambiguous_component / allow_ambiguous_resource
+fn ecs_world_mod_deep_allow_ambiguous_component(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    w.last_bool = 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_allow_ambiguous_component(w: EcsWorldDeep) -> bool { return w.last_bool != 0; }
+fn ecs_world_mod_deep_allow_ambiguous_resource(w: EcsWorldDeep, resource_id: i32) -> EcsWorldDeep {
+    w.last_bool = 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_allow_ambiguous_resource(w: EcsWorldDeep) -> bool { return w.last_bool != 0; }
+
+// register_required_components / register_required_components_with / try_register_required_components / try_register_required_components_with / get_required_components
+fn ecs_world_mod_deep_register_required_components(w: EcsWorldDeep, component_id: i32, required_id: i32) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_register_component(w, component_id);
+    w = ecs_world_mod_deep_register_component(w, required_id);
+    w.last_bool = 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_required_components(w: EcsWorldDeep) -> bool { return w.last_bool != 0; }
+fn ecs_world_mod_deep_register_required_components_with(w: EcsWorldDeep, component_id: i32, required_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_required_components(w, component_id, required_id);
+}
+fn ecs_world_mod_deep_try_register_required_components(w: EcsWorldDeep, component_id: i32, required_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_required_components(w, component_id, required_id);
+}
+fn ecs_world_mod_deep_try_register_required_components_with(w: EcsWorldDeep, component_id: i32, required_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_required_components(w, component_id, required_id);
+}
+fn ecs_world_mod_deep_get_required_components(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    let cid = ecs_world_mod_deep_component_id(w, component_id);
+    if cid == (0 - 1) {
+        w.last_bool = 0;
+        w.last_i64_value = 0;
+    } else {
+        w.last_bool = 1;
+        w.last_i64_value = 0;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_last_get_required_components_found(w: EcsWorldDeep) -> bool { return w.last_bool != 0; }
+fn ecs_world_mod_deep_last_get_required_components_count(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+fn ecs_world_mod_deep_get_required_components_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_get_required_components(w, component_id);
+}
+
+// register_component_hooks / register_component_hooks_by_id
+fn ecs_world_mod_deep_register_component_hooks(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    w = ecs_world_mod_deep_register_component(w, component_id);
+    w.last_bool = 1;
+    return w;
+}
+fn ecs_world_mod_deep_last_register_component_hooks(w: EcsWorldDeep) -> bool { return w.last_bool != 0; }
+fn ecs_world_mod_deep_register_component_hooks_by_id(w: EcsWorldDeep, component_id: i32) -> EcsWorldDeep {
+    return ecs_world_mod_deep_register_component_hooks(w, component_id);
+}
+
+// components_queue / components_registrator / storages / bundles / archetypes / entities_field / entity_allocator / entity_allocator_mut / commands
+fn ecs_world_mod_deep_components_queue(w: EcsWorldDeep) -> i64 { return 0; }
+fn ecs_world_mod_deep_components_registrator(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_int_value = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_components_registrator(w: EcsWorldDeep) -> i32 { return w.last_int_value; }
+fn ecs_world_mod_deep_storages(w: EcsWorldDeep) -> i64 { return 0; }
+fn ecs_world_mod_deep_bundles(w: EcsWorldDeep) -> i64 { return 0; }
+fn ecs_world_mod_deep_archetypes(w: EcsWorldDeep) -> i64 { return 0; }
+fn ecs_world_mod_deep_entities_field(w: EcsWorldDeep) -> i64 { return w.en as i64; }
+fn ecs_world_mod_deep_entity_allocator(w: EcsWorldDeep) -> i64 { return w.next_entity; }
+fn ecs_world_mod_deep_entity_allocator_mut(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_i64_value = w.next_entity;
+    return w;
+}
+fn ecs_world_mod_deep_last_entity_allocator_mut(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+fn ecs_world_mod_deep_commands(w: EcsWorldDeep) -> EcsWorldDeep {
+    w.last_i64_value = 0;
+    return w;
+}
+fn ecs_world_mod_deep_last_commands(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+
+// inspect_entity: returns (found, count)
+fn ecs_world_mod_deep_inspect_entity(w: EcsWorldDeep, entity: i64) -> EcsWorldDeep {
+    let valid = ecs_world_mod_deep_entity_valid(w, entity);
+    if valid {
+        w.last_bool = 1;
+        w.last_i64_value = w.entity_count;
+    } else {
+        w.last_bool = 0;
+        w.last_i64_value = 0;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_last_inspect_entity_found(w: EcsWorldDeep) -> bool { return w.last_bool != 0; }
+fn ecs_world_mod_deep_last_inspect_entity_count(w: EcsWorldDeep) -> i64 { return w.last_i64_value; }
+
+// set_apply_final_deferred / apply_final_deferred
+fn ecs_world_mod_deep_set_apply_final_deferred(w: EcsWorldDeep, apply: bool) -> EcsWorldDeep {
+    if apply {
+        w.apply_final_deferred = 1;
+    } else {
+        w.apply_final_deferred = 0;
+    };
+    return w;
+}
+fn ecs_world_mod_deep_apply_final_deferred(w: EcsWorldDeep) -> bool { return w.apply_final_deferred != 0; }

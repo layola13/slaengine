@@ -1,0 +1,218 @@
+// Deep self-contained System trait + SystemStateFlags + RunSystemOnce + RunSystemError.
+// Mirrors lib/system_trait.sla (101 lines) with fixed-cap scalar fields. No @import.
+// Key design: EcsSystemDeep stores flags as a flat i32 bitfield (not a nested struct),
+// matching the system_trait_extras_deep pattern that avoids SA backend MemoryLeak.
+// Tuple return (EcsSystem, i64) replaced by wrapper struct EcsSystemRunResult.
+
+// === SystemStateFlags standalone (bitfield) ===
+@derive(copy)
+struct EcsSystemStateFlagsDeep {
+    bits: i32,
+}
+
+fn ecs_system_state_flags_deep_new() -> EcsSystemStateFlagsDeep {
+    return EcsSystemStateFlagsDeep { bits: 0 };
+}
+
+fn ecs_system_state_flags_deep_set(f: EcsSystemStateFlagsDeep, bit: i32) -> EcsSystemStateFlagsDeep {
+    f.bits = f.bits | bit;
+    return f;
+}
+
+fn ecs_system_state_flags_deep_unset(f: EcsSystemStateFlagsDeep, bit: i32) -> EcsSystemStateFlagsDeep {
+    f.bits = f.bits ^ (f.bits & bit);
+    return f;
+}
+
+fn ecs_system_state_flags_deep_has(f: EcsSystemStateFlagsDeep, bit: i32) -> bool {
+    return (f.bits & bit) != 0;
+}
+
+const ECS_SSTFD_INITIALIZED: i32 = 1;
+const ECS_SSTFD_EXCLUSIVE: i32 = 2;
+const ECS_SSTFD_HAS_DEFERRED: i32 = 4;
+const ECS_SSTFD_READ_ONLY: i32 = 8;
+
+fn ecs_system_state_flags_deep_is_initialized(f: EcsSystemStateFlagsDeep) -> bool {
+    return ecs_system_state_flags_deep_has(f, ECS_SSTFD_INITIALIZED);
+}
+
+fn ecs_system_state_flags_deep_is_exclusive(f: EcsSystemStateFlagsDeep) -> bool {
+    return ecs_system_state_flags_deep_has(f, ECS_SSTFD_EXCLUSIVE);
+}
+
+fn ecs_system_state_flags_deep_has_deferred(f: EcsSystemStateFlagsDeep) -> bool {
+    return ecs_system_state_flags_deep_has(f, ECS_SSTFD_HAS_DEFERRED);
+}
+
+fn ecs_system_state_flags_deep_is_read_only(f: EcsSystemStateFlagsDeep) -> bool {
+    return ecs_system_state_flags_deep_has(f, ECS_SSTFD_READ_ONLY);
+}
+
+// === System trait surface (flat flags_bits, not nested) ===
+@derive(copy)
+struct EcsSystemDeep {
+    name_id: i64,
+    flags_bits: i32,
+    last_run_value: i64,
+}
+
+fn ecs_system_deep_new(name_id: i64) -> EcsSystemDeep {
+    return EcsSystemDeep { name_id: name_id, flags_bits: 0, last_run_value: 0 };
+}
+
+fn ecs_system_deep_name(s: EcsSystemDeep) -> i64 {
+    return s.name_id;
+}
+
+fn ecs_system_deep_flags_bits(s: EcsSystemDeep) -> i32 {
+    return s.flags_bits;
+}
+
+fn ecs_system_deep_set_flag_bits(s: EcsSystemDeep, bits: i32) -> EcsSystemDeep {
+    s.flags_bits = bits;
+    return s;
+}
+
+fn ecs_system_deep_initialize(s: EcsSystemDeep) -> EcsSystemDeep {
+    s.flags_bits = s.flags_bits | ECS_SSTFD_INITIALIZED;
+    return s;
+}
+
+fn ecs_system_deep_is_initialized(s: EcsSystemDeep) -> bool {
+    return (s.flags_bits & ECS_SSTFD_INITIALIZED) != 0;
+}
+
+fn ecs_system_deep_set_exclusive(s: EcsSystemDeep) -> EcsSystemDeep {
+    s.flags_bits = s.flags_bits | ECS_SSTFD_EXCLUSIVE;
+    return s;
+}
+
+fn ecs_system_deep_is_exclusive(s: EcsSystemDeep) -> bool {
+    return (s.flags_bits & ECS_SSTFD_EXCLUSIVE) != 0;
+}
+
+fn ecs_system_deep_set_read_only(s: EcsSystemDeep) -> EcsSystemDeep {
+    s.flags_bits = s.flags_bits | ECS_SSTFD_READ_ONLY;
+    return s;
+}
+
+fn ecs_system_deep_is_read_only(s: EcsSystemDeep) -> bool {
+    return (s.flags_bits & ECS_SSTFD_READ_ONLY) != 0;
+}
+
+fn ecs_system_deep_has_deferred(s: EcsSystemDeep) -> bool {
+    return (s.flags_bits & ECS_SSTFD_HAS_DEFERRED) != 0;
+}
+
+// Helper to keep the flags module useful for SAS-style tests: convert stack flag struct
+// to its bit value, mirroring state-flags-set testing pattern.
+fn _ecs_ssf_bits_from_flags(f: EcsSystemStateFlagsDeep) -> i32 {
+    return f.bits;
+}
+
+// === EcsSystemRunResult: wrapper for tuple (EcsSystem, i64) ===
+@derive(copy)
+struct EcsSystemRunResult {
+    flags_bits: i32,
+    name_id: i64,
+    last_run_value: i64,
+}
+
+fn ecs_system_run_deep_result_new(flags_bits: i32, name_id: i64, last_run_value: i64) -> EcsSystemRunResult {
+    return EcsSystemRunResult { flags_bits: flags_bits, name_id: name_id, last_run_value: last_run_value };
+}
+
+fn ecs_system_run_deep_result_output(r: EcsSystemRunResult) -> i64 {
+    return r.last_run_value;
+}
+
+fn ecs_system_run_deep_result_name(r: EcsSystemRunResult) -> i64 {
+    return r.name_id;
+}
+
+fn ecs_system_run_deep_result_flags_bits(r: EcsSystemRunResult) -> i32 {
+    return r.flags_bits;
+}
+
+fn ecs_system_run_deep_result_system(r: EcsSystemRunResult) -> EcsSystemDeep {
+    return EcsSystemDeep { name_id: r.name_id, flags_bits: r.flags_bits, last_run_value: r.last_run_value };
+}
+
+fn ecs_system_deep_run(s: EcsSystemDeep, input: i64) -> EcsSystemRunResult {
+    s.last_run_value = input;
+    return EcsSystemRunResult { flags_bits: s.flags_bits, name_id: s.name_id, last_run_value: input };
+}
+
+fn ecs_system_deep_last_run(s: EcsSystemDeep) -> i64 {
+    return s.last_run_value;
+}
+
+fn ecs_system_deep_apply_deferred(s: EcsSystemDeep) -> EcsSystemDeep {
+    s.flags_bits = s.flags_bits | ECS_SSTFD_HAS_DEFERRED;
+    return s;
+}
+
+fn ecs_system_deep_clear_deferred(s: EcsSystemDeep) -> EcsSystemDeep {
+    s.flags_bits = s.flags_bits ^ (s.flags_bits & ECS_SSTFD_HAS_DEFERRED);
+    return s;
+}
+
+// === RunSystemError ===
+// 0 = Ok, 1 = SystemNotInitialized, 2 = WorldError
+const ECS_RSED_OK: i32 = 0;
+const ECS_RSED_NOT_INITIALIZED: i32 = 1;
+const ECS_RSED_WORLD_ERROR: i32 = 2;
+
+@derive(copy)
+struct EcsRunSystemOnceResultDeep {
+    error_kind: i32,
+    output: i64,
+}
+
+fn ecs_run_system_once_deep_ok(output: i64) -> EcsRunSystemOnceResultDeep {
+    return EcsRunSystemOnceResultDeep { error_kind: ECS_RSED_OK, output: output };
+}
+
+fn ecs_run_system_once_deep_err(kind: i32) -> EcsRunSystemOnceResultDeep {
+    return EcsRunSystemOnceResultDeep { error_kind: kind, output: 0 };
+}
+
+fn ecs_run_system_once_deep_is_ok(r: EcsRunSystemOnceResultDeep) -> bool {
+    return r.error_kind == ECS_RSED_OK;
+}
+
+fn ecs_run_system_once_deep_output_value(r: EcsRunSystemOnceResultDeep) -> i64 {
+    return r.output;
+}
+
+fn ecs_run_system_once_deep_error_kind(r: EcsRunSystemOnceResultDeep) -> i32 {
+    return r.error_kind;
+}
+
+fn ecs_run_system_once_deep_error_name(r: EcsRunSystemOnceResultDeep) -> i32 {
+    if r.error_kind == ECS_RSED_NOT_INITIALIZED { return 1; };
+    if r.error_kind == ECS_RSED_WORLD_ERROR { return 2; };
+    return 0;
+}
+
+// run_system_once: run a system once, returns result
+fn ecs_run_system_once_deep(s: EcsSystemDeep, input: i64) -> EcsRunSystemOnceResultDeep {
+    if ecs_system_deep_is_initialized(s) != true {
+        return ecs_run_system_once_deep_err(ECS_RSED_NOT_INITIALIZED);
+    };
+    s.last_run_value = input;
+    return ecs_run_system_once_deep_ok(input);
+}
+
+// run_system_once_with_flags: check initialized + exclusive constraints
+fn ecs_run_system_once_deep_with_flags(s: EcsSystemDeep, input: i64) -> EcsRunSystemOnceResultDeep {
+    if ecs_system_deep_is_initialized(s) != true {
+        return ecs_run_system_once_deep_err(ECS_RSED_NOT_INITIALIZED);
+    };
+    if ecs_system_deep_is_exclusive(s) {
+        // Exclusive systems always succeed (no world error in self-contained deep)
+    };
+    s.last_run_value = input;
+    return ecs_run_system_once_deep_ok(input);
+}

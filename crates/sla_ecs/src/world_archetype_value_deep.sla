@@ -1,0 +1,1547 @@
+// Deep bed for lib/world_archetype_value.sla (Batch 388).
+// Mirrors shallow `lib/world_archetype_value.sla`'s `ArchetypeValueWorld<T, R, M>` as a
+// SELF-CONTAINED fixed-cap variant (NO `@import`) using concrete typed columns based on
+// `ArchetypeValueData { amount }`, `ArchetypeValueTime { tick }` (resource), and
+// `ArchetypeValueEvent { amount }` (message).  Storage is archetype-grouped: each archetype
+// carries cap-4 component columns x cap-4 entity rows of typed values, and each entity has a
+// (archetype_id, row) location. Inserting/removing a component migrates the entity between
+// archetypes, preserving its existing component values from the old archetype and adding the
+// new component's value. Mirrors Bevy's archetype-store: an entity moves on component change.
+//
+// Storage layout: cap-4 archetypes, cap-4 component ids per archetype, cap-4 entity rows per
+// archetype, cap-8 entity ids overall.  Per-archetype value array is flat 4*4 = 16 i32 slots
+// (indexed by col*4 + row).  `present_mask` per column (i32 bitmask over rows).  Per-archetype
+// `added_t0..15` and `changed_t0..15` likewise flat cap-16 indexed col*4 + row.  Resource slot +
+// message slot + monotone `change_tick`.  Wrapper structs expose scalar accessors (no tuple-
+// return destructuring in tests).
+
+const ECS_AV_CAP_ARCH: i32 = 4;
+const ECS_AV_CAP_COMPONENTS_PER_ARCH: i32 = 4;
+const ECS_AV_CAP_ROWS_PER_ARCH: i32 = 4;
+const ECS_AV_CAP_ENTITIES: i32 = 8;
+const ECS_AV_CAP_MESSAGES: i32 = 8;
+const ECS_AV_TICK_NONE: i32 = 999999;
+
+struct EcsAVEntityDeep { id: i32, generation: i32 }
+
+fn ecs_av_entity_eq_deep(a: EcsAVEntityDeep, b: EcsAVEntityDeep) -> bool {
+    if a.id != b.id { return false; };
+    if a.generation != b.generation { return false; };
+    return true;
+}
+
+fn ecs_av_entity_id_deep(a: EcsAVEntityDeep) -> i32 { return a.id; }
+fn ecs_av_entity_gen_deep(a: EcsAVEntityDeep) -> i32 { return a.generation; }
+fn ecs_av_entity_new(id: i32, generation: i32) -> EcsAVEntityDeep {
+    return EcsAVEntityDeep { id: id, generation: generation };
+}
+
+// ── Concrete typed plugs (mirror the shallow ArchetypeValueData / Time / Event). ─────────────
+struct EcsAVDataDeep { amount: i32 }
+struct EcsAVTimeDeep { tick: i32 }
+struct EcsAVEventDeep { amount: i32 }
+
+fn ecs_av_data_deep_new(amount: i32) -> EcsAVDataDeep { return EcsAVDataDeep { amount: amount }; }
+fn ecs_av_data_deep_amount(r: EcsAVDataDeep) -> i32 { return r.amount; }
+fn ecs_av_time_deep_new(tick: i32) -> EcsAVTimeDeep { return EcsAVTimeDeep { tick: tick }; }
+fn ecs_av_time_deep_tick(r: EcsAVTimeDeep) -> i32 { return r.tick; }
+fn ecs_av_event_deep_new(amount: i32) -> EcsAVEventDeep { return EcsAVEventDeep { amount: amount }; }
+fn ecs_av_event_deep_amount(r: EcsAVEventDeep) -> i32 { return r.amount; }
+struct EcsAVResDeep { value: i32, added_tick: i32, changed_tick: i32 }
+struct EcsAVResMutDeep { value: i32, added_tick: i32, changed_tick: i32 }
+
+
+// ── ComponentInfo { id } wrapper. ───────────────────────────────────────────────────────────
+struct EcsAVCompInfoDeep { id: i32 }
+fn ecs_av_comp_info_id_deep(r: EcsAVCompInfoDeep) -> i32 { return r.id; }
+fn ecs_av_comp_info_new(id: i32) -> EcsAVCompInfoDeep { return EcsAVCompInfoDeep { id: id }; }
+
+// ── Register wrapper { world, info }. ───────────────────────────────────────────────────────
+struct EcsAVRegisterDeep { world: EcsAVWorldDeep, info: EcsAVCompInfoDeep }
+fn ecs_av_register_world_deep(r: EcsAVRegisterDeep) -> EcsAVWorldDeep { return r.world; }
+fn ecs_av_register_info_deep(r: EcsAVRegisterDeep) -> EcsAVCompInfoDeep { return r.info; }
+
+// ── Spawn wrapper { world, entity }. ─────────────────────────────────────────────────────────
+struct EcsAVSpawnDeep { world: EcsAVWorldDeep, entity: EcsAVEntityDeep }
+fn ecs_av_spawn_world_deep(r: EcsAVSpawnDeep) -> EcsAVWorldDeep { return r.world; }
+fn ecs_av_spawn_entity_deep(r: EcsAVSpawnDeep) -> EcsAVEntityDeep { return r.entity; }
+
+// ── Per-archetype storage: cap-4 component columns x cap-4 entity rows of typed values, plus
+//    `present_mask` per column (i32 bitmask over rows), `row_count`, and a per-row entity id.
+//    `vals0..15` / `added_t0..15` / `changed_t0..15` are flat col*4+row indexed.
+struct EcsAVArchDeep {
+    id: i32,
+    used: i32,
+    kind_v: i32,
+    comp_count: i32,
+    comp_id0: i32, comp_id1: i32, comp_id2: i32, comp_id3: i32,
+    present0: i32, present1: i32, present2: i32, present3: i32,
+    row_count: i32,
+    eid0: i32, eid1: i32, eid2: i32, eid3: i32,
+    vals0: i32, vals1: i32, vals2: i32, vals3: i32, vals4: i32, vals5: i32, vals6: i32, vals7: i32,
+    vals8: i32, vals9: i32, vals10: i32, vals11: i32, vals12: i32, vals13: i32, vals14: i32, vals15: i32,
+    added_t0: i32, added_t1: i32, added_t2: i32, added_t3: i32, added_t4: i32, added_t5: i32, added_t6: i32, added_t7: i32,
+    added_t8: i32, added_t9: i32, added_t10: i32, added_t11: i32, added_t12: i32, added_t13: i32, added_t14: i32, added_t15: i32,
+    changed_t0: i32, changed_t1: i32, changed_t2: i32, changed_t3: i32, changed_t4: i32, changed_t5: i32, changed_t6: i32, changed_t7: i32,
+    changed_t8: i32, changed_t9: i32, changed_t10: i32, changed_t11: i32, changed_t12: i32, changed_t13: i32, changed_t14: i32, changed_t15: i32
+}
+
+fn _ecs_av_arch_empty(id: i32, kind_v: i32) -> EcsAVArchDeep {
+    return EcsAVArchDeep {
+        id: id, used: 0, kind_v: kind_v, comp_count: 0,
+        comp_id0: -1, comp_id1: -1, comp_id2: -1, comp_id3: -1,
+        present0: 0, present1: 0, present2: 0, present3: 0,
+        row_count: 0,
+        eid0: -1, eid1: -1, eid2: -1, eid3: -1,
+        vals0: 0, vals1: 0, vals2: 0, vals3: 0, vals4: 0, vals5: 0, vals6: 0, vals7: 0,
+        vals8: 0, vals9: 0, vals10: 0, vals11: 0, vals12: 0, vals13: 0, vals14: 0, vals15: 0,
+        added_t0: ECS_AV_TICK_NONE, added_t1: ECS_AV_TICK_NONE, added_t2: ECS_AV_TICK_NONE, added_t3: ECS_AV_TICK_NONE, added_t4: ECS_AV_TICK_NONE, added_t5: ECS_AV_TICK_NONE, added_t6: ECS_AV_TICK_NONE, added_t7: ECS_AV_TICK_NONE,
+        added_t8: ECS_AV_TICK_NONE, added_t9: ECS_AV_TICK_NONE, added_t10: ECS_AV_TICK_NONE, added_t11: ECS_AV_TICK_NONE, added_t12: ECS_AV_TICK_NONE, added_t13: ECS_AV_TICK_NONE, added_t14: ECS_AV_TICK_NONE, added_t15: ECS_AV_TICK_NONE,
+        changed_t0: ECS_AV_TICK_NONE, changed_t1: ECS_AV_TICK_NONE, changed_t2: ECS_AV_TICK_NONE, changed_t3: ECS_AV_TICK_NONE, changed_t4: ECS_AV_TICK_NONE, changed_t5: ECS_AV_TICK_NONE, changed_t6: ECS_AV_TICK_NONE, changed_t7: ECS_AV_TICK_NONE,
+        changed_t8: ECS_AV_TICK_NONE, changed_t9: ECS_AV_TICK_NONE, changed_t10: ECS_AV_TICK_NONE, changed_t11: ECS_AV_TICK_NONE, changed_t12: ECS_AV_TICK_NONE, changed_t13: ECS_AV_TICK_NONE, changed_t14: ECS_AV_TICK_NONE, changed_t15: ECS_AV_TICK_NONE
+    };
+}
+
+// ── Per-archetype slot helpers (4-case cascade-of-return). ──────────────────────────────────
+fn _ecs_av_arch_comp_id_at(a: EcsAVArchDeep, col: i32) -> i32 {
+    if col == 0 { return a.comp_id0; };
+    if col == 1 { return a.comp_id1; };
+    if col == 2 { return a.comp_id2; };
+    return a.comp_id3;
+}
+
+fn _ecs_av_arch_set_comp_id(a0: EcsAVArchDeep, col: i32, value: i32) -> EcsAVArchDeep {
+    if col == 0 { a0.comp_id0 = value; return a0; };
+    if col == 1 { a0.comp_id1 = value; return a0; };
+    if col == 2 { a0.comp_id2 = value; return a0; };
+    a0.comp_id3 = value;
+    return a0;
+}
+
+fn _ecs_av_arch_present_at(a: EcsAVArchDeep, col: i32) -> i32 {
+    if col == 0 { return a.present0; };
+    if col == 1 { return a.present1; };
+    if col == 2 { return a.present2; };
+    return a.present3;
+}
+
+fn _ecs_av_arch_set_present(a0: EcsAVArchDeep, col: i32, value: i32) -> EcsAVArchDeep {
+    if col == 0 { a0.present0 = value; return a0; };
+    if col == 1 { a0.present1 = value; return a0; };
+    if col == 2 { a0.present2 = value; return a0; };
+    a0.present3 = value;
+    return a0;
+}
+
+fn _ecs_av_arch_eid_at(a: EcsAVArchDeep, row: i32) -> i32 {
+    if row == 0 { return a.eid0; };
+    if row == 1 { return a.eid1; };
+    if row == 2 { return a.eid2; };
+    return a.eid3;
+}
+
+fn _ecs_av_arch_set_eid(a0: EcsAVArchDeep, row: i32, value: i32) -> EcsAVArchDeep {
+    if row == 0 { a0.eid0 = value; return a0; };
+    if row == 1 { a0.eid1 = value; return a0; };
+    if row == 2 { a0.eid2 = value; return a0; };
+    a0.eid3 = value;
+    return a0;
+}
+
+fn _ecs_av_arch_val_at(a: EcsAVArchDeep, slot: i32) -> i32 {
+    if slot == 0 { return a.vals0; };
+    if slot == 1 { return a.vals1; };
+    if slot == 2 { return a.vals2; };
+    if slot == 3 { return a.vals3; };
+    if slot == 4 { return a.vals4; };
+    if slot == 5 { return a.vals5; };
+    if slot == 6 { return a.vals6; };
+    if slot == 7 { return a.vals7; };
+    if slot == 8 { return a.vals8; };
+    if slot == 9 { return a.vals9; };
+    if slot == 10 { return a.vals10; };
+    if slot == 11 { return a.vals11; };
+    if slot == 12 { return a.vals12; };
+    if slot == 13 { return a.vals13; };
+    if slot == 14 { return a.vals14; };
+    return a.vals15;
+}
+
+fn _ecs_av_arch_set_val(a0: EcsAVArchDeep, slot: i32, value: i32) -> EcsAVArchDeep {
+    if slot == 0 { a0.vals0 = value; return a0; };
+    if slot == 1 { a0.vals1 = value; return a0; };
+    if slot == 2 { a0.vals2 = value; return a0; };
+    if slot == 3 { a0.vals3 = value; return a0; };
+    if slot == 4 { a0.vals4 = value; return a0; };
+    if slot == 5 { a0.vals5 = value; return a0; };
+    if slot == 6 { a0.vals6 = value; return a0; };
+    if slot == 7 { a0.vals7 = value; return a0; };
+    if slot == 8 { a0.vals8 = value; return a0; };
+    if slot == 9 { a0.vals9 = value; return a0; };
+    if slot == 10 { a0.vals10 = value; return a0; };
+    if slot == 11 { a0.vals11 = value; return a0; };
+    if slot == 12 { a0.vals12 = value; return a0; };
+    if slot == 13 { a0.vals13 = value; return a0; };
+    if slot == 14 { a0.vals14 = value; return a0; };
+    a0.vals15 = value;
+    return a0;
+}
+
+fn _ecs_av_arch_added_at(a: EcsAVArchDeep, slot: i32) -> i32 {
+    if slot == 0 { return a.added_t0; };
+    if slot == 1 { return a.added_t1; };
+    if slot == 2 { return a.added_t2; };
+    if slot == 3 { return a.added_t3; };
+    if slot == 4 { return a.added_t4; };
+    if slot == 5 { return a.added_t5; };
+    if slot == 6 { return a.added_t6; };
+    if slot == 7 { return a.added_t7; };
+    if slot == 8 { return a.added_t8; };
+    if slot == 9 { return a.added_t9; };
+    if slot == 10 { return a.added_t10; };
+    if slot == 11 { return a.added_t11; };
+    if slot == 12 { return a.added_t12; };
+    if slot == 13 { return a.added_t13; };
+    if slot == 14 { return a.added_t14; };
+    return a.added_t15;
+}
+
+fn _ecs_av_arch_set_added(a0: EcsAVArchDeep, slot: i32, value: i32) -> EcsAVArchDeep {
+    if slot == 0 { a0.added_t0 = value; return a0; };
+    if slot == 1 { a0.added_t1 = value; return a0; };
+    if slot == 2 { a0.added_t2 = value; return a0; };
+    if slot == 3 { a0.added_t3 = value; return a0; };
+    if slot == 4 { a0.added_t4 = value; return a0; };
+    if slot == 5 { a0.added_t5 = value; return a0; };
+    if slot == 6 { a0.added_t6 = value; return a0; };
+    if slot == 7 { a0.added_t7 = value; return a0; };
+    if slot == 8 { a0.added_t8 = value; return a0; };
+    if slot == 9 { a0.added_t9 = value; return a0; };
+    if slot == 10 { a0.added_t10 = value; return a0; };
+    if slot == 11 { a0.added_t11 = value; return a0; };
+    if slot == 12 { a0.added_t12 = value; return a0; };
+    if slot == 13 { a0.added_t13 = value; return a0; };
+    if slot == 14 { a0.added_t14 = value; return a0; };
+    a0.added_t15 = value;
+    return a0;
+}
+
+fn _ecs_av_arch_changed_at(a: EcsAVArchDeep, slot: i32) -> i32 {
+    if slot == 0 { return a.changed_t0; };
+    if slot == 1 { return a.changed_t1; };
+    if slot == 2 { return a.changed_t2; };
+    if slot == 3 { return a.changed_t3; };
+    if slot == 4 { return a.changed_t4; };
+    if slot == 5 { return a.changed_t5; };
+    if slot == 6 { return a.changed_t6; };
+    if slot == 7 { return a.changed_t7; };
+    if slot == 8 { return a.changed_t8; };
+    if slot == 9 { return a.changed_t9; };
+    if slot == 10 { return a.changed_t10; };
+    if slot == 11 { return a.changed_t11; };
+    if slot == 12 { return a.changed_t12; };
+    if slot == 13 { return a.changed_t13; };
+    if slot == 14 { return a.changed_t14; };
+    return a.changed_t15;
+}
+
+fn _ecs_av_arch_set_changed(a0: EcsAVArchDeep, slot: i32, value: i32) -> EcsAVArchDeep {
+    if slot == 0 { a0.changed_t0 = value; return a0; };
+    if slot == 1 { a0.changed_t1 = value; return a0; };
+    if slot == 2 { a0.changed_t2 = value; return a0; };
+    if slot == 3 { a0.changed_t3 = value; return a0; };
+    if slot == 4 { a0.changed_t4 = value; return a0; };
+    if slot == 5 { a0.changed_t5 = value; return a0; };
+    if slot == 6 { a0.changed_t6 = value; return a0; };
+    if slot == 7 { a0.changed_t7 = value; return a0; };
+    if slot == 8 { a0.changed_t8 = value; return a0; };
+    if slot == 9 { a0.changed_t9 = value; return a0; };
+    if slot == 10 { a0.changed_t10 = value; return a0; };
+    if slot == 11 { a0.changed_t11 = value; return a0; };
+    if slot == 12 { a0.changed_t12 = value; return a0; };
+    if slot == 13 { a0.changed_t13 = value; return a0; };
+    if slot == 14 { a0.changed_t14 = value; return a0; };
+    a0.changed_t15 = value;
+    return a0;
+}
+
+// ── World: cap-4 archetypes, cap-8 entity registry, cap-4 registered component ids, tick,
+//    resource slot, message slot.  Entity location table is (arch_id, row).  Generations and
+//    alive flags are per-entity (cap-8).  Messages form a circular cap-8 buffer with a cursor.
+struct EcsAVWorldDeep {
+    // cap-4 archetype slots.
+    arch_count: i32,
+    arch0: EcsAVArchDeep, arch1: EcsAVArchDeep, arch2: EcsAVArchDeep, arch3: EcsAVArchDeep,
+    // cap-8 entity location/generation/alive.
+    loc_arch0: i32, loc_arch1: i32, loc_arch2: i32, loc_arch3: i32, loc_arch4: i32, loc_arch5: i32, loc_arch6: i32, loc_arch7: i32,
+    loc_row0: i32, loc_row1: i32, loc_row2: i32, loc_row3: i32, loc_row4: i32, loc_row5: i32, loc_row6: i32, loc_row7: i32,
+    gen0: i32, gen1: i32, gen2: i32, gen3: i32, gen4: i32, gen5: i32, gen6: i32, gen7: i32,
+    alive0: i32, alive1: i32, alive2: i32, alive3: i32, alive4: i32, alive5: i32, alive6: i32, alive7: i32,
+    entity_count: i32,
+    // cap-4 registered component ids (id starts at 1; 0 is reserved sentinel for "none").
+    comp_count: i32,
+    reg_id0: i32, reg_id1: i32, reg_id2: i32, reg_id3: i32,
+    reg_kind0: i32, reg_kind1: i32, reg_kind2: i32, reg_kind3: i32,
+    change_tick: i32,
+    // Resource slot (single Time plug).
+    res_has: i32,
+    res_tick: i32,
+    res_added_tick: i32,
+    res_changed_tick: i32,
+    // Message slot (cap-8 circular).
+    msg_head: i32,
+    msg_tail: i32,
+    msg0: i32, msg1: i32, msg2: i32, msg3: i32, msg4: i32, msg5: i32, msg6: i32, msg7: i32,
+    msg_cursor0: i32, msg_cursor1: i32, msg_cursor2: i32, msg_cursor3: i32, msg_cursor4: i32, msg_cursor5: i32, msg_cursor6: i32, msg_cursor7: i32
+}
+
+fn _ecs_av_world_arch_zeros() -> EcsAVArchDeep {
+    return _ecs_av_arch_empty(0, 0);
+}
+
+fn ecs_av_world_deep_new() -> EcsAVWorldDeep {
+    let a0 = _ecs_av_arch_empty(0, 0);
+    return EcsAVWorldDeep {
+        arch_count: 1,
+        arch0: a0, arch1: _ecs_av_arch_empty(1, 0), arch2: _ecs_av_arch_empty(2, 0), arch3: _ecs_av_arch_empty(3, 0),
+        loc_arch0: -1, loc_arch1: -1, loc_arch2: -1, loc_arch3: -1, loc_arch4: -1, loc_arch5: -1, loc_arch6: -1, loc_arch7: -1,
+        loc_row0: -1, loc_row1: -1, loc_row2: -1, loc_row3: -1, loc_row4: -1, loc_row5: -1, loc_row6: -1, loc_row7: -1,
+        gen0: 0, gen1: 0, gen2: 0, gen3: 0, gen4: 0, gen5: 0, gen6: 0, gen7: 0,
+        alive0: 0, alive1: 0, alive2: 0, alive3: 0, alive4: 0, alive5: 0, alive6: 0, alive7: 0,
+        entity_count: 0,
+        comp_count: 0,
+        reg_id0: 0, reg_id1: 0, reg_id2: 0, reg_id3: 0,
+        reg_kind0: 0, reg_kind1: 0, reg_kind2: 0, reg_kind3: 0,
+        change_tick: 0,
+        res_has: 0,
+        res_tick: 0,
+        res_added_tick: 0,
+        res_changed_tick: 0,
+        msg_head: 0, msg_tail: 0,
+        msg0: 0, msg1: 0, msg2: 0, msg3: 0, msg4: 0, msg5: 0, msg6: 0, msg7: 0,
+        msg_cursor0: 0, msg_cursor1: 0, msg_cursor2: 0, msg_cursor3: 0, msg_cursor4: 0, msg_cursor5: 0, msg_cursor6: 0, msg_cursor7: 0
+    };
+}
+
+// ── World archetype (cap-4 slot) accessors. ──────────────────────────────────────────────────
+fn _ecs_av_world_arch_at(w: EcsAVWorldDeep, idx: i32) -> EcsAVArchDeep {
+    if idx == 0 { return w.arch0; };
+    if idx == 1 { return w.arch1; };
+    if idx == 2 { return w.arch2; };
+    return w.arch3;
+}
+
+fn _ecs_av_world_set_arch(w0: EcsAVWorldDeep, idx: i32, arch: EcsAVArchDeep) -> EcsAVWorldDeep {
+    if idx == 0 { w0.arch0 = arch; return w0; };
+    if idx == 1 { w0.arch1 = arch; return w0; };
+    if idx == 2 { w0.arch2 = arch; return w0; };
+    w0.arch3 = arch;
+    return w0;
+}
+
+// ── World entity (cap-8 slot) accessors. ───────────────────────────────────────────────────
+fn _ecs_av_world_gen_at(w: EcsAVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.gen0; };
+    if eid == 1 { return w.gen1; };
+    if eid == 2 { return w.gen2; };
+    if eid == 3 { return w.gen3; };
+    if eid == 4 { return w.gen4; };
+    if eid == 5 { return w.gen5; };
+    if eid == 6 { return w.gen6; };
+    return w.gen7;
+}
+
+fn _ecs_av_world_set_gen(w0: EcsAVWorldDeep, eid: i32, value: i32) -> EcsAVWorldDeep {
+    if eid == 0 { w0.gen0 = value; return w0; };
+    if eid == 1 { w0.gen1 = value; return w0; };
+    if eid == 2 { w0.gen2 = value; return w0; };
+    if eid == 3 { w0.gen3 = value; return w0; };
+    if eid == 4 { w0.gen4 = value; return w0; };
+    if eid == 5 { w0.gen5 = value; return w0; };
+    if eid == 6 { w0.gen6 = value; return w0; };
+    w0.gen7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_alive_at(w: EcsAVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.alive0; };
+    if eid == 1 { return w.alive1; };
+    if eid == 2 { return w.alive2; };
+    if eid == 3 { return w.alive3; };
+    if eid == 4 { return w.alive4; };
+    if eid == 5 { return w.alive5; };
+    if eid == 6 { return w.alive6; };
+    return w.alive7;
+}
+
+fn _ecs_av_world_set_alive(w0: EcsAVWorldDeep, eid: i32, value: i32) -> EcsAVWorldDeep {
+    if eid == 0 { w0.alive0 = value; return w0; };
+    if eid == 1 { w0.alive1 = value; return w0; };
+    if eid == 2 { w0.alive2 = value; return w0; };
+    if eid == 3 { w0.alive3 = value; return w0; };
+    if eid == 4 { w0.alive4 = value; return w0; };
+    if eid == 5 { w0.alive5 = value; return w0; };
+    if eid == 6 { w0.alive6 = value; return w0; };
+    w0.alive7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_loc_arch_at(w: EcsAVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.loc_arch0; };
+    if eid == 1 { return w.loc_arch1; };
+    if eid == 2 { return w.loc_arch2; };
+    if eid == 3 { return w.loc_arch3; };
+    if eid == 4 { return w.loc_arch4; };
+    if eid == 5 { return w.loc_arch5; };
+    if eid == 6 { return w.loc_arch6; };
+    return w.loc_arch7;
+}
+
+fn _ecs_av_world_set_loc_arch(w0: EcsAVWorldDeep, eid: i32, value: i32) -> EcsAVWorldDeep {
+    if eid == 0 { w0.loc_arch0 = value; return w0; };
+    if eid == 1 { w0.loc_arch1 = value; return w0; };
+    if eid == 2 { w0.loc_arch2 = value; return w0; };
+    if eid == 3 { w0.loc_arch3 = value; return w0; };
+    if eid == 4 { w0.loc_arch4 = value; return w0; };
+    if eid == 5 { w0.loc_arch5 = value; return w0; };
+    if eid == 6 { w0.loc_arch6 = value; return w0; };
+    w0.loc_arch7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_loc_row_at(w: EcsAVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.loc_row0; };
+    if eid == 1 { return w.loc_row1; };
+    if eid == 2 { return w.loc_row2; };
+    if eid == 3 { return w.loc_row3; };
+    if eid == 4 { return w.loc_row4; };
+    if eid == 5 { return w.loc_row5; };
+    if eid == 6 { return w.loc_row6; };
+    return w.loc_row7;
+}
+
+fn _ecs_av_world_set_loc_row(w0: EcsAVWorldDeep, eid: i32, value: i32) -> EcsAVWorldDeep {
+    if eid == 0 { w0.loc_row0 = value; return w0; };
+    if eid == 1 { w0.loc_row1 = value; return w0; };
+    if eid == 2 { w0.loc_row2 = value; return w0; };
+    if eid == 3 { w0.loc_row3 = value; return w0; };
+    if eid == 4 { w0.loc_row4 = value; return w0; };
+    if eid == 5 { w0.loc_row5 = value; return w0; };
+    if eid == 6 { w0.loc_row6 = value; return w0; };
+    w0.loc_row7 = value;
+    return w0;
+}
+
+// ── Registered component id (cap-4 slot) accessors. ────────────────────────────────────────
+fn _ecs_av_world_reg_id_at(w: EcsAVWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.reg_id0; };
+    if idx == 1 { return w.reg_id1; };
+    if idx == 2 { return w.reg_id2; };
+    return w.reg_id3;
+}
+
+fn _ecs_av_world_set_reg_id(w0: EcsAVWorldDeep, idx: i32, value: i32) -> EcsAVWorldDeep {
+    if idx == 0 { w0.reg_id0 = value; return w0; };
+    if idx == 1 { w0.reg_id1 = value; return w0; };
+    if idx == 2 { w0.reg_id2 = value; return w0; };
+    w0.reg_id3 = value;
+    return w0;
+}
+
+fn _ecs_av_world_reg_kind_at(w: EcsAVWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.reg_kind0; };
+    if idx == 1 { return w.reg_kind1; };
+    if idx == 2 { return w.reg_kind2; };
+    return w.reg_kind3;
+}
+
+fn _ecs_av_world_set_reg_kind(w0: EcsAVWorldDeep, idx: i32, value: i32) -> EcsAVWorldDeep {
+    if idx == 0 { w0.reg_kind0 = value; return w0; };
+    if idx == 1 { w0.reg_kind1 = value; return w0; };
+    if idx == 2 { w0.reg_kind2 = value; return w0; };
+    w0.reg_kind3 = value;
+    return w0;
+}
+
+// ── Tick + counts. ────────────────────────────────────────────────────────────────────────
+fn ecs_av_world_deep_change_tick(w: EcsAVWorldDeep) -> i32 { return w.change_tick; }
+
+fn ecs_av_world_deep_increment_tick(w0: EcsAVWorldDeep) -> EcsAVWorldDeep {
+    w0.change_tick = w0.change_tick + 1;
+    return w0;
+}
+
+fn ecs_av_world_deep_entity_count(w: EcsAVWorldDeep) -> i32 { return w.entity_count; }
+fn ecs_av_world_deep_archetype_count(w: EcsAVWorldDeep) -> i32 { return w.arch_count; }
+fn ecs_av_world_deep_component_count(w: EcsAVWorldDeep) -> i32 { return w.comp_count; }
+
+// ── Register: allocate a new column id (id starts at 1). Each register also bumps change_tick
+//    so that subsequent inserts see a strictly-greater tick (mirrors the shallow's registry tick
+//    bump).  The `kind_v` distinguishes a table column (1) from a sparse-set column (2); both
+//    surface as a stored value column on the deep's archetype-grouped storage, so the only effect
+//    is reaching `component_count` (cap-4) at which the 5th register silently no-ops.
+fn _ecs_av_world_register(w0: EcsAVWorldDeep, kind_v: i32) -> EcsAVRegisterDeep {
+    if w0.comp_count >= ECS_AV_CAP_COMPONENTS_PER_ARCH {
+        return EcsAVRegisterDeep { world: w0, info: EcsAVCompInfoDeep { id: -1 } };
+    };
+    let new_id = w0.comp_count + 1;
+    let w1 = _ecs_av_world_set_reg_id(w0, w0.comp_count, new_id);
+    let w2 = _ecs_av_world_set_reg_kind(w1, w1.comp_count, kind_v);
+    w2.comp_count = w2.comp_count + 1;
+    w2.change_tick = w2.change_tick + 1;
+    return EcsAVRegisterDeep { world: w2, info: EcsAVCompInfoDeep { id: new_id } };
+}
+
+fn ecs_av_world_deep_register_table(w0: EcsAVWorldDeep) -> EcsAVRegisterDeep {
+    return _ecs_av_world_register(w0, 1);
+}
+
+fn ecs_av_world_deep_register_sparse_set(w0: EcsAVWorldDeep) -> EcsAVRegisterDeep {
+    return _ecs_av_world_register(w0, 2);
+}
+
+// ── Spawn: allocate a free entity id (next sequential slot under cap-8). Place in arch 0 (the
+//    empty archetype) at its next row.  Mirrors shallow spawn which goes into `RegistryArchetypeWorld`
+//    -> arch 0 (no components).  On cap overflow, returns entity { id: -1 } sentinel.
+fn _ecs_av_arch_attach_empty(w0: EcsAVWorldDeep, eid: i32) -> EcsAVWorldDeep {
+    let a = _ecs_av_world_arch_at(w0, 0);
+    if a.row_count >= ECS_AV_CAP_ROWS_PER_ARCH {
+        // The deep aborts spawning here; the outer caller surfaces { id: -1 }.
+        return w0;
+    };
+    let row = a.row_count;
+    let a1 = _ecs_av_arch_set_eid(a, row, eid);
+    a1.row_count = a1.row_count + 1;
+    let w1 = _ecs_av_world_set_arch(w0, 0, a1);
+    let w2 = _ecs_av_world_set_loc_arch(w1, eid, 0);
+    let w3 = _ecs_av_world_set_loc_row(w2, eid, row);
+    return w3;
+}
+
+fn ecs_av_world_deep_spawn(w0: EcsAVWorldDeep) -> EcsAVSpawnDeep {
+    if w0.entity_count >= ECS_AV_CAP_ENTITIES {
+        return EcsAVSpawnDeep { world: w0, entity: EcsAVEntityDeep { id: -1, generation: 0 } };
+    };
+    // The producer constraint is the row cap on the empty archetype 0 (fresh-spawned entities
+    // have no components and so land in arch 0). If arch 0 is full, the spawn fails with id = -1.
+    let arch0 = _ecs_av_world_arch_at(w0, 0);
+    if arch0.row_count >= ECS_AV_CAP_ROWS_PER_ARCH {
+        return EcsAVSpawnDeep { world: w0, entity: EcsAVEntityDeep { id: -1, generation: 0 } };
+    };
+    let eid = w0.entity_count;
+    let w1 = _ecs_av_world_set_alive(w0, eid, 1);
+    let w2 = _ecs_av_arch_attach_empty(w1, eid);
+    w2.entity_count = w2.entity_count + 1;
+    let gen = _ecs_av_world_gen_at(w2, eid);
+    return EcsAVSpawnDeep { world: w2, entity: EcsAVEntityDeep { id: eid, generation: gen } };
+}
+
+// ── Is-alive: look up the alive flag for entity.id (with generation check). ─────────────────
+fn ecs_av_world_deep_is_alive(w: EcsAVWorldDeep, e: EcsAVEntityDeep) -> bool {
+    if e.id < 0 { return false; };
+    if e.id >= ECS_AV_CAP_ENTITIES { return false; };
+    let live = _ecs_av_world_alive_at(w, e.id);
+    if live == 0 { return false; };
+    let g = _ecs_av_world_gen_at(w, e.id);
+    return g == e.generation;
+}
+
+// ── Entity archetype/row helpers (used by query/migrate). ──────────────────────────────────
+fn ecs_av_world_deep_entity_archetype_id(w: EcsAVWorldDeep, e: EcsAVEntityDeep) -> i32 {
+    let live = ecs_av_world_deep_is_alive(w, e);
+    if live == false { return -1; };
+    return _ecs_av_world_loc_arch_at(w, e.id);
+}
+
+fn ecs_av_world_deep_entity_row(w: EcsAVWorldDeep, e: EcsAVEntityDeep) -> i32 {
+    let live = ecs_av_world_deep_is_alive(w, e);
+    if live == false { return -1; };
+    return _ecs_av_world_loc_row_at(w, e.id);
+}
+
+fn ecs_av_world_deep_archetype_entity_count(w: EcsAVWorldDeep, arch_id: i32) -> i32 {
+    if arch_id < 0 { return 0; };
+    if arch_id >= w.arch_count { return 0; };
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    return a.row_count;
+}
+
+// ── Has: search the entity's archetype's column-id list for the requested component; the column
+//    slot must also mark the entity's row present.
+fn _ecs_av_arch_find_col(a: EcsAVArchDeep, comp_id: i32, col: i32) -> i32 {
+    if col >= ECS_AV_CAP_COMPONENTS_PER_ARCH { return -1; };
+    if _ecs_av_arch_comp_id_at(a, col) == comp_id { if col == 0 { return 0; }; return col; };
+    return _ecs_av_arch_find_col(a, comp_id, col + 1);
+}
+
+fn ecs_av_world_deep_has(w: EcsAVWorldDeep, e: EcsAVEntityDeep, comp_id: i32) -> bool {
+    let live = ecs_av_world_deep_is_alive(w, e);
+    if live == false { return false; };
+    let arch_id = _ecs_av_world_loc_arch_at(w, e.id);
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return false; };
+    let presence = _ecs_av_arch_present_at(a, col);
+    if presence == 0 { return false; };
+    return true;
+}
+
+// ── Get: read the typed value at the entity's archetype column for the requested component. ──
+fn ecs_av_world_deep_get(w: EcsAVWorldDeep, e: EcsAVEntityDeep, comp_id: i32) -> EcsAVDataDeep {
+    let live = ecs_av_world_deep_is_alive(w, e);
+    if live == false { return EcsAVDataDeep { amount: 0 }; };
+    let arch_id = _ecs_av_world_loc_arch_at(w, e.id);
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return EcsAVDataDeep { amount: 0 }; };
+    let slot = col * 4 + row;
+    let v = _ecs_av_arch_val_at(a, slot);
+    return EcsAVDataDeep { amount: v };
+}
+
+// ── added_since / changed_since: read the per-entity tick at the loc's archetype column slot. ─
+fn ecs_av_world_deep_added_since(w: EcsAVWorldDeep, e: EcsAVEntityDeep, comp_id: i32, tick: i32) -> bool {
+    let live = ecs_av_world_deep_is_alive(w, e);
+    if live == false { return false; };
+    let arch_id = _ecs_av_world_loc_arch_at(w, e.id);
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return false; };
+    let slot = col * 4 + row;
+    let added_t = _ecs_av_arch_added_at(a, slot);
+    if added_t >= ECS_AV_TICK_NONE - 1 { return false; };
+    return added_t > tick;
+}
+
+fn ecs_av_world_deep_changed_since(w: EcsAVWorldDeep, e: EcsAVEntityDeep, comp_id: i32, tick: i32) -> bool {
+    let live = ecs_av_world_deep_is_alive(w, e);
+    if live == false { return false; };
+    let arch_id = _ecs_av_world_loc_arch_at(w, e.id);
+    let row = _ecs_av_world_loc_row_at(w, e.id);
+    let a = _ecs_av_world_arch_at(w, arch_id);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return false; };
+    let slot = col * 4 + row;
+    let changed_t = _ecs_av_arch_changed_at(a, slot);
+    if changed_t >= ECS_AV_TICK_NONE - 1 { return false; };
+    return changed_t > tick;
+}
+
+// ── Signature accumulator: collects (comp_id, slot, value, added, changed) for the entity's
+//    PRE-current-op columns. `slot` denotes the slot in the old archetype being migrated from;
+//    the migration helpers read components out of their old archetype through `slot = col*4 + row`.
+struct EcsAVSigAcc {
+    count: i32,
+    cid0: i32, cid1: i32, cid2: i32, cid3: i32,
+    slot0: i32, slot1: i32, slot2: i32, slot3: i32,
+    val0: i32, val1: i32, val2: i32, val3: i32,
+    added0: i32, added1: i32, added2: i32, added3: i32,
+    changed0: i32, changed1: i32, changed2: i32, changed3: i32
+}
+
+fn _ecs_av_sig_empty() -> EcsAVSigAcc {
+    return EcsAVSigAcc {
+        count: 0,
+        cid0: -1, cid1: -1, cid2: -1, cid3: -1,
+        slot0: -1, slot1: -1, slot2: -1, slot3: -1,
+        val0: 0, val1: 0, val2: 0, val3: 0,
+        added0: ECS_AV_TICK_NONE, added1: ECS_AV_TICK_NONE, added2: ECS_AV_TICK_NONE, added3: ECS_AV_TICK_NONE,
+        changed0: ECS_AV_TICK_NONE, changed1: ECS_AV_TICK_NONE, changed2: ECS_AV_TICK_NONE, changed3: ECS_AV_TICK_NONE
+    };
+}
+
+fn _ecs_av_sig_at_cid(acc: EcsAVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.cid0; };
+    if idx == 1 { return acc.cid1; };
+    if idx == 2 { return acc.cid2; };
+    return acc.cid3;
+}
+
+fn _ecs_av_sig_at_slot(acc: EcsAVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.slot0; };
+    if idx == 1 { return acc.slot1; };
+    if idx == 2 { return acc.slot2; };
+    return acc.slot3;
+}
+
+fn _ecs_av_sig_at_val(acc: EcsAVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.val0; };
+    if idx == 1 { return acc.val1; };
+    if idx == 2 { return acc.val2; };
+    return acc.val3;
+}
+
+fn _ecs_av_sig_at_added(acc: EcsAVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.added0; };
+    if idx == 1 { return acc.added1; };
+    if idx == 2 { return acc.added2; };
+    return acc.added3;
+}
+
+fn _ecs_av_sig_at_changed(acc: EcsAVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.changed0; };
+    if idx == 1 { return acc.changed1; };
+    if idx == 2 { return acc.changed2; };
+    return acc.changed3;
+}
+
+fn _ecs_av_sig_push(acc0: EcsAVSigAcc, k: i32, cid: i32, slot: i32, val: i32, added: i32, changed: i32) -> EcsAVSigAcc {
+    if k == 0 { acc0.cid0 = cid; acc0.slot0 = slot; acc0.val0 = val; acc0.added0 = added; acc0.changed0 = changed; acc0.count = acc0.count + 1; return acc0; };
+    if k == 1 { acc0.cid1 = cid; acc0.slot1 = slot; acc0.val1 = val; acc0.added1 = added; acc0.changed1 = changed; acc0.count = acc0.count + 1; return acc0; };
+    if k == 2 { acc0.cid2 = cid; acc0.slot2 = slot; acc0.val2 = val; acc0.added2 = added; acc0.changed2 = changed; acc0.count = acc0.count + 1; return acc0; };
+    acc0.cid3 = cid; acc0.slot3 = slot; acc0.val3 = val; acc0.added3 = added; acc0.changed3 = changed; acc0.count = acc0.count + 1;
+    return acc0;
+}
+
+// Collect the entity's present (comp_id, slot, val, added, changed) signature from its archetype.
+fn _ecs_av_arch_collect_sig(w: EcsAVWorldDeep, a: EcsAVArchDeep, eid: i32, row: i32, col: i32, acc0: EcsAVSigAcc) -> EcsAVSigAcc {
+    if col >= ECS_AV_CAP_COMPONENTS_PER_ARCH { return acc0; };
+    let presence = _ecs_av_arch_present_at(a, col);
+    if presence == 0 {
+        return _ecs_av_arch_collect_sig(w, a, eid, row, col + 1, acc0);
+    };
+    let cid = _ecs_av_arch_comp_id_at(a, col);
+    let slot = col * 4 + row;
+    let v = _ecs_av_arch_val_at(a, slot);
+    let added_t = _ecs_av_arch_added_at(a, slot);
+    let changed_t = _ecs_av_arch_changed_at(a, slot);
+    let acc1 = _ecs_av_sig_push(acc0, acc0.count, cid, slot, v, added_t, changed_t);
+    return _ecs_av_arch_collect_sig(w, a, eid, row, col + 1, acc1);
+}
+
+// Build the target signature for an insert: copy the current sig; if the new cid was already
+// present, replace its (val, changed) with the new (value, tick); otherwise append the new
+// (cid, value, tick, tick) entry.
+fn _ecs_av_build_insert_sig(src: EcsAVSigAcc, new_cid: i32, new_val: i32, new_tick: i32, was_present: bool) -> EcsAVSigAcc {
+    if was_present == true { return _ecs_av_copy_sig_replace(src, new_cid, new_val, new_tick); };
+    return _ecs_av_copy_sig_and_append(src, new_cid, new_val, new_tick);
+}
+
+fn _ecs_av_copy_sig_replace(src: EcsAVSigAcc, new_cid: i32, new_val: i32, new_tick: i32) -> EcsAVSigAcc {
+    let dst = _ecs_av_sig_empty();
+    return _ecs_av_copy_sig_replace_scan(src, dst, 0, new_cid, new_val, new_tick);
+}
+
+fn _ecs_av_copy_sig_replace_scan(src0: EcsAVSigAcc, dst0: EcsAVSigAcc, idx: i32, new_cid: i32, new_val: i32, new_tick: i32) -> EcsAVSigAcc {
+    if idx >= src0.count { return dst0; };
+    let cid = _ecs_av_sig_at_cid(src0, idx);
+    let slot = _ecs_av_sig_at_slot(src0, idx);
+    let v = _ecs_av_sig_at_val(src0, idx);
+    let added_t = _ecs_av_sig_at_added(src0, idx);
+    let changed_t = _ecs_av_sig_at_changed(src0, idx);
+    if cid == new_cid {
+        let dst1 = _ecs_av_sig_push(dst0, dst0.count, cid, slot, new_val, added_t, new_tick);
+        return _ecs_av_copy_sig_replace_scan(src0, dst1, idx + 1, new_cid, new_val, new_tick);
+    };
+    let dst1 = _ecs_av_sig_push(dst0, dst0.count, cid, slot, v, added_t, changed_t);
+    return _ecs_av_copy_sig_replace_scan(src0, dst1, idx + 1, new_cid, new_val, new_tick);
+}
+
+fn _ecs_av_copy_sig_and_append(src: EcsAVSigAcc, new_cid: i32, new_val: i32, new_tick: i32) -> EcsAVSigAcc {
+    let dst = _ecs_av_sig_empty();
+    let dst1 = _ecs_av_copy_sig_scan(src, dst, 0);
+    let dst2 = _ecs_av_sig_push(dst1, dst1.count, new_cid, -1, new_val, new_tick, new_tick);
+    return dst2;
+}
+
+fn _ecs_av_copy_sig_scan(src0: EcsAVSigAcc, dst0: EcsAVSigAcc, idx: i32) -> EcsAVSigAcc {
+    if idx >= src0.count { return dst0; };
+    let cid = _ecs_av_sig_at_cid(src0, idx);
+    let slot = _ecs_av_sig_at_slot(src0, idx);
+    let v = _ecs_av_sig_at_val(src0, idx);
+    let added_t = _ecs_av_sig_at_added(src0, idx);
+    let changed_t = _ecs_av_sig_at_changed(src0, idx);
+    let dst1 = _ecs_av_sig_push(dst0, dst0.count, cid, slot, v, added_t, changed_t);
+    return _ecs_av_copy_sig_scan(src0, dst1, idx + 1);
+}
+
+// ── Signature match: every component in the sig has a corresponding column id in the archetype.
+//    We compare against the archetype's `comp_count` columns (the rest are unused/-1).
+fn _ecs_av_arch_comp_id_contains(a: EcsAVArchDeep, cid: i32, idx: i32) -> bool {
+    if idx >= ECS_AV_CAP_COMPONENTS_PER_ARCH { return false; };
+    let has = _ecs_av_arch_comp_id_at(a, idx);
+    if has == cid { return true; };
+    return _ecs_av_arch_comp_id_contains(a, cid, idx + 1);
+}
+
+fn _ecs_av_sig_match_arch(sig: EcsAVSigAcc, a: EcsAVArchDeep, sig_idx: i32) -> bool {
+    if sig_idx >= sig.count { return true; };
+    let cid = _ecs_av_sig_at_cid(sig, sig_idx);
+    if _ecs_av_arch_comp_id_contains(a, cid, 0) == false { return false; };
+    return _ecs_av_sig_match_arch(sig, a, sig_idx + 1);
+}
+
+fn _ecs_av_find_arch_for_sig(w: EcsAVWorldDeep, sig: EcsAVSigAcc, k: i32) -> i32 {
+    if k >= w.arch_count { return -1; };
+    let a = _ecs_av_world_arch_at(w, k);
+    if a.comp_count == sig.count {
+        if _ecs_av_sig_match_arch(sig, a, 0) == true { return k; };
+    };
+    return _ecs_av_find_arch_for_sig(w, sig, k + 1);
+}
+
+// ── Create a fresh archetype for the sig: set `comp_id{0..3}` from the sig's cids,
+//    mark `comp_count == sig.count` (and the new `used` flag), increment `world.arch_count`.
+fn _ecs_av_create_arch_for_sig(w0: EcsAVWorldDeep, sig: EcsAVSigAcc) -> (EcsAVWorldDeep, i32) {
+    if w0.arch_count >= ECS_AV_CAP_ARCH {
+        return (w0, -1);
+    };
+    let new_id = w0.arch_count;
+    let a = _ecs_av_arch_empty(new_id, 0);
+    let a1 = _ecs_av_arch_set_comp_id_from_sig(a, sig, 0);
+    a1.comp_count = sig.count;
+    a1.used = 1;
+    let w1 = _ecs_av_world_set_arch(w0, new_id, a1);
+    w1.arch_count = w1.arch_count + 1;
+    return (w1, new_id);
+}
+
+fn _ecs_av_arch_set_comp_id_from_sig(a0: EcsAVArchDeep, sig: EcsAVSigAcc, idx: i32) -> EcsAVArchDeep {
+    if idx >= sig.count { return a0; };
+    let cid = _ecs_av_sig_at_cid(sig, idx);
+    let a1 = _ecs_av_arch_set_comp_id(a0, idx, cid);
+    return _ecs_av_arch_set_comp_id_from_sig(a1, sig, idx + 1);
+}
+
+// ── Attach: allocate a new row in `arch`'s target archetype. For each sig entry, locate the
+//    target col in the new archetype (matching cid), write the deferrable typed value (added
+//    and changed for new components are written by the caller), then update the row's entity id.
+fn _ecs_av_attach_row(w0: EcsAVWorldDeep, arch_id: i32, eid: i32, sig: EcsAVSigAcc) -> EcsAVWorldDeep {
+    let a = _ecs_av_world_arch_at(w0, arch_id);
+    if a.row_count >= ECS_AV_CAP_ROWS_PER_ARCH { return w0; };
+    let row = a.row_count;
+    let a1 = _ecs_av_arch_set_eid(a, row, eid);
+    let a2 = _ecs_av_attach_row_fill(a1, sig, row, 0);
+    a2.row_count = a2.row_count + 1;
+    let w1 = _ecs_av_world_set_arch(w0, arch_id, a2);
+    let w2 = _ecs_av_world_set_loc_arch(w1, eid, arch_id);
+    let w3 = _ecs_av_world_set_loc_row(w2, eid, row);
+    return w3;
+}
+
+fn _ecs_av_attach_row_fill(a0: EcsAVArchDeep, sig: EcsAVSigAcc, row: i32, sig_idx: i32) -> EcsAVArchDeep {
+    if sig_idx >= sig.count { return a0; };
+    let cid = _ecs_av_sig_at_cid(sig, sig_idx);
+    let col = _ecs_av_arch_find_col(a0, cid, 0);
+    if col < 0 { return _ecs_av_attach_row_fill(a0, sig, row, sig_idx + 1); };
+    let slot = col * 4 + row;
+    let v = _ecs_av_sig_at_val(sig, sig_idx);
+    let added_t = _ecs_av_sig_at_added(sig, sig_idx);
+    let changed_t = _ecs_av_sig_at_changed(sig, sig_idx);
+    let a1 = _ecs_av_arch_set_val(a0, slot, v);
+    let a2 = _ecs_av_arch_set_added(a1, slot, added_t);
+    let a3 = _ecs_av_arch_set_changed(a2, slot, changed_t);
+    let presence = _ecs_av_arch_present_at(a3, col);
+    let a4 = _ecs_av_arch_set_present(a3, col, presence + 1);
+    return _ecs_av_attach_row_fill(a4, sig, row, sig_idx + 1);
+}
+
+// ── Detach: swap-remove the entity's row from `arch_id`. If the row is the last, just decrement
+//    `row_count`; else copy the last row's (eid, vals, added, changed) into the departed row,
+//    update the moved entity's loc_row, then decrement. Also clears the departed row's slot data
+//    (present mask is decremented per column that had presence).
+fn _ecs_av_world_set_loc_row_for_eid(w0: EcsAVWorldDeep, eid: i32, value: i32) -> EcsAVWorldDeep {
+    return _ecs_av_world_set_loc_row(w0, eid, value);
+}
+
+fn _ecs_av_detach_row(w0: EcsAVWorldDeep, arch_id: i32, eid: i32, row: i32) -> EcsAVWorldDeep {
+    let a = _ecs_av_world_arch_at(w0, arch_id);
+    if a.row_count <= 0 { return w0; };
+    let last = a.row_count - 1;
+    if row != last {
+        let a1 = _ecs_av_detach_row_copy_cols(a, row, last, 0);
+        let moved_eid = _ecs_av_arch_eid_at(a1, last);
+        a1.row_count = a1.row_count - 1;
+        let w1 = _ecs_av_world_set_arch(w0, arch_id, a1);
+        let w2 = _ecs_av_world_set_loc_row_for_eid(w1, moved_eid, row);
+        return w2;
+    };
+    // Row is the last: just clear presence per-col (none) and decrement row_count.
+    a.row_count = a.row_count - 1;
+    let w1 = _ecs_av_world_set_arch(w0, arch_id, a);
+    return w1;
+}
+
+fn _ecs_av_detach_row_copy_cols(a0: EcsAVArchDeep, row: i32, last: i32, col: i32) -> EcsAVArchDeep {
+    if col >= ECS_AV_CAP_COMPONENTS_PER_ARCH {
+        // copy the eid so the moved row takes the departed slot's entity id
+        let moved_eid = _ecs_av_arch_eid_at(a0, last);
+        let a1 = _ecs_av_arch_set_eid(a0, row, moved_eid);
+        return a1;
+    };
+    let presence = _ecs_av_arch_present_at(a0, col);
+    if presence == 0 { return _ecs_av_detach_row_copy_cols(a0, row, last, col + 1); };
+    let src_slot = col * 4 + last;
+    let dst_slot = col * 4 + row;
+    let v = _ecs_av_arch_val_at(a0, src_slot);
+    let added_t = _ecs_av_arch_added_at(a0, src_slot);
+    let changed_t = _ecs_av_arch_changed_at(a0, src_slot);
+    let a1 = _ecs_av_arch_set_val(a0, dst_slot, v);
+    let a2 = _ecs_av_arch_set_added(a1, dst_slot, added_t);
+    let a3 = _ecs_av_arch_set_changed(a2, dst_slot, changed_t);
+    // Clear the source row's slot for cleanliness.
+    let a4 = _ecs_av_arch_set_val(a3, src_slot, 0);
+    let a5 = _ecs_av_arch_set_added(a4, src_slot, ECS_AV_TICK_NONE);
+    let a6 = _ecs_av_arch_set_changed(a5, src_slot, ECS_AV_TICK_NONE);
+    return _ecs_av_detach_row_copy_cols(a6, row, last, col + 1);
+}
+
+// ── Insert.  Migrates the entity's archetype by:
+//    1. Building the entity's signature from its CURRENT archetype's present columns.
+//    2. Building the target signature (replace in-place if the comp was present; else append).
+//    3. Locating (or creating) the target archetype that stores exactly that signature.
+//    4. Detaching the entity's row from its old archetype, attaching it to the new one.
+//
+//    If `had_component`, the replace path updates the existing column's value to `value.amount`
+//    and bumps `changed_t` to the current change_tick (the added_t is preserved).  If NOT
+//    `had_component`, the append path gives the new comp both added_t and changed_t equal to the
+//    current tick.
+fn ecs_av_world_deep_insert(w0: EcsAVWorldDeep, e: EcsAVEntityDeep, comp_id: i32, value: EcsAVDataDeep) -> EcsAVWorldDeep {
+    let live = ecs_av_world_deep_is_alive(w0, e);
+    if live == false { return w0; };
+    if _ecs_av_world_has_reg(w0, comp_id) == false { return w0; };
+    let tick = w0.change_tick;
+    let old_arch_id = _ecs_av_world_loc_arch_at(w0, e.id);
+    let old_row = _ecs_av_world_loc_row_at(w0, e.id);
+    let old_arch = _ecs_av_world_arch_at(w0, old_arch_id);
+    let cur_sig = _ecs_av_arch_collect_sig(w0, old_arch, e.id, old_row, 0, _ecs_av_sig_empty());
+    let was_present = _ecs_av_sig_contains_cid(cur_sig, comp_id, 0);
+    let target_sig = _ecs_av_build_insert_sig(cur_sig, comp_id, value.amount, tick, was_present);
+    if was_present == true {
+        let a1 = _ecs_av_arch_replace_in_place(old_arch, target_sig, comp_id, old_row, 0);
+        return _ecs_av_world_set_arch(w0, old_arch_id, a1);
+    };
+    let target_arch_id = _ecs_av_find_arch_for_sig(w0, target_sig, 0);
+    if target_arch_id < 0 {
+        let (w1, new_arch_id) = _ecs_av_create_arch_for_sig(w0, target_sig);
+        if new_arch_id < 0 { return w1; };
+        let w2 = _ecs_av_attach_row(w1, new_arch_id, e.id, target_sig);
+        let w3 = _ecs_av_detach_row(w2, old_arch_id, e.id, old_row);
+        return w3;
+    };
+    let w1 = _ecs_av_attach_row(w0, target_arch_id, e.id, target_sig);
+    let w2 = _ecs_av_detach_row(w1, old_arch_id, e.id, old_row);
+    return w2;
+}
+
+fn _ecs_av_sig_contains_cid(sig: EcsAVSigAcc, cid: i32, idx: i32) -> bool {
+    if idx >= sig.count { return false; };
+    if _ecs_av_sig_at_cid(sig, idx) == cid { return true; };
+    return _ecs_av_sig_contains_cid(sig, cid, idx + 1);
+}
+fn _ecs_av_arch_replace_in_place(a0: EcsAVArchDeep, sig: EcsAVSigAcc, cid: i32, row: i32, idx: i32) -> EcsAVArchDeep {
+    if idx >= sig.count { return a0; };
+    let s_cid = _ecs_av_sig_at_cid(sig, idx);
+    if s_cid == cid {
+        let col = _ecs_av_arch_find_col(a0, cid, 0);
+        if col >= 0 {
+            let slot = col * 4 + row;
+            let a1 = _ecs_av_arch_set_val(a0, slot, _ecs_av_sig_at_val(sig, idx));
+            let a2 = _ecs_av_arch_set_changed(a1, slot, _ecs_av_sig_at_changed(sig, idx));
+            return a2;
+        };
+    };
+    return _ecs_av_arch_replace_in_place(a0, sig, cid, row, idx + 1);
+}
+
+// ── Remove.  The target signature drops the cid the test asked to remove; the entity migrates to
+//    the archetype that stores exactly that reduced signature (creating one if necessary).
+fn _ecs_av_build_remove_sig(src: EcsAVSigAcc, remove_cid: i32) -> EcsAVSigAcc {
+    let dst = _ecs_av_sig_empty();
+    return _ecs_av_build_remove_sig_scan(src, dst, remove_cid, 0);
+}
+
+fn _ecs_av_build_remove_sig_scan(src: EcsAVSigAcc, dst0: EcsAVSigAcc, remove_cid: i32, idx: i32) -> EcsAVSigAcc {
+    if idx >= src.count { return dst0; };
+    let cid = _ecs_av_sig_at_cid(src, idx);
+    if cid == remove_cid {
+        return _ecs_av_build_remove_sig_scan(src, dst0, remove_cid, idx + 1);
+    };
+    let slot = _ecs_av_sig_at_slot(src, idx);
+    let v = _ecs_av_sig_at_val(src, idx);
+    let added_t = _ecs_av_sig_at_added(src, idx);
+    let changed_t = _ecs_av_sig_at_changed(src, idx);
+    let dst1 = _ecs_av_sig_push(dst0, dst0.count, cid, slot, v, added_t, changed_t);
+    return _ecs_av_build_remove_sig_scan(src, dst1, remove_cid, idx + 1);
+}
+
+fn ecs_av_world_deep_remove(w0: EcsAVWorldDeep, e: EcsAVEntityDeep, comp_id: i32) -> EcsAVWorldDeep {
+    let live = ecs_av_world_deep_is_alive(w0, e);
+    if live == false { return w0; };
+    if ecs_av_world_deep_has(w0, e, comp_id) == false { return w0; };
+    let old_arch_id = _ecs_av_world_loc_arch_at(w0, e.id);
+    let old_row = _ecs_av_world_loc_row_at(w0, e.id);
+    let old_arch = _ecs_av_world_arch_at(w0, old_arch_id);
+    let cur_sig = _ecs_av_arch_collect_sig(w0, old_arch, e.id, old_row, 0, _ecs_av_sig_empty());
+    let target_sig = _ecs_av_build_remove_sig(cur_sig, comp_id);
+    let target_arch_id = _ecs_av_find_arch_for_sig(w0, target_sig, 0);
+    if target_arch_id < 0 {
+        let (w1, new_arch_id) = _ecs_av_create_arch_for_sig(w0, target_sig);
+        if new_arch_id < 0 { return w1; };
+        let w2 = _ecs_av_attach_row(w1, new_arch_id, e.id, target_sig);
+        let w3 = _ecs_av_detach_row(w2, old_arch_id, e.id, old_row);
+        return w3;
+    };
+    if target_arch_id == old_arch_id { return w0; };
+    let w1 = _ecs_av_attach_row(w0, target_arch_id, e.id, target_sig);
+    let w2 = _ecs_av_detach_row(w1, old_arch_id, e.id, old_row);
+    return w2;
+}
+
+// ── Despawn. alive=0, gen+1, entity_count--. Detach the entity's row from its archetype.
+fn ecs_av_world_deep_despawn(w0: EcsAVWorldDeep, e: EcsAVEntityDeep) -> EcsAVWorldDeep {
+    let live = ecs_av_world_deep_is_alive(w0, e);
+    if live == false { return w0; };
+    let arch_id = _ecs_av_world_loc_arch_at(w0, e.id);
+    let row = _ecs_av_world_loc_row_at(w0, e.id);
+    let w1 = _ecs_av_detach_row(w0, arch_id, e.id, row);
+    let w2 = _ecs_av_world_set_alive(w1, e.id, 0);
+    let g = _ecs_av_world_gen_at(w2, e.id);
+    let w3 = _ecs_av_world_set_gen(w2, e.id, g + 1);
+    let w4 = _ecs_av_world_set_loc_arch(w3, e.id, -1);
+    let w5 = _ecs_av_world_set_loc_row(w4, e.id, -1);
+    w5.entity_count = w5.entity_count - 1;
+    return w5;
+}
+
+// ── helper: is `cid` registered on this world? ─────────────────────────────────────────────
+fn _ecs_av_world_has_reg(w: EcsAVWorldDeep, cid: i32) -> bool {
+    return _ecs_av_world_reg_scan(w, cid, 0, w.comp_count);
+}
+
+fn _ecs_av_world_reg_scan(w: EcsAVWorldDeep, cid: i32, idx: i32, cnt: i32) -> bool {
+    if idx >= cnt { return false; };
+    if _ecs_av_world_reg_id_at(w, idx) == cid { return true; };
+    return _ecs_av_world_reg_scan(w, cid, idx + 1, cnt);
+}
+
+// ── Resource + message slots (single typed plug for ArchetypeValueTime / ArchetypeValueEvent). ──
+fn ecs_av_world_deep_insert_resource(w0: EcsAVWorldDeep, value: EcsAVTimeDeep) -> EcsAVWorldDeep {
+    let was_present = w0.res_has;
+    if was_present == 0 {
+        w0.res_added_tick = w0.change_tick;
+    };
+    w0.res_tick = value.tick;
+    w0.res_changed_tick = w0.change_tick;
+    w0.res_has = 1;
+    return w0;
+}
+
+fn ecs_av_world_deep_get_resource(w: EcsAVWorldDeep) -> EcsAVTimeDeep {
+    return EcsAVTimeDeep { tick: w.res_tick };
+}
+
+fn ecs_av_world_deep_has_resource(w: EcsAVWorldDeep) -> bool {
+    return w.res_has == 1;
+}
+
+fn ecs_av_world_deep_res(w: EcsAVWorldDeep) -> EcsAVResDeep {
+    return EcsAVResDeep { value: w.res_tick, added_tick: w.res_added_tick, changed_tick: w.res_changed_tick };
+}
+
+fn ecs_av_resdeep_value(r: EcsAVResDeep) -> i32 { return r.value; }
+fn ecs_av_resdeep_added(r: EcsAVResDeep) -> i32 { return r.added_tick; }
+fn ecs_av_resdeep_changed(r: EcsAVResDeep) -> i32 { return r.changed_tick; }
+fn ecs_av_resdeep_is_added_since(r: EcsAVResDeep, tick: i32) -> bool { return r.added_tick > tick; }
+fn ecs_av_resdeep_is_changed_since(r: EcsAVResDeep, tick: i32) -> bool { return r.changed_tick > tick; }
+
+fn ecs_av_world_deep_res_mut(w: EcsAVWorldDeep) -> EcsAVResMutDeep {
+    return EcsAVResMutDeep { value: w.res_tick, added_tick: w.res_added_tick, changed_tick: w.res_changed_tick };
+}
+
+fn ecs_av_resmut_value(r: EcsAVResMutDeep) -> i32 { return r.value; }
+fn ecs_av_resmut_added(r: EcsAVResMutDeep) -> i32 { return r.added_tick; }
+fn ecs_av_resmut_changed(r: EcsAVResMutDeep) -> i32 { return r.changed_tick; }
+fn ecs_av_resmut_is_added_since(r: EcsAVResMutDeep, tick: i32) -> bool { return r.added_tick > tick; }
+fn ecs_av_resmut_is_changed_since(r: EcsAVResMutDeep, tick: i32) -> bool { return r.changed_tick > tick; }
+
+fn ecs_av_world_deep_resource_added_since(w: EcsAVWorldDeep, tick: i32) -> bool {
+    if w.res_has == 0 { return false; };
+    return w.res_added_tick > tick;
+}
+
+fn ecs_av_world_deep_resource_changed_since(w: EcsAVWorldDeep, tick: i32) -> bool {
+    if w.res_has == 0 { return false; };
+    return w.res_changed_tick > tick;
+}
+
+fn ecs_av_world_deep_res_mut_write(w0: EcsAVWorldDeep, res: EcsAVResMutDeep, value: EcsAVTimeDeep) -> EcsAVWorldDeep {
+    if w0.res_has == 0 { return w0; };
+    w0.res_tick = value.tick;
+    w0.res_changed_tick = w0.change_tick;
+    return w0;
+}
+
+fn ecs_av_world_deep_remove_resource(w0: EcsAVWorldDeep) -> EcsAVWorldDeep {
+    w0.res_has = 0;
+    w0.res_tick = 0;
+    w0.res_added_tick = 0;
+    w0.res_changed_tick = 0;
+    return w0;
+}
+
+// ── Message slot (circular). write appends at tail, read takes the next from head and advances
+//    the reader's cursor (we keep a single sentinel `cursor` per reader; reads track position).
+fn ecs_av_world_deep_write_message(w0: EcsAVWorldDeep, value: EcsAVEventDeep) -> EcsAVWorldDeep {
+    let tail = w0.msg_tail;
+    if tail >= ECS_AV_CAP_MESSAGES {
+        // Cycle back to 0 — the buffer is full-forgotten, not error.
+        return w0;
+    };
+    let w1 = _ecs_av_world_set_msg(w0, tail, value.amount);
+    w1.msg_tail = tail + 1;
+    return w1;
+}
+
+fn _ecs_av_world_set_msg(w0: EcsAVWorldDeep, idx: i32, value: i32) -> EcsAVWorldDeep {
+    if idx == 0 { w0.msg0 = value; return w0; };
+    if idx == 1 { w0.msg1 = value; return w0; };
+    if idx == 2 { w0.msg2 = value; return w0; };
+    if idx == 3 { w0.msg3 = value; return w0; };
+    if idx == 4 { w0.msg4 = value; return w0; };
+    if idx == 5 { w0.msg5 = value; return w0; };
+    if idx == 6 { w0.msg6 = value; return w0; };
+    w0.msg7 = value;
+    return w0;
+}
+
+fn _ecs_av_world_msg_at(w: EcsAVWorldDeep, idx: i32) -> i32 {
+    if idx == 0 { return w.msg0; };
+    if idx == 1 { return w.msg1; };
+    if idx == 2 { return w.msg2; };
+    if idx == 3 { return w.msg3; };
+    if idx == 4 { return w.msg4; };
+    if idx == 5 { return w.msg5; };
+    if idx == 6 { return w.msg6; };
+    return w.msg7;
+}
+
+struct EcsAVReadDeep { has_value: bool, value: EcsAVEventDeep, cursor: i32 }
+fn ecs_av_read_has_value(r: EcsAVReadDeep) -> bool { return r.has_value; }
+fn ecs_av_read_value(r: EcsAVReadDeep) -> EcsAVEventDeep { return r.value; }
+fn ecs_av_read_amount(r: EcsAVReadDeep) -> i32 { return r.value.amount; }
+fn ecs_av_read_cursor(r: EcsAVReadDeep) -> i32 { return r.cursor; }
+
+fn ecs_av_world_deep_read_message(w: EcsAVWorldDeep, cursor: i32, default_value: EcsAVEventDeep) -> EcsAVReadDeep {
+    if cursor >= w.msg_tail {
+        return EcsAVReadDeep { has_value: false, value: default_value, cursor: cursor };
+    };
+    let amt = _ecs_av_world_msg_at(w, cursor);
+    return EcsAVReadDeep { has_value: true, value: EcsAVEventDeep { amount: amt }, cursor: cursor + 1 };
+}
+
+// ── Query result wrapper.  cap-8 paired (entity, value) slots. Mirrors shallow Query<EntityItem<T>>. ─
+struct EcsAVEntityItemDeep { entity: EcsAVEntityDeep, value: EcsAVDataDeep }
+fn ecs_av_entity_item_entity(r: EcsAVEntityItemDeep) -> EcsAVEntityDeep { return r.entity; }
+fn ecs_av_entity_item_value(r: EcsAVEntityItemDeep) -> EcsAVDataDeep { return r.value; }
+fn ecs_av_entity_item_amount(r: EcsAVEntityItemDeep) -> i32 { return r.value.amount; }
+
+struct EcsAVQueryDeep {
+    count: i32,
+    entity0: EcsAVEntityDeep, entity1: EcsAVEntityDeep, entity2: EcsAVEntityDeep, entity3: EcsAVEntityDeep,
+    entity4: EcsAVEntityDeep, entity5: EcsAVEntityDeep, entity6: EcsAVEntityDeep, entity7: EcsAVEntityDeep,
+    amount0: i32, amount1: i32, amount2: i32, amount3: i32, amount4: i32, amount5: i32, amount6: i32, amount7: i32
+}
+
+fn _ecs_av_query_empty() -> EcsAVQueryDeep {
+    return EcsAVQueryDeep {
+        count: 0,
+        entity0: EcsAVEntityDeep { id: -1, generation: 0 }, entity1: EcsAVEntityDeep { id: -1, generation: 0 }, entity2: EcsAVEntityDeep { id: -1, generation: 0 }, entity3: EcsAVEntityDeep { id: -1, generation: 0 },
+        entity4: EcsAVEntityDeep { id: -1, generation: 0 }, entity5: EcsAVEntityDeep { id: -1, generation: 0 }, entity6: EcsAVEntityDeep { id: -1, generation: 0 }, entity7: EcsAVEntityDeep { id: -1, generation: 0 },
+        amount0: 0, amount1: 0, amount2: 0, amount3: 0, amount4: 0, amount5: 0, amount6: 0, amount7: 0
+    };
+}
+
+fn ecs_av_query_deep_count(r: EcsAVQueryDeep) -> i32 { return r.count; }
+
+fn ecs_av_query_deep_at(r: EcsAVQueryDeep, idx: i32) -> EcsAVEntityItemDeep {
+    if idx == 0 { return EcsAVEntityItemDeep { entity: r.entity0, value: EcsAVDataDeep { amount: r.amount0 } }; };
+    if idx == 1 { return EcsAVEntityItemDeep { entity: r.entity1, value: EcsAVDataDeep { amount: r.amount1 } }; };
+    if idx == 2 { return EcsAVEntityItemDeep { entity: r.entity2, value: EcsAVDataDeep { amount: r.amount2 } }; };
+    if idx == 3 { return EcsAVEntityItemDeep { entity: r.entity3, value: EcsAVDataDeep { amount: r.amount3 } }; };
+    if idx == 4 { return EcsAVEntityItemDeep { entity: r.entity4, value: EcsAVDataDeep { amount: r.amount4 } }; };
+    if idx == 5 { return EcsAVEntityItemDeep { entity: r.entity5, value: EcsAVDataDeep { amount: r.amount5 } }; };
+    if idx == 6 { return EcsAVEntityItemDeep { entity: r.entity6, value: EcsAVDataDeep { amount: r.amount6 } }; };
+    return EcsAVEntityItemDeep { entity: r.entity7, value: EcsAVDataDeep { amount: r.amount7 } };
+}
+
+fn _ecs_av_query_push(r0: EcsAVQueryDeep, k: i32, item: EcsAVEntityItemDeep) -> EcsAVQueryDeep {
+    let r = r0;
+    if k == 0 { r.entity0 = item.entity; r.amount0 = item.value.amount; r.count = r.count + 1; return r; };
+    if k == 1 { r.entity1 = item.entity; r.amount1 = item.value.amount; r.count = r.count + 1; return r; };
+    if k == 2 { r.entity2 = item.entity; r.amount2 = item.value.amount; r.count = r.count + 1; return r; };
+    if k == 3 { r.entity3 = item.entity; r.amount3 = item.value.amount; r.count = r.count + 1; return r; };
+    if k == 4 { r.entity4 = item.entity; r.amount4 = item.value.amount; r.count = r.count + 1; return r; };
+    if k == 5 { r.entity5 = item.entity; r.amount5 = item.value.amount; r.count = r.count + 1; return r; };
+    if k == 6 { r.entity6 = item.entity; r.amount6 = item.value.amount; r.count = r.count + 1; return r; };
+    r.entity7 = item.entity; r.amount7 = item.value.amount; r.count = r.count + 1;
+    return r;
+}
+
+// ── Walk archetypes: for each row alive + present at col, push (eid, value) into query. ──
+fn _ecs_av_query_walk_arch(w: EcsAVWorldDeep, a: EcsAVArchDeep, col: i32, acc0: EcsAVQueryDeep, row: i32) -> EcsAVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    let presence = _ecs_av_arch_present_at(a, col);
+    let has_at_row = presence > row;
+    if has_at_row {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        let slot = col * 4 + row;
+        let v = _ecs_av_arch_val_at(a, slot);
+        let item = EcsAVEntityItemDeep {
+            entity: EcsAVEntityDeep { id: eid, generation: _ecs_av_world_gen_at(w, eid) },
+            value: EcsAVDataDeep { amount: v }
+        };
+        let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+        return _ecs_av_query_walk_arch(w, a, col, acc1, row + 1);
+    };
+    return _ecs_av_query_walk_arch(w, a, col, acc0, row + 1);
+}
+
+fn _ecs_av_query_walk_archs(w: EcsAVWorldDeep, comp_id: i32, acc0: EcsAVQueryDeep, k: i32) -> EcsAVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    let a = _ecs_av_world_arch_at(w, k);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_av_query_walk_archs(w, comp_id, acc0, k + 1); };
+    let acc1 = _ecs_av_query_walk_arch(w, a, col, acc0, 0);
+    return _ecs_av_query_walk_archs(w, comp_id, acc1, k + 1);
+}
+
+fn ecs_av_world_deep_query(w: EcsAVWorldDeep, comp_id: i32) -> EcsAVQueryDeep {
+    return _ecs_av_query_walk_archs(w, comp_id, _ecs_av_query_empty(), 0);
+}
+
+// ── query_with / query_without: walks archetypes containing comp_id, keeps rows whose presence
+//    (resp. absence) at `with_comp_id` (resp. `without_comp_id`) holds. ──
+fn _ecs_av_query_with_walk_row(w: EcsAVWorldDeep, a: EcsAVArchDeep, col: i32, with_col: i32, acc0: EcsAVQueryDeep, row: i32) -> EcsAVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    let with_present = _ecs_av_arch_present_at(a, with_col) > row;
+    if with_present {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        let slot = col * 4 + row;
+        let v = _ecs_av_arch_val_at(a, slot);
+        let item = EcsAVEntityItemDeep {
+            entity: EcsAVEntityDeep { id: eid, generation: _ecs_av_world_gen_at(w, eid) },
+            value: EcsAVDataDeep { amount: v }
+        };
+        let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+        return _ecs_av_query_with_walk_row(w, a, col, with_col, acc1, row + 1);
+    };
+    return _ecs_av_query_with_walk_row(w, a, col, with_col, acc0, row + 1);
+}
+
+fn _ecs_av_query_with_walk_archs(w: EcsAVWorldDeep, comp_id: i32, with_comp_id: i32, acc0: EcsAVQueryDeep, k: i32) -> EcsAVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    let a = _ecs_av_world_arch_at(w, k);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_av_query_with_walk_archs(w, comp_id, with_comp_id, acc0, k + 1); };
+    let with_col = _ecs_av_arch_find_col(a, with_comp_id, 0);
+    if with_col < 0 { return _ecs_av_query_with_walk_archs(w, comp_id, with_comp_id, acc0, k + 1); };
+    let acc1 = _ecs_av_query_with_walk_row(w, a, col, with_col, acc0, 0);
+    return _ecs_av_query_with_walk_archs(w, comp_id, with_comp_id, acc1, k + 1);
+}
+
+fn ecs_av_world_deep_query_with(w: EcsAVWorldDeep, comp_id: i32, with_comp_id: i32) -> EcsAVQueryDeep {
+    return _ecs_av_query_with_walk_archs(w, comp_id, with_comp_id, _ecs_av_query_empty(), 0);
+}
+
+fn _ecs_av_query_without_walk_row(w: EcsAVWorldDeep, a: EcsAVArchDeep, col: i32, without_col: i32, acc0: EcsAVQueryDeep, row: i32) -> EcsAVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    let without_present = _ecs_av_arch_present_at(a, without_col) > row;
+    if without_present == false {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        let slot = col * 4 + row;
+        let v = _ecs_av_arch_val_at(a, slot);
+        let item = EcsAVEntityItemDeep {
+            entity: EcsAVEntityDeep { id: eid, generation: _ecs_av_world_gen_at(w, eid) },
+            value: EcsAVDataDeep { amount: v }
+        };
+        let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+        return _ecs_av_query_without_walk_row(w, a, col, without_col, acc1, row + 1);
+    };
+    return _ecs_av_query_without_walk_row(w, a, col, without_col, acc0, row + 1);
+}
+
+fn _ecs_av_query_without_walk_archs(w: EcsAVWorldDeep, comp_id: i32, without_comp_id: i32, acc0: EcsAVQueryDeep, k: i32) -> EcsAVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    let a = _ecs_av_world_arch_at(w, k);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_av_query_without_walk_archs(w, comp_id, without_comp_id, acc0, k + 1); };
+    let without_col = _ecs_av_arch_find_col(a, without_comp_id, 0);
+    if without_col < 0 {
+        // The archetype has no `without_comp_id` column at all, so every row qualifies.
+        let acc1 = _ecs_av_query_walk_arch(w, a, col, acc0, 0);
+        return _ecs_av_query_without_walk_archs(w, comp_id, without_comp_id, acc1, k + 1);
+    };
+    let acc1 = _ecs_av_query_without_walk_row(w, a, col, without_col, acc0, 0);
+    return _ecs_av_query_without_walk_archs(w, comp_id, without_comp_id, acc1, k + 1);
+}
+
+fn ecs_av_world_deep_query_without(w: EcsAVWorldDeep, comp_id: i32, without_comp_id: i32) -> EcsAVQueryDeep {
+    return _ecs_av_query_without_walk_archs(w, comp_id, without_comp_id, _ecs_av_query_empty(), 0);
+}
+
+// ── query_added: each entity in archetypes with comp_id whose added_tick > since_tick. ──
+fn _ecs_av_query_added_walk_arch(w: EcsAVWorldDeep, a: EcsAVArchDeep, col: i32, since: i32, acc0: EcsAVQueryDeep, row: i32) -> EcsAVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    let presence = _ecs_av_arch_present_at(a, col);
+    if presence > row {
+        let slot = col * 4 + row;
+        let added_t = _ecs_av_arch_added_at(a, slot);
+        if added_t > since {
+            let eid = _ecs_av_arch_eid_at(a, row);
+            let v = _ecs_av_arch_val_at(a, slot);
+            let item = EcsAVEntityItemDeep {
+                entity: EcsAVEntityDeep { id: eid, generation: _ecs_av_world_gen_at(w, eid) },
+                value: EcsAVDataDeep { amount: v }
+            };
+            let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+            return _ecs_av_query_added_walk_arch(w, a, col, since, acc1, row + 1);
+        };
+    };
+    return _ecs_av_query_added_walk_arch(w, a, col, since, acc0, row + 1);
+}
+
+fn _ecs_av_query_added_walk_archs(w: EcsAVWorldDeep, comp_id: i32, since: i32, acc0: EcsAVQueryDeep, k: i32) -> EcsAVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    let a = _ecs_av_world_arch_at(w, k);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_av_query_added_walk_archs(w, comp_id, since, acc0, k + 1); };
+    let acc1 = _ecs_av_query_added_walk_arch(w, a, col, since, acc0, 0);
+    return _ecs_av_query_added_walk_archs(w, comp_id, since, acc1, k + 1);
+}
+
+fn ecs_av_world_deep_query_added(w: EcsAVWorldDeep, comp_id: i32, since_tick: i32) -> EcsAVQueryDeep {
+    return _ecs_av_query_added_walk_archs(w, comp_id, since_tick, _ecs_av_query_empty(), 0);
+}
+
+// ── query_changed: each entity whose changed_tick > since_tick. ──
+fn _ecs_av_query_changed_walk_arch(w: EcsAVWorldDeep, a: EcsAVArchDeep, col: i32, since: i32, acc0: EcsAVQueryDeep, row: i32) -> EcsAVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    let presence = _ecs_av_arch_present_at(a, col);
+    if presence > row {
+        let slot = col * 4 + row;
+        let changed_t = _ecs_av_arch_changed_at(a, slot);
+        if changed_t > since {
+            let eid = _ecs_av_arch_eid_at(a, row);
+            let v = _ecs_av_arch_val_at(a, slot);
+            let item = EcsAVEntityItemDeep {
+                entity: EcsAVEntityDeep { id: eid, generation: _ecs_av_world_gen_at(w, eid) },
+                value: EcsAVDataDeep { amount: v }
+            };
+            let acc1 = _ecs_av_query_push(acc0, acc0.count, item);
+            return _ecs_av_query_changed_walk_arch(w, a, col, since, acc1, row + 1);
+        };
+    };
+    return _ecs_av_query_changed_walk_arch(w, a, col, since, acc0, row + 1);
+}
+
+fn _ecs_av_query_changed_walk_archs(w: EcsAVWorldDeep, comp_id: i32, since: i32, acc0: EcsAVQueryDeep, k: i32) -> EcsAVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    let a = _ecs_av_world_arch_at(w, k);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_av_query_changed_walk_archs(w, comp_id, since, acc0, k + 1); };
+    let acc1 = _ecs_av_query_changed_walk_arch(w, a, col, since, acc0, 0);
+    return _ecs_av_query_changed_walk_archs(w, comp_id, since, acc1, k + 1);
+}
+
+fn ecs_av_world_deep_query_changed(w: EcsAVWorldDeep, comp_id: i32, since_tick: i32) -> EcsAVQueryDeep {
+    return _ecs_av_query_changed_walk_archs(w, comp_id, since_tick, _ecs_av_query_empty(), 0);
+}
+
+// ── Pair query mut-first.  Mirrors the shallow ArchetypeValuePairMut<T>: a query that exposes the
+//    first comp's value plus the second comp's value for each entity that has both.  The walker
+//    reuses the `entity_loc` lookups.  We expose `entity`, `first`, `second`, and a `first_comp_id`.
+struct EcsAVPairMutDeep {
+    entity: EcsAVEntityDeep,
+    first_comp_id: i32,
+    first: EcsAVDataDeep,
+    second: EcsAVDataDeep,
+    first_slot: i32,
+    first_arch_id: i32,
+    first_row: i32
+}
+
+fn ecs_av_pair_mut_entity(p: EcsAVPairMutDeep) -> EcsAVEntityDeep { return p.entity; }
+fn ecs_av_pair_mut_first(p: EcsAVPairMutDeep) -> EcsAVDataDeep { return p.first; }
+fn ecs_av_pair_mut_second(p: EcsAVPairMutDeep) -> EcsAVDataDeep { return p.second; }
+fn ecs_av_pair_mut_first_comp_id(p: EcsAVPairMutDeep) -> i32 { return p.first_comp_id; }
+fn ecs_av_pair_mut_first_value(p: EcsAVPairMutDeep) -> EcsAVDataDeep { return p.first; }
+
+struct EcsAVPairQueryMutDeep {
+    count: i32,
+    entity0: EcsAVEntityDeep, entity1: EcsAVEntityDeep, entity2: EcsAVEntityDeep, entity3: EcsAVEntityDeep,
+    fc0: i32, fc1: i32, fc2: i32, fc3: i32,
+    f_arch0: i32, f_arch1: i32, f_arch2: i32, f_arch3: i32,
+    f_row0: i32, f_row1: i32, f_row2: i32, f_row3: i32,
+    f_slot0: i32, f_slot1: i32, f_slot2: i32, f_slot3: i32,
+    f0: i32, f1: i32, f2: i32, f3: i32,
+    s0: i32, s1: i32, s2: i32, s3: i32
+}
+
+fn _ecs_av_pair_query_mut_empty() -> EcsAVPairQueryMutDeep {
+    return EcsAVPairQueryMutDeep {
+        count: 0,
+        entity0: EcsAVEntityDeep { id: -1, generation: 0 }, entity1: EcsAVEntityDeep { id: -1, generation: 0 }, entity2: EcsAVEntityDeep { id: -1, generation: 0 }, entity3: EcsAVEntityDeep { id: -1, generation: 0 },
+        fc0: -1, fc1: -1, fc2: -1, fc3: -1,
+        f_arch0: -1, f_arch1: -1, f_arch2: -1, f_arch3: -1,
+        f_row0: -1, f_row1: -1, f_row2: -1, f_row3: -1,
+        f_slot0: -1, f_slot1: -1, f_slot2: -1, f_slot3: -1,
+        f0: 0, f1: 0, f2: 0, f3: 0,
+        s0: 0, s1: 0, s2: 0, s3: 0
+    };
+}
+
+fn ecs_av_pair_query_mut_count(r: EcsAVPairQueryMutDeep) -> i32 { return r.count; }
+
+fn ecs_av_pair_query_mut_at(r: EcsAVPairQueryMutDeep, idx: i32) -> EcsAVPairMutDeep {
+    if idx == 0 {
+        return EcsAVPairMutDeep { entity: r.entity0, first_comp_id: r.fc0, first: EcsAVDataDeep { amount: r.f0 }, second: EcsAVDataDeep { amount: r.s0 }, first_slot: r.f_slot0, first_arch_id: r.f_arch0, first_row: r.f_row0 };
+    };
+    if idx == 1 {
+        return EcsAVPairMutDeep { entity: r.entity1, first_comp_id: r.fc1, first: EcsAVDataDeep { amount: r.f1 }, second: EcsAVDataDeep { amount: r.s1 }, first_slot: r.f_slot1, first_arch_id: r.f_arch1, first_row: r.f_row1 };
+    };
+    if idx == 2 {
+        return EcsAVPairMutDeep { entity: r.entity2, first_comp_id: r.fc2, first: EcsAVDataDeep { amount: r.f2 }, second: EcsAVDataDeep { amount: r.s2 }, first_slot: r.f_slot2, first_arch_id: r.f_arch2, first_row: r.f_row2 };
+    };
+    return EcsAVPairMutDeep { entity: r.entity3, first_comp_id: r.fc3, first: EcsAVDataDeep { amount: r.f3 }, second: EcsAVDataDeep { amount: r.s3 }, first_slot: r.f_slot3, first_arch_id: r.f_arch3, first_row: r.f_row3 };
+}
+
+fn _ecs_av_pair_query_mut_push(r0: EcsAVPairQueryMutDeep, k: i32, pair: EcsAVPairMutDeep) -> EcsAVPairQueryMutDeep {
+    let r = r0;
+    if k == 0 {
+        r.entity0 = pair.entity; r.fc0 = pair.first_comp_id; r.f0 = pair.first.amount; r.s0 = pair.second.amount;
+        r.f_arch0 = pair.first_arch_id; r.f_row0 = pair.first_row; r.f_slot0 = pair.first_slot;
+        r.count = r.count + 1; return r;
+    };
+    if k == 1 {
+        r.entity1 = pair.entity; r.fc1 = pair.first_comp_id; r.f1 = pair.first.amount; r.s1 = pair.second.amount;
+        r.f_arch1 = pair.first_arch_id; r.f_row1 = pair.first_row; r.f_slot1 = pair.first_slot;
+        r.count = r.count + 1; return r;
+    };
+    if k == 2 {
+        r.entity2 = pair.entity; r.fc2 = pair.first_comp_id; r.f2 = pair.first.amount; r.s2 = pair.second.amount;
+        r.f_arch2 = pair.first_arch_id; r.f_row2 = pair.first_row; r.f_slot2 = pair.first_slot;
+        r.count = r.count + 1; return r;
+    };
+    r.entity3 = pair.entity; r.fc3 = pair.first_comp_id; r.f3 = pair.first.amount; r.s3 = pair.second.amount;
+    r.f_arch3 = pair.first_arch_id; r.f_row3 = pair.first_row; r.f_slot3 = pair.first_slot;
+    r.count = r.count + 1;
+    return r;
+}
+
+fn _ecs_av_query_pair_mut_walk_row(w: EcsAVWorldDeep, a: EcsAVArchDeep, first_col: i32, second_col: i32, first_comp_id: i32, acc0: EcsAVPairQueryMutDeep, row: i32) -> EcsAVPairQueryMutDeep {
+    if row >= a.row_count { return acc0; };
+    let first_present = _ecs_av_arch_present_at(a, first_col) > row;
+    let second_present = _ecs_av_arch_present_at(a, second_col) > row;
+    if first_present && second_present {
+        let eid = _ecs_av_arch_eid_at(a, row);
+        let f_slot = first_col * 4 + row;
+        let s_slot = second_col * 4 + row;
+        let fv = _ecs_av_arch_val_at(a, f_slot);
+        let sv = _ecs_av_arch_val_at(a, s_slot);
+        let pair = EcsAVPairMutDeep {
+            entity: EcsAVEntityDeep { id: eid, generation: _ecs_av_world_gen_at(w, eid) },
+            first_comp_id: first_comp_id,
+            first: EcsAVDataDeep { amount: fv },
+            second: EcsAVDataDeep { amount: sv },
+            first_slot: f_slot,
+            first_arch_id: a.id,
+            first_row: row
+        };
+        let acc1 = _ecs_av_pair_query_mut_push(acc0, acc0.count, pair);
+        return _ecs_av_query_pair_mut_walk_row(w, a, first_col, second_col, first_comp_id, acc1, row + 1);
+    };
+    return _ecs_av_query_pair_mut_walk_row(w, a, first_col, second_col, first_comp_id, acc0, row + 1);
+}
+
+fn _ecs_av_query_pair_mut_walk_archs(w: EcsAVWorldDeep, first_comp_id: i32, second_comp_id: i32, acc0: EcsAVPairQueryMutDeep, k: i32) -> EcsAVPairQueryMutDeep {
+    if k >= w.arch_count { return acc0; };
+    let a = _ecs_av_world_arch_at(w, k);
+    let first_col = _ecs_av_arch_find_col(a, first_comp_id, 0);
+    let second_col = _ecs_av_arch_find_col(a, second_comp_id, 0);
+    if first_col < 0 || second_col < 0 { return _ecs_av_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, acc0, k + 1); };
+    let acc1 = _ecs_av_query_pair_mut_walk_row(w, a, first_col, second_col, first_comp_id, acc0, 0);
+    return _ecs_av_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, acc1, k + 1);
+}
+
+fn ecs_av_world_deep_query_pair_mut_first(w: EcsAVWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsAVPairQueryMutDeep {
+    return _ecs_av_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, _ecs_av_pair_query_mut_empty(), 0);
+}
+
+// ── pair_write_first: write the new pos value into the captured entity's first-comp slot. Uses
+//    the slot captured in the pair handle, which is col*4 + row within the first-arch-bearing row.
+fn ecs_av_world_deep_pair_write_first(w0: EcsAVWorldDeep, item: EcsAVPairMutDeep, value: EcsAVDataDeep) -> EcsAVWorldDeep {
+    let live = ecs_av_world_deep_is_alive(w0, item.entity);
+    if live == false { return w0; };
+    let a = _ecs_av_world_arch_at(w0, item.first_arch_id);
+    let slot = item.first_slot;
+    let a1 = _ecs_av_arch_set_val(a, slot, value.amount);
+    let a2 = _ecs_av_arch_set_changed(a1, slot, w0.change_tick);
+    let w1 = _ecs_av_world_set_arch(w0, item.first_arch_id, a2);
+    return w1;
+}
+
+// ── query_mut helpers (read-only write of a slot via an EntityItem handle). The shallow's
+//    `archetype_value_world_write` writes a new value to the column slot captured in the
+//    EntityItem handle's (slot) field and bumps the changed tick.
+fn ecs_av_world_deep_write(w0: EcsAVWorldDeep, item: EcsAVEntityItemDeep, comp_id: i32, value: EcsAVDataDeep) -> EcsAVWorldDeep {
+    let live = ecs_av_world_deep_is_alive(w0, item.entity);
+    if live == false { return w0; };
+    let arch_id = _ecs_av_world_loc_arch_at(w0, item.entity.id);
+    let row = _ecs_av_world_loc_row_at(w0, item.entity.id);
+    let a = _ecs_av_world_arch_at(w0, arch_id);
+    let col = _ecs_av_arch_find_col(a, comp_id, 0);
+    if col < 0 { return w0; };
+    let slot = col * 4 + row;
+    let a1 = _ecs_av_arch_set_val(a, slot, value.amount);
+    let changed_t = _ecs_av_arch_set_changed(a1, slot, w0.change_tick);
+    let w1 = _ecs_av_world_set_arch(w0, arch_id, changed_t);
+    return w1;
+}
+
+fn ecs_av_world_deep_query_mut(w: EcsAVWorldDeep, comp_id: i32) -> EcsAVQueryDeep {
+    return ecs_av_world_deep_query(w, comp_id);
+}
+
+fn ecs_av_world_deep_query_pair(w: EcsAVWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsAVQueryDeep {
+    // reuse the pair_mut path but only return entities that match both comps; we lose the
+    // second-value semantics here but the Query<EntityItem> surface stores first-value only.
+    let pq = ecs_av_world_deep_query_pair_mut_first(w, first_comp_id, second_comp_id);
+    let q = _ecs_av_query_empty();
+    return _ecs_av_pair_to_entity_items(pq, q, 0, pq.count, first_comp_id);
+}
+
+fn _ecs_av_pair_to_entity_items(pq: EcsAVPairQueryMutDeep, q0: EcsAVQueryDeep, idx: i32, cnt: i32, first_comp_id: i32) -> EcsAVQueryDeep {
+    if idx >= cnt { return q0; };
+    let pair = ecs_av_pair_query_mut_at(pq, idx);
+    let item = EcsAVEntityItemDeep { entity: pair.entity, value: pair.first };
+    let q1 = _ecs_av_query_push(q0, q0.count, item);
+    return _ecs_av_pair_to_entity_items(pq, q1, idx + 1, cnt, first_comp_id);
+}
+
+fn ecs_av_world_deep_query_pair_without(w: EcsAVWorldDeep, first_comp_id: i32, second_comp_id: i32, without_comp_id: i32) -> EcsAVQueryDeep {
+    let q = ecs_av_world_deep_query_pair(w, first_comp_id, second_comp_id);
+    // filter out entities that have the `without_comp_id` comp
+    return _ecs_av_filter_without(w, q, without_comp_id);
+}
+
+fn _ecs_av_filter_without(w: EcsAVWorldDeep, src: EcsAVQueryDeep, without_comp_id: i32) -> EcsAVQueryDeep {
+    return _ecs_av_filter_into(w, src, _ecs_av_query_empty(), without_comp_id, 0, src.count);
+}
+fn _ecs_av_filter_into(w: EcsAVWorldDeep, src: EcsAVQueryDeep, dst0: EcsAVQueryDeep, without_comp_id: i32, idx: i32, cnt: i32) -> EcsAVQueryDeep {
+    if idx >= cnt { return dst0; };
+    let item = ecs_av_query_deep_at(src, idx);
+    let has_without = ecs_av_world_deep_has(w, item.entity, without_comp_id);
+    if has_without == false {
+        let dst1 = _ecs_av_query_push(dst0, dst0.count, item);
+        return _ecs_av_filter_into(w, src, dst1, without_comp_id, idx + 1, cnt);
+    };
+    return _ecs_av_filter_into(w, src, dst0, without_comp_id, idx + 1, cnt);
+}
+
+// ── Res<T> / ResMut<T> wrappers (for the shallow's `res()` and `res_mut()` helpers that the
+//    test file inspects).  Expose scalar accessors; mirrors `res_is_added_since` /
+//    `res_mut_is_added_since` so tests can read both via the same entrypoint.

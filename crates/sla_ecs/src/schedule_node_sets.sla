@@ -1,0 +1,523 @@
+// Bevy ECS schedule node extensions: SystemSets, ConflictingSystems, plus missing Systems methods.
+// Mirrors src/schedule/node.rs (extension of schedule_node.sla).
+
+// === Systems extensions: get_mut, get_conditions_mut, iter, is_initialized, initialize, get_conflicting_systems ===
+// Uses EcsSystemWithAccess and EcsConditionWithAccess from schedule_node.sla.
+
+// To keep self-contained we re-declare the small structs to avoid heavy imports.
+struct EcsNodeSetEntry {
+    system_id: i32,
+    system_name: i64,
+    is_exclusive: bool,
+}
+
+struct EcsNodeSetCond {
+    condition_id: i32,
+}
+
+struct EcsNodeSetSystemsEntry {
+    system: EcsNodeSetEntry,
+    conditions: Vec<EcsNodeSetCond>,
+}
+
+struct EcsNodeSetUninit {
+    systems: Vec<i32>,           // keys pending initialization
+    initialized: Vec<i32>,      // keys already initialized
+}
+
+struct EcsNodeSetSystems {
+    entries: Vec<EcsNodeSetSystemsEntry>,
+    uninit: EcsNodeSetUninit,
+}
+
+fn ecs_systems_ext_new() -> EcsNodeSetSystems {
+    let u = EcsNodeSetUninit { systems: Vec::new(), initialized: Vec::new() };
+    let e = Vec::new();
+    return EcsNodeSetSystems { entries: e, uninit: u };
+}
+
+fn ecs_systems_ext_len(s: EcsNodeSetSystems) -> i64 { return len(s.entries) as i64; }
+fn ecs_systems_ext_is_empty(s: EcsNodeSetSystems) -> bool { return len(s.entries) == 0; }
+
+fn ecs_systems_ext_entry(system_id: i32, system_name: i64, is_exclusive: bool) -> EcsNodeSetEntry {
+    return EcsNodeSetEntry { system_id: system_id, system_name: system_name, is_exclusive: is_exclusive };
+}
+
+fn ecs_systems_ext_insert(s: EcsNodeSetSystems, system: EcsNodeSetEntry) -> (EcsNodeSetSystems, i32) {
+    let key = len(s.entries) as i32;
+    s.entries.push(EcsNodeSetSystemsEntry { system: system, conditions: Vec::new() });
+    s.uninit.systems.push(key);
+    return (s, key);
+}
+
+// get_mut: returns a mutable copy of the system entry (in SLA, by val then re-set)
+fn ecs_systems_ext_get(s: EcsNodeSetSystems, key: i32) -> (bool, EcsNodeSetEntry) {
+    if key < 0 || key >= (len(s.entries) as i32) { return (false, ecs_systems_ext_entry(0, 0, false)); };
+    return (true, s.entries[key].system);
+}
+
+fn ecs_systems_ext_get_mut(s: EcsNodeSetSystems, key: i32) -> (bool, EcsNodeSetSystems, EcsNodeSetEntry) {
+    if key < 0 || key >= (len(s.entries) as i32) { return (false, s, ecs_systems_ext_entry(0, 0, false)); };
+    return (true, s, s.entries[key].system);
+}
+
+fn ecs_systems_ext_set_system(s: EcsNodeSetSystems, key: i32, system: EcsNodeSetEntry) -> EcsNodeSetSystems {
+    if key >= 0 && key < (len(s.entries) as i32) {
+        s.entries[key].system.system_id = system.system_id;
+        s.entries[key].system.system_name = system.system_name;
+        s.entries[key].system.is_exclusive = system.is_exclusive;
+    };
+    return s;
+}
+
+fn ecs_systems_ext_has_conditions(s: EcsNodeSetSystems, key: i32) -> bool {
+    if key < 0 || key >= (len(s.entries) as i32) { return false; };
+    return len(s.entries[key].conditions) > 0;
+}
+
+fn ecs_systems_ext_get_conditions(s: EcsNodeSetSystems, key: i32) -> (bool, Vec<EcsNodeSetCond>) {
+    if key < 0 || key >= (len(s.entries) as i32) { return (false, Vec::new()); };
+    return (true, s.entries[key].conditions);
+}
+
+fn ecs_systems_ext_get_conditions_mut(s: EcsNodeSetSystems, key: i32) -> (bool, EcsNodeSetSystems, Vec<EcsNodeSetCond>) {
+    if key < 0 || key >= (len(s.entries) as i32) { return (false, s, Vec::new()); };
+    return (true, s, s.entries[key].conditions);
+}
+
+fn ecs_systems_ext_add_condition(s: EcsNodeSetSystems, key: i32, cond: EcsNodeSetCond) -> EcsNodeSetSystems {
+    if key >= 0 && key < (len(s.entries) as i32) {
+        s.entries[key].conditions.push(ecs_node_set_cond_new(cond.condition_id));
+    };
+    return s;
+}
+
+fn ecs_systems_ext_condition_count(s: EcsNodeSetSystems, key: i32) -> i64 {
+    if key < 0 || key >= (len(s.entries) as i32) { return 0; };
+    return len(s.entries[key].conditions) as i64;
+}
+
+// iter: returns parallel vectors (keys, system_ids, condition counts) for caller iteration
+fn ecs_systems_ext_iter_keys(s: EcsNodeSetSystems) -> Vec<i32> {
+    let keys = Vec::new();
+    let i = 0;
+    while i < len(s.entries) {
+        keys.push(i as i32);
+        i = i + 1;
+    }
+    return keys;
+}
+
+fn ecs_systems_ext_iter_system_ids(s: EcsNodeSetSystems) -> Vec<i32> {
+    let v = Vec::new();
+    let i = 0;
+    while i < len(s.entries) {
+        v.push(s.entries[i].system.system_id);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn ecs_systems_ext_iter_condition_counts(s: EcsNodeSetSystems) -> Vec<i64> {
+    let v = Vec::new();
+    let i = 0;
+    while i < len(s.entries) {
+        v.push(len(s.entries[i].conditions) as i64);
+        i = i + 1;
+    }
+    return v;
+}
+
+// remove: returns new Systems and found flag
+fn ecs_systems_ext_remove(s: EcsNodeSetSystems, key: i32) -> (EcsNodeSetSystems, bool) {
+    let found = false;
+    if key >= 0 && key < (len(s.entries) as i32) {
+        // Mark entry as empty by zeroing system fields; SLA doesn't support vec removal easily.
+        let blank = ecs_systems_ext_entry(0, 0, false);
+        s.entries[key].system = blank;
+        s.entries[key].conditions = Vec::new();
+        found = true;
+    };
+    // Remove from uninit list if present
+    let new_uninit = Vec::new();
+    let i = 0;
+    while i < len(s.uninit.systems) {
+        if s.uninit.systems[i] != key { new_uninit.push(s.uninit.systems[i]); };
+        i = i + 1;
+    }
+    s.uninit.systems = new_uninit;
+    return (s, found);
+}
+
+fn ecs_systems_ext_is_initialized(s: EcsNodeSetSystems) -> bool {
+    return len(s.uninit.systems) == 0;
+}
+
+fn ecs_systems_ext_uninit_count(s: EcsNodeSetSystems) -> i64 { return len(s.uninit.systems) as i64; }
+
+// initialize: drains uninit list, moves keys to initialized list
+fn ecs_systems_ext_initialize(s: EcsNodeSetSystems) -> EcsNodeSetSystems {
+    let i = 0;
+    while i < len(s.uninit.systems) {
+        s.uninit.initialized.push(s.uninit.systems[i]);
+        i = i + 1;
+    }
+    s.uninit.systems = Vec::new();
+    return s;
+}
+
+// === ConflictingSystems: pairs (a, b, conflict component ids) ===
+struct EcsNodeSetConflict {
+    a: i32,   // SystemKey
+    b: i32,   // SystemKey
+    conflicts: Vec<i32>,  // ComponentId list (empty = world access conflict)
+}
+
+struct EcsNodeSetConflictingSystems {
+    items: Vec<EcsNodeSetConflict>,
+}
+
+fn ecs_conflicting_systems_new() -> EcsNodeSetConflictingSystems {
+    return EcsNodeSetConflictingSystems { items: Vec::new() };
+}
+
+fn ecs_conflicting_systems_len(c: EcsNodeSetConflictingSystems) -> i64 { return len(c.items) as i64; }
+fn ecs_conflicting_systems_is_empty(c: EcsNodeSetConflictingSystems) -> bool { return len(c.items) == 0; }
+
+fn ecs_conflicting_systems_push(c: EcsNodeSetConflictingSystems, conflict: EcsNodeSetConflict) -> EcsNodeSetConflictingSystems {
+    c.items.push(conflict);
+    return c;
+}
+
+fn ecs_conflicting_systems_check_if_not_empty(c: EcsNodeSetConflictingSystems) -> i32 {
+    if len(c.items) == 0 { return 0; };
+    return 1;
+}
+
+fn ecs_conflicting_systems_get(c: EcsNodeSetConflictingSystems, index: i32) -> EcsNodeSetConflict {
+    return c.items[index];
+}
+
+fn ecs_conflicting_systems_a(c: EcsNodeSetConflict) -> i32 { return c.a; }
+fn ecs_conflicting_systems_b(c: EcsNodeSetConflict) -> i32 { return c.b; }
+fn ecs_conflicting_systems_conflicts(c: EcsNodeSetConflict) -> Vec<i32> { return c.conflicts; }
+fn ecs_conflicting_systems_conflict_count(c: EcsNodeSetConflict) -> i64 { return len(c.conflicts) as i64; }
+
+// to_string equivalent: returns counts of system names + conflict names
+fn ecs_conflicting_systems_to_string_count(c: EcsNodeSetConflictingSystems) -> i64 {
+    return len(c.items) as i64;
+}
+
+// === get_conflicting_systems: compute conflicts from flat_dependency disconnected pairs ===
+// Inputs:
+//   systems: EcsNodeSetSystems
+//   disconnected_pairs: flat list of (a, b) system keys that share no dependency edge
+//   ambiguous_edges: pairs (a, b) marked as ambiguous-with (skip)
+//   ambiguous_with_all: set of system keys explicitly marked ambiguous-with-all (skip)
+//   ignored_ambiguities: set of component ids to ignore
+// Access pattern stored on each system: read_components/write_components/reads_all/writes_all
+
+struct EcsNodeSetSystemAccess {
+    read_components: Vec<i32>,
+    write_components: Vec<i32>,
+    reads_all: bool,
+    writes_all: bool,
+}
+
+fn ecs_system_access_new() -> EcsNodeSetSystemAccess {
+    return EcsNodeSetSystemAccess { read_components: Vec::new(), write_components: Vec::new(), reads_all: false, writes_all: false };
+}
+
+fn ecs_system_access_add_read(a: EcsNodeSetSystemAccess, comp_id: i32) -> EcsNodeSetSystemAccess {
+    a.read_components.push(comp_id);
+    return a;
+}
+
+fn ecs_system_access_add_write(a: EcsNodeSetSystemAccess, comp_id: i32) -> EcsNodeSetSystemAccess {
+    a.write_components.push(comp_id);
+    return a;
+}
+
+fn ecs_system_access_set_reads_all(a: EcsNodeSetSystemAccess) -> EcsNodeSetSystemAccess {
+    a.reads_all = true;
+    return a;
+}
+
+fn ecs_system_access_set_writes_all(a: EcsNodeSetSystemAccess) -> EcsNodeSetSystemAccess {
+    a.writes_all = true;
+    return a;
+}
+
+fn ecs_vec_contains_i32(v: Vec<i32>, x: i32) -> bool {
+    let i = 0;
+    while i < len(v) {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_vec_remove_i32(v: Vec<i32>, x: i32) -> Vec<i32> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(v) {
+        if v[i] != x { out.push(v[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// Is access_a compatible with access_b? (return false = conflict)
+fn ecs_system_access_is_compatible(a: EcsNodeSetSystemAccess, b: EcsNodeSetSystemAccess) -> bool {
+    // Read-read is fine. Write-write or write-read on same component = conflict.
+    if a.writes_all || b.writes_all { return false; };
+    if a.reads_all && b.writes_all { return false; };
+    if a.writes_all && b.reads_all { return false; };
+    if a.writes_all && b.writes_all { return false; };
+    // check per-component
+    let i = 0;
+    while i < len(a.write_components) {
+        let w = a.write_components[i];
+        // a writes w, b writes w or reads w
+        if ecs_vec_contains_i32(b.write_components, w) { return false; };
+        if ecs_vec_contains_i32(b.read_components, w) { return false; };
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(a.read_components) {
+        let r = a.read_components[j];
+        if ecs_vec_contains_i32(b.write_components, r) { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+// get_conflicts: returns list of conflicting component ids, or empty vec (meaning AccessConflicts::All)
+fn ecs_system_access_get_conflicts(a: EcsNodeSetSystemAccess, b: EcsNodeSetSystemAccess) -> (bool, Vec<i32>) {
+    // bool = is_individual (true) vs All (false)
+    if a.writes_all || b.writes_all { return (false, Vec::new()); };
+    if a.reads_all && b.writes_all { return (false, Vec::new()); };
+    if a.writes_all && b.reads_all { return (false, Vec::new()); };
+    if a.writes_all && b.writes_all { return (false, Vec::new()); };
+    let intro_comp = Vec::new();
+    let i = 0;
+    while i < len(a.write_components) {
+        let w = a.write_components[i];
+        if ecs_vec_contains_i32(b.write_components, w) { intro_comp.push(w); }
+        else { if ecs_vec_contains_i32(b.read_components, w) { intro_comp.push(w); }; };
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(a.read_components) {
+        let r = a.read_components[j];
+        if ecs_vec_contains_i32(b.write_components, r) {
+            if ecs_vec_contains_i32(intro_comp, r) != true { intro_comp.push(r); };
+        };
+        j = j + 1;
+    }
+    return (true, intro_comp);
+}
+
+// === SystemSets ===
+struct EcsNodeSetSetEntry {
+    set_id: i32,
+    is_system_type: bool,
+}
+
+struct EcsNodeSetUninitializedSet {
+    key: i32,
+    start: i64,
+    end: i64,
+}
+
+struct EcsNodeSetSystemSets {
+    sets: Vec<EcsNodeSetSetEntry>,  // index = key
+    conditions: Vec<Vec<EcsNodeSetCond>>,
+    ids_map_keys: Vec<i32>,         // set_id list
+    ids_map_keys_vec: Vec<i32>,    // matching key for each set_id (parallel)
+    uninit: Vec<EcsNodeSetUninitializedSet>,
+}
+
+fn ecs_system_sets_new() -> EcsNodeSetSystemSets {
+    let s = EcsNodeSetSystemSets { sets: Vec::new(), conditions: Vec::new(), ids_map_keys: Vec::new(), ids_map_keys_vec: Vec::new(), uninit: Vec::new() };
+    return s;
+}
+
+fn ecs_system_sets_len(s: EcsNodeSetSystemSets) -> i64 { return len(s.sets) as i64; }
+fn ecs_system_sets_is_empty(s: EcsNodeSetSystemSets) -> bool { return len(s.sets) == 0; }
+
+fn ecs_vec_contains_i32_idx(v: Vec<i32>, x: i32, out: (bool, i32)) -> (bool, i32) {
+    let i = 0;
+    while i < len(v) {
+        if v[i] == x { return (true, i); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn ecs_system_sets_contains(s: EcsNodeSetSystemSets, set_id: i32) -> bool {
+    let dummy = (false, 0);
+    let res = ecs_vec_contains_i32_idx(s.ids_map_keys, set_id, dummy);
+    return res.0;
+}
+
+fn ecs_system_sets_get_index(s: EcsNodeSetSystemSets, set_id: i32) -> i32 {
+    let dummy = (false, 0);
+    let res = ecs_vec_contains_i32_idx(s.ids_map_keys, set_id, dummy);
+    if res.0 { return s.ids_map_keys_vec[res.1]; };
+    return -1;
+}
+
+fn ecs_system_sets_get(s: EcsNodeSetSystemSets, key: i32) -> (bool, EcsNodeSetSetEntry) {
+    if key < 0 || key >= (len(s.sets) as i32) { return (false, EcsNodeSetSetEntry { set_id: 0, is_system_type: false }); };
+    return (true, s.sets[key]);
+}
+
+fn ecs_system_sets_get_key(s: EcsNodeSetSystemSets, set_id: i32) -> i32 {
+    return ecs_system_sets_get_index(s, set_id);
+}
+
+fn ecs_system_sets_get_key_or_insert(s: EcsNodeSetSystemSets, set_id: i32) -> (EcsNodeSetSystemSets, i32) {
+    let idx = ecs_system_sets_get_index(s, set_id);
+    if idx >= 0 { return (s, idx); };
+    let key = len(s.sets) as i32;
+    s.sets.push(EcsNodeSetSetEntry { set_id: set_id, is_system_type: false });
+    s.conditions.push(Vec::new());
+    s.ids_map_keys.push(set_id);
+    s.ids_map_keys_vec.push(key);
+    return (s, key);
+}
+
+fn ecs_system_sets_has_conditions(s: EcsNodeSetSystemSets, key: i32) -> bool {
+    if key < 0 || key >= (len(s.conditions) as i32) { return false; };
+    return len(s.conditions[key]) > 0;
+}
+
+fn ecs_system_sets_get_conditions(s: EcsNodeSetSystemSets, key: i32) -> (bool, Vec<EcsNodeSetCond>) {
+    if key < 0 || key >= (len(s.conditions) as i32) { return (false, Vec::new()); };
+    return (true, s.conditions[key]);
+}
+
+fn ecs_system_sets_get_conditions_mut(s: EcsNodeSetSystemSets, key: i32) -> (bool, EcsNodeSetSystemSets, Vec<EcsNodeSetCond>) {
+    if key < 0 || key >= (len(s.conditions) as i32) { return (false, s, Vec::new()); };
+    return (true, s, s.conditions[key]);
+}
+
+fn ecs_system_sets_add_condition(s: EcsNodeSetSystemSets, key: i32, cond: EcsNodeSetCond) -> EcsNodeSetSystemSets {
+    if key >= 0 && key < (len(s.conditions) as i32) {
+        s.conditions[key].push(ecs_node_set_cond_new(cond.condition_id));
+        let start = (len(s.conditions[key]) as i64) - 1;
+        s.uninit.push(EcsNodeSetUninitializedSet { key: key, start: start, end: start + 1 });
+    };
+    return s;
+}
+
+fn ecs_system_sets_set_is_system_type(s: EcsNodeSetSystemSets, key: i32, is_st: bool) -> EcsNodeSetSystemSets {
+    if key >= 0 && key < (len(s.sets) as i32) {
+        s.sets[key].is_system_type = is_st;
+    };
+    return s;
+}
+
+fn ecs_system_sets_iter_keys(s: EcsNodeSetSystemSets) -> Vec<i32> {
+    let keys = Vec::new();
+    let i = 0;
+    while i < len(s.sets) {
+        keys.push(i as i32);
+        i = i + 1;
+    }
+    return keys;
+}
+
+fn ecs_system_sets_iter_set_ids(s: EcsNodeSetSystemSets) -> Vec<i32> {
+    let v = Vec::new();
+    let i = 0;
+    while i < len(s.sets) {
+        v.push(s.sets[i].set_id);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn ecs_system_sets_remove(s: EcsNodeSetSystemSets, key: i32) -> (EcsNodeSetSystemSets, bool) {
+    let found = false;
+    if key >= 0 && key < (len(s.sets) as i32) {
+        s.sets[key] = EcsNodeSetSetEntry { set_id: 0, is_system_type: false };
+        s.conditions[key] = Vec::new();
+        found = true;
+    };
+    let new_uninit = Vec::new();
+    let i = 0;
+    while i < len(s.uninit) {
+        if s.uninit[i].key != key { new_uninit.push(s.uninit[i]); };
+        i = i + 1;
+    }
+    s.uninit = new_uninit;
+    return (s, found);
+}
+
+fn ecs_system_sets_is_initialized(s: EcsNodeSetSystemSets) -> bool {
+    return len(s.uninit) == 0;
+}
+
+fn ecs_system_sets_initialize(s: EcsNodeSetSystemSets) -> EcsNodeSetSystemSets {
+    s.uninit = Vec::new();
+    return s;
+}
+
+fn ecs_system_sets_uninit_count(s: EcsNodeSetSystemSets) -> i64 { return len(s.uninit) as i64; }
+
+// check_type_set_ambiguity: set is system_type, has >1 instances, and has any relation edges
+// Returns 0 = ok, key+1 (>=1) = error on that key
+fn ecs_system_sets_check_type_set_ambiguity(s: EcsNodeSetSystemSets, set_instances: Vec<i64>, set_relations: Vec<i64>) -> i32 {
+    // parallel arrays: index = key; set_instances[key] = number of systems in set, set_relations[key] = number of relation edges
+    let i = 0;
+    while i < len(s.sets) {
+        if s.sets[i].is_system_type {
+            let instances = set_instances[i];
+            let relations = set_relations[i];
+            if instances > 1 && relations > 0 {
+                return i + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// === AmbiguousSystemConflictsWarning ===
+struct EcsAmbiguousSystemConflictsWarning {
+    conflicts: EcsNodeSetConflictingSystems,
+}
+
+fn ecs_ambiguous_warning_new(conflicts: EcsNodeSetConflictingSystems) -> EcsAmbiguousSystemConflictsWarning {
+    return EcsAmbiguousSystemConflictsWarning { conflicts: conflicts };
+}
+
+fn ecs_ambiguous_warning_len(w: EcsAmbiguousSystemConflictsWarning) -> i64 { return ecs_conflicting_systems_len(w.conflicts); }
+fn ecs_ambiguous_warning_is_empty(w: EcsAmbiguousSystemConflictsWarning) -> bool { return ecs_conflicting_systems_is_empty(w.conflicts); }
+fn ecs_ambiguous_warning_get(w: EcsAmbiguousSystemConflictsWarning, index: i32) -> EcsNodeSetConflict { return ecs_conflicting_systems_get(w.conflicts, index); }
+
+// === SystemTypeSetAmbiguityError ===
+struct EcsSystemTypeSetAmbiguityError {
+    key: i32,
+}
+
+fn ecs_system_type_set_ambiguity_error_new(key: i32) -> EcsSystemTypeSetAmbiguityError {
+    return EcsSystemTypeSetAmbiguityError { key: key };
+}
+
+fn ecs_system_type_set_ambiguity_error_key(e: EcsSystemTypeSetAmbiguityError) -> i32 { return e.key; }
+
+// === Constructors for test/external use ===
+fn ecs_node_set_cond_new(condition_id: i32) -> EcsNodeSetCond {
+    return EcsNodeSetCond { condition_id: condition_id };
+}
+
+fn ecs_node_set_conflict_new(a: i32, b: i32, conflicts: Vec<i32>) -> EcsNodeSetConflict {
+    return EcsNodeSetConflict { a: a, b: b, conflicts: conflicts };
+}
+
+fn ecs_node_set_uninitialized_set_new(key: i32, start: i64, end: i64) -> EcsNodeSetUninitializedSet {
+    return EcsNodeSetUninitializedSet { key: key, start: start, end: end };
+}

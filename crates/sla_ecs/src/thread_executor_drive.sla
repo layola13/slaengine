@@ -1,0 +1,132 @@
+// Bevy ThreadExecutor owner-ticker drive model over explicit i32 tasks.
+//
+// ThreadExecutor permits tasks to be spawned from other threads, but only the
+// thread that created the executor can obtain a ticker and manually drive task
+// progress. This module builds on `thread_executor.sla` to model continuous
+// owner-thread ticking and remote spawn attempts.
+@import "thread_executor.sla"
+
+struct EcsThreadExecutorDriveState {
+    executor: EcsThreadExecutor,
+    remote_spawn_count: i64,
+    local_spawn_count: i64,
+    rejected_ticker_count: i64,
+}
+
+struct EcsThreadExecutorDriveSpawnResult {
+    state: EcsThreadExecutorDriveState,
+    task: EcsThreadTask,
+}
+
+struct EcsThreadExecutorDriveRunResult {
+    state: EcsThreadExecutorDriveState,
+    ticked_count: i64,
+    completed_count: i64,
+    target_ready: bool,
+    target_value: i32,
+}
+
+fn ecs_thread_executor_drive_state_new(owner_thread_id: i64, executor_id: i64) -> EcsThreadExecutorDriveState {
+    return EcsThreadExecutorDriveState { executor: ecs_thread_executor_new_with_id(owner_thread_id, executor_id), remote_spawn_count: 0, local_spawn_count: 0, rejected_ticker_count: 0 };
+}
+
+fn ecs_thread_executor_drive_spawn_from_thread(state: EcsThreadExecutorDriveState, spawning_thread_id: i64, value: i32) -> EcsThreadExecutorDriveSpawnResult {
+    let (executor, task) = ecs_thread_executor_spawn_value(state.executor, value);
+    state.executor = executor;
+    if spawning_thread_id == state.executor.owner_thread_id {
+        state.local_spawn_count = state.local_spawn_count + 1;
+    } else {
+        state.remote_spawn_count = state.remote_spawn_count + 1;
+    };
+    return EcsThreadExecutorDriveSpawnResult { state: state, task: task };
+}
+
+fn ecs_thread_executor_drive_try_tick_from_thread(state: EcsThreadExecutorDriveState, current_thread_id: i64) -> EcsThreadExecutorTickResult {
+    let ticker = ecs_thread_executor_ticker(state.executor, current_thread_id);
+    return ecs_thread_executor_try_tick(state.executor, ticker);
+}
+
+fn ecs_thread_executor_drive_run_until_idle_from_thread(state: EcsThreadExecutorDriveState, current_thread_id: i64) -> EcsThreadExecutorDriveRunResult {
+    let ticker = ecs_thread_executor_ticker(state.executor, current_thread_id);
+    if ticker.has_ticker != true {
+        state.rejected_ticker_count = state.rejected_ticker_count + 1;
+        return EcsThreadExecutorDriveRunResult { state: state, ticked_count: 0, completed_count: len(state.executor.completed_task_ids) as i64, target_ready: false, target_value: 0 };
+    };
+    let ticked_count: i64 = 0;
+    while len(state.executor.queued_task_ids) > 0 {
+        let tick = ecs_thread_executor_try_tick(state.executor, ticker);
+        state.executor = tick.executor;
+        if tick.ticked { ticked_count = ticked_count + 1; };
+    }
+    return EcsThreadExecutorDriveRunResult { state: state, ticked_count: ticked_count, completed_count: len(state.executor.completed_task_ids) as i64, target_ready: false, target_value: 0 };
+}
+
+fn ecs_thread_executor_drive_run_until_task_from_thread(state: EcsThreadExecutorDriveState, current_thread_id: i64, task: EcsThreadTask) -> EcsThreadExecutorDriveRunResult {
+    let ticker = ecs_thread_executor_ticker(state.executor, current_thread_id);
+    if ticker.has_ticker != true {
+        state.rejected_ticker_count = state.rejected_ticker_count + 1;
+        return EcsThreadExecutorDriveRunResult { state: state, ticked_count: 0, completed_count: len(state.executor.completed_task_ids) as i64, target_ready: false, target_value: 0 };
+    };
+    let ticked_count: i64 = 0;
+    while ecs_thread_task_is_finished(state.executor, task) != true {
+        let tick = ecs_thread_executor_try_tick(state.executor, ticker);
+        state.executor = tick.executor;
+        if tick.ticked {
+            ticked_count = ticked_count + 1;
+        } else {
+            return EcsThreadExecutorDriveRunResult { state: state, ticked_count: ticked_count, completed_count: len(state.executor.completed_task_ids) as i64, target_ready: false, target_value: 0 };
+        };
+    }
+    let value = ecs_thread_task_value_or(state.executor, task, 0);
+    return EcsThreadExecutorDriveRunResult { state: state, ticked_count: ticked_count, completed_count: len(state.executor.completed_task_ids) as i64, target_ready: true, target_value: value };
+}
+
+@test "thread executor remote spawn waits for owner ticker drive"() {
+    let state0 = ecs_thread_executor_drive_state_new(10, 77);
+    let spawn = ecs_thread_executor_drive_spawn_from_thread(state0, 11, 5);
+    if spawn.state.remote_spawn_count != 1 { panic(32610); };
+    if ecs_thread_task_is_finished(spawn.state.executor, spawn.task) { panic(32611); };
+    let run = ecs_thread_executor_drive_run_until_idle_from_thread(spawn.state, 10);
+    if run.ticked_count != 1 { panic(32612); };
+    if ecs_thread_task_value_or(run.state.executor, spawn.task, -1) != 5 { panic(32613); };
+}
+
+@test "thread executor non owner ticker cannot drive queued task"() {
+    let state0 = ecs_thread_executor_drive_state_new(10, 77);
+    let spawn = ecs_thread_executor_drive_spawn_from_thread(state0, 11, 6);
+    let run = ecs_thread_executor_drive_run_until_idle_from_thread(spawn.state, 11);
+    if run.ticked_count != 0 { panic(32620); };
+    if run.state.rejected_ticker_count != 1 { panic(32621); };
+    if ecs_thread_task_is_finished(run.state.executor, spawn.task) { panic(32622); };
+}
+
+@test "thread executor owner run until idle drains all queued tasks"() {
+    let state0 = ecs_thread_executor_drive_state_new(10, 77);
+    let s1 = ecs_thread_executor_drive_spawn_from_thread(state0, 10, 1);
+    let s2 = ecs_thread_executor_drive_spawn_from_thread(s1.state, 11, 2);
+    let s3 = ecs_thread_executor_drive_spawn_from_thread(s2.state, 12, 3);
+    let run = ecs_thread_executor_drive_run_until_idle_from_thread(s3.state, 10);
+    if run.ticked_count != 3 { panic(32630); };
+    if run.completed_count != 3 { panic(32631); };
+    if run.state.local_spawn_count != 1 { panic(32632); };
+    if run.state.remote_spawn_count != 2 { panic(32633); };
+}
+
+@test "thread executor run until task stops when target completes"() {
+    let state0 = ecs_thread_executor_drive_state_new(10, 77);
+    let s1 = ecs_thread_executor_drive_spawn_from_thread(state0, 11, 8);
+    let s2 = ecs_thread_executor_drive_spawn_from_thread(s1.state, 11, 9);
+    let run = ecs_thread_executor_drive_run_until_task_from_thread(s2.state, 10, s1.task);
+    if run.target_ready != true { panic(32640); };
+    if run.target_value != 8 { panic(32641); };
+    if run.ticked_count != 1 { panic(32642); };
+    if ecs_thread_task_is_finished(run.state.executor, s2.task) { panic(32643); };
+}
+
+@test "thread executor run until task reports false for unknown task"() {
+    let state0 = ecs_thread_executor_drive_state_new(10, 77);
+    let unknown = ecs_thread_task_new(77, 99, false);
+    let run = ecs_thread_executor_drive_run_until_task_from_thread(state0, 10, unknown);
+    if run.target_ready { panic(32650); };
+    if run.ticked_count != 0 { panic(32651); };
+}

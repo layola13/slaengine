@@ -1,0 +1,167 @@
+// Bevy ECS SystemChangeTick + ParamSet + Deferred surface — mirrors src/system/system_param.rs.
+//
+//   pub struct SystemChangeTick { this_run: Tick, last_run: Tick }
+//     pub fn this_run(&self) -> Tick
+//     pub fn last_run(&self) -> Tick
+//
+//   pub struct ParamSet<'w,'s,T: SystemParam> { ... }
+//     pub fn get_mut(&mut self, index: usize) -> T::Item   -- mutable access to the i-th param
+//     pub fn for_each(&mut self, f: ...)                  -- apply per param (modelled via id)
+//
+//   pub struct Deferred<'a, T: SystemBuffer>(&'a mut T)
+//     pub fn reborrow(&mut self) -> Deferred<'_, T>       -- extend a mutable borrow's lifetime
+//
+//   pub struct If<T>(pub T)                                -- conditional system-param gate
+//
+// `Tick` is modelled as i64 (the change-tick value). Generic params & closures (FnMut) are
+// modelled via parameter-id indices (per SLA rules 11–12). The param-set holds a Vec of param
+// slots (modelled as integer slots — a real param value would be boxed but we model the
+// access-control semantics: an active mutable borrow index is tracked so a second overlapping
+// get_mut on a same active index panics).
+
+// === SystemChangeTick ===
+struct EcsSystemChangeTick {
+    this_run: i64,
+    last_run: i64,
+}
+
+fn ecs_system_change_tick_new(this_run: i64, last_run: i64) -> EcsSystemChangeTick {
+    return EcsSystemChangeTick { this_run: this_run, last_run: last_run };
+}
+
+fn ecs_system_change_tick_this_run(t: EcsSystemChangeTick) -> i64 {
+    return t.this_run;
+}
+
+fn ecs_system_change_tick_last_run(t: EcsSystemChangeTick) -> i64 {
+    return t.last_run;
+}
+
+// === ParamSet get_mut result (single-field accessor — avoids scalar-tuple .1 corruption) ===
+struct ParamSetGetResult {
+    has_value: bool,
+    value: i64,
+    active_index: i32,
+}
+
+fn ecs_psr_has(r: ParamSetGetResult) -> bool {
+    return r.has_value;
+}
+
+fn ecs_psr_value(r: ParamSetGetResult) -> i64 {
+    return r.value;
+}
+
+fn ecs_psr_active(r: ParamSetGetResult) -> i32 {
+    return r.active_index;
+}
+
+// === EcsParamSet model: a Vec<i64> of slots + an "active_mut_index" tracking which slot is
+// currently mutably borrowed so a second get_mut on the same index without returning (reborrow)
+// panics — mirrors Rust borrow rules made explicit at runtime.
+//
+// We model the SystemParam values as i64 slots (component-id proxy). The access-control
+// semantics is the testable invariant.
+struct EcsParamSet {
+    slots: Vec<i64>,
+    active_mut_index: i32,
+}
+
+fn ecs_param_set_new(slots: Vec<i64>) -> EcsParamSet {
+    return EcsParamSet { slots: slots, active_mut_index: (0 - 1) };
+}
+
+fn ecs_param_set_len(p: EcsParamSet) -> i32 {
+    return len(p.slots) as i32;
+}
+
+fn ecs_param_set_is_empty(p: EcsParamSet) -> bool {
+    return len(p.slots) as i32 == 0;
+}
+
+// Release the active mutable borrow (mirrors the end of `let _guard = set.get_mut(i); ...`).
+fn ecs_param_set_release(p: EcsParamSet) -> EcsParamSet {
+    p.active_mut_index = (0 - 1);
+    return p;
+}
+
+fn ecs_param_set_active_index(p: EcsParamSet) -> i32 {
+    return p.active_mut_index;
+}
+
+// get_mut(index) — mutable access to the i-th param. Panics (sentinel) if the index is out of
+// range or if a mutable borrow of the *same* slot is already active (Rust aliasing rule).
+// Returns the slot value in a single-field result struct.
+fn ecs_param_set_get_mut(p: EcsParamSet, index: i32) -> ParamSetGetResult {
+    if index < 0 || index >= len(p.slots) as i32 {
+        // Out-of-range: Bevy's tuple-indexing `pN()` panics on const-N beyond arity.
+        return ParamSetGetResult { has_value: false, value: (0 - 1), active_index: (0 - 1) };
+    };
+    if p.active_mut_index == index {
+        // Overlapping mutable borrow of the same param slot — not valid in Rust.
+        return ParamSetGetResult { has_value: false, value: (0 - 2), active_index: index };
+    };
+    let val = p.slots[index];
+    p.active_mut_index = index;
+    return ParamSetGetResult { has_value: true, value: val, active_index: index };
+}
+
+// for_each applies an action to every param slot in order. We model the closure-less effect as
+// returning the count of slots visited (Bevy's FnMut would mutate state; we expose the
+// iteration-order invariant: slots visited left-to-right).
+fn ecs_param_set_for_each_count(p: EcsParamSet) -> i32 {
+    return len(p.slots) as i32;
+}
+
+fn ecs_param_set_slot_at(p: EcsParamSet, index: i32) -> (i32, i64) {
+    if index < 0 || index >= len(p.slots) as i32 {
+        return ((0 - 1), (0 - 1));
+    };
+    return (index, p.slots[index]);
+}
+
+// === Deferred<T> reborrow ===
+// Deferred wraps a &mut T. reborrow(&mut self) -> Deferred<T> reissues a fresh mutable borrow.
+// We model the wrapped SystemBuffer state as an i64 (the deferred-mutations count).
+struct EcsDeferred {
+    buffer_state: i64,
+}
+
+fn ecs_deferred_new(buffer_state: i64) -> EcsDeferred {
+    return EcsDeferred { buffer_state: buffer_state };
+}
+
+fn ecs_deferred_buffer_state(d: EcsDeferred) -> i64 {
+    return d.buffer_state;
+}
+
+// reborrow — returns a new Deferred handle sharing the same buffer (the state value is shared;
+// caller can keep mutating via the reborrowed handle). Modelled as a read of the buffer state.
+fn ecs_deferred_reborrow(d: EcsDeferred) -> EcsDeferred {
+    return EcsDeferred { buffer_state: d.buffer_state };
+}
+
+// apply() — mirrors SystemBuffer::apply(&mut self, meta, world) flushing deferred mutations.
+// We model the flush as bumping the buffer_state to the new change-tick the apply commits at.
+fn ecs_deferred_apply(d: EcsDeferred, apply_at_tick: i64) -> EcsDeferred {
+    return EcsDeferred { buffer_state: apply_at_tick };
+}
+
+// === If<T> gate ===
+// If<T>(pub T) — conditionally-share-conditions param; publishes a `matches` flag predicate.
+struct EcsIf {
+    inner: i64,
+    matches: bool,
+}
+
+fn ecs_if_new(inner: i64, matches: bool) -> EcsIf {
+    return EcsIf { inner: inner, matches: matches };
+}
+
+fn ecs_if_inner(x: EcsIf) -> i64 {
+    return x.inner;
+}
+
+fn ecs_if_matches(x: EcsIf) -> bool {
+    return x.matches;
+}

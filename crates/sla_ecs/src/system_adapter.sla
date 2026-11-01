@@ -1,0 +1,116 @@
+// Bevy ECS system::adapter_system (src/system/adapter_system.rs):
+// Adapt trait + AdapterSystem + IntoAdapterSystem + common adapter markers
+// (Not, map, chain). Models the system-adapter surface that transforms a
+// system's input/output without re-running it.
+
+// === RunSystemError mirror ===
+struct EcsRunSystemError {
+    code: i32,    // 0 = ok, >0 = error kind
+    payload: i64,
+}
+
+fn ecs_run_system_ok() -> EcsRunSystemError { return EcsRunSystemError { code: 0, payload: 0 }; }
+
+fn ecs_run_system_err(code: i32, payload: i64) -> EcsRunSystemError {
+    return EcsRunSystemError { code: code, payload: payload };
+}
+
+fn ecs_run_system_is_ok(e: EcsRunSystemError) -> bool { return e.code == 0; }
+
+fn ecs_run_system_payload(e: EcsRunSystemError) -> i64 { return e.payload; }
+
+// === NotMarker / NotSystem adapter ===
+// Adapt impl that inverts a bool output.
+struct EcsNotMarker {}
+
+fn ecs_not_marker_new() -> EcsNotMarker { return EcsNotMarker {}; }
+
+// adapt: given the inner system result (bool) + error, return (error, !result)
+fn ecs_not_adapt(marker: EcsNotMarker, inner_result: bool, inner_err: EcsRunSystemError) -> (EcsRunSystemError, bool) {
+    if ecs_run_system_is_ok(inner_err) {
+        return (ecs_run_system_ok(), inner_result != true);
+    };
+    return (inner_err, false);
+}
+
+// === AdapterSystem<Func, S> ===
+struct EcsAdapterSystem {
+    func_kind: i32,   // 0 = not, 1 = map, 2 = chain
+    inner_value: i64, // inner system output
+    name: i64,        // system name id
+}
+
+fn ecs_adapter_system_new(func_kind: i32, inner_value: i64, name: i64) -> EcsAdapterSystem {
+    return EcsAdapterSystem { func_kind: func_kind, inner_value: inner_value, name: name };
+}
+
+fn ecs_adapter_system_kind(s: EcsAdapterSystem) -> i32 { return s.func_kind; }
+
+fn ecs_adapter_system_name(s: EcsAdapterSystem) -> i64 { return s.name; }
+
+// run the adapter: applies the adapt function to the inner output
+fn ecs_adapter_system_run(s: EcsAdapterSystem, input: i64) -> (EcsRunSystemError, i64) {
+    if s.func_kind == 0 {
+        // not: invert bool (inner_value treated as 0/1)
+        let out = (s.inner_value != 0) != true;
+        let v = 0;
+        if out { v = 1; };
+        return (ecs_run_system_ok(), v);
+    };
+    if s.func_kind == 1 {
+        // map: identity over input (placeholder transform)
+        return (ecs_run_system_ok(), input + s.inner_value);
+    };
+    // chain: feed inner_value into next
+    return (ecs_run_system_ok(), s.inner_value + input);
+}
+
+// === IntoAdapterSystem<Func, S> ===
+struct EcsIntoAdapterSystem {
+    func_kind: i32,
+    inner_value: i64,
+}
+
+fn ecs_into_adapter_system_new(func_kind: i32, inner_value: i64) -> EcsIntoAdapterSystem {
+    return EcsIntoAdapterSystem { func_kind: func_kind, inner_value: inner_value };
+}
+
+// convert IntoAdapterSystem into AdapterSystem with a name
+fn ecs_into_adapter_system_into(s: EcsIntoAdapterSystem, name: i64) -> EcsAdapterSystem {
+    return ecs_adapter_system_new(s.func_kind, s.inner_value, name);
+}
+
+// === Map adapter ===
+// map: applies a transform f to the system output.
+struct EcsMapAdapter {
+    offset: i64, // represents the mapping function (e.g. +offset)
+}
+
+fn ecs_map_adapter_new(offset: i64) -> EcsMapAdapter { return EcsMapAdapter { offset: offset }; }
+
+fn ecs_map_adapt(m: EcsMapAdapter, inner_value: i64, inner_err: EcsRunSystemError) -> (EcsRunSystemError, i64) {
+    if ecs_run_system_is_ok(inner_err) {
+        return (ecs_run_system_ok(), inner_value + m.offset);
+    };
+    return (inner_err, 0);
+}
+
+// === Chain adapter ===
+// chain: feeds the output of one system as input to the next.
+struct EcsChainAdapter {
+    second_offset: i64,
+}
+
+fn ecs_chain_adapter_new(second_offset: i64) -> EcsChainAdapter { return EcsChainAdapter { second_offset: second_offset }; }
+
+fn ecs_chain_adapt(c: EcsChainAdapter, first_output: i64, first_err: EcsRunSystemError) -> (EcsRunSystemError, i64) {
+    if ecs_run_system_is_ok(first_err) {
+        return (ecs_run_system_ok(), first_output + c.second_offset);
+    };
+    return (first_err, 0);
+}
+
+// === IsAdapterSystemMarker ===
+struct EcsIsAdapterSystemMarker {}
+
+fn ecs_is_adapter_system_marker_new() -> EcsIsAdapterSystemMarker { return EcsIsAdapterSystemMarker {}; }

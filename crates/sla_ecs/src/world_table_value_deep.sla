@@ -1,0 +1,1351 @@
+// Deep bed for lib/world_table_value.sla (Batch 386).
+// Mirrors shallow `lib/world_table_value.sla`'s `TableValueWorld<T, R, M>` as a SELF-CONTAINED
+// fixed-cap variant (no @import) using concrete typed columns based on `TableValueData { amount }`,
+// `TableValueTime { tick }` (resource), `TableValueEvent { amount }` (message).  Storage is archetype-
+// grouped: each archetype carries cap-4 component columns x cap-4 entity rows of typed values, and
+// each entity has a (archetype_id, row) location.  Inserting/removing a component migrates the entity
+// between archetypes, preserving its existing values from the old archetype and adding the new
+// component's value.  Mirrors Bevy's archetype-table storage where entity moves on component change.
+//
+// Storage layout: cap-4 archetypes, cap-4 component ids per archetype, cap-4 entity rows per
+// archetype, cap-8 entity ids overall.  Per-archetype value array is flat 4*4 = 16 i32 slots
+// (indexed by col*4 + row).  present_mask per column (i32 bitmask over rows).  Per-archetype
+// `added_t0..15` and `changed_t0..15` likewise flat cap-16 indexed col*4 + row.  Resource slot +
+// message slot + monotone change_tick.  Wrapper structs expose scalar accessors (no tuple-return
+// destructuring in tests).
+
+const ECS_TV_CAP_ARCH: i32 = 4;
+const ECS_TV_CAP_COMPONENTS_PER_ARCH: i32 = 4;
+const ECS_TV_CAP_ROWS_PER_ARCH: i32 = 4;
+const ECS_TV_CAP_ENTITIES: i32 = 8;
+const ECS_TV_TICK_NONE: i32 = 999999;
+
+struct EcsTVEntityDeep { id: i32, generation: i32 }
+
+fn ecs_tv_entity_eq_deep(a: EcsTVEntityDeep, b: EcsTVEntityDeep) -> bool {
+    if a.id != b.id { return false; };
+    if a.generation != b.generation { return false; };
+    return true;
+}
+
+fn ecs_tv_entity_id_deep(a: EcsTVEntityDeep) -> i32 { return a.id; }
+fn ecs_tv_entity_gen_deep(a: EcsTVEntityDeep) -> i32 { return a.generation; }
+fn ecs_tv_entity_new(id: i32, generation: i32) -> EcsTVEntityDeep {
+    return EcsTVEntityDeep { id: id, generation: generation };
+}
+
+// ── Concrete typed plugs (mirror the shallow's TableValueData / Time / Event). ────────────────
+struct EcsTVDataDeep { amount: i32 }
+struct EcsTVTimeDeep { tick: i32 }
+struct EcsTVEventDeep { amount: i32 }
+
+fn ecs_tv_data_deep_new(amount: i32) -> EcsTVDataDeep { return EcsTVDataDeep { amount: amount }; }
+fn ecs_tv_data_deep_amount(r: EcsTVDataDeep) -> i32 { return r.amount; }
+fn ecs_tv_time_deep_new(tick: i32) -> EcsTVTimeDeep { return EcsTVTimeDeep { tick: tick }; }
+fn ecs_tv_time_deep_tick(r: EcsTVTimeDeep) -> i32 { return r.tick; }
+fn ecs_tv_event_deep_new(amount: i32) -> EcsTVEventDeep { return EcsTVEventDeep { amount: amount }; }
+fn ecs_tv_event_deep_amount(r: EcsTVEventDeep) -> i32 { return r.amount; }
+
+// ── ComponentInfo { id } wrapper (mirrors shallow ComponentInfo). ────────────────────────────
+struct EcsTVCompInfoDeep { id: i32 }
+fn ecs_tv_comp_info_id_deep(r: EcsTVCompInfoDeep) -> i32 { return r.id; }
+fn ecs_tv_comp_info_new(id: i32) -> EcsTVCompInfoDeep { return EcsTVCompInfoDeep { id: id }; }
+
+// ── Register wrapper { world, info }. ────────────────────────────────────────────────────────
+struct EcsTVRegisterDeep { world: EcsTVWorldDeep, info: EcsTVCompInfoDeep }
+fn ecs_tv_register_world_deep(r: EcsTVRegisterDeep) -> EcsTVWorldDeep { return r.world; }
+fn ecs_tv_register_info_deep(r: EcsTVRegisterDeep) -> EcsTVCompInfoDeep { return r.info; }
+
+// ── Spawn wrapper { world, entity }. ────────────────────────────────────────────────────────
+struct EcsTVSpawnDeep { world: EcsTVWorldDeep, entity: EcsTVEntityDeep }
+fn ecs_tv_spawn_world_deep(r: EcsTVSpawnDeep) -> EcsTVWorldDeep { return r.world; }
+fn ecs_tv_spawn_entity_deep(r: EcsTVSpawnDeep) -> EcsTVEntityDeep { return r.entity; }
+
+// ── Per-archetype storage: cap-4 component columns x cap-4 entity rows of typed values, plus
+//    present_mask per column (i32 bitmask over rows), row_count, and a per-row entity id. The value
+//    arrays `vals0..15` / `added_t0..15` / `changed_t0..15` are flat col*4+row indexed.
+struct EcsTVArchDeep {
+    id: i32,
+    used: i32,
+    comp_count: i32,
+    comp_id0: i32, comp_id1: i32, comp_id2: i32, comp_id3: i32,
+    present0: i32, present1: i32, present2: i32, present3: i32,
+    row_count: i32,
+    eid0: i32, eid1: i32, eid2: i32, eid3: i32,
+    // Per-(col,row) typed value cap-16 (4 cols x 4 rows). Indexed col*4 + row.
+    vals0: i32, vals1: i32, vals2: i32, vals3: i32, vals4: i32, vals5: i32, vals6: i32, vals7: i32,
+    vals8: i32, vals9: i32, vals10: i32, vals11: i32, vals12: i32, vals13: i32, vals14: i32, vals15: i32,
+    added_t0: i32, added_t1: i32, added_t2: i32, added_t3: i32, added_t4: i32, added_t5: i32, added_t6: i32, added_t7: i32,
+    added_t8: i32, added_t9: i32, added_t10: i32, added_t11: i32, added_t12: i32, added_t13: i32, added_t14: i32, added_t15: i32,
+    changed_t0: i32, changed_t1: i32, changed_t2: i32, changed_t3: i32, changed_t4: i32, changed_t5: i32, changed_t6: i32, changed_t7: i32,
+    changed_t8: i32, changed_t9: i32, changed_t10: i32, changed_t11: i32, changed_t12: i32, changed_t13: i32, changed_t14: i32, changed_t15: i32
+}
+
+fn _ecs_tv_arch_empty(id: i32) -> EcsTVArchDeep {
+    return EcsTVArchDeep {
+        id: id, used: 0, comp_count: 0,
+        comp_id0: -1, comp_id1: -1, comp_id2: -1, comp_id3: -1,
+        present0: 0, present1: 0, present2: 0, present3: 0,
+        row_count: 0,
+        eid0: -1, eid1: -1, eid2: -1, eid3: -1,
+        vals0: 0, vals1: 0, vals2: 0, vals3: 0, vals4: 0, vals5: 0, vals6: 0, vals7: 0,
+        vals8: 0, vals9: 0, vals10: 0, vals11: 0, vals12: 0, vals13: 0, vals14: 0, vals15: 0,
+        added_t0: ECS_TV_TICK_NONE, added_t1: ECS_TV_TICK_NONE, added_t2: ECS_TV_TICK_NONE, added_t3: ECS_TV_TICK_NONE, added_t4: ECS_TV_TICK_NONE, added_t5: ECS_TV_TICK_NONE, added_t6: ECS_TV_TICK_NONE, added_t7: ECS_TV_TICK_NONE,
+        added_t8: ECS_TV_TICK_NONE, added_t9: ECS_TV_TICK_NONE, added_t10: ECS_TV_TICK_NONE, added_t11: ECS_TV_TICK_NONE, added_t12: ECS_TV_TICK_NONE, added_t13: ECS_TV_TICK_NONE, added_t14: ECS_TV_TICK_NONE, added_t15: ECS_TV_TICK_NONE,
+        changed_t0: ECS_TV_TICK_NONE, changed_t1: ECS_TV_TICK_NONE, changed_t2: ECS_TV_TICK_NONE, changed_t3: ECS_TV_TICK_NONE, changed_t4: ECS_TV_TICK_NONE, changed_t5: ECS_TV_TICK_NONE, changed_t6: ECS_TV_TICK_NONE, changed_t7: ECS_TV_TICK_NONE,
+        changed_t8: ECS_TV_TICK_NONE, changed_t9: ECS_TV_TICK_NONE, changed_t10: ECS_TV_TICK_NONE, changed_t11: ECS_TV_TICK_NONE, changed_t12: ECS_TV_TICK_NONE, changed_t13: ECS_TV_TICK_NONE, changed_t14: ECS_TV_TICK_NONE, changed_t15: ECS_TV_TICK_NONE
+    };
+}
+
+// Per-archetype slot helpers (4-case cascade-of-return, well within the SA's expansion budget).
+fn _ecs_tv_arch_comp_id_at(a: EcsTVArchDeep, col: i32) -> i32 {
+    if col == 0 { return a.comp_id0; };
+    if col == 1 { return a.comp_id1; };
+    if col == 2 { return a.comp_id2; };
+    return a.comp_id3;
+}
+
+fn _ecs_tv_arch_set_comp_id(a0: EcsTVArchDeep, col: i32, value: i32) -> EcsTVArchDeep {
+    if col == 0 { a0.comp_id0 = value; return a0; };
+    if col == 1 { a0.comp_id1 = value; return a0; };
+    if col == 2 { a0.comp_id2 = value; return a0; };
+    a0.comp_id3 = value;
+    return a0;
+}
+
+fn _ecs_tv_arch_present_at(a: EcsTVArchDeep, col: i32) -> i32 {
+    if col == 0 { return a.present0; };
+    if col == 1 { return a.present1; };
+    if col == 2 { return a.present2; };
+    return a.present3;
+}
+
+fn _ecs_tv_arch_set_present(a0: EcsTVArchDeep, col: i32, value: i32) -> EcsTVArchDeep {
+    if col == 0 { a0.present0 = value; return a0; };
+    if col == 1 { a0.present1 = value; return a0; };
+    if col == 2 { a0.present2 = value; return a0; };
+    a0.present3 = value;
+    return a0;
+}
+
+fn _ecs_tv_arch_eid_at(a: EcsTVArchDeep, row: i32) -> i32 {
+    if row == 0 { return a.eid0; };
+    if row == 1 { return a.eid1; };
+    if row == 2 { return a.eid2; };
+    return a.eid3;
+}
+
+fn _ecs_tv_arch_set_eid(a0: EcsTVArchDeep, row: i32, value: i32) -> EcsTVArchDeep {
+    if row == 0 { a0.eid0 = value; return a0; };
+    if row == 1 { a0.eid1 = value; return a0; };
+    if row == 2 { a0.eid2 = value; return a0; };
+    a0.eid3 = value;
+    return a0;
+}
+
+// vals0..15 + added_t + changed_t getters/setters are 16-case cascades.  col*4 + row indexing means
+// we look up by flat index `slot`. We dispatch on slot 0..15.
+fn _ecs_tv_arch_val_at(a: EcsTVArchDeep, slot: i32) -> i32 {
+    if slot == 0 { return a.vals0; };
+    if slot == 1 { return a.vals1; };
+    if slot == 2 { return a.vals2; };
+    if slot == 3 { return a.vals3; };
+    if slot == 4 { return a.vals4; };
+    if slot == 5 { return a.vals5; };
+    if slot == 6 { return a.vals6; };
+    if slot == 7 { return a.vals7; };
+    if slot == 8 { return a.vals8; };
+    if slot == 9 { return a.vals9; };
+    if slot == 10 { return a.vals10; };
+    if slot == 11 { return a.vals11; };
+    if slot == 12 { return a.vals12; };
+    if slot == 13 { return a.vals13; };
+    if slot == 14 { return a.vals14; };
+    return a.vals15;
+}
+
+fn _ecs_tv_arch_set_val(a0: EcsTVArchDeep, slot: i32, value: i32) -> EcsTVArchDeep {
+    if slot == 0 { a0.vals0 = value; return a0; };
+    if slot == 1 { a0.vals1 = value; return a0; };
+    if slot == 2 { a0.vals2 = value; return a0; };
+    if slot == 3 { a0.vals3 = value; return a0; };
+    if slot == 4 { a0.vals4 = value; return a0; };
+    if slot == 5 { a0.vals5 = value; return a0; };
+    if slot == 6 { a0.vals6 = value; return a0; };
+    if slot == 7 { a0.vals7 = value; return a0; };
+    if slot == 8 { a0.vals8 = value; return a0; };
+    if slot == 9 { a0.vals9 = value; return a0; };
+    if slot == 10 { a0.vals10 = value; return a0; };
+    if slot == 11 { a0.vals11 = value; return a0; };
+    if slot == 12 { a0.vals12 = value; return a0; };
+    if slot == 13 { a0.vals13 = value; return a0; };
+    if slot == 14 { a0.vals14 = value; return a0; };
+    a0.vals15 = value;
+    return a0;
+}
+
+fn _ecs_tv_arch_added_at(a: EcsTVArchDeep, slot: i32) -> i32 {
+    if slot == 0 { return a.added_t0; };
+    if slot == 1 { return a.added_t1; };
+    if slot == 2 { return a.added_t2; };
+    if slot == 3 { return a.added_t3; };
+    if slot == 4 { return a.added_t4; };
+    if slot == 5 { return a.added_t5; };
+    if slot == 6 { return a.added_t6; };
+    if slot == 7 { return a.added_t7; };
+    if slot == 8 { return a.added_t8; };
+    if slot == 9 { return a.added_t9; };
+    if slot == 10 { return a.added_t10; };
+    if slot == 11 { return a.added_t11; };
+    if slot == 12 { return a.added_t12; };
+    if slot == 13 { return a.added_t13; };
+    if slot == 14 { return a.added_t14; };
+    return a.added_t15;
+}
+
+fn _ecs_tv_arch_set_added(a0: EcsTVArchDeep, slot: i32, value: i32) -> EcsTVArchDeep {
+    if slot == 0 { a0.added_t0 = value; return a0; };
+    if slot == 1 { a0.added_t1 = value; return a0; };
+    if slot == 2 { a0.added_t2 = value; return a0; };
+    if slot == 3 { a0.added_t3 = value; return a0; };
+    if slot == 4 { a0.added_t4 = value; return a0; };
+    if slot == 5 { a0.added_t5 = value; return a0; };
+    if slot == 6 { a0.added_t6 = value; return a0; };
+    if slot == 7 { a0.added_t7 = value; return a0; };
+    if slot == 8 { a0.added_t8 = value; return a0; };
+    if slot == 9 { a0.added_t9 = value; return a0; };
+    if slot == 10 { a0.added_t10 = value; return a0; };
+    if slot == 11 { a0.added_t11 = value; return a0; };
+    if slot == 12 { a0.added_t12 = value; return a0; };
+    if slot == 13 { a0.added_t13 = value; return a0; };
+    if slot == 14 { a0.added_t14 = value; return a0; };
+    a0.added_t15 = value;
+    return a0;
+}
+
+fn _ecs_tv_arch_changed_at(a: EcsTVArchDeep, slot: i32) -> i32 {
+    if slot == 0 { return a.changed_t0; };
+    if slot == 1 { return a.changed_t1; };
+    if slot == 2 { return a.changed_t2; };
+    if slot == 3 { return a.changed_t3; };
+    if slot == 4 { return a.changed_t4; };
+    if slot == 5 { return a.changed_t5; };
+    if slot == 6 { return a.changed_t6; };
+    if slot == 7 { return a.changed_t7; };
+    if slot == 8 { return a.changed_t8; };
+    if slot == 9 { return a.changed_t9; };
+    if slot == 10 { return a.changed_t10; };
+    if slot == 11 { return a.changed_t11; };
+    if slot == 12 { return a.changed_t12; };
+    if slot == 13 { return a.changed_t13; };
+    if slot == 14 { return a.changed_t14; };
+    return a.changed_t15;
+}
+
+fn _ecs_tv_arch_set_changed(a0: EcsTVArchDeep, slot: i32, value: i32) -> EcsTVArchDeep {
+    if slot == 0 { a0.changed_t0 = value; return a0; };
+    if slot == 1 { a0.changed_t1 = value; return a0; };
+    if slot == 2 { a0.changed_t2 = value; return a0; };
+    if slot == 3 { a0.changed_t3 = value; return a0; };
+    if slot == 4 { a0.changed_t4 = value; return a0; };
+    if slot == 5 { a0.changed_t5 = value; return a0; };
+    if slot == 6 { a0.changed_t6 = value; return a0; };
+    if slot == 7 { a0.changed_t7 = value; return a0; };
+    if slot == 8 { a0.changed_t8 = value; return a0; };
+    if slot == 9 { a0.changed_t9 = value; return a0; };
+    if slot == 10 { a0.changed_t10 = value; return a0; };
+    if slot == 11 { a0.changed_t11 = value; return a0; };
+    if slot == 12 { a0.changed_t12 = value; return a0; };
+    if slot == 13 { a0.changed_t13 = value; return a0; };
+    if slot == 14 { a0.changed_t14 = value; return a0; };
+    a0.changed_t15 = value;
+    return a0;
+}
+
+// ── World: cap-4 archetypes, cap-8 entity registry, cap-4 registered component ids, tick,
+//    resource slot, message slot. ────────────────────────────────────────────────────────────
+struct EcsTVWorldDeep {
+    arch0: EcsTVArchDeep, arch1: EcsTVArchDeep, arch2: EcsTVArchDeep, arch3: EcsTVArchDeep,
+    arch_count: i32,
+    // cap-8 entity row: gen + alive + (arch_id, row) location.
+    gen0: i32, gen1: i32, gen2: i32, gen3: i32, gen4: i32, gen5: i32, gen6: i32, gen7: i32,
+    alive0: i32, alive1: i32, alive2: i32, alive3: i32, alive4: i32, alive5: i32, alive6: i32, alive7: i32,
+    loc_arch0: i32, loc_arch1: i32, loc_arch2: i32, loc_arch3: i32, loc_arch4: i32, loc_arch5: i32, loc_arch6: i32, loc_arch7: i32,
+    loc_row0: i32, loc_row1: i32, loc_row2: i32, loc_row3: i32, loc_row4: i32, loc_row5: i32, loc_row6: i32, loc_row7: i32,
+    next_entity: i32, entity_count: i32,
+    change_tick: i32,
+    comp_count: i32,
+    res_time_tick: i32, res_time_set: i32,
+    res_added_tick: i32, res_changed_tick: i32,
+    msg_event_amount: i32, msg_count: i32
+}
+
+fn _ecs_tv_world_arch_zeros() -> EcsTVArchDeep {
+    return _ecs_tv_arch_empty(0);
+}
+
+fn ecs_tv_world_deep_new() -> EcsTVWorldDeep {
+    // Archetype 0 is the empty archetype (inhabited by freshly-spawned entities with no components).
+    let a0 = _ecs_tv_arch_empty(0);
+    a0.used = 1;
+    a0.row_count = 0;
+    return EcsTVWorldDeep {
+        arch0: a0, arch1: _ecs_tv_arch_empty(1), arch2: _ecs_tv_arch_empty(2), arch3: _ecs_tv_arch_empty(3),
+        arch_count: 1,
+        gen0: 0, gen1: 0, gen2: 0, gen3: 0, gen4: 0, gen5: 0, gen6: 0, gen7: 0,
+        alive0: 0, alive1: 0, alive2: 0, alive3: 0, alive4: 0, alive5: 0, alive6: 0, alive7: 0,
+        loc_arch0: -1, loc_arch1: -1, loc_arch2: -1, loc_arch3: -1, loc_arch4: -1, loc_arch5: -1, loc_arch6: -1, loc_arch7: -1,
+        loc_row0: -1, loc_row1: -1, loc_row2: -1, loc_row3: -1, loc_row4: -1, loc_row5: -1, loc_row6: -1, loc_row7: -1,
+        next_entity: 0, entity_count: 0, change_tick: 0, comp_count: 0,
+        res_time_tick: 0, res_time_set: 0,
+        res_added_tick: ECS_TV_TICK_NONE, res_changed_tick: ECS_TV_TICK_NONE,
+        msg_event_amount: 0, msg_count: 0
+    };
+}
+
+// ── World archetype (cap-4 slot) accessors. ──────────────────────────────────────────────────
+fn _ecs_tv_world_arch_at(w: EcsTVWorldDeep, idx: i32) -> EcsTVArchDeep {
+    if idx == 0 { return w.arch0; };
+    if idx == 1 { return w.arch1; };
+    if idx == 2 { return w.arch2; };
+    return w.arch3;
+}
+
+fn _ecs_tv_world_set_arch(w0: EcsTVWorldDeep, idx: i32, arch: EcsTVArchDeep) -> EcsTVWorldDeep {
+    if idx == 0 { w0.arch0 = arch; return w0; };
+    if idx == 1 { w0.arch1 = arch; return w0; };
+    if idx == 2 { w0.arch2 = arch; return w0; };
+    w0.arch3 = arch;
+    return w0;
+}
+
+// ── World entity (cap-8 slot) accessors. ───────────────────────────────────────────────────
+fn _ecs_tv_world_gen_at(w: EcsTVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.gen0; };
+    if eid == 1 { return w.gen1; };
+    if eid == 2 { return w.gen2; };
+    if eid == 3 { return w.gen3; };
+    if eid == 4 { return w.gen4; };
+    if eid == 5 { return w.gen5; };
+    if eid == 6 { return w.gen6; };
+    return w.gen7;
+}
+
+fn _ecs_tv_world_set_gen(w0: EcsTVWorldDeep, eid: i32, value: i32) -> EcsTVWorldDeep {
+    if eid == 0 { w0.gen0 = value; return w0; };
+    if eid == 1 { w0.gen1 = value; return w0; };
+    if eid == 2 { w0.gen2 = value; return w0; };
+    if eid == 3 { w0.gen3 = value; return w0; };
+    if eid == 4 { w0.gen4 = value; return w0; };
+    if eid == 5 { w0.gen5 = value; return w0; };
+    if eid == 6 { w0.gen6 = value; return w0; };
+    w0.gen7 = value;
+    return w0;
+}
+
+fn _ecs_tv_world_alive_at(w: EcsTVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.alive0; };
+    if eid == 1 { return w.alive1; };
+    if eid == 2 { return w.alive2; };
+    if eid == 3 { return w.alive3; };
+    if eid == 4 { return w.alive4; };
+    if eid == 5 { return w.alive5; };
+    if eid == 6 { return w.alive6; };
+    return w.alive7;
+}
+
+fn _ecs_tv_world_set_alive(w0: EcsTVWorldDeep, eid: i32, value: i32) -> EcsTVWorldDeep {
+    if eid == 0 { w0.alive0 = value; return w0; };
+    if eid == 1 { w0.alive1 = value; return w0; };
+    if eid == 2 { w0.alive2 = value; return w0; };
+    if eid == 3 { w0.alive3 = value; return w0; };
+    if eid == 4 { w0.alive4 = value; return w0; };
+    if eid == 5 { w0.alive5 = value; return w0; };
+    if eid == 6 { w0.alive6 = value; return w0; };
+    w0.alive7 = value;
+    return w0;
+}
+
+fn _ecs_tv_world_loc_arch_at(w: EcsTVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.loc_arch0; };
+    if eid == 1 { return w.loc_arch1; };
+    if eid == 2 { return w.loc_arch2; };
+    if eid == 3 { return w.loc_arch3; };
+    if eid == 4 { return w.loc_arch4; };
+    if eid == 5 { return w.loc_arch5; };
+    if eid == 6 { return w.loc_arch6; };
+    return w.loc_arch7;
+}
+
+fn _ecs_tv_world_set_loc_arch(w0: EcsTVWorldDeep, eid: i32, value: i32) -> EcsTVWorldDeep {
+    if eid == 0 { w0.loc_arch0 = value; return w0; };
+    if eid == 1 { w0.loc_arch1 = value; return w0; };
+    if eid == 2 { w0.loc_arch2 = value; return w0; };
+    if eid == 3 { w0.loc_arch3 = value; return w0; };
+    if eid == 4 { w0.loc_arch4 = value; return w0; };
+    if eid == 5 { w0.loc_arch5 = value; return w0; };
+    if eid == 6 { w0.loc_arch6 = value; return w0; };
+    w0.loc_arch7 = value;
+    return w0;
+}
+
+fn _ecs_tv_world_loc_row_at(w: EcsTVWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.loc_row0; };
+    if eid == 1 { return w.loc_row1; };
+    if eid == 2 { return w.loc_row2; };
+    if eid == 3 { return w.loc_row3; };
+    if eid == 4 { return w.loc_row4; };
+    if eid == 5 { return w.loc_row5; };
+    if eid == 6 { return w.loc_row6; };
+    return w.loc_row7;
+}
+
+fn _ecs_tv_world_set_loc_row(w0: EcsTVWorldDeep, eid: i32, value: i32) -> EcsTVWorldDeep {
+    if eid == 0 { w0.loc_row0 = value; return w0; };
+    if eid == 1 { w0.loc_row1 = value; return w0; };
+    if eid == 2 { w0.loc_row2 = value; return w0; };
+    if eid == 3 { w0.loc_row3 = value; return w0; };
+    if eid == 4 { w0.loc_row4 = value; return w0; };
+    if eid == 5 { w0.loc_row5 = value; return w0; };
+    if eid == 6 { w0.loc_row6 = value; return w0; };
+    w0.loc_row7 = value;
+    return w0;
+}
+
+fn ecs_tv_world_deep_change_tick(w: EcsTVWorldDeep) -> i32 { return w.change_tick; }
+fn ecs_tv_world_deep_increment_tick(w0: EcsTVWorldDeep) -> EcsTVWorldDeep {
+    w0.change_tick = w0.change_tick + 1;
+    return w0;
+}
+fn ecs_tv_world_deep_entity_count(w: EcsTVWorldDeep) -> i32 { return w.entity_count; }
+fn ecs_tv_world_deep_archetype_count(w: EcsTVWorldDeep) -> i32 { return w.arch_count; }
+fn ecs_tv_world_deep_component_count(w: EcsTVWorldDeep) -> i32 { return w.comp_count; }
+
+// ── Bit helpers for the per-(arch,col) row-present bitmask. ──────────────────────────────────
+fn _ecs_tv_bit_mask(row: i32) -> i32 {
+    if row == 0 { return 1; };
+    if row == 1 { return 2; };
+    if row == 2 { return 4; };
+    return 8;
+}
+
+fn _ecs_tv_bit_clear_mask(row: i32) -> i32 {
+    if row == 0 { return -2; };
+    if row == 1 { return -3; };
+    if row == 2 { return -5; };
+    return -9;
+}
+
+fn _ecs_tv_bit_set(present: i32, row: i32) -> i32 { return present | _ecs_tv_bit_mask(row); }
+fn _ecs_tv_bit_clear(present: i32, row: i32) -> i32 { return present & _ecs_tv_bit_clear_mask(row); }
+fn _ecs_tv_bit_has(present: i32, row: i32) -> bool {
+    if (present & _ecs_tv_bit_mask(row)) != 0 { return true; };
+    return false;
+}
+
+// ── Register. Each new component gets a monotone `comp_count` id. Bumps change_tick to match
+//    the shallow's per-register tick-forward behavior. ────────────────────────────────────────
+fn _ecs_tv_world_register(w0: EcsTVWorldDeep) -> EcsTVRegisterDeep {
+    if w0.comp_count >= ECS_TV_CAP_COMPONENTS_PER_ARCH {
+        return _ecs_tv_register_wrap(w0, ecs_tv_comp_info_new(-1));
+    };
+    let new_id = w0.comp_count;
+    w0.comp_count = w0.comp_count + 1;
+    w0.change_tick = w0.change_tick + 1;
+    return _ecs_tv_register_wrap(w0, ecs_tv_comp_info_new(new_id));
+}
+
+fn _ecs_tv_register_wrap(world: EcsTVWorldDeep, info: EcsTVCompInfoDeep) -> EcsTVRegisterDeep {
+    return EcsTVRegisterDeep { world: world, info: info };
+}
+
+fn ecs_tv_world_deep_register_table(w0: EcsTVWorldDeep) -> EcsTVRegisterDeep {
+    return _ecs_tv_world_register(w0);
+}
+
+fn ecs_tv_world_deep_register_sparse_set(w0: EcsTVWorldDeep) -> EcsTVRegisterDeep {
+    return _ecs_tv_world_register(w0);
+}
+
+// ── Spawn: allocate next_entity++ slot, mark alive, set loc to (arch=0, row=arch0.row_count++)
+//    and bump arch0.row_count + arch0's row eids. cap-8 reject silent (entity.id=-1). ─────────
+fn ecs_tv_world_deep_spawn(w0: EcsTVWorldDeep) -> EcsTVSpawnDeep {
+    if w0.next_entity >= ECS_TV_CAP_ENTITIES {
+        return _ecs_tv_spawn_wrap(w0, ecs_tv_entity_new(-1, 0));
+    };
+    if w0.arch_count < 1 {
+        return _ecs_tv_spawn_wrap(w0, ecs_tv_entity_new(-1, 0));
+    };
+    let a0 = _ecs_tv_world_arch_at(w0, 0);
+    if a0.row_count >= ECS_TV_CAP_ROWS_PER_ARCH {
+        return _ecs_tv_spawn_wrap(w0, ecs_tv_entity_new(-1, 0));
+    };
+    let eid = w0.next_entity;
+    let row = a0.row_count;
+    let a1 = _ecs_tv_arch_set_eid(a0, row, eid);
+    a1.row_count = a1.row_count + 1;
+    let w1 = _ecs_tv_world_set_arch(w0, 0, a1);
+    w1.next_entity = w1.next_entity + 1;
+    let w2 = _ecs_tv_world_set_alive(w1, eid, 1);
+    let w3 = _ecs_tv_world_set_loc_arch(w2, eid, 0);
+    let w4 = _ecs_tv_world_set_loc_row(w3, eid, row);
+    w4.entity_count = w4.entity_count + 1;
+    return _ecs_tv_spawn_wrap(w4, ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w4, eid)));
+}
+
+fn _ecs_tv_spawn_wrap(world: EcsTVWorldDeep, entity: EcsTVEntityDeep) -> EcsTVSpawnDeep {
+    return EcsTVSpawnDeep { world: world, entity: entity };
+}
+
+fn ecs_tv_world_deep_is_alive(w: EcsTVWorldDeep, e: EcsTVEntityDeep) -> bool {
+    if e.id < 0 { return false; };
+    if e.id >= ECS_TV_CAP_ENTITIES { return false; };
+    if _ecs_tv_world_alive_at(w, e.id) != 1 { return false; };
+    if _ecs_tv_world_gen_at(w, e.id) != e.generation { return false; };
+    return true;
+}
+
+fn ecs_tv_world_deep_entity_archetype_id(w: EcsTVWorldDeep, e: EcsTVEntityDeep) -> i32 {
+    if ecs_tv_world_deep_is_alive(w, e) != true { return -1; };
+    return _ecs_tv_world_loc_arch_at(w, e.id);
+}
+
+fn ecs_tv_world_deep_entity_row(w: EcsTVWorldDeep, e: EcsTVEntityDeep) -> i32 {
+    if ecs_tv_world_deep_is_alive(w, e) != true { return -1; };
+    return _ecs_tv_world_loc_row_at(w, e.id);
+}
+
+fn ecs_tv_world_deep_archetype_entity_count(w: EcsTVWorldDeep, arch_id: i32) -> i32 {
+    if arch_id < 0 { return 0; };
+    if arch_id >= ECS_TV_CAP_ARCH { return 0; };
+    return _ecs_tv_world_arch_at(w, arch_id).row_count;
+}
+
+// ── Has: search the entity's archetype's column-id list for the requested component. Returns
+//    the column index K (0..3) or -1. ───────────────────────────────────────────────────────────
+fn _ecs_tv_arch_find_col(a: EcsTVArchDeep, comp_id: i32, col: i32) -> i32 {
+    if col >= a.comp_count { return -1; };
+    if col >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return -1; };
+    if _ecs_tv_arch_comp_id_at(a, col) == comp_id { return col; };
+    return _ecs_tv_arch_find_col(a, comp_id, col + 1);
+}
+
+fn ecs_tv_world_deep_has(w: EcsTVWorldDeep, e: EcsTVEntityDeep, comp_id: i32) -> bool {
+    if ecs_tv_world_deep_is_alive(w, e) != true { return false; };
+    let a = _ecs_tv_world_arch_at(w, _ecs_tv_world_loc_arch_at(w, e.id));
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 { return false; };
+    return _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), _ecs_tv_world_loc_row_at(w, e.id));
+}
+
+// ── Get: read the typed value at the entity's archetype column for the requested component. ──
+fn ecs_tv_world_deep_get(w: EcsTVWorldDeep, e: EcsTVEntityDeep, comp_id: i32) -> EcsTVDataDeep {
+    if ecs_tv_world_deep_is_alive(w, e) != true { return ecs_tv_data_deep_new(0); };
+    let a = _ecs_tv_world_arch_at(w, _ecs_tv_world_loc_arch_at(w, e.id));
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 { return ecs_tv_data_deep_new(0); };
+    let row = _ecs_tv_world_loc_row_at(w, e.id);
+    let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+    return ecs_tv_data_deep_new(_ecs_tv_arch_val_at(a, slot));
+}
+
+// ── Find a column slot in the entity's archetype that matches comp_id and is present at the
+//    entity's row. Returns (col, slot) -- col is -1 if missing. ──────────────────────────────
+fn _ecs_tv_arch_col_slot_for(a: EcsTVArchDeep, comp_id: i32, eid_row: i32, col: i32) -> i32 {
+    if col >= a.comp_count { return -1; };
+    if col >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return -1; };
+    if _ecs_tv_arch_comp_id_at(a, col) == comp_id {
+        if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), eid_row) {
+            return col;
+        };
+    };
+    return _ecs_tv_arch_col_slot_for(a, comp_id, eid_row, col + 1);
+}
+
+// ── added_since / changed_since: read the per-entity tick from the loc's archetype column slot. ─
+fn ecs_tv_world_deep_added_since(w: EcsTVWorldDeep, e: EcsTVEntityDeep, comp_id: i32, tick: i32) -> bool {
+    if ecs_tv_world_deep_is_alive(w, e) != true { return false; };
+    let a = _ecs_tv_world_arch_at(w, _ecs_tv_world_loc_arch_at(w, e.id));
+    let row = _ecs_tv_world_loc_row_at(w, e.id);
+    let col = _ecs_tv_arch_col_slot_for(a, comp_id, row, 0);
+    if col < 0 { return false; };
+    let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+    let added = _ecs_tv_arch_added_at(a, slot);
+    return added > tick;
+}
+
+fn ecs_tv_world_deep_changed_since(w: EcsTVWorldDeep, e: EcsTVEntityDeep, comp_id: i32, tick: i32) -> bool {
+    if ecs_tv_world_deep_is_alive(w, e) != true { return false; };
+    let a = _ecs_tv_world_arch_at(w, _ecs_tv_world_loc_arch_at(w, e.id));
+    let row = _ecs_tv_world_loc_row_at(w, e.id);
+    let col = _ecs_tv_arch_col_slot_for(a, comp_id, row, 0);
+    if col < 0 { return false; };
+    let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+    let changed = _ecs_tv_arch_changed_at(a, slot);
+    return changed > tick;
+}
+
+// ── Signature walker: collect (comp_id, col) pairs whose present bit is set for the entity's
+//    row in the entity's archetype into a small fixed-size accumulator `EcsTVSigAcc` (cap-4 pairs).
+//    Implemented as recursive scan (cap-4 columns) building a parallel list of comp_ids +
+//    the (col, row)-flat slot paths. Each pair has both `comp_id` and `slot` (the flat slot of the
+//    value at (col, eid_row)) so callers can copy the existing values into the target archetype.
+struct EcsTVSigAcc {
+    count: i32,
+    cid0: i32, cid1: i32, cid2: i32, cid3: i32,
+    slot0: i32, slot1: i32, slot2: i32, slot3: i32,
+    val0: i32, val1: i32, val2: i32, val3: i32,
+    added0: i32, added1: i32, added2: i32, added3: i32,
+    changed0: i32, changed1: i32, changed2: i32, changed3: i32
+}
+
+fn _ecs_tv_sig_empty() -> EcsTVSigAcc {
+    return EcsTVSigAcc {
+        count: 0,
+        cid0: -1, cid1: -1, cid2: -1, cid3: -1,
+        slot0: -1, slot1: -1, slot2: -1, slot3: -1,
+        val0: 0, val1: 0, val2: 0, val3: 0,
+        added0: ECS_TV_TICK_NONE, added1: ECS_TV_TICK_NONE, added2: ECS_TV_TICK_NONE, added3: ECS_TV_TICK_NONE,
+        changed0: ECS_TV_TICK_NONE, changed1: ECS_TV_TICK_NONE, changed2: ECS_TV_TICK_NONE, changed3: ECS_TV_TICK_NONE
+    };
+}
+
+fn _ecs_tv_sig_at_cid(acc: EcsTVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.cid0; };
+    if idx == 1 { return acc.cid1; };
+    if idx == 2 { return acc.cid2; };
+    return acc.cid3;
+}
+
+fn _ecs_tv_sig_at_val(acc: EcsTVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.val0; };
+    if idx == 1 { return acc.val1; };
+    if idx == 2 { return acc.val2; };
+    return acc.val3;
+}
+
+fn _ecs_tv_sig_at_added(acc: EcsTVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.added0; };
+    if idx == 1 { return acc.added1; };
+    if idx == 2 { return acc.added2; };
+    return acc.added3;
+}
+
+fn _ecs_tv_sig_at_changed(acc: EcsTVSigAcc, idx: i32) -> i32 {
+    if idx == 0 { return acc.changed0; };
+    if idx == 1 { return acc.changed1; };
+    if idx == 2 { return acc.changed2; };
+    return acc.changed3;
+}
+
+fn _ecs_tv_sig_push(acc0: EcsTVSigAcc, k: i32, cid: i32, slot: i32, val: i32, added: i32, changed: i32) -> EcsTVSigAcc {
+    if acc0.count >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return acc0; };
+    if k == 0 { acc0.cid0 = cid; acc0.slot0 = slot; acc0.val0 = val; acc0.added0 = added; acc0.changed0 = changed; acc0.count = acc0.count + 1; return acc0; };
+    if k == 1 { acc0.cid1 = cid; acc0.slot1 = slot; acc0.val1 = val; acc0.added1 = added; acc0.changed1 = changed; acc0.count = acc0.count + 1; return acc0; };
+    if k == 2 { acc0.cid2 = cid; acc0.slot2 = slot; acc0.val2 = val; acc0.added2 = added; acc0.changed2 = changed; acc0.count = acc0.count + 1; return acc0; };
+    acc0.cid3 = cid; acc0.slot3 = slot; acc0.val3 = val; acc0.added3 = added; acc0.changed3 = changed;
+    acc0.count = acc0.count + 1;
+    return acc0;
+}
+
+// Recurse over the entity's arch columns collecting (comp_id, slot, val, added, changed) for each
+// column whose present bit is set at the entity's row.
+fn _ecs_tv_arch_collect_sig(w: EcsTVWorldDeep, a: EcsTVArchDeep, eid: i32, row: i32, col: i32, acc0: EcsTVSigAcc) -> EcsTVSigAcc {
+    if col >= a.comp_count { return acc0; };
+    if col >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), row) {
+        let cid = _ecs_tv_arch_comp_id_at(a, col);
+        let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+        let val = _ecs_tv_arch_val_at(a, slot);
+        let added = _ecs_tv_arch_added_at(a, slot);
+        let changed = _ecs_tv_arch_changed_at(a, slot);
+        let acc1 = _ecs_tv_sig_push(acc0, acc0.count, cid, slot, val, added, changed);
+        return _ecs_tv_arch_collect_sig(w, a, eid, row, col + 1, acc1);
+    };
+    return _ecs_tv_arch_collect_sig(w, a, eid, row, col + 1, acc0);
+}
+
+// ── Compute the target signature for an insert / remove: from the existing signature + the new
+//    comp_id (insert) or with the matching crit removed (remove). Cap-4 walks.
+//    Returns an `EcsTVSigAcc` describing the target -- its cid0..3 form the matching
+//    archetype's column-id set, and val0..3 / added / changed carry the values the entity had
+//    (or fresh values for the inserted component id from the caller).
+fn _ecs_tv_build_insert_sig(src: EcsTVSigAcc, new_cid: i32, new_val: i32, new_tick: i32, was_present: bool) -> EcsTVSigAcc {
+    // If the source signature already contains new_cid, treat as a replace (no new row). The
+    // caller's was_present flag indicates this; if so, just bump the changed tick on the existing
+    // pair.
+    let dst0 = _ecs_tv_sig_empty();
+    if was_present == true {
+        return _ecs_tv_copy_sig_replace(src, new_cid, new_val, new_tick);
+    };
+    return _ecs_tv_copy_sig_and_append(src, new_cid, new_val, new_tick);
+}
+
+fn _ecs_tv_copy_sig_replace(src: EcsTVSigAcc, new_cid: i32, new_val: i32, new_tick: i32) -> EcsTVSigAcc {
+    let dst0 = _ecs_tv_sig_empty();
+    // Recurse over src.count entries: copy each; if cid == new_cid, swap in the new_val + new_tick
+    // for the changed field. Added tick preserved.
+    return _ecs_tv_copy_sig_replace_scan(src, dst0, 0, new_cid, new_val, new_tick);
+}
+
+fn _ecs_tv_copy_sig_replace_scan(src0: EcsTVSigAcc, dst0: EcsTVSigAcc, idx: i32, new_cid: i32, new_val: i32, new_tick: i32) -> EcsTVSigAcc {
+    if idx >= src0.count { return dst0; };
+    let cid = _ecs_tv_sig_at_cid(src0, idx);
+    let val = _ecs_tv_sig_at_val(src0, idx);
+    let added = _ecs_tv_sig_at_added(src0, idx);
+    let changed = _ecs_tv_sig_at_changed(src0, idx);
+    if cid == new_cid {
+        let push_tick = new_tick;
+        // Use the NEXT push helper -- replaces val + sets changed to new_tick; added preserved.
+        let dst1 = _ecs_tv_sig_push_explicit_ticks(dst0, dst0.count, cid, -1, new_val, added, push_tick);
+        return _ecs_tv_copy_sig_replace_scan(src0, dst1, idx + 1, new_cid, new_val, new_tick);
+    };
+    let dst1 = _ecs_tv_sig_push(dst0, dst0.count, cid, -1, val, added, changed);
+    return _ecs_tv_copy_sig_replace_scan(src0, dst1, idx + 1, new_cid, new_val, new_tick);
+}
+
+fn _ecs_tv_copy_sig_and_append(src: EcsTVSigAcc, new_cid: i32, new_val: i32, new_tick: i32) -> EcsTVSigAcc {
+    let dst0 = _ecs_tv_sig_empty();
+    let dst1 = _ecs_tv_copy_sig_scan(src, dst0, 0);
+    // After copying existing entries, append the new (cid, val=-1, new_tick) pair with ticks=new_tick
+    // (added==new_tick on first insert + changed==new_tick).
+    return _ecs_tv_sig_push(dst1, dst1.count, new_cid, -1, new_val, new_tick, new_tick);
+}
+
+fn _ecs_tv_copy_sig_scan(src0: EcsTVSigAcc, dst0: EcsTVSigAcc, idx: i32) -> EcsTVSigAcc {
+    if idx >= src0.count { return dst0; };
+    let cid = _ecs_tv_sig_at_cid(src0, idx);
+    let val = _ecs_tv_sig_at_val(src0, idx);
+    let added = _ecs_tv_sig_at_added(src0, idx);
+    let changed = _ecs_tv_sig_at_changed(src0, idx);
+    let dst1 = _ecs_tv_sig_push(dst0, dst0.count, cid, -1, val, added, changed);
+    return _ecs_tv_copy_sig_scan(src0, dst1, idx + 1);
+}
+
+// Same as _ecs_tv_sig_push, but lets callers specify ADDED + CHANGED ticks explicitly. Used for
+// "replace" where ADDED is preserved but CHANGED is bumped to the new tick.
+fn _ecs_tv_sig_push_explicit_ticks(acc0: EcsTVSigAcc, k: i32, cid: i32, slot: i32, val: i32, added: i32, changed: i32) -> EcsTVSigAcc {
+    if acc0.count >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return acc0; };
+    if k == 0 { acc0.cid0 = cid; acc0.slot0 = slot; acc0.val0 = val; acc0.added0 = added; acc0.changed0 = changed; acc0.count = acc0.count + 1; return acc0; };
+    if k == 1 { acc0.cid1 = cid; acc0.slot1 = slot; acc0.val1 = val; acc0.added1 = added; acc0.changed1 = changed; acc0.count = acc0.count + 1; return acc0; };
+    if k == 2 { acc0.cid2 = cid; acc0.slot2 = slot; acc0.val2 = val; acc0.added2 = added; acc0.changed2 = changed; acc0.count = acc0.count + 1; return acc0; };
+    acc0.cid3 = cid; acc0.slot3 = slot; acc0.val3 = val; acc0.added3 = added; acc0.changed3 = changed;
+    acc0.count = acc0.count + 1;
+    return acc0;
+}
+
+// ── Signature match: target arch (cap-N component ids) vs sig (collected src.sig). The match is
+//    "exact set equality ignoring order" -- the arch may have its comp_count components in any
+//    order; we check the sig's count == arch's comp_count AND each sig cid is present in the arch's
+//    comp_id0..3 (recursive find over cap-4 list).
+fn _ecs_tv_arch_comp_id_contains(a: EcsTVArchDeep, cid: i32, idx: i32) -> bool {
+    if idx >= a.comp_count { return false; };
+    if idx >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return false; };
+    if _ecs_tv_arch_comp_id_at(a, idx) == cid { return true; };
+    return _ecs_tv_arch_comp_id_contains(a, cid, idx + 1);
+}
+
+fn _ecs_tv_sig_match_arch(sig: EcsTVSigAcc, a: EcsTVArchDeep, sig_idx: i32) -> bool {
+    if sig.count != a.comp_count { return false; };
+    if sig_idx >= sig.count { return true; };
+    let cid = _ecs_tv_sig_at_cid(sig, sig_idx);
+    if _ecs_tv_arch_comp_id_contains(a, cid, 0) != true { return false; };
+    return _ecs_tv_sig_match_arch(sig, a, sig_idx + 1);
+}
+
+fn _ecs_tv_find_arch_for_sig(w: EcsTVWorldDeep, sig: EcsTVSigAcc, k: i32) -> i32 {
+    if k >= w.arch_count { return -1; };
+    if k >= ECS_TV_CAP_ARCH { return -1; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    if _ecs_tv_sig_match_arch(sig, a, 0) == true { return k; };
+    return _ecs_tv_find_arch_for_sig(w, sig, k + 1);
+}
+
+// ── Create a fresh archetype allocating cap-4 component column slots named after the sig's cid0..3
+//    (the sig walked the src arch columns ascending so cid order tends to match src, but the target
+//    arch's comp_ids are simply stored in their sig push order to maximise the set-equality match). ─
+fn _ecs_tv_create_arch_for_sig(w0: EcsTVWorldDeep, sig: EcsTVSigAcc) -> (EcsTVWorldDeep, i32) {
+    if w0.arch_count >= ECS_TV_CAP_ARCH {
+        return (w0, -1);
+    };
+    let slot = w0.arch_count;
+    let a0 = _ecs_tv_arch_empty(slot);
+    a0.used = 1;
+    // Populate the comp_ids from sig.cid0..3 -- copy explicitly slot-by-slot via cascade-of-return.
+    let a1 = _ecs_tv_arch_set_comp_id_from_sig(a0, sig, 0);
+    let w1 = _ecs_tv_world_set_arch(w0, slot, a1);
+    w1.arch_count = w1.arch_count + 1;
+    return (w1, slot);
+}
+
+fn _ecs_tv_arch_set_comp_id_from_sig(a0: EcsTVArchDeep, sig: EcsTVSigAcc, idx: i32) -> EcsTVArchDeep {
+    if idx >= sig.count { return a0; };
+    if idx >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return a0; };
+    let cid = _ecs_tv_sig_at_cid(sig, idx);
+    let a1 = _ecs_tv_arch_set_comp_id(a0, idx, cid);
+    a1.comp_count = a1.comp_count + 1;
+    return _ecs_tv_arch_set_comp_id_from_sig(a1, sig, idx + 1);
+}
+
+// ── Attach: allocate a new row in `arch`. For each signature entry, find the target col in the
+//    arch (by comp_id), set the present bit at the new row, write val/added/changed ticks into the
+//    flat slot. Set the arch's eid[new_row] = eid. Set the world's loc_arch[eid] = arch_id and
+//    loc_row[eid] = new_row. Bump arch.row_count.
+fn _ecs_tv_attach_row(w0: EcsTVWorldDeep, arch_id: i32, eid: i32, sig: EcsTVSigAcc) -> EcsTVWorldDeep {
+    let a0 = _ecs_tv_world_arch_at(w0, arch_id);
+    if a0.row_count >= ECS_TV_CAP_ROWS_PER_ARCH { return w0; };
+    let row = a0.row_count;
+    let a1 = _ecs_tv_attach_row_fill(a0, sig, row, 0);
+    let a2 = _ecs_tv_arch_set_eid(a1, row, eid);
+    a2.row_count = a2.row_count + 1;
+    let w1 = _ecs_tv_world_set_arch(w0, arch_id, a2);
+    let w2 = _ecs_tv_world_set_loc_arch(w1, eid, arch_id);
+    let w3 = _ecs_tv_world_set_loc_row(w2, eid, row);
+    return w3;
+}
+
+fn _ecs_tv_attach_row_fill(a0: EcsTVArchDeep, sig: EcsTVSigAcc, row: i32, sig_idx: i32) -> EcsTVArchDeep {
+    if sig_idx >= sig.count { return a0; };
+    let cid = _ecs_tv_sig_at_cid(sig, sig_idx);
+    let val = _ecs_tv_sig_at_val(sig, sig_idx);
+    let added = _ecs_tv_sig_at_added(sig, sig_idx);
+    let changed = _ecs_tv_sig_at_changed(sig, sig_idx);
+    let col = _ecs_tv_arch_find_col(a0, cid, 0);
+    if col < 0 { return _ecs_tv_attach_row_fill(a0, sig, row, sig_idx + 1); };
+    let present = _ecs_tv_bit_set(_ecs_tv_arch_present_at(a0, col), row);
+    let a1 = _ecs_tv_arch_set_present(a0, col, present);
+    let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+    let a2 = _ecs_tv_arch_set_val(a1, slot, val);
+    let a3 = _ecs_tv_arch_set_added(a2, slot, added);
+    let a4 = _ecs_tv_arch_set_changed(a3, slot, changed);
+    return _ecs_tv_attach_row_fill(a4, sig, row, sig_idx + 1);
+}
+
+// ── Detach: swap-remove the entity's row from `arch_id`. If the row is the last, just decrement
+//    row_count. Otherwise, copy the last row's whole flat slot for each col into the target row's
+//    slot, set purpose + eid[target_row] = eid[last], then decrement row_count. Update the moved
+//    entity's loc_row to the target_row. Marks the column's present bit cleared at the target row
+//    if it was set (handled via copy which OVERWRITES present/val/ticks at the target row anyway
+//    since after `set_present`/`set_val`/`set_added`/`set_changed` we copy the last row's content
+//    forward; if no comp at the target row that's a different issue).
+fn _ecs_tv_world_set_loc_row_for_eid(w0: EcsTVWorldDeep, eid: i32, value: i32) -> EcsTVWorldDeep {
+    return _ecs_tv_world_set_loc_row(w0, eid, value);
+}
+
+fn _ecs_tv_detach_row(w0: EcsTVWorldDeep, arch_id: i32, eid: i32, row: i32) -> EcsTVWorldDeep {
+    let a0 = _ecs_tv_world_arch_at(w0, arch_id);
+    if row < 0 { return w0; };
+    if row >= a0.row_count { return w0; };
+    let last = a0.row_count - 1;
+    if row == last {
+        a0.row_count = a0.row_count - 1;
+        let w1 = _ecs_tv_world_set_arch(w0, arch_id, a0);
+        return w1;
+    };
+    // Copy last row's content forward into the target row for each col.
+    let a1 = _ecs_tv_detach_row_copy_cols(a0, row, last, 0);
+    // Move the last row's eid into the target row + update the moved entity's loc_row.
+    let last_eid = _ecs_tv_arch_eid_at(a1, last);
+    let a2 = _ecs_tv_arch_set_eid(a1, row, last_eid);
+    a2.row_count = a2.row_count - 1;
+    let w1 = _ecs_tv_world_set_arch(w0, arch_id, a2);
+    let w2 = _ecs_tv_world_set_loc_row_for_eid(w1, last_eid, row);
+    return w2;
+}
+
+fn _ecs_tv_detach_row_copy_cols(a0: EcsTVArchDeep, row: i32, last: i32, col: i32) -> EcsTVArchDeep {
+    if col >= a0.comp_count { return a0; };
+    if col >= ECS_TV_CAP_COMPONENTS_PER_ARCH { return a0; };
+    let present = _ecs_tv_arch_present_at(a0, col);
+    let slot_dst = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+    let slot_src = col * ECS_TV_CAP_ROWS_PER_ARCH + last;
+    let src_present = _ecs_tv_bit_has(present, last);
+    if src_present == true {
+        let a1 = _ecs_tv_arch_set_present(a0, col, _ecs_tv_bit_set(present, row));
+        let val = _ecs_tv_arch_val_at(a1, slot_src);
+        let added = _ecs_tv_arch_added_at(a1, slot_src);
+        let changed = _ecs_tv_arch_changed_at(a1, slot_src);
+        let a2 = _ecs_tv_arch_set_val(a1, slot_dst, val);
+        let a3 = _ecs_tv_arch_set_added(a2, slot_dst, added);
+        let a4 = _ecs_tv_arch_set_changed(a3, slot_dst, changed);
+        // Clear the last-row present bit so it doesn't leak into subsequent operations.
+        let a5 = _ecs_tv_arch_set_present(a4, col, _ecs_tv_bit_clear(_ecs_tv_arch_present_at(a4, col), last));
+        return _ecs_tv_detach_row_copy_cols(a5, row, last, col + 1);
+    };
+    // No source present at this col for the last row -- clear the target row bit.
+    let a1 = _ecs_tv_arch_set_present(a0, col, _ecs_tv_bit_clear(_ecs_tv_arch_present_at(a0, col), row));
+    return _ecs_tv_detach_row_copy_cols(a1, row, last, col + 1);
+}
+
+// ── Insert. Migrates the entity's archetype by:
+//   1) collecting current signature (cid + val + ticks) from the entity's current arch,
+//   2) checking was_present (if the entity already has comp_id, treat as replace -- same arch),
+//   3) building the target signature with the new val + tick (replace path preserves added tick),
+//   4) finding or creating the archetype with that exact signature,
+//   5) attaching a new row in the target arch with the entity's preserved values + new tick,
+//   6) detaching the entity's row from the old arch (swap-remove).
+//   Returns the updated world.
+fn ecs_tv_world_deep_insert(w0: EcsTVWorldDeep, e: EcsTVEntityDeep, comp_id: i32, value: EcsTVDataDeep) -> EcsTVWorldDeep {
+    if ecs_tv_world_deep_is_alive(w0, e) != true { return w0; };
+    let old_arch_id = _ecs_tv_world_loc_arch_at(w0, e.id);
+    let old_row = _ecs_tv_world_loc_row_at(w0, e.id);
+    let old_arch = _ecs_tv_world_arch_at(w0, old_arch_id);
+    let cur_sig = _ecs_tv_arch_collect_sig(w0, old_arch, e.id, old_row, 0, _ecs_tv_sig_empty());
+    let was_present = _ecs_tv_sig_contains_cid(cur_sig, comp_id, 0);
+    let target_sig = _ecs_tv_build_insert_sig(cur_sig, comp_id, value.amount, w0.change_tick, was_present);
+    if was_present == true {
+        // Replace: same archetype. Walk the target_sig, find the comp's col, write the new val +
+        // bumped changed (added preserved by _ecs_tv_copy_sig_replace). Writes happen in-place at
+        // the entity's row (no migration).
+        let a1 = _ecs_tv_arch_replace_in_place(old_arch, target_sig, comp_id, old_row, 0);
+        return _ecs_tv_world_set_arch(w0, old_arch_id, a1);
+    };
+    // Migration: find or create the target archetype.
+    let target_arch_id = _ecs_tv_find_arch_for_sig(w0, target_sig, 0);
+    if target_arch_id < 0 {
+        let (w1, new_arch_id) = _ecs_tv_create_arch_for_sig(w0, target_sig);
+        if new_arch_id < 0 { return w1; };
+        let w2 = _ecs_tv_attach_row(w1, new_arch_id, e.id, target_sig);
+        let w3 = _ecs_tv_detach_row(w2, old_arch_id, e.id, old_row);
+        return w3;
+    };
+    let w1 = _ecs_tv_attach_row(w0, target_arch_id, e.id, target_sig);
+    let w2 = _ecs_tv_detach_row(w1, old_arch_id, e.id, old_row);
+    return w2;
+}
+
+fn _ecs_tv_sig_contains_cid(sig: EcsTVSigAcc, cid: i32, idx: i32) -> bool {
+    if idx >= sig.count { return false; };
+    if _ecs_tv_sig_at_cid(sig, idx) == cid { return true; };
+    return _ecs_tv_sig_contains_cid(sig, cid, idx + 1);
+}
+
+// Replace_in_place writes the new val + bumped changed tick into the entity's (col, row) slot.
+// We walk the target_sig entries for the comp_id and write their val into the slot.
+fn _ecs_tv_arch_replace_in_place(a0: EcsTVArchDeep, sig: EcsTVSigAcc, cid: i32, row: i32, idx: i32) -> EcsTVArchDeep {
+    if idx >= sig.count { return a0; };
+    let sig_cid = _ecs_tv_sig_at_cid(sig, idx);
+    if sig_cid == cid {
+        let col = _ecs_tv_arch_find_col(a0, cid, 0);
+        if col < 0 { return _ecs_tv_arch_replace_in_place(a0, sig, cid, row, idx + 1); };
+        let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+        let val = _ecs_tv_sig_at_val(sig, idx);
+        let added = _ecs_tv_sig_at_added(sig, idx);
+        let changed = _ecs_tv_sig_at_changed(sig, idx);
+        let a1 = _ecs_tv_arch_set_val(a0, slot, val);
+        let a2 = _ecs_tv_arch_set_added(a1, slot, added);
+        let a3 = _ecs_tv_arch_set_changed(a2, slot, changed);
+        return _ecs_tv_arch_replace_in_place(a3, sig, cid, row, idx + 1);
+    };
+    return _ecs_tv_arch_replace_in_place(a0, sig, cid, row, idx + 1);
+}
+
+// ── Remove. The target signature drops the cid the test asked to remove; the entity migrates to
+//    the archetype with that smaller signature (could be archetype 0 -- the empty archetype).
+fn _ecs_tv_build_remove_sig(src: EcsTVSigAcc, remove_cid: i32) -> EcsTVSigAcc {
+    let dst0 = _ecs_tv_sig_empty();
+    return _ecs_tv_build_remove_sig_scan(src, dst0, remove_cid, 0);
+}
+
+fn _ecs_tv_build_remove_sig_scan(src: EcsTVSigAcc, dst0: EcsTVSigAcc, remove_cid: i32, idx: i32) -> EcsTVSigAcc {
+    if idx >= src.count { return dst0; };
+    let cid = _ecs_tv_sig_at_cid(src, idx);
+    if cid == remove_cid {
+        return _ecs_tv_build_remove_sig_scan(src, dst0, remove_cid, idx + 1);
+    };
+    let val = _ecs_tv_sig_at_val(src, idx);
+    let added = _ecs_tv_sig_at_added(src, idx);
+    let changed = _ecs_tv_sig_at_changed(src, idx);
+    let dst1 = _ecs_tv_sig_push(dst0, dst0.count, cid, -1, val, added, changed);
+    return _ecs_tv_build_remove_sig_scan(src, dst1, remove_cid, idx + 1);
+}
+
+fn ecs_tv_world_deep_remove(w0: EcsTVWorldDeep, e: EcsTVEntityDeep, comp_id: i32) -> EcsTVWorldDeep {
+    if ecs_tv_world_deep_is_alive(w0, e) != true { return w0; };
+    let old_arch_id = _ecs_tv_world_loc_arch_at(w0, e.id);
+    let old_row = _ecs_tv_world_loc_row_at(w0, e.id);
+    let old_arch = _ecs_tv_world_arch_at(w0, old_arch_id);
+    let cur_sig = _ecs_tv_arch_collect_sig(w0, old_arch, e.id, old_row, 0, _ecs_tv_sig_empty());
+    if _ecs_tv_sig_contains_cid(cur_sig, comp_id, 0) != true { return w0; };
+    let target_sig = _ecs_tv_build_remove_sig(cur_sig, comp_id);
+    let target_arch_id = _ecs_tv_find_arch_for_sig(w0, target_sig, 0);
+    if target_arch_id < 0 {
+        let (w1, new_arch_id) = _ecs_tv_create_arch_for_sig(w0, target_sig);
+        if new_arch_id < 0 { return w1; };
+        let w2 = _ecs_tv_attach_row(w1, new_arch_id, e.id, target_sig);
+        let w3 = _ecs_tv_detach_row(w2, old_arch_id, e.id, old_row);
+        return w3;
+    };
+    let w1 = _ecs_tv_attach_row(w0, target_arch_id, e.id, target_sig);
+    let w2 = _ecs_tv_detach_row(w1, old_arch_id, e.id, old_row);
+    return w2;
+}
+
+// ── Despawn. alive=0, gen+1, entity_count--. Detach the entity's row from its archetype.
+fn ecs_tv_world_deep_despawn(w0: EcsTVWorldDeep, e: EcsTVEntityDeep) -> EcsTVWorldDeep {
+    if ecs_tv_world_deep_is_alive(w0, e) != true { return w0; };
+    let old_arch_id = _ecs_tv_world_loc_arch_at(w0, e.id);
+    let old_row = _ecs_tv_world_loc_row_at(w0, e.id);
+    let w1 = _ecs_tv_detach_row(w0, old_arch_id, e.id, old_row);
+    let w2 = _ecs_tv_world_set_alive(w1, e.id, 0);
+    let g = _ecs_tv_world_gen_at(w2, e.id);
+    let w3 = _ecs_tv_world_set_gen(w2, e.id, g + 1);
+    let w4 = _ecs_tv_world_set_loc_arch(w3, e.id, -1);
+    let w5 = _ecs_tv_world_set_loc_row(w4, e.id, -1);
+    w5.entity_count = w5.entity_count - 1;
+    return w5;
+}
+
+// ── Resource + message slots (single typed plug for TableValueTime / TableValueEvent). ──────
+fn ecs_tv_world_deep_insert_resource(w0: EcsTVWorldDeep, value: EcsTVTimeDeep) -> EcsTVWorldDeep {
+    let old_set = w0.res_time_set;
+    w0.res_time_tick = value.tick;
+    w0.res_time_set = 1;
+    // First insert records ADDED ticks; replaces preserve them and bump CHANGED only. Mirror Bevy.
+    if old_set != 1 {
+        w0.res_added_tick = w0.change_tick;
+    };
+    w0.res_changed_tick = w0.change_tick;
+    return w0;
+}
+
+fn ecs_tv_world_deep_get_resource(w: EcsTVWorldDeep) -> EcsTVTimeDeep {
+    return ecs_tv_time_deep_new(w.res_time_tick);
+}
+
+fn ecs_tv_world_deep_resource_added_since(w: EcsTVWorldDeep, tick: i32) -> bool {
+    if w.res_time_set != 1 { return false; };
+    return w.res_added_tick > tick;
+}
+
+fn ecs_tv_world_deep_resource_changed_since(w: EcsTVWorldDeep, tick: i32) -> bool {
+    if w.res_time_set != 1 { return false; };
+    return w.res_changed_tick > tick;
+}
+
+fn ecs_tv_world_deep_write_message(w0: EcsTVWorldDeep, value: EcsTVEventDeep) -> EcsTVWorldDeep {
+    w0.msg_event_amount = value.amount;
+    w0.msg_count = w0.msg_count + 1;
+    return w0;
+}
+
+struct EcsTVMessageReadDeep { has_value: bool, amount: i32 }
+
+fn ecs_tv_message_read_amount(r: EcsTVMessageReadDeep) -> i32 { return r.amount; }
+fn ecs_tv_message_read_has_value(r: EcsTVMessageReadDeep) -> bool { return r.has_value; }
+
+fn ecs_tv_world_deep_read_message(w: EcsTVWorldDeep, default_value: EcsTVEventDeep) -> EcsTVMessageReadDeep {
+    if w.msg_count == 0 {
+        return EcsTVMessageReadDeep { has_value: false, amount: default_value.amount };
+    };
+    return EcsTVMessageReadDeep { has_value: true, amount: w.msg_event_amount };
+}
+
+// ── Query result wrapper. cap-8 paired (entity, value) slots. Mirrors shallow Query<EntityItem<T>>. ─
+struct EcsTVEntityItemDeep {
+    entity: EcsTVEntityDeep,
+    value: EcsTVDataDeep
+}
+
+fn ecs_tv_entity_item_entity(r: EcsTVEntityItemDeep) -> EcsTVEntityDeep { return r.entity; }
+fn ecs_tv_entity_item_value(r: EcsTVEntityItemDeep) -> EcsTVDataDeep { return r.value; }
+
+struct EcsTVQueryDeep { count: i32, e0: EcsTVEntityItemDeep, e1: EcsTVEntityItemDeep, e2: EcsTVEntityItemDeep, e3: EcsTVEntityItemDeep, e4: EcsTVEntityItemDeep, e5: EcsTVEntityItemDeep, e6: EcsTVEntityItemDeep, e7: EcsTVEntityItemDeep }
+
+fn _ecs_tv_query_empty() -> EcsTVQueryDeep {
+    let z = EcsTVEntityItemDeep { entity: ecs_tv_entity_new(-1, 0), value: ecs_tv_data_deep_new(0) };
+    return EcsTVQueryDeep { count: 0, e0: z, e1: z, e2: z, e3: z, e4: z, e5: z, e6: z, e7: z };
+}
+
+fn ecs_tv_query_deep_count(r: EcsTVQueryDeep) -> i32 { return r.count; }
+fn ecs_tv_query_deep_at(r: EcsTVQueryDeep, idx: i32) -> EcsTVEntityItemDeep {
+    if idx == 0 { return r.e0; };
+    if idx == 1 { return r.e1; };
+    if idx == 2 { return r.e2; };
+    if idx == 3 { return r.e3; };
+    if idx == 4 { return r.e4; };
+    if idx == 5 { return r.e5; };
+    if idx == 6 { return r.e6; };
+    return r.e7;
+}
+
+fn _ecs_tv_query_push(r0: EcsTVQueryDeep, k: i32, item: EcsTVEntityItemDeep) -> EcsTVQueryDeep {
+    if r0.count >= ECS_TV_CAP_ENTITIES { return r0; };
+    if k == 0 { r0.e0 = item; r0.count = r0.count + 1; return r0; };
+    if k == 1 { r0.e1 = item; r0.count = r0.count + 1; return r0; };
+    if k == 2 { r0.e2 = item; r0.count = r0.count + 1; return r0; };
+    if k == 3 { r0.e3 = item; r0.count = r0.count + 1; return r0; };
+    if k == 4 { r0.e4 = item; r0.count = r0.count + 1; return r0; };
+    if k == 5 { r0.e5 = item; r0.count = r0.count + 1; return r0; };
+    if k == 6 { r0.e6 = item; r0.count = r0.count + 1; return r0; };
+    r0.e7 = item;
+    r0.count = r0.count + 1;
+    return r0;
+}
+
+// ── Walk archetypes: for each row alive + present at col, push (eid, value) into query. ──
+fn _ecs_tv_query_walk_arch(w: EcsTVWorldDeep, a: EcsTVArchDeep, col: i32, acc0: EcsTVQueryDeep, row: i32) -> EcsTVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), row) {
+        let eid = _ecs_tv_arch_eid_at(a, row);
+        let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+        let val = _ecs_tv_arch_val_at(a, slot);
+        let item = EcsTVEntityItemDeep {
+            entity: ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w, eid)),
+            value: ecs_tv_data_deep_new(val)
+        };
+        let acc1 = _ecs_tv_query_push(acc0, acc0.count, item);
+        return _ecs_tv_query_walk_arch(w, a, col, acc1, row + 1);
+    };
+    return _ecs_tv_query_walk_arch(w, a, col, acc0, row + 1);
+}
+
+fn _ecs_tv_query_walk_archs(w: EcsTVWorldDeep, comp_id: i32, acc0: EcsTVQueryDeep, k: i32) -> EcsTVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    if k >= ECS_TV_CAP_ARCH { return acc0; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 {
+        return _ecs_tv_query_walk_archs(w, comp_id, acc0, k + 1);
+    };
+    let acc1 = _ecs_tv_query_walk_arch(w, a, col, acc0, 0);
+    return _ecs_tv_query_walk_archs(w, comp_id, acc1, k + 1);
+}
+
+fn ecs_tv_world_deep_query(w: EcsTVWorldDeep, comp_id: i32) -> EcsTVQueryDeep {
+    return _ecs_tv_query_walk_archs(w, comp_id, _ecs_tv_query_empty(), 0);
+}
+
+// ── query_with / query_without: walks archetypes containing comp_id, keeps rows whose presence
+//    bit is set for comp_id col BUT whose presence bit is (for `query_with`: set| for `query_without`: clear)
+//    in the other_component_id col (which may be -1/missing).
+fn _ecs_tv_query_with_walk_row(w: EcsTVWorldDeep, a: EcsTVArchDeep, col: i32, with_col: i32, acc0: EcsTVQueryDeep, row: i32) -> EcsTVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), row) {
+        if with_col < 0 { return _ecs_tv_query_with_walk_row(w, a, col, with_col, acc0, row + 1); };
+        if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, with_col), row) {
+            let eid = _ecs_tv_arch_eid_at(a, row);
+            let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+            let val = _ecs_tv_arch_val_at(a, slot);
+            let item = EcsTVEntityItemDeep { entity: ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w, eid)), value: ecs_tv_data_deep_new(val) };
+            let acc1 = _ecs_tv_query_push(acc0, acc0.count, item);
+            return _ecs_tv_query_with_walk_row(w, a, col, with_col, acc1, row + 1);
+        };
+    };
+    return _ecs_tv_query_with_walk_row(w, a, col, with_col, acc0, row + 1);
+}
+
+fn _ecs_tv_query_with_walk_archs(w: EcsTVWorldDeep, comp_id: i32, with_comp_id: i32, acc0: EcsTVQueryDeep, k: i32) -> EcsTVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    if k >= ECS_TV_CAP_ARCH { return acc0; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 {
+        return _ecs_tv_query_with_walk_archs(w, comp_id, with_comp_id, acc0, k + 1);
+    };
+    let with_col = _ecs_tv_arch_find_col(a, with_comp_id, 0);
+    let acc1 = _ecs_tv_query_with_walk_row(w, a, col, with_col, acc0, 0);
+    return _ecs_tv_query_with_walk_archs(w, comp_id, with_comp_id, acc1, k + 1);
+}
+
+fn _ecs_tv_query_without_walk_row(w: EcsTVWorldDeep, a: EcsTVArchDeep, col: i32, without_col: i32, acc0: EcsTVQueryDeep, row: i32) -> EcsTVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), row) {
+        let without_present = if without_col < 0 { false; } else { _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, without_col), row); };
+        if without_present != true {
+            let eid = _ecs_tv_arch_eid_at(a, row);
+            let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+            let val = _ecs_tv_arch_val_at(a, slot);
+            let item = EcsTVEntityItemDeep { entity: ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w, eid)), value: ecs_tv_data_deep_new(val) };
+            let acc1 = _ecs_tv_query_push(acc0, acc0.count, item);
+            return _ecs_tv_query_without_walk_row(w, a, col, without_col, acc1, row + 1);
+        };
+    };
+    return _ecs_tv_query_without_walk_row(w, a, col, without_col, acc0, row + 1);
+}
+
+fn _ecs_tv_query_without_walk_archs(w: EcsTVWorldDeep, comp_id: i32, without_comp_id: i32, acc0: EcsTVQueryDeep, k: i32) -> EcsTVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    if k >= ECS_TV_CAP_ARCH { return acc0; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 {
+        return _ecs_tv_query_without_walk_archs(w, comp_id, without_comp_id, acc0, k + 1);
+    };
+    let without_col = _ecs_tv_arch_find_col(a, without_comp_id, 0);
+    let acc1 = _ecs_tv_query_without_walk_row(w, a, col, without_col, acc0, 0);
+    return _ecs_tv_query_without_walk_archs(w, comp_id, without_comp_id, acc1, k + 1);
+}
+
+fn ecs_tv_world_deep_query_with(w: EcsTVWorldDeep, comp_id: i32, with_comp_id: i32) -> EcsTVQueryDeep {
+    return _ecs_tv_query_with_walk_archs(w, comp_id, with_comp_id, _ecs_tv_query_empty(), 0);
+}
+
+fn ecs_tv_world_deep_query_without(w: EcsTVWorldDeep, comp_id: i32, without_comp_id: i32) -> EcsTVQueryDeep {
+    return _ecs_tv_query_without_walk_archs(w, comp_id, without_comp_id, _ecs_tv_query_empty(), 0);
+}
+
+// ── query_added: each entity in archetypes with comp_id whose added_tick > since_tick. ──
+fn _ecs_tv_query_added_walk_arch(w: EcsTVWorldDeep, a: EcsTVArchDeep, col: i32, since: i32, acc0: EcsTVQueryDeep, row: i32) -> EcsTVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), row) {
+        let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+        if _ecs_tv_arch_added_at(a, slot) > since {
+            let eid = _ecs_tv_arch_eid_at(a, row);
+            let item = EcsTVEntityItemDeep { entity: ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w, eid)), value: ecs_tv_data_deep_new(_ecs_tv_arch_val_at(a, slot)) };
+            let acc1 = _ecs_tv_query_push(acc0, acc0.count, item);
+            return _ecs_tv_query_added_walk_arch(w, a, col, since, acc1, row + 1);
+        };
+    };
+    return _ecs_tv_query_added_walk_arch(w, a, col, since, acc0, row + 1);
+}
+
+fn _ecs_tv_query_added_walk_archs(w: EcsTVWorldDeep, comp_id: i32, since: i32, acc0: EcsTVQueryDeep, k: i32) -> EcsTVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    if k >= ECS_TV_CAP_ARCH { return acc0; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_tv_query_added_walk_archs(w, comp_id, since, acc0, k + 1); };
+    let acc1 = _ecs_tv_query_added_walk_arch(w, a, col, since, acc0, 0);
+    return _ecs_tv_query_added_walk_archs(w, comp_id, since, acc1, k + 1);
+}
+
+fn ecs_tv_world_deep_query_added(w: EcsTVWorldDeep, comp_id: i32, since_tick: i32) -> EcsTVQueryDeep {
+    return _ecs_tv_query_added_walk_archs(w, comp_id, since_tick, _ecs_tv_query_empty(), 0);
+}
+
+// ── query_changed: each entity whose changed_tick > since_tick. ──
+fn _ecs_tv_query_changed_walk_arch(w: EcsTVWorldDeep, a: EcsTVArchDeep, col: i32, since: i32, acc0: EcsTVQueryDeep, row: i32) -> EcsTVQueryDeep {
+    if row >= a.row_count { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, col), row) {
+        let slot = col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+        if _ecs_tv_arch_changed_at(a, slot) > since {
+            let eid = _ecs_tv_arch_eid_at(a, row);
+            let item = EcsTVEntityItemDeep { entity: ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w, eid)), value: ecs_tv_data_deep_new(_ecs_tv_arch_val_at(a, slot)) };
+            let acc1 = _ecs_tv_query_push(acc0, acc0.count, item);
+            return _ecs_tv_query_changed_walk_arch(w, a, col, since, acc1, row + 1);
+        };
+    };
+    return _ecs_tv_query_changed_walk_arch(w, a, col, since, acc0, row + 1);
+}
+
+fn _ecs_tv_query_changed_walk_archs(w: EcsTVWorldDeep, comp_id: i32, since: i32, acc0: EcsTVQueryDeep, k: i32) -> EcsTVQueryDeep {
+    if k >= w.arch_count { return acc0; };
+    if k >= ECS_TV_CAP_ARCH { return acc0; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    let col = _ecs_tv_arch_find_col(a, comp_id, 0);
+    if col < 0 { return _ecs_tv_query_changed_walk_archs(w, comp_id, since, acc0, k + 1); };
+    let acc1 = _ecs_tv_query_changed_walk_arch(w, a, col, since, acc0, 0);
+    return _ecs_tv_query_changed_walk_archs(w, comp_id, since, acc1, k + 1);
+}
+
+fn ecs_tv_world_deep_query_changed(w: EcsTVWorldDeep, comp_id: i32, since_tick: i32) -> EcsTVQueryDeep {
+    return _ecs_tv_query_changed_walk_archs(w, comp_id, since_tick, _ecs_tv_query_empty(), 0);
+}
+
+// ── Pair query mut-first. Mirrors the shallow TableValuePairMut<T>: a query that exposes the
+//    entity + the first-component value + the second-component value (read-only). The mut-first
+//    variant writes the first-component's value back via pair_write_first.
+struct EcsTVPairMutDeep {
+    entity: EcsTVEntityDeep,
+    first: EcsTVDataDeep,
+    second: EcsTVDataDeep,
+    first_comp_id: i32
+}
+
+fn ecs_tv_pair_mut_entity(p: EcsTVPairMutDeep) -> EcsTVEntityDeep { return p.entity; }
+fn ecs_tv_pair_mut_first(p: EcsTVPairMutDeep) -> EcsTVDataDeep { return p.first; }
+fn ecs_tv_pair_mut_second(p: EcsTVPairMutDeep) -> EcsTVDataDeep { return p.second; }
+fn ecs_tv_pair_mut_first_comp_id(p: EcsTVPairMutDeep) -> i32 { return p.first_comp_id; }
+fn ecs_tv_pair_mut_first_value(p: EcsTVPairMutDeep) -> EcsTVDataDeep { return p.first; }
+
+struct EcsTVPairQueryMutDeep { count: i32, p0: EcsTVPairMutDeep, p1: EcsTVPairMutDeep, p2: EcsTVPairMutDeep, p3: EcsTVPairMutDeep, p4: EcsTVPairMutDeep, p5: EcsTVPairMutDeep, p6: EcsTVPairMutDeep, p7: EcsTVPairMutDeep }
+
+fn _ecs_tv_pair_query_mut_empty() -> EcsTVPairQueryMutDeep {
+    let z = EcsTVPairMutDeep { entity: ecs_tv_entity_new(-1, 0), first: ecs_tv_data_deep_new(0), second: ecs_tv_data_deep_new(0), first_comp_id: -1 };
+    return EcsTVPairQueryMutDeep { count: 0, p0: z, p1: z, p2: z, p3: z, p4: z, p5: z, p6: z, p7: z };
+}
+
+fn ecs_tv_pair_query_mut_count(r: EcsTVPairQueryMutDeep) -> i32 { return r.count; }
+fn ecs_tv_pair_query_mut_at(r: EcsTVPairQueryMutDeep, idx: i32) -> EcsTVPairMutDeep {
+    if idx == 0 { return r.p0; };
+    if idx == 1 { return r.p1; };
+    if idx == 2 { return r.p2; };
+    if idx == 3 { return r.p3; };
+    if idx == 4 { return r.p4; };
+    if idx == 5 { return r.p5; };
+    if idx == 6 { return r.p6; };
+    return r.p7;
+}
+
+fn _ecs_tv_pair_query_mut_push(r0: EcsTVPairQueryMutDeep, k: i32, pair: EcsTVPairMutDeep) -> EcsTVPairQueryMutDeep {
+    if r0.count >= ECS_TV_CAP_ENTITIES { return r0; };
+    if k == 0 { r0.p0 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 1 { r0.p1 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 2 { r0.p2 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 3 { r0.p3 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 4 { r0.p4 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 5 { r0.p5 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 6 { r0.p6 = pair; r0.count = r0.count + 1; return r0; };
+    r0.p7 = pair;
+    r0.count = r0.count + 1;
+    return r0;
+}
+
+// Walk archetypes that contain BOTH first_comp_id + second_comp_id, then walk each row.
+fn _ecs_tv_query_pair_mut_walk_row(w: EcsTVWorldDeep, a: EcsTVArchDeep, first_col: i32, second_col: i32, first_comp_id: i32, acc0: EcsTVPairQueryMutDeep, row: i32) -> EcsTVPairQueryMutDeep {
+    if row >= a.row_count { return acc0; };
+    if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, first_col), row) {
+        if _ecs_tv_bit_has(_ecs_tv_arch_present_at(a, second_col), row) {
+            let eid = _ecs_tv_arch_eid_at(a, row);
+            let first_slot = first_col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+            let second_slot = second_col * ECS_TV_CAP_ROWS_PER_ARCH + row;
+            let pair = EcsTVPairMutDeep {
+                entity: ecs_tv_entity_new(eid, _ecs_tv_world_gen_at(w, eid)),
+                first: ecs_tv_data_deep_new(_ecs_tv_arch_val_at(a, first_slot)),
+                second: ecs_tv_data_deep_new(_ecs_tv_arch_val_at(a, second_slot)),
+                first_comp_id: first_comp_id
+            };
+            let acc1 = _ecs_tv_pair_query_mut_push(acc0, acc0.count, pair);
+            return _ecs_tv_query_pair_mut_walk_row(w, a, first_col, second_col, first_comp_id, acc1, row + 1);
+        };
+    };
+    return _ecs_tv_query_pair_mut_walk_row(w, a, first_col, second_col, first_comp_id, acc0, row + 1);
+}
+
+fn _ecs_tv_query_pair_mut_walk_archs(w: EcsTVWorldDeep, first_comp_id: i32, second_comp_id: i32, acc0: EcsTVPairQueryMutDeep, k: i32) -> EcsTVPairQueryMutDeep {
+    if k >= w.arch_count { return acc0; };
+    if k >= ECS_TV_CAP_ARCH { return acc0; };
+    let a = _ecs_tv_world_arch_at(w, k);
+    let first_col = _ecs_tv_arch_find_col(a, first_comp_id, 0);
+    if first_col < 0 { return _ecs_tv_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, acc0, k + 1); };
+    let second_col = _ecs_tv_arch_find_col(a, second_comp_id, 0);
+    if second_col < 0 { return _ecs_tv_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, acc0, k + 1); };
+    let acc1 = _ecs_tv_query_pair_mut_walk_row(w, a, first_col, second_col, first_comp_id, acc0, 0);
+    return _ecs_tv_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, acc1, k + 1);
+}
+
+fn ecs_tv_world_deep_query_pair_mut_first(w: EcsTVWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsTVPairQueryMutDeep {
+    return _ecs_tv_query_pair_mut_walk_archs(w, first_comp_id, second_comp_id, _ecs_tv_pair_query_mut_empty(), 0);
+}
+
+// ── pair_write_first: write the new pos value into the captured entity's first-comp slot. Uses
+//    insert (which finds the entity's current arch col for the first_comp_id and writes the new
+//    value at the entity's row, bumping the changed tick). Tick semantics: the shallow uses
+//    insert_component (no extra tick bump on the writes), so we call insert directly.
+fn ecs_tv_world_deep_pair_write_first(w0: EcsTVWorldDeep, item: EcsTVPairMutDeep, value: EcsTVDataDeep) -> EcsTVWorldDeep {
+    return ecs_tv_world_deep_insert(w0, item.entity, item.first_comp_id, value);
+}
+
+// ── query_mut helpers (read-only write of a slot via an EntityItem handle). The shallow's
+//    table_value_world_write(item, new_value) writes the new value into the captured comp_id slot
+//    via the item's entity.
+fn ecs_tv_world_deep_write(w0: EcsTVWorldDeep, item: EcsTVEntityItemDeep, comp_id: i32, value: EcsTVDataDeep) -> EcsTVWorldDeep {
+    return ecs_tv_world_deep_insert(w0, item.entity, comp_id, value);
+}
+
+// query_mut returns the first live entity with comp_id (cap-1 single query). Mirrors the shallow's
+// `Query<EntityItem<T>>` first item access pattern used by tests.
+fn ecs_tv_world_deep_query_mut(w: EcsTVWorldDeep, comp_id: i32) -> EcsTVQueryDeep {
+    return ecs_tv_world_deep_query(w, comp_id);
+}

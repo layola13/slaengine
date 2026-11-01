@@ -1,0 +1,137 @@
+// Type-erased Event observers keyed by Sla-generated event type ids.
+// Events are reactive: triggering an event immediately invokes all observers
+// registered for that event type, unlike Messages<T> reader-driven channels.
+@import "entity.sla"
+@import "box_drop.sla"
+@import "sa_std/vec.sa"
+@import "sa_std/core/box.sa"
+
+struct ErasedEventValue {
+    type_id: i32,
+    raw: *u8,
+}
+
+struct ErasedEventObserver {
+    type_id: i32,
+    run: fn(ErasedEventValue, i32) -> i32,
+}
+
+struct ErasedObservers {
+    observers: Vec<ErasedEventObserver>,
+    trigger_count: i32,
+    last_event_type_id: i32,
+    last_entity_id: i32,
+    result_sum: i32,
+}
+
+fn erased_event_value_new<T>(type_id: i32, value: T) -> ErasedEventValue {
+    let boxed = Box::new(value);
+    let raw = Box::into_raw(boxed) as *u8;
+    return ErasedEventValue { type_id: type_id, raw: raw };
+}
+
+fn erased_event_value_read<T>(value: ErasedEventValue, type_id: i32) -> T {
+    if value.type_id != type_id { panic(12900); };
+    let typed = value.raw as *T;
+    return unsafe { *typed };
+}
+
+fn erased_observers_new() -> ErasedObservers {
+    let observers: Vec<ErasedEventObserver> = Vec::new();
+    return ErasedObservers { observers: observers, trigger_count: 0, last_event_type_id: 0, last_entity_id: -1, result_sum: 0 };
+}
+
+fn erased_observer_new(type_id: i32, run: fn(ErasedEventValue, i32) -> i32) -> ErasedEventObserver {
+    return ErasedEventObserver { type_id: type_id, run: run };
+}
+
+fn erased_observers_add(observers: ErasedObservers, observer: ErasedEventObserver) -> ErasedObservers {
+    observers.observers.push(observer);
+    return observers;
+}
+
+fn erased_observers_count(observers: ErasedObservers) -> i64 {
+    return len(observers.observers) as i64;
+}
+
+fn erased_observers_trigger_value(observers: ErasedObservers, value: ErasedEventValue, target_entity_id: i32, drop_fn: fn(*u8) -> void) -> ErasedObservers {
+    let i: i64 = 0;
+    let cnt = len(observers.observers) as i64;
+    while i < cnt {
+        let observer = observers.observers[i];
+        if observer.type_id == value.type_id {
+            let run = observer.run;
+            let result = run(value, target_entity_id);
+            observers.trigger_count = observers.trigger_count + 1;
+            observers.last_event_type_id = value.type_id;
+            observers.last_entity_id = target_entity_id;
+            observers.result_sum = observers.result_sum + result;
+        };
+        i = i + 1;
+    }
+    drop_fn(value.raw);
+    return observers;
+}
+
+fn erased_observers_trigger<T>(observers: ErasedObservers, type_id: i32, drop_fn: fn(*u8) -> void, value: T) -> ErasedObservers {
+    let erased = erased_event_value_new<T>(type_id, value);
+    return erased_observers_trigger_value(observers, erased, -1, drop_fn);
+}
+
+fn erased_observers_trigger_entity<T>(observers: ErasedObservers, entity: Entity, type_id: i32, drop_fn: fn(*u8) -> void, value: T) -> ErasedObservers {
+    let erased = erased_event_value_new<T>(type_id, value);
+    return erased_observers_trigger_value(observers, erased, entity.id, drop_fn);
+}
+
+@derive(Event)
+struct ErasedSpeakEvent { code: i32 }
+
+@derive(Event)
+struct ErasedExplodeEvent { damage: i32 }
+
+impl ErasedSpeakEvent {
+    fn event_type_id() -> i32 { return 129101; }
+}
+
+impl ErasedExplodeEvent {
+    fn event_type_id() -> i32 { return 129102; }
+}
+
+fn erased_speak_observer(value: ErasedEventValue, target_entity_id: i32) -> i32 {
+    let event = erased_event_value_read<ErasedSpeakEvent>(value, ErasedSpeakEvent::event_type_id());
+    if target_entity_id >= 0 { return event.code + target_entity_id; };
+    return event.code;
+}
+
+fn erased_explode_observer(value: ErasedEventValue, target_entity_id: i32) -> i32 {
+    let event = erased_event_value_read<ErasedExplodeEvent>(value, ErasedExplodeEvent::event_type_id());
+    return event.damage + target_entity_id;
+}
+
+@test "erased observers trigger matching event immediately"() {
+    let speak_type = ErasedSpeakEvent::event_type_id();
+    let explode_type = ErasedExplodeEvent::event_type_id();
+    if speak_type <= 0 { panic(12910); };
+    if explode_type <= 0 { panic(12911); };
+    if speak_type == explode_type { panic(12912); };
+    let observers0 = erased_observers_new();
+    let observers1 = erased_observers_add(observers0, erased_observer_new(speak_type, erased_speak_observer));
+    let observers2 = erased_observers_add(observers1, erased_observer_new(explode_type, erased_explode_observer));
+    if erased_observers_count(observers2) != 2 { panic(12913); };
+    let observers3 = erased_observers_trigger<ErasedSpeakEvent>(observers2, speak_type, ecs_box_drop<ErasedSpeakEvent>, ErasedSpeakEvent { code: 5 });
+    if observers3.trigger_count != 1 { panic(12914); };
+    if observers3.result_sum != 5 { panic(12915); };
+    if observers3.last_event_type_id != speak_type { panic(12916); };
+    if observers3.last_entity_id != -1 { panic(12917); };
+}
+
+@test "erased observers support targeted entity events"() {
+    let explode_type = ErasedExplodeEvent::event_type_id();
+    let observers0 = erased_observers_new();
+    let observers1 = erased_observers_add(observers0, erased_observer_new(explode_type, erased_explode_observer));
+    let entity = entity_new(9, 1);
+    let observers2 = erased_observers_trigger_entity<ErasedExplodeEvent>(observers1, entity, explode_type, ecs_box_drop<ErasedExplodeEvent>, ErasedExplodeEvent { damage: 4 });
+    if observers2.trigger_count != 1 { panic(12920); };
+    if observers2.last_entity_id != 9 { panic(12921); };
+    if observers2.result_sum != 13 { panic(12922); };
+}

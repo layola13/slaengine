@@ -1,0 +1,429 @@
+// Deepened Bevy ECS FilteredResources / FilteredResourcesMut.
+// Mirrors src/world/filtered_resource.rs (+ ResourceFetchError from world/error.rs):
+//   FilteredResources::{access, has_read, get, get_by_id}
+//   FilteredResourcesMut::{as_readonly, reborrow, has_read, has_write, get, get_mut,
+//     get_by_id, get_mut_by_id, into_mut}
+//   ResourceFetchError::{NotRegistered, DoesNotExist, NoResourceAccess, Immutable}
+// Fixed capacity: 4 resources. Access via bitmasks for ids 0..30 + write_all.
+// Shallow lib/filtered_resource.sla retained.
+
+const ECS_FR_OK: i32 = 0;
+const ECS_FR_NOT_REGISTERED: i32 = 1;
+const ECS_FR_DOES_NOT_EXIST: i32 = 2;
+const ECS_FR_NO_RESOURCE_ACCESS: i32 = 3;
+const ECS_FR_IMMUTABLE: i32 = 4;
+
+struct EcsFrAccessDeep {
+    read_bits: i64,
+    write_bits: i64,
+    read_all: bool,
+    write_all: bool,
+}
+
+fn ecs_fr_access_deep_new() -> EcsFrAccessDeep {
+    return EcsFrAccessDeep { read_bits: 0, write_bits: 0, read_all: false, write_all: false };
+}
+
+fn ecs_fr_bit(id: i32) -> i64 {
+    if id < 0 { return 0; };
+    if id > 30 { return 0; };
+    let b: i64 = 1;
+    let i: i32 = 0;
+    while i < id {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ecs_fr_bits_or(bits: i64, bit: i64) -> i64 {
+    if bit == 0 { return bits; };
+    if (bits / bit) % 2 == 1 { return bits; };
+    return bits + bit;
+}
+
+fn ecs_fr_access_deep_add_read(a: EcsFrAccessDeep, id: i32) -> EcsFrAccessDeep {
+    return EcsFrAccessDeep {
+        read_bits: ecs_fr_bits_or(a.read_bits, ecs_fr_bit(id)),
+        write_bits: a.write_bits, read_all: a.read_all, write_all: a.write_all,
+    };
+}
+
+fn ecs_fr_access_deep_add_write(a: EcsFrAccessDeep, id: i32) -> EcsFrAccessDeep {
+    let bit = ecs_fr_bit(id);
+    return EcsFrAccessDeep {
+        read_bits: ecs_fr_bits_or(a.read_bits, bit),
+        write_bits: ecs_fr_bits_or(a.write_bits, bit),
+        read_all: a.read_all, write_all: a.write_all,
+    };
+}
+
+fn ecs_fr_access_deep_read_all(a: EcsFrAccessDeep) -> EcsFrAccessDeep {
+    return EcsFrAccessDeep { read_bits: a.read_bits, write_bits: a.write_bits, read_all: true, write_all: a.write_all };
+}
+
+fn ecs_fr_access_deep_write_all(a: EcsFrAccessDeep) -> EcsFrAccessDeep {
+    return EcsFrAccessDeep { read_bits: a.read_bits, write_bits: a.write_bits, read_all: a.read_all, write_all: true };
+}
+
+fn ecs_fr_access_deep_has_read(a: EcsFrAccessDeep, id: i32) -> bool {
+    if a.read_all { return true; };
+    if a.write_all { return true; };
+    let bit = ecs_fr_bit(id);
+    if bit == 0 { return false; };
+    if (a.read_bits / bit) % 2 == 1 { return true; };
+    if (a.write_bits / bit) % 2 == 1 { return true; };
+    return false;
+}
+
+fn ecs_fr_access_deep_has_write(a: EcsFrAccessDeep, id: i32) -> bool {
+    if a.write_all { return true; };
+    let bit = ecs_fr_bit(id);
+    if bit == 0 { return false; };
+    if (a.write_bits / bit) % 2 == 1 { return true; };
+    return false;
+}
+
+// World resource registry: up to 4 resources with registered/exists/mutable flags
+struct EcsFrWorldDeep {
+    n: i32,
+    id0: i32, val0: i64, reg0: bool, exist0: bool, mut0: bool, add0: i64, ch0: i64,
+    id1: i32, val1: i64, reg1: bool, exist1: bool, mut1: bool, add1: i64, ch1: i64,
+    id2: i32, val2: i64, reg2: bool, exist2: bool, mut2: bool, add2: i64, ch2: i64,
+    id3: i32, val3: i64, reg3: bool, exist3: bool, mut3: bool, add3: i64, ch3: i64,
+    last_run: i64,
+    this_run: i64,
+}
+
+fn ecs_fr_world_deep_new() -> EcsFrWorldDeep {
+    return EcsFrWorldDeep {
+        n: 0,
+        id0: -1, val0: 0, reg0: false, exist0: false, mut0: true, add0: 0, ch0: 0,
+        id1: -1, val1: 0, reg1: false, exist1: false, mut1: true, add1: 0, ch1: 0,
+        id2: -1, val2: 0, reg2: false, exist2: false, mut2: true, add2: 0, ch2: 0,
+        id3: -1, val3: 0, reg3: false, exist3: false, mut3: true, add3: 0, ch3: 0,
+        last_run: 0, this_run: 1,
+    };
+}
+
+fn ecs_fr_world_deep_with_ticks(w: EcsFrWorldDeep, last_run: i64, this_run: i64) -> EcsFrWorldDeep {
+    return EcsFrWorldDeep {
+        n: w.n,
+        id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+        id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+        id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+        id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+        last_run: last_run, this_run: this_run,
+    };
+}
+
+fn ecs_fr_world_deep_find(w: EcsFrWorldDeep, id: i32) -> i32 {
+    if w.n >= 1 {
+        if w.id0 == id { return 0; };
+    };
+    if w.n >= 2 {
+        if w.id1 == id { return 1; };
+    };
+    if w.n >= 3 {
+        if w.id2 == id { return 2; };
+    };
+    if w.n >= 4 {
+        if w.id3 == id { return 3; };
+    };
+    return -1;
+}
+
+fn ecs_fr_world_deep_register(w: EcsFrWorldDeep, id: i32, mutable: bool) -> EcsFrWorldDeep {
+    let idx = ecs_fr_world_deep_find(w, id);
+    if idx >= 0 {
+        // already registered
+        if idx == 0 {
+            return EcsFrWorldDeep {
+                n: w.n, id0: w.id0, val0: w.val0, reg0: true, exist0: w.exist0, mut0: mutable, add0: w.add0, ch0: w.ch0,
+                id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+                id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+                id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+                last_run: w.last_run, this_run: w.this_run,
+            };
+        };
+        return w;
+    };
+    if w.n >= 4 { return w; };
+    if w.n == 0 {
+        return EcsFrWorldDeep {
+            n: 1, id0: id, val0: 0, reg0: true, exist0: false, mut0: mutable, add0: 0, ch0: 0,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if w.n == 1 {
+        return EcsFrWorldDeep {
+            n: 2, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: id, val1: 0, reg1: true, exist1: false, mut1: mutable, add1: 0, ch1: 0,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if w.n == 2 {
+        return EcsFrWorldDeep {
+            n: 3, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: id, val2: 0, reg2: true, exist2: false, mut2: mutable, add2: 0, ch2: 0,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    return EcsFrWorldDeep {
+        n: 4, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+        id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+        id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+        id3: id, val3: 0, reg3: true, exist3: false, mut3: mutable, add3: 0, ch3: 0,
+        last_run: w.last_run, this_run: w.this_run,
+    };
+}
+
+fn ecs_fr_world_deep_insert(w: EcsFrWorldDeep, id: i32, value: i64, mutable: bool) -> EcsFrWorldDeep {
+    w = ecs_fr_world_deep_register(w, id, mutable);
+    let idx = ecs_fr_world_deep_find(w, id);
+    if idx == 0 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: value, reg0: true, exist0: true, mut0: mutable, add0: w.this_run, ch0: w.this_run,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if idx == 1 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: value, reg1: true, exist1: true, mut1: mutable, add1: w.this_run, ch1: w.this_run,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if idx == 2 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: value, reg2: true, exist2: true, mut2: mutable, add2: w.this_run, ch2: w.this_run,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if idx == 3 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: value, reg3: true, exist3: true, mut3: mutable, add3: w.this_run, ch3: w.this_run,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    return w;
+}
+
+struct EcsFrSlot {
+    found_idx: i32,
+    registered: bool,
+    exists: bool,
+    mutable: bool,
+    value: i64,
+    added: i64,
+    changed: i64,
+}
+
+fn ecs_fr_slot_idx(s: EcsFrSlot) -> i32 { return s.found_idx; }
+fn ecs_fr_slot_registered(s: EcsFrSlot) -> bool { return s.registered; }
+fn ecs_fr_slot_exists(s: EcsFrSlot) -> bool { return s.exists; }
+fn ecs_fr_slot_mutable(s: EcsFrSlot) -> bool { return s.mutable; }
+fn ecs_fr_slot_value(s: EcsFrSlot) -> i64 { return s.value; }
+
+fn ecs_fr_world_deep_slot(w: EcsFrWorldDeep, id: i32) -> EcsFrSlot {
+    let idx = ecs_fr_world_deep_find(w, id);
+    if idx < 0 {
+        return EcsFrSlot { found_idx: -1, registered: false, exists: false, mutable: true, value: 0, added: 0, changed: 0 };
+    };
+    if idx == 0 {
+        return EcsFrSlot { found_idx: 0, registered: w.reg0, exists: w.exist0, mutable: w.mut0, value: w.val0, added: w.add0, changed: w.ch0 };
+    };
+    if idx == 1 {
+        return EcsFrSlot { found_idx: 1, registered: w.reg1, exists: w.exist1, mutable: w.mut1, value: w.val1, added: w.add1, changed: w.ch1 };
+    };
+    if idx == 2 {
+        return EcsFrSlot { found_idx: 2, registered: w.reg2, exists: w.exist2, mutable: w.mut2, value: w.val2, added: w.add2, changed: w.ch2 };
+    };
+    return EcsFrSlot { found_idx: 3, registered: w.reg3, exists: w.exist3, mutable: w.mut3, value: w.val3, added: w.add3, changed: w.ch3 };
+}
+
+fn ecs_fr_world_deep_set_value(w: EcsFrWorldDeep, id: i32, value: i64) -> EcsFrWorldDeep {
+    let idx = ecs_fr_world_deep_find(w, id);
+    if idx == 0 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: value, reg0: w.reg0, exist0: true, mut0: w.mut0, add0: w.add0, ch0: w.this_run,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if idx == 1 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: value, reg1: w.reg1, exist1: true, mut1: w.mut1, add1: w.add1, ch1: w.this_run,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if idx == 2 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: value, reg2: w.reg2, exist2: true, mut2: w.mut2, add2: w.add2, ch2: w.this_run,
+            id3: w.id3, val3: w.val3, reg3: w.reg3, exist3: w.exist3, mut3: w.mut3, add3: w.add3, ch3: w.ch3,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    if idx == 3 {
+        return EcsFrWorldDeep {
+            n: w.n, id0: w.id0, val0: w.val0, reg0: w.reg0, exist0: w.exist0, mut0: w.mut0, add0: w.add0, ch0: w.ch0,
+            id1: w.id1, val1: w.val1, reg1: w.reg1, exist1: w.exist1, mut1: w.mut1, add1: w.add1, ch1: w.ch1,
+            id2: w.id2, val2: w.val2, reg2: w.reg2, exist2: w.exist2, mut2: w.mut2, add2: w.add2, ch2: w.ch2,
+            id3: w.id3, val3: value, reg3: w.reg3, exist3: true, mut3: w.mut3, add3: w.add3, ch3: w.this_run,
+            last_run: w.last_run, this_run: w.this_run,
+        };
+    };
+    return w;
+}
+
+// FilteredResources
+struct EcsFrDeep {
+    world: EcsFrWorldDeep,
+    access: EcsFrAccessDeep,
+}
+
+fn ecs_fr_deep_new(world: EcsFrWorldDeep, access: EcsFrAccessDeep) -> EcsFrDeep {
+    return EcsFrDeep { world: world, access: access };
+}
+
+fn ecs_fr_deep_has_read(f: EcsFrDeep, id: i32) -> bool {
+    return ecs_fr_access_deep_has_read(f.access, id);
+}
+
+struct EcsFrGet {
+    ok: bool,
+    err: i32,
+    value: i64,
+    added: i64,
+    changed: i64,
+}
+
+fn ecs_fr_get_ok(r: EcsFrGet) -> bool { return r.ok; }
+fn ecs_fr_get_err(r: EcsFrGet) -> i32 { return r.err; }
+fn ecs_fr_get_value(r: EcsFrGet) -> i64 { return r.value; }
+fn ecs_fr_get_added(r: EcsFrGet) -> i64 { return r.added; }
+fn ecs_fr_get_changed(r: EcsFrGet) -> i64 { return r.changed; }
+
+fn ecs_fr_deep_get(f: EcsFrDeep, id: i32) -> EcsFrGet {
+    let slot = ecs_fr_world_deep_slot(f.world, id);
+    if ecs_fr_slot_registered(slot) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_NOT_REGISTERED, value: 0, added: 0, changed: 0 };
+    };
+    if ecs_fr_access_deep_has_read(f.access, id) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_NO_RESOURCE_ACCESS, value: 0, added: 0, changed: 0 };
+    };
+    if ecs_fr_slot_exists(slot) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_DOES_NOT_EXIST, value: 0, added: 0, changed: 0 };
+    };
+    return EcsFrGet {
+        ok: true, err: ECS_FR_OK, value: ecs_fr_slot_value(slot),
+        added: slot.added, changed: slot.changed,
+    };
+}
+
+fn ecs_fr_deep_get_by_id(f: EcsFrDeep, id: i32) -> EcsFrGet {
+    return ecs_fr_deep_get(f, id);
+}
+
+// FilteredResourcesMut
+struct EcsFrMutDeep {
+    world: EcsFrWorldDeep,
+    access: EcsFrAccessDeep,
+}
+
+fn ecs_fr_mut_deep_new(world: EcsFrWorldDeep, access: EcsFrAccessDeep) -> EcsFrMutDeep {
+    return EcsFrMutDeep { world: world, access: access };
+}
+
+fn ecs_fr_mut_deep_world(f: EcsFrMutDeep) -> EcsFrWorldDeep { return f.world; }
+fn ecs_fr_mut_deep_has_read(f: EcsFrMutDeep, id: i32) -> bool {
+    return ecs_fr_access_deep_has_read(f.access, id);
+}
+fn ecs_fr_mut_deep_has_write(f: EcsFrMutDeep, id: i32) -> bool {
+    return ecs_fr_access_deep_has_write(f.access, id);
+}
+
+fn ecs_fr_mut_deep_as_readonly(f: EcsFrMutDeep) -> EcsFrDeep {
+    return EcsFrDeep { world: f.world, access: f.access };
+}
+
+fn ecs_fr_mut_deep_reborrow(f: EcsFrMutDeep) -> EcsFrMutDeep {
+    return EcsFrMutDeep { world: f.world, access: f.access };
+}
+
+fn ecs_fr_mut_deep_get(f: EcsFrMutDeep, id: i32) -> EcsFrGet {
+    return ecs_fr_deep_get(EcsFrDeep { world: f.world, access: f.access }, id);
+}
+
+fn ecs_fr_mut_deep_get_mut(f: EcsFrMutDeep, id: i32) -> EcsFrGet {
+    let slot = ecs_fr_world_deep_slot(f.world, id);
+    if ecs_fr_slot_registered(slot) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_NOT_REGISTERED, value: 0, added: 0, changed: 0 };
+    };
+    if ecs_fr_access_deep_has_write(f.access, id) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_NO_RESOURCE_ACCESS, value: 0, added: 0, changed: 0 };
+    };
+    if ecs_fr_slot_exists(slot) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_DOES_NOT_EXIST, value: 0, added: 0, changed: 0 };
+    };
+    if ecs_fr_slot_mutable(slot) != true {
+        return EcsFrGet { ok: false, err: ECS_FR_IMMUTABLE, value: 0, added: 0, changed: 0 };
+    };
+    return EcsFrGet {
+        ok: true, err: ECS_FR_OK, value: ecs_fr_slot_value(slot),
+        added: slot.added, changed: slot.changed,
+    };
+}
+
+fn ecs_fr_mut_deep_get_mut_by_id(f: EcsFrMutDeep, id: i32) -> EcsFrGet {
+    return ecs_fr_mut_deep_get_mut(f, id);
+}
+
+fn ecs_fr_mut_deep_into_mut(f: EcsFrMutDeep, id: i32) -> EcsFrGet {
+    return ecs_fr_mut_deep_get_mut(f, id);
+}
+
+struct EcsFrSetResult {
+    view: EcsFrMutDeep,
+    ok: bool,
+    err: i32,
+}
+
+fn ecs_fr_set_view(r: EcsFrSetResult) -> EcsFrMutDeep { return r.view; }
+fn ecs_fr_set_ok(r: EcsFrSetResult) -> bool { return r.ok; }
+fn ecs_fr_set_err(r: EcsFrSetResult) -> i32 { return r.err; }
+
+fn ecs_fr_mut_deep_set(f: EcsFrMutDeep, id: i32, value: i64) -> EcsFrSetResult {
+    let g = ecs_fr_mut_deep_get_mut(f, id);
+    if ecs_fr_get_ok(g) != true {
+        return EcsFrSetResult { view: f, ok: false, err: ecs_fr_get_err(g) };
+    };
+    let w2 = ecs_fr_world_deep_set_value(f.world, id, value);
+    let f2 = EcsFrMutDeep { world: w2, access: f.access };
+    return EcsFrSetResult { view: f2, ok: true, err: ECS_FR_OK };
+}

@@ -1,0 +1,273 @@
+// Bevy-style mutable World writeback plan over the access-safety batches.
+//
+// This is still an explicit library model, not a Rust in-place async executor:
+// systems publish write intents, `parallel_mut_safety.sla` decides compatible
+// batches, and this module commits those intents in batch order.
+@import "sa_std/vec.sa"
+@import "parallel_mut_safety.sla"
+
+struct EcsParallelMutWritebackWorld {
+    component_ids: Vec<i32>,
+    component_values: Vec<i32>,
+    resource_value: i32,
+    message_count: i64,
+    change_tick: i32,
+}
+
+struct EcsParallelMutWriteIntent {
+    system_id: i64,
+    writes_component: bool,
+    component_id: i32,
+    component_delta: i32,
+    writes_resource: bool,
+    resource_delta: i32,
+    writes_messages: bool,
+    message_delta: i64,
+}
+
+struct EcsParallelMutWritebackPlan {
+    safety: EcsParallelMutSafetyPlan,
+    intents: Vec<EcsParallelMutWriteIntent>,
+}
+
+struct EcsParallelMutWritebackRunResult {
+    world: EcsParallelMutWritebackWorld,
+    safety_run: EcsParallelMutSafetyRunResult,
+    applied_systems: Vec<i64>,
+    skipped_systems: Vec<i64>,
+    deferred_systems: Vec<i64>,
+    applied_write_count: i64,
+    missing_intent_count: i64,
+    completed: bool,
+}
+
+fn ecs_parallel_mut_writeback_world_new() -> EcsParallelMutWritebackWorld {
+    let component_ids: Vec<i32> = Vec::new();
+    let component_values: Vec<i32> = Vec::new();
+    return EcsParallelMutWritebackWorld { component_ids: component_ids, component_values: component_values, resource_value: 0, message_count: 0, change_tick: 0 };
+}
+
+fn ecs_parallel_mut_writeback_component_slot(world: EcsParallelMutWritebackWorld, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let n = len(world.component_ids) as i64;
+    while i < n {
+        if world.component_ids[i] == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_parallel_mut_writeback_component_value(world: EcsParallelMutWritebackWorld, component_id: i32) -> i32 {
+    let slot = ecs_parallel_mut_writeback_component_slot(world, component_id);
+    if slot < 0 { return 0; };
+    return world.component_values[slot];
+}
+
+fn ecs_parallel_mut_writeback_add_component_delta(world: EcsParallelMutWritebackWorld, component_id: i32, delta: i32) -> EcsParallelMutWritebackWorld {
+    let slot = ecs_parallel_mut_writeback_component_slot(world, component_id);
+    if slot < 0 {
+        world.component_ids.push(component_id);
+        world.component_values.push(delta);
+        world.change_tick = world.change_tick + 1;
+        return world;
+    };
+    world.component_values[slot] = world.component_values[slot] + delta;
+    world.change_tick = world.change_tick + 1;
+    return world;
+}
+
+fn ecs_parallel_mut_write_intent_none(system_id: i64) -> EcsParallelMutWriteIntent {
+    return EcsParallelMutWriteIntent { system_id: system_id, writes_component: false, component_id: 0, component_delta: 0, writes_resource: false, resource_delta: 0, writes_messages: false, message_delta: 0 };
+}
+
+fn ecs_parallel_mut_write_intent_component(system_id: i64, component_id: i32, delta: i32) -> EcsParallelMutWriteIntent {
+    return EcsParallelMutWriteIntent { system_id: system_id, writes_component: true, component_id: component_id, component_delta: delta, writes_resource: false, resource_delta: 0, writes_messages: false, message_delta: 0 };
+}
+
+fn ecs_parallel_mut_write_intent_resource(system_id: i64, delta: i32) -> EcsParallelMutWriteIntent {
+    return EcsParallelMutWriteIntent { system_id: system_id, writes_component: false, component_id: 0, component_delta: 0, writes_resource: true, resource_delta: delta, writes_messages: false, message_delta: 0 };
+}
+
+fn ecs_parallel_mut_write_intent_messages(system_id: i64, delta: i64) -> EcsParallelMutWriteIntent {
+    return EcsParallelMutWriteIntent { system_id: system_id, writes_component: false, component_id: 0, component_delta: 0, writes_resource: false, resource_delta: 0, writes_messages: true, message_delta: delta };
+}
+
+fn ecs_parallel_mut_write_intent_component_resource(system_id: i64, component_id: i32, component_delta: i32, resource_delta: i32) -> EcsParallelMutWriteIntent {
+    return EcsParallelMutWriteIntent { system_id: system_id, writes_component: true, component_id: component_id, component_delta: component_delta, writes_resource: true, resource_delta: resource_delta, writes_messages: false, message_delta: 0 };
+}
+
+fn ecs_parallel_mut_writeback_plan_new() -> EcsParallelMutWritebackPlan {
+    let intents: Vec<EcsParallelMutWriteIntent> = Vec::new();
+    return EcsParallelMutWritebackPlan { safety: ecs_parallel_mut_safety_plan_new(), intents: intents };
+}
+
+fn ecs_parallel_mut_writeback_plan_add(plan: EcsParallelMutWritebackPlan, spec: EcsParallelMutSystemSpec, intent: EcsParallelMutWriteIntent) -> EcsParallelMutWritebackPlan {
+    plan.safety = ecs_parallel_mut_safety_plan_add(plan.safety, spec);
+    plan.intents.push(intent);
+    return plan;
+}
+
+fn ecs_parallel_mut_writeback_plan_add_without_intent(plan: EcsParallelMutWritebackPlan, spec: EcsParallelMutSystemSpec) -> EcsParallelMutWritebackPlan {
+    plan.safety = ecs_parallel_mut_safety_plan_add(plan.safety, spec);
+    return plan;
+}
+
+fn ecs_parallel_mut_writeback_intent_index(plan: EcsParallelMutWritebackPlan, system_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(plan.intents) as i64;
+    while i < n {
+        if plan.intents[i].system_id == system_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_parallel_mut_writeback_apply_intent(world: EcsParallelMutWritebackWorld, intent: EcsParallelMutWriteIntent) -> (EcsParallelMutWritebackWorld, i64) {
+    let writes: i64 = 0;
+    if intent.writes_component {
+        world = ecs_parallel_mut_writeback_add_component_delta(world, intent.component_id, intent.component_delta);
+        writes = writes + 1;
+    };
+    if intent.writes_resource {
+        world.resource_value = world.resource_value + intent.resource_delta;
+        world.change_tick = world.change_tick + 1;
+        writes = writes + 1;
+    };
+    if intent.writes_messages {
+        world.message_count = world.message_count + intent.message_delta;
+        world.change_tick = world.change_tick + 1;
+        writes = writes + 1;
+    };
+    return (world, writes);
+}
+
+fn ecs_parallel_mut_writeback_run(world: EcsParallelMutWritebackWorld, plan: EcsParallelMutWritebackPlan, max_width: i64) -> EcsParallelMutWritebackRunResult {
+    let safety_run = ecs_parallel_mut_safety_run(plan.safety, max_width);
+    let applied_systems: Vec<i64> = Vec::new();
+    let skipped_systems: Vec<i64> = Vec::new();
+    let deferred_systems: Vec<i64> = Vec::new();
+    let applied_write_count: i64 = 0;
+    let missing_intent_count: i64 = 0;
+    let batch_i: i64 = 0;
+    let batch_n = len(safety_run.batches) as i64;
+    while batch_i < batch_n {
+        let batch = safety_run.batches[batch_i];
+        let d: i64 = 0;
+        let deferred_n = len(batch.deferred) as i64;
+        while d < deferred_n {
+            deferred_systems.push(batch.deferred[d]);
+            d = d + 1;
+        }
+        let s: i64 = 0;
+        let skipped_n = len(batch.skipped) as i64;
+        while s < skipped_n {
+            skipped_systems.push(batch.skipped[s]);
+            s = s + 1;
+        }
+        let r: i64 = 0;
+        let ran_n = len(batch.systems) as i64;
+        while r < ran_n {
+            let system_id = batch.systems[r];
+            let intent_index = ecs_parallel_mut_writeback_intent_index(plan, system_id);
+            if intent_index < 0 {
+                missing_intent_count = missing_intent_count + 1;
+            } else {
+                let (next_world, writes) = ecs_parallel_mut_writeback_apply_intent(world, plan.intents[intent_index]);
+                world = next_world;
+                applied_write_count = applied_write_count + writes;
+            };
+            applied_systems.push(system_id);
+            r = r + 1;
+        }
+        batch_i = batch_i + 1;
+    }
+    return EcsParallelMutWritebackRunResult { world: world, safety_run: safety_run, applied_systems: applied_systems, skipped_systems: skipped_systems, deferred_systems: deferred_systems, applied_write_count: applied_write_count, missing_intent_count: missing_intent_count, completed: safety_run.completed && missing_intent_count == 0 };
+}
+
+@test "parallel mut writeback applies disjoint component writes from one threaded batch"() {
+    let a_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let b_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 2);
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add(p0, ecs_parallel_mut_system_spec(0, a_access, false, false, true), ecs_parallel_mut_write_intent_component(0, 1, 10));
+    let p2 = ecs_parallel_mut_writeback_plan_add(p1, ecs_parallel_mut_system_spec(1, b_access, false, false, true), ecs_parallel_mut_write_intent_component(1, 2, 20));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p2, 4);
+    if run.completed != true { panic(33010); };
+    if run.safety_run.threaded_batch_count != 1 { panic(33011); };
+    if ecs_parallel_mut_writeback_component_value(run.world, 1) != 10 { panic(33012); };
+    if ecs_parallel_mut_writeback_component_value(run.world, 2) != 20 { panic(33013); };
+    if run.applied_write_count != 2 { panic(33014); };
+}
+
+@test "parallel mut writeback serializes conflicting component writes"() {
+    let first_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let second_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add(p0, ecs_parallel_mut_system_spec(0, first_access, false, false, true), ecs_parallel_mut_write_intent_component(0, 1, 3));
+    let p2 = ecs_parallel_mut_writeback_plan_add(p1, ecs_parallel_mut_system_spec(1, second_access, false, false, true), ecs_parallel_mut_write_intent_component(1, 1, 4));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p2, 4);
+    if run.completed != true { panic(33020); };
+    if len(run.safety_run.batches) != 2 { panic(33021); };
+    if run.safety_run.conflict_count != 1 { panic(33022); };
+    if ecs_parallel_mut_writeback_component_value(run.world, 1) != 7 { panic(33023); };
+    if run.deferred_systems[0] != 1 { panic(33024); };
+}
+
+@test "parallel mut writeback does not apply skipped system intents"() {
+    let access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add(p0, ecs_parallel_mut_system_spec(0, access, false, false, false), ecs_parallel_mut_write_intent_component(0, 1, 9));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p1, 4);
+    if run.completed != true { panic(33030); };
+    if ecs_parallel_mut_writeback_component_value(run.world, 1) != 0 { panic(33031); };
+    if len(run.skipped_systems) != 1 { panic(33032); };
+    if run.applied_write_count != 0 { panic(33033); };
+}
+
+@test "parallel mut writeback applies resource and message writes"() {
+    let resource_access = ecs_parallel_mut_access_write_resource(ecs_parallel_mut_access_none());
+    let message_access = ecs_parallel_mut_access_write_messages(ecs_parallel_mut_access_none());
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add(p0, ecs_parallel_mut_system_spec(0, resource_access, false, false, true), ecs_parallel_mut_write_intent_resource(0, 5));
+    let p2 = ecs_parallel_mut_writeback_plan_add(p1, ecs_parallel_mut_system_spec(1, message_access, false, false, true), ecs_parallel_mut_write_intent_messages(1, 2));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p2, 4);
+    if run.completed != true { panic(33040); };
+    if run.world.resource_value != 5 { panic(33041); };
+    if run.world.message_count != 2 { panic(33042); };
+    if run.world.change_tick != 2 { panic(33043); };
+}
+
+@test "parallel mut writeback serializes exclusive write intents"() {
+    let a_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let b_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 2);
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add(p0, ecs_parallel_mut_system_spec(0, a_access, true, false, true), ecs_parallel_mut_write_intent_component(0, 1, 1));
+    let p2 = ecs_parallel_mut_writeback_plan_add(p1, ecs_parallel_mut_system_spec(1, b_access, false, false, true), ecs_parallel_mut_write_intent_component(1, 2, 1));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p2, 4);
+    if run.completed != true { panic(33050); };
+    if run.safety_run.serialized_batch_count != 1 { panic(33051); };
+    if len(run.safety_run.batches) != 2 { panic(33052); };
+}
+
+@test "parallel mut writeback respects max width waves"() {
+    let a_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let b_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 2);
+    let c_access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 3);
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add(p0, ecs_parallel_mut_system_spec(0, a_access, false, false, true), ecs_parallel_mut_write_intent_component(0, 1, 1));
+    let p2 = ecs_parallel_mut_writeback_plan_add(p1, ecs_parallel_mut_system_spec(1, b_access, false, false, true), ecs_parallel_mut_write_intent_component(1, 2, 1));
+    let p3 = ecs_parallel_mut_writeback_plan_add(p2, ecs_parallel_mut_system_spec(2, c_access, false, false, true), ecs_parallel_mut_write_intent_component(2, 3, 1));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p3, 2);
+    if run.completed != true { panic(33060); };
+    if len(run.safety_run.batches) != 2 { panic(33061); };
+    if run.safety_run.threaded_batch_count != 1 { panic(33062); };
+    if run.applied_write_count != 3 { panic(33063); };
+}
+
+@test "parallel mut writeback reports missing intent"() {
+    let access = ecs_parallel_mut_access_write_component(ecs_parallel_mut_access_none(), 1);
+    let p0 = ecs_parallel_mut_writeback_plan_new();
+    let p1 = ecs_parallel_mut_writeback_plan_add_without_intent(p0, ecs_parallel_mut_system_spec(0, access, false, false, true));
+    let run = ecs_parallel_mut_writeback_run(ecs_parallel_mut_writeback_world_new(), p1, 4);
+    if run.completed { panic(33070); };
+    if run.missing_intent_count != 1 { panic(33071); };
+}

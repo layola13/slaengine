@@ -1,0 +1,266 @@
+// Bevy bevy_tasks ParallelSlice-style helpers over Vec<i32>.
+// SLA has no generic Fn traits, so these APIs use named function pointers.
+@import "parallel_runner.sla"
+@import "sa_std/vec.sa"
+@import "sa_std/thread.sa"
+
+struct EcsParallelSliceMapResult {
+    values: Vec<i32>,
+    output_values: Vec<i32>,
+    chunk_starts: Vec<i64>,
+    chunk_lens: Vec<i64>,
+    used_threads: bool,
+    chunk_count: i64,
+}
+
+struct EcsParallelI32MutChunkResult {
+    chunk: Vec<i32>,
+    value: i32,
+}
+
+fn ecs_parallel_slice_map_result(values: Vec<i32>, output_values: Vec<i32>, chunk_starts: Vec<i64>, chunk_lens: Vec<i64>, used_threads: bool) -> EcsParallelSliceMapResult {
+    return EcsParallelSliceMapResult { values: values, output_values: output_values, chunk_starts: chunk_starts, chunk_lens: chunk_lens, used_threads: used_threads, chunk_count: len(chunk_starts) as i64 };
+}
+
+fn ecs_parallel_i32_mut_chunk_result(chunk: Vec<i32>, value: i32) -> EcsParallelI32MutChunkResult {
+    return EcsParallelI32MutChunkResult { chunk: chunk, value: value };
+}
+
+fn ecs_parallel_slice_effective_chunk_size(chunk_size: i64) -> i64 {
+    if chunk_size <= 0 { return 1; };
+    return chunk_size;
+}
+
+fn ecs_parallel_slice_chunk_count(len: i64, chunk_size: i64) -> i64 {
+    if len <= 0 { return 0; };
+    let size = ecs_parallel_slice_effective_chunk_size(chunk_size);
+    return (len + size - 1) / size;
+}
+
+fn ecs_parallel_slice_splat_chunk_size(pool: EcsParallelTaskPool, len: i64, max_tasks: i64) -> i64 {
+    if len <= 0 { return 1; };
+    let workers = ecs_parallel_task_pool_worker_count(pool);
+    if workers <= 0 { workers = 1; };
+    let thread_part = len / workers;
+    let task_part: i64 = 0;
+    if max_tasks > 0 { task_part = len / max_tasks; };
+    let chunk_size = thread_part;
+    if task_part > chunk_size { chunk_size = task_part; };
+    if chunk_size < 1 { return 1; };
+    return chunk_size;
+}
+
+fn ecs_parallel_i32_slice_chunk(values: Vec<i32>, start: i64, chunk_len: i64) -> Vec<i32> {
+    let chunk: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < chunk_len {
+        chunk.push(values[start + i]);
+        i = i + 1;
+    }
+    return chunk;
+}
+
+fn ecs_parallel_i32_copy_vec(values: Vec<i32>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n = len(values) as i64;
+    while i < n {
+        out.push(values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_map_chunk_run(start: i64, chunk: Vec<i32>, mapper: fn(i64, Vec<i32>) -> i32) -> i32 {
+    return mapper(start, chunk);
+}
+
+fn ecs_parallel_i32_map_mut_chunk_run(start: i64, chunk: Vec<i32>, mapper: fn(i64, Vec<i32>) -> EcsParallelI32MutChunkResult) -> EcsParallelI32MutChunkResult {
+    return mapper(start, chunk);
+}
+
+fn ecs_parallel_i32_par_chunk_map(pool: EcsParallelTaskPool, values: Vec<i32>, chunk_size: i64, mapper: fn(i64, Vec<i32>) -> i32) -> EcsParallelSliceMapResult {
+    let size = ecs_parallel_slice_effective_chunk_size(chunk_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let mapped: Vec<i32> = Vec::new();
+    let handles: Vec<JoinHandle<i32>> = Vec::new();
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_slice_chunk(values, start, current_len);
+        starts.push(start);
+        lens.push(current_len);
+        let task_start = start;
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_map_chunk_run(task_start, chunk, mapper)));
+        } else {
+            mapped.push(ecs_parallel_i32_map_chunk_run(task_start, chunk, mapper));
+        };
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        mapped.push(handles[join_i].join().unwrap());
+        join_i = join_i + 1;
+    }
+    let output = ecs_parallel_i32_copy_vec(values);
+    return ecs_parallel_slice_map_result(mapped, output, starts, lens, len(handles) > 0);
+}
+
+fn ecs_parallel_i32_par_splat_map(pool: EcsParallelTaskPool, values: Vec<i32>, max_tasks: i64, mapper: fn(i64, Vec<i32>) -> i32) -> EcsParallelSliceMapResult {
+    let value_len = len(values) as i64;
+    let chunk_size = ecs_parallel_slice_splat_chunk_size(pool, value_len, max_tasks);
+    return ecs_parallel_i32_par_chunk_map(pool, values, chunk_size, mapper);
+}
+
+fn ecs_parallel_i32_par_chunk_map_mut(pool: EcsParallelTaskPool, values: Vec<i32>, chunk_size: i64, mapper: fn(i64, Vec<i32>) -> EcsParallelI32MutChunkResult) -> EcsParallelSliceMapResult {
+    let size = ecs_parallel_slice_effective_chunk_size(chunk_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let mapped: Vec<i32> = Vec::new();
+    let output = ecs_parallel_i32_copy_vec(values);
+    let handles: Vec<JoinHandle<EcsParallelI32MutChunkResult>> = Vec::new();
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_slice_chunk(values, start, current_len);
+        starts.push(start);
+        lens.push(current_len);
+        let task_start = start;
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_map_mut_chunk_run(task_start, chunk, mapper)));
+        } else {
+            let inline_result = ecs_parallel_i32_map_mut_chunk_run(task_start, chunk, mapper);
+            mapped.push(inline_result.value);
+            let k: i64 = 0;
+            while k < len(inline_result.chunk) as i64 {
+                output[task_start + k] = inline_result.chunk[k];
+                k = k + 1;
+            }
+        };
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        let chunk_result = handles[join_i].join().unwrap();
+        mapped.push(chunk_result.value);
+        let out_start = starts[join_i];
+        let k: i64 = 0;
+        while k < len(chunk_result.chunk) as i64 {
+            output[out_start + k] = chunk_result.chunk[k];
+            k = k + 1;
+        }
+        join_i = join_i + 1;
+    }
+    return ecs_parallel_slice_map_result(mapped, output, starts, lens, len(handles) > 0 && ecs_parallel_task_pool_worker_count(pool) != 0);
+}
+
+fn ecs_parallel_i32_par_splat_map_mut(pool: EcsParallelTaskPool, values: Vec<i32>, max_tasks: i64, mapper: fn(i64, Vec<i32>) -> EcsParallelI32MutChunkResult) -> EcsParallelSliceMapResult {
+    let value_len = len(values) as i64;
+    let chunk_size = ecs_parallel_slice_splat_chunk_size(pool, value_len, max_tasks);
+    return ecs_parallel_i32_par_chunk_map_mut(pool, values, chunk_size, mapper);
+}
+
+fn ecs_parallel_slice_test_sum_with_start(start: i64, chunk: Vec<i32>) -> i32 {
+    let total: i32 = 0;
+    let i: i64 = 0;
+    while i < len(chunk) as i64 {
+        total = total + chunk[i];
+        i = i + 1;
+    }
+    return (start as i32) * 100 + total;
+}
+
+fn ecs_parallel_slice_test_increment_sum(start: i64, chunk: Vec<i32>) -> EcsParallelI32MutChunkResult {
+    let updated: Vec<i32> = Vec::new();
+    let total: i32 = 0;
+    let i: i64 = 0;
+    while i < len(chunk) as i64 {
+        let next = chunk[i] + 1;
+        updated.push(next);
+        total = total + next;
+        i = i + 1;
+    }
+    return ecs_parallel_i32_mut_chunk_result(updated, (start as i32) * 100 + total);
+}
+
+fn ecs_parallel_slice_test_values_1_to_10() -> Vec<i32> {
+    let values: Vec<i32> = Vec::new();
+    let i: i32 = 1;
+    while i <= 10 {
+        values.push(i);
+        i = i + 1;
+    }
+    return values;
+}
+
+@test "parallel slice chunk count clamps invalid size"() {
+    if ecs_parallel_slice_chunk_count(0, 3) != 0 { panic(31010); };
+    if ecs_parallel_slice_chunk_count(10, 3) != 4 { panic(31011); };
+    if ecs_parallel_slice_chunk_count(3, 0) != 3 { panic(31012); };
+}
+
+@test "parallel slice par chunk map preserves chunk order"() {
+    let pool = ecs_parallel_task_pool_new(4);
+    let values = ecs_parallel_slice_test_values_1_to_10();
+    let result = ecs_parallel_i32_par_chunk_map(pool, values, 3, ecs_parallel_slice_test_sum_with_start);
+    if result.chunk_count != 4 { panic(31020); };
+    if len(result.values) != 4 { panic(31021); };
+    if result.values[0] != 6 { panic(31022); };
+    if result.values[1] != 315 { panic(31023); };
+    if result.values[2] != 624 { panic(31024); };
+    if result.values[3] != 910 { panic(31025); };
+    if result.chunk_starts[2] != 6 { panic(31026); };
+    if result.chunk_lens[3] != 1 { panic(31027); };
+    if result.used_threads != true { panic(31028); };
+}
+
+@test "parallel slice par splat map matches Bevy chunk sizing"() {
+    let pool = ecs_parallel_task_pool_new(4);
+    let values = ecs_parallel_slice_test_values_1_to_10();
+    let value_len = len(values) as i64;
+    let chunk_size = ecs_parallel_slice_splat_chunk_size(pool, value_len, 2);
+    if chunk_size != 5 { panic(31030); };
+    let result = ecs_parallel_i32_par_splat_map(pool, values, 2, ecs_parallel_slice_test_sum_with_start);
+    if result.chunk_count != 2 { panic(31031); };
+    if result.values[0] != 15 { panic(31032); };
+    if result.values[1] != 540 { panic(31033); };
+    if result.chunk_lens[0] != 5 { panic(31034); };
+    if result.chunk_lens[1] != 5 { panic(31035); };
+}
+
+@test "parallel slice par chunk map mut returns updated values"() {
+    let pool = ecs_parallel_task_pool_new(3);
+    let values = ecs_parallel_slice_test_values_1_to_10();
+    let result = ecs_parallel_i32_par_chunk_map_mut(pool, values, 4, ecs_parallel_slice_test_increment_sum);
+    if result.chunk_count != 3 { panic(31040); };
+    if result.values[0] != 14 { panic(31041); };
+    if result.values[1] != 430 { panic(31042); };
+    if result.values[2] != 821 { panic(31043); };
+    if len(result.output_values) != 10 { panic(31044); };
+    if result.output_values[0] != 2 { panic(31045); };
+    if result.output_values[9] != 11 { panic(31046); };
+}
+
+@test "parallel slice par splat map mut clamps zero workers"() {
+    let pool = ecs_parallel_task_pool_new(0);
+    let values = ecs_parallel_slice_test_values_1_to_10();
+    let value_len = len(values) as i64;
+    let chunk_size = ecs_parallel_slice_splat_chunk_size(pool, value_len, 0);
+    if chunk_size != 10 { panic(31050); };
+    let result = ecs_parallel_i32_par_splat_map_mut(pool, values, 0, ecs_parallel_slice_test_increment_sum);
+    if result.chunk_count != 1 { panic(31051); };
+    if result.values[0] != 65 { panic(31052); };
+    if result.output_values[0] != 2 { panic(31053); };
+    if result.output_values[9] != 11 { panic(31054); };
+    if result.used_threads != false { panic(31055); };
+}

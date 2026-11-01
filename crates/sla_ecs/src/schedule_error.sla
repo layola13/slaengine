@@ -1,0 +1,446 @@
+// Bevy ECS schedule build errors and warnings.
+// Mirrors src/schedule/error.rs.
+
+// === ScheduleBuildError ===
+const ECS_SCHED_ERR_HIERARCHY_SORT: i32 = 0;
+const ECS_SCHED_ERR_DEPENDENCY_SORT: i32 = 1;
+const ECS_SCHED_ERR_FLAT_DEPENDENCY_SORT: i32 = 2;
+const ECS_SCHED_ERR_CROSS_DEPENDENCY: i32 = 3;
+const ECS_SCHED_ERR_SETS_HAVE_ORDER_BUT_INTERSECT: i32 = 4;
+const ECS_SCHED_ERR_SYSTEM_TYPE_SET_AMBIGUITY: i32 = 5;
+const ECS_SCHED_ERR_ELEVATED: i32 = 6;
+const ECS_SCHED_ERR_HIERARCHY_REDUNDANCY: i32 = 7;
+const ECS_SCHED_ERR_AMBIGUITY: i32 = 8;
+
+struct EcsScheduleBuildError {
+    kind: i32,
+    message_id: i64,
+}
+
+fn ecs_schedule_build_error_new(kind: i32, message_id: i64) -> EcsScheduleBuildError {
+    return EcsScheduleBuildError { kind: kind, message_id: message_id };
+}
+
+fn ecs_schedule_build_error_kind(e: EcsScheduleBuildError) -> i32 { return e.kind; }
+fn ecs_schedule_build_error_message(e: EcsScheduleBuildError) -> i64 { return e.message_id; }
+
+fn ecs_schedule_build_error_is_hierarchy_sort(e: EcsScheduleBuildError) -> bool { return e.kind == ECS_SCHED_ERR_HIERARCHY_SORT; }
+fn ecs_schedule_build_error_is_dependency_sort(e: EcsScheduleBuildError) -> bool { return e.kind == ECS_SCHED_ERR_DEPENDENCY_SORT; }
+fn ecs_schedule_build_error_is_ambiguity(e: EcsScheduleBuildError) -> bool { return e.kind == ECS_SCHED_ERR_AMBIGUITY; }
+
+// === ScheduleBuildWarning ===
+const ECS_SCHED_WARN_AMBIGUOUS: i32 = 0;
+const ECS_SCHED_WARN_REDUNDANT: i32 = 1;
+
+struct EcsScheduleBuildWarning {
+    kind: i32,
+    system_a: i32,
+    system_b: i32,
+}
+
+fn ecs_schedule_build_warning_ambiguous(a: i32, b: i32) -> EcsScheduleBuildWarning {
+    return EcsScheduleBuildWarning { kind: ECS_SCHED_WARN_AMBIGUOUS, system_a: a, system_b: b };
+}
+
+fn ecs_schedule_build_warning_redundant(a: i32, b: i32) -> EcsScheduleBuildWarning {
+    return EcsScheduleBuildWarning { kind: ECS_SCHED_WARN_REDUNDANT, system_a: a, system_b: b };
+}
+
+fn ecs_schedule_build_warning_kind(w: EcsScheduleBuildWarning) -> i32 { return w.kind; }
+fn ecs_schedule_build_warning_is_ambiguous(w: EcsScheduleBuildWarning) -> bool { return w.kind == ECS_SCHED_WARN_AMBIGUOUS; }
+fn ecs_schedule_build_warning_is_redundant(w: EcsScheduleBuildWarning) -> bool { return w.kind == ECS_SCHED_WARN_REDUNDANT; }
+
+// === ScheduleError: runtime schedule execution error ===
+const ECS_SCHEDULE_ERR_BUILD: i32 = 0;
+const ECS_SCHEDULE_ERR_SYSTEM: i32 = 1;
+
+struct EcsScheduleError {
+    kind: i32,
+    inner: EcsScheduleBuildError,
+}
+
+fn ecs_schedule_error_build(inner: EcsScheduleBuildError) -> EcsScheduleError {
+    return EcsScheduleError { kind: ECS_SCHEDULE_ERR_BUILD, inner: inner };
+}
+
+fn ecs_schedule_error_system(message_id: i64) -> EcsScheduleError {
+    return EcsScheduleError { kind: ECS_SCHEDULE_ERR_SYSTEM, inner: ecs_schedule_build_error_new(0, message_id) };
+}
+
+fn ecs_schedule_error_kind(e: EcsScheduleError) -> i32 { return e.kind; }
+fn ecs_schedule_error_is_build(e: EcsScheduleError) -> bool { return e.kind == ECS_SCHEDULE_ERR_BUILD; }
+fn ecs_schedule_error_is_system(e: EcsScheduleError) -> bool { return e.kind == ECS_SCHEDULE_ERR_SYSTEM; }
+
+// === ScheduleBuildSettings ===
+struct EcsScheduleBuildSettings {
+    auto_insert_apply_deferred: bool,
+    use_shortnames: bool,
+    ambiguity_detection: bool,
+}
+
+fn ecs_schedule_build_settings_default() -> EcsScheduleBuildSettings {
+    return EcsScheduleBuildSettings { auto_insert_apply_deferred: true, use_shortnames: true, ambiguity_detection: false };
+}
+
+fn ecs_schedule_build_settings_set_auto_insert(s: EcsScheduleBuildSettings, val: bool) -> EcsScheduleBuildSettings {
+    s.auto_insert_apply_deferred = val;
+    return s;
+}
+
+fn ecs_schedule_build_settings_set_ambiguity_detection(s: EcsScheduleBuildSettings, val: bool) -> EcsScheduleBuildSettings {
+    s.ambiguity_detection = val;
+    return s;
+}
+
+fn ecs_schedule_build_settings_auto_insert(s: EcsScheduleBuildSettings) -> bool { return s.auto_insert_apply_deferred; }
+fn ecs_schedule_build_settings_ambiguity_detection(s: EcsScheduleBuildSettings) -> bool { return s.ambiguity_detection; }
+
+// ---------------------------------------------------------------------------
+// Batch 171 — Deepened Bevy schedule::error surface.
+// Models DiGraphToposortError (Loop/Cycle) payload + cross_dependency pairs +
+// overlapping_group pairs + elevated warning, plus to_string kind labels.
+// Mirrors src/schedule/error.rs (lines 1-303).
+// ---------------------------------------------------------------------------
+
+// === DiGraphToposortError (Bevy error.rs line ~340-ish, from graph/dag.rs) ===
+// enum DiGraphToposortError<N> { Loop(N), Cycle(Vec<N>) }
+const ECS_TOPOSORT_ERROR_LOOP: i32 = 0;
+const ECS_TOPOSORT_ERROR_CYCLE: i32 = 1;
+
+struct EcsDiGraphToposortError {
+    variant: i32,
+    // For Loop: loop_node = node_id; For Cycle: cycle_nodes = Vec<i32> of node_ids
+    loop_node: i32,
+    cycle_nodes: Vec<i32>,
+}
+
+fn ecs_toposort_error_loop(node_id: i32) -> EcsDiGraphToposortError {
+    return EcsDiGraphToposortError { variant: ECS_TOPOSORT_ERROR_LOOP, loop_node: node_id, cycle_nodes: Vec::new() };
+}
+
+fn ecs_toposort_error_cycle(cycle_nodes: Vec<i32>) -> EcsDiGraphToposortError {
+    return EcsDiGraphToposortError { variant: ECS_TOPOSORT_ERROR_CYCLE, loop_node: -1, cycle_nodes: cycle_nodes };
+}
+
+fn ecs_toposort_error_is_loop(e: EcsDiGraphToposortError) -> bool {
+    return e.variant == ECS_TOPOSORT_ERROR_LOOP;
+}
+
+fn ecs_toposort_error_is_cycle(e: EcsDiGraphToposortError) -> bool {
+    return e.variant == ECS_TOPOSORT_ERROR_CYCLE;
+}
+
+fn ecs_toposort_error_loop_node(e: EcsDiGraphToposortError) -> i32 {
+    return e.loop_node;
+}
+
+fn ecs_toposort_error_cycle_count(e: EcsDiGraphToposortError) -> i32 {
+    return len(e.cycle_nodes) as i32;
+}
+
+fn ecs_toposort_error_cycle_node_at(e: EcsDiGraphToposortError, idx: i32) -> i32 {
+    if idx < 0 || idx >= len(e.cycle_nodes) as i32 {
+        return -1;
+    };
+    return e.cycle_nodes[idx];
+}
+
+// === DagRedundancyError(Vec<(N,N)>) — pairs of transitive edges ===
+struct EcsDagRedundancyError {
+    edges: Vec<i32>,   // flattened pairs: edge_from, edge_to, ...
+}
+
+fn ecs_dag_redundancy_error_new(edges: Vec<i32>) -> EcsDagRedundancyError {
+    return EcsDagRedundancyError { edges: edges };
+}
+
+fn ecs_dag_redundancy_error_count(e: EcsDagRedundancyError) -> i32 {
+    return len(e.edges) as i32 / 2;
+}
+
+fn ecs_dag_redundancy_error_from(e: EcsDagRedundancyError, idx: i32) -> i32 {
+    let i = idx * 2;
+    if i < 0 || i >= len(e.edges) as i32 {
+        return -1;
+    };
+    return e.edges[i];
+}
+
+fn ecs_dag_redundancy_error_to(e: EcsDagRedundancyError, idx: i32) -> i32 {
+    let i = idx * 2 + 1;
+    if i < 0 || i >= len(e.edges) as i32 {
+        return -1;
+    };
+    return e.edges[i];
+}
+
+// === DagCrossDependencyError(N, N) — (node_a, node_b) ===
+struct EcsDagCrossDependencyError {
+    node_a: i32,
+    node_b: i32,
+}
+
+fn ecs_dag_cross_dependency_error_new(node_a: i32, node_b: i32) -> EcsDagCrossDependencyError {
+    return EcsDagCrossDependencyError { node_a: node_a, node_b: node_b };
+}
+
+fn ecs_dag_cross_dependency_error_a(e: EcsDagCrossDependencyError) -> i32 {
+    return e.node_a;
+}
+
+fn ecs_dag_cross_dependency_error_b(e: EcsDagCrossDependencyError) -> i32 {
+    return e.node_b;
+}
+
+// === DagOverlappingGroupError(K, K) — (set_a, set_b) ===
+struct EcsDagOverlappingGroupError {
+    set_a: i32,
+    set_b: i32,
+}
+
+fn ecs_dag_overlapping_group_error_new(set_a: i32, set_b: i32) -> EcsDagOverlappingGroupError {
+    return EcsDagOverlappingGroupError { set_a: set_a, set_b: set_b };
+}
+
+fn ecs_dag_overlapping_group_error_a(e: EcsDagOverlappingGroupError) -> i32 {
+    return e.set_a;
+}
+
+fn ecs_dag_overlapping_group_error_b(e: EcsDagOverlappingGroupError) -> i32 {
+    return e.set_b;
+}
+
+// === AmbiguousSystemConflictsWarning(Vec<(SystemKey, SystemKey, Vec<ComponentId>)>) ===
+struct EcsAmbiguousSystemConflictsWarning {
+    // flattened triples: system_a, system_b, component_count, then component ids
+    conflicts: Vec<i32>,
+}
+
+fn ecs_ambiguous_conflicts_warning_new() -> EcsAmbiguousSystemConflictsWarning {
+    return EcsAmbiguousSystemConflictsWarning { conflicts: Vec::new() };
+}
+
+fn ecs_ambiguous_conflicts_warning_push(w: EcsAmbiguousSystemConflictsWarning, system_a: i32, system_b: i32, component_count: i32) -> EcsAmbiguousSystemConflictsWarning {
+    w.conflicts.push(system_a);
+    w.conflicts.push(system_b);
+    w.conflicts.push(component_count);
+    return w;
+}
+
+fn ecs_ambiguous_conflicts_warning_count(w: EcsAmbiguousSystemConflictsWarning) -> i32 {
+    return len(w.conflicts) as i32;
+}
+
+// === SystemTypeSetAmbiguityError ===
+struct EcsSystemTypeSetAmbiguityError {
+    system_type: i32,
+}
+
+fn ecs_system_type_set_ambiguity_new(system_type: i32) -> EcsSystemTypeSetAmbiguityError {
+    return EcsSystemTypeSetAmbiguityError { system_type: system_type };
+}
+
+fn ecs_system_type_set_ambiguity_type(e: EcsSystemTypeSetAmbiguityError) -> i32 {
+    return e.system_type;
+}
+
+// === Deepened EcsScheduleBuildErrorV2 with payloads ===
+struct EcsScheduleBuildErrorV2 {
+    kind: i32,
+    // For *_Sort: payload_topsort_error
+    toposort_error: EcsDiGraphToposortError,
+    // For CrossDependency
+    cross_dep: EcsDagCrossDependencyError,
+    // For SetsHaveOrderButIntersect
+    overlap_err: EcsDagOverlappingGroupError,
+    // For SystemTypeSetAmbiguity
+    type_set_ambiguity: EcsSystemTypeSetAmbiguityError,
+    // For Elevated (wraps a ScheduleBuildWarning)
+    elevated_kind: i32,
+    elevated_system_a: i32,
+    elevated_system_b: i32,
+}
+
+fn ecs_schedule_build_error_hierarchy_sort(te: EcsDiGraphToposortError) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_HIERARCHY_SORT,
+        toposort_error: te,
+        cross_dep: ecs_dag_cross_dependency_error_new(0, 0),
+        overlap_err: ecs_dag_overlapping_group_error_new(0, 0),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(0),
+        elevated_kind: -1, elevated_system_a: 0, elevated_system_b: 0,
+    };
+}
+
+fn ecs_schedule_build_error_dependency_sort(te: EcsDiGraphToposortError) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_DEPENDENCY_SORT,
+        toposort_error: te,
+        cross_dep: ecs_dag_cross_dependency_error_new(0, 0),
+        overlap_err: ecs_dag_overlapping_group_error_new(0, 0),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(0),
+        elevated_kind: -1, elevated_system_a: 0, elevated_system_b: 0,
+    };
+}
+
+fn ecs_schedule_build_error_flat_dependency_sort(te: EcsDiGraphToposortError) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_FLAT_DEPENDENCY_SORT,
+        toposort_error: te,
+        cross_dep: ecs_dag_cross_dependency_error_new(0, 0),
+        overlap_err: ecs_dag_overlapping_group_error_new(0, 0),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(0),
+        elevated_kind: -1, elevated_system_a: 0, elevated_system_b: 0,
+    };
+}
+
+fn ecs_schedule_build_error_cross_dependency(node_a: i32, node_b: i32) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_CROSS_DEPENDENCY,
+        toposort_error: ecs_toposort_error_loop(-1),
+        cross_dep: ecs_dag_cross_dependency_error_new(node_a, node_b),
+        overlap_err: ecs_dag_overlapping_group_error_new(0, 0),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(0),
+        elevated_kind: -1, elevated_system_a: 0, elevated_system_b: 0,
+    };
+}
+
+fn ecs_schedule_build_error_sets_have_order(set_a: i32, set_b: i32) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_SETS_HAVE_ORDER_BUT_INTERSECT,
+        toposort_error: ecs_toposort_error_loop(-1),
+        cross_dep: ecs_dag_cross_dependency_error_new(0, 0),
+        overlap_err: ecs_dag_overlapping_group_error_new(set_a, set_b),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(0),
+        elevated_kind: -1, elevated_system_a: 0, elevated_system_b: 0,
+    };
+}
+
+fn ecs_schedule_build_error_system_type_set_ambiguity(system_type: i32) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_SYSTEM_TYPE_SET_AMBIGUITY,
+        toposort_error: ecs_toposort_error_loop(-1),
+        cross_dep: ecs_dag_cross_dependency_error_new(0, 0),
+        overlap_err: ecs_dag_overlapping_group_error_new(0, 0),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(system_type),
+        elevated_kind: -1, elevated_system_a: 0, elevated_system_b: 0,
+    };
+}
+
+fn ecs_schedule_build_error_elevated(warning_kind: i32, system_a: i32, system_b: i32) -> EcsScheduleBuildErrorV2 {
+    return EcsScheduleBuildErrorV2 {
+        kind: ECS_SCHED_ERR_ELEVATED,
+        toposort_error: ecs_toposort_error_loop(-1),
+        cross_dep: ecs_dag_cross_dependency_error_new(0, 0),
+        overlap_err: ecs_dag_overlapping_group_error_new(0, 0),
+        type_set_ambiguity: ecs_system_type_set_ambiguity_new(0),
+        elevated_kind: warning_kind, elevated_system_a: system_a, elevated_system_b: system_b,
+    };
+}
+
+// kind accessor
+fn ecs_schedule_build_error_v2_kind(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.kind;
+}
+
+// to_string_kind_label: return a stable numeric label for each kind (primitive proxy for string)
+// Bevy to_string returns a String; here we return a hash/id per kind
+const ECS_LABEL_HIERARCHY_SORT: i64 = 101;
+const ECS_LABEL_DEPENDENCY_SORT: i64 = 102;
+const ECS_LABEL_FLAT_DEPENDENCY_SORT: i64 = 103;
+const ECS_LABEL_CROSS_DEPENDENCY: i64 = 104;
+const ECS_LABEL_SETS_HAVE_ORDER_BUT_INTERSECT: i64 = 105;
+const ECS_LABEL_SYSTEM_TYPE_SET_AMBIGUITY: i64 = 106;
+const ECS_LABEL_UNINITIALIZED: i64 = 107;
+const ECS_LABEL_ELEVATED: i64 = 108;
+const ECS_LABEL_HIERARCHY_REDUNDANCY: i64 = 109;
+const ECS_LABEL_AMBIGUITY: i64 = 110;
+
+fn ecs_schedule_build_error_v2_label(e: EcsScheduleBuildErrorV2) -> i64 {
+    if e.kind == ECS_SCHED_ERR_HIERARCHY_SORT { return ECS_LABEL_HIERARCHY_SORT; };
+    if e.kind == ECS_SCHED_ERR_DEPENDENCY_SORT { return ECS_LABEL_DEPENDENCY_SORT; };
+    if e.kind == ECS_SCHED_ERR_FLAT_DEPENDENCY_SORT { return ECS_LABEL_FLAT_DEPENDENCY_SORT; };
+    if e.kind == ECS_SCHED_ERR_CROSS_DEPENDENCY { return ECS_LABEL_CROSS_DEPENDENCY; };
+    if e.kind == ECS_SCHED_ERR_SETS_HAVE_ORDER_BUT_INTERSECT { return ECS_LABEL_SETS_HAVE_ORDER_BUT_INTERSECT; };
+    if e.kind == ECS_SCHED_ERR_SYSTEM_TYPE_SET_AMBIGUITY { return ECS_LABEL_SYSTEM_TYPE_SET_AMBIGUITY; };
+    if e.kind == ECS_SCHED_ERR_ELEVATED { return ECS_LABEL_ELEVATED; };
+    if e.kind == ECS_SCHED_ERR_HIERARCHY_REDUNDANCY { return ECS_LABEL_HIERARCHY_REDUNDANCY; };
+    if e.kind == ECS_SCHED_ERR_AMBIGUITY { return ECS_LABEL_AMBIGUITY; };
+    return ECS_LABEL_UNINITIALIZED;
+}
+
+fn ecs_schedule_build_error_v2_is_hierarchy_sort(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_HIERARCHY_SORT;
+}
+
+fn ecs_schedule_build_error_v2_is_dependency_sort(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_DEPENDENCY_SORT;
+}
+
+fn ecs_schedule_build_error_v2_is_flat_dependency_sort(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_FLAT_DEPENDENCY_SORT;
+}
+
+fn ecs_schedule_build_error_v2_is_cross_dependency(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_CROSS_DEPENDENCY;
+}
+
+fn ecs_schedule_build_error_v2_is_sets_have_order(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_SETS_HAVE_ORDER_BUT_INTERSECT;
+}
+
+fn ecs_schedule_build_error_v2_is_system_type_set_ambiguity(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_SYSTEM_TYPE_SET_AMBIGUITY;
+}
+
+fn ecs_schedule_build_error_v2_is_elevated(e: EcsScheduleBuildErrorV2) -> bool {
+    return e.kind == ECS_SCHED_ERR_ELEVATED;
+}
+
+// payload accessors
+fn ecs_schedule_build_error_v2_loop_node(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.toposort_error.loop_node;
+}
+
+fn ecs_schedule_build_error_v2_cycle_count(e: EcsScheduleBuildErrorV2) -> i32 {
+    return len(e.toposort_error.cycle_nodes) as i32;
+}
+
+fn ecs_schedule_build_error_v2_cycle_node_at(e: EcsScheduleBuildErrorV2, idx: i32) -> i32 {
+    if idx < 0 || idx >= len(e.toposort_error.cycle_nodes) as i32 {
+        return -1;
+    };
+    return e.toposort_error.cycle_nodes[idx];
+}
+
+fn ecs_schedule_build_error_v2_cross_node_a(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.cross_dep.node_a;
+}
+
+fn ecs_schedule_build_error_v2_cross_node_b(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.cross_dep.node_b;
+}
+
+fn ecs_schedule_build_error_v2_overlap_set_a(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.overlap_err.set_a;
+}
+
+fn ecs_schedule_build_error_v2_overlap_set_b(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.overlap_err.set_b;
+}
+
+fn ecs_schedule_build_error_v2_type_ambiguity_system_type(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.type_set_ambiguity.system_type;
+}
+
+fn ecs_schedule_build_error_v2_elevated_warning_kind(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.elevated_kind;
+}
+
+fn ecs_schedule_build_error_v2_elevated_system_a(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.elevated_system_a;
+}
+
+fn ecs_schedule_build_error_v2_elevated_system_b(e: EcsScheduleBuildErrorV2) -> i32 {
+    return e.elevated_system_b;
+}

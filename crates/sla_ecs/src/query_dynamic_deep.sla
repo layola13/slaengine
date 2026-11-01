@@ -1,0 +1,1234 @@
+// Deep bed for lib/query_dynamic.sla (Batch 396).
+// Self-contained fixed-cap mirror of DynamicWorld<A,B,R,M> query layer.
+// Shallow composes RegistryWorld + DynamicComponentStore<A/B> + Query wrappers; deep inlines
+// a cap-16 entity allocator, A/B registry membership columns with added/changed ticks, typed
+// A/B stores, a resource slot, and cap-16 message queue. No @import, no generics, no tuple destructuring.
+
+const ECS_QD_CAP: i32 = 16;
+const ECS_QD_A_ID: i32 = 0;
+const ECS_QD_B_ID: i32 = 1;
+
+struct EcsQdEntity { id: i32, generation: i32 }
+fn ecs_qd_entity_id(e: EcsQdEntity) -> i32 { return e.id; }
+fn ecs_qd_entity_gen(e: EcsQdEntity) -> i32 { return e.generation; }
+fn ecs_qd_entity_new(id: i32, gen: i32) -> EcsQdEntity { return EcsQdEntity { id: id, generation: gen }; }
+
+struct EcsQdPos { x: i32, y: i32 }
+struct EcsQdVel { x: i32, y: i32 }
+struct EcsQdTime { tick: i32 }
+struct EcsQdEvent { amount: i32 }
+fn ecs_qd_pos_new(x: i32, y: i32) -> EcsQdPos { return EcsQdPos { x: x, y: y }; }
+fn ecs_qd_pos_x(p: EcsQdPos) -> i32 { return p.x; }
+fn ecs_qd_pos_y(p: EcsQdPos) -> i32 { return p.y; }
+fn ecs_qd_vel_new(x: i32, y: i32) -> EcsQdVel { return EcsQdVel { x: x, y: y }; }
+fn ecs_qd_vel_x(v: EcsQdVel) -> i32 { return v.x; }
+fn ecs_qd_vel_y(v: EcsQdVel) -> i32 { return v.y; }
+fn ecs_qd_time_new(t: i32) -> EcsQdTime { return EcsQdTime { tick: t }; }
+fn ecs_qd_time_tick(t: EcsQdTime) -> i32 { return t.tick; }
+fn ecs_qd_event_new(a: i32) -> EcsQdEvent { return EcsQdEvent { amount: a }; }
+fn ecs_qd_event_amount(e: EcsQdEvent) -> i32 { return e.amount; }
+
+struct EcsQdWorld {
+    next_id: i32, free_count: i32, gen0: i32, gen1: i32, gen2: i32, gen3: i32, gen4: i32, gen5: i32,
+    gen6: i32, gen7: i32, gen8: i32, gen9: i32, gen10: i32, gen11: i32, gen12: i32, gen13: i32,
+    gen14: i32, gen15: i32, free_id0: i32, free_id1: i32, free_id2: i32, free_id3: i32, free_id4: i32, free_id5: i32,
+    free_id6: i32, free_id7: i32, free_id8: i32, free_id9: i32, free_id10: i32, free_id11: i32, free_id12: i32, free_id13: i32,
+    free_id14: i32, free_id15: i32, occ0: i32, occ1: i32, occ2: i32, occ3: i32, occ4: i32, occ5: i32,
+    occ6: i32, occ7: i32, occ8: i32, occ9: i32, occ10: i32, occ11: i32, occ12: i32, occ13: i32,
+    occ14: i32, occ15: i32, change_tick: i32, a_count: i32, a_eid0: i32, a_eid1: i32, a_eid2: i32, a_eid3: i32,
+    a_eid4: i32, a_eid5: i32, a_eid6: i32, a_eid7: i32, a_eid8: i32, a_eid9: i32, a_eid10: i32, a_eid11: i32,
+    a_eid12: i32, a_eid13: i32, a_eid14: i32, a_eid15: i32, a_x0: i32, a_x1: i32, a_x2: i32, a_x3: i32,
+    a_x4: i32, a_x5: i32, a_x6: i32, a_x7: i32, a_x8: i32, a_x9: i32, a_x10: i32, a_x11: i32,
+    a_x12: i32, a_x13: i32, a_x14: i32, a_x15: i32, a_y0: i32, a_y1: i32, a_y2: i32, a_y3: i32,
+    a_y4: i32, a_y5: i32, a_y6: i32, a_y7: i32, a_y8: i32, a_y9: i32, a_y10: i32, a_y11: i32,
+    a_y12: i32, a_y13: i32, a_y14: i32, a_y15: i32, a_added_t0: i32, a_added_t1: i32, a_added_t2: i32, a_added_t3: i32,
+    a_added_t4: i32, a_added_t5: i32, a_added_t6: i32, a_added_t7: i32, a_added_t8: i32, a_added_t9: i32, a_added_t10: i32, a_added_t11: i32,
+    a_added_t12: i32, a_added_t13: i32, a_added_t14: i32, a_added_t15: i32, a_changed_t0: i32, a_changed_t1: i32, a_changed_t2: i32, a_changed_t3: i32,
+    a_changed_t4: i32, a_changed_t5: i32, a_changed_t6: i32, a_changed_t7: i32, a_changed_t8: i32, a_changed_t9: i32, a_changed_t10: i32, a_changed_t11: i32,
+    a_changed_t12: i32, a_changed_t13: i32, a_changed_t14: i32, a_changed_t15: i32, b_count: i32, b_eid0: i32, b_eid1: i32, b_eid2: i32,
+    b_eid3: i32, b_eid4: i32, b_eid5: i32, b_eid6: i32, b_eid7: i32, b_eid8: i32, b_eid9: i32, b_eid10: i32,
+    b_eid11: i32, b_eid12: i32, b_eid13: i32, b_eid14: i32, b_eid15: i32, b_x0: i32, b_x1: i32, b_x2: i32,
+    b_x3: i32, b_x4: i32, b_x5: i32, b_x6: i32, b_x7: i32, b_x8: i32, b_x9: i32, b_x10: i32,
+    b_x11: i32, b_x12: i32, b_x13: i32, b_x14: i32, b_x15: i32, b_y0: i32, b_y1: i32, b_y2: i32,
+    b_y3: i32, b_y4: i32, b_y5: i32, b_y6: i32, b_y7: i32, b_y8: i32, b_y9: i32, b_y10: i32,
+    b_y11: i32, b_y12: i32, b_y13: i32, b_y14: i32, b_y15: i32, b_added_t0: i32, b_added_t1: i32, b_added_t2: i32,
+    b_added_t3: i32, b_added_t4: i32, b_added_t5: i32, b_added_t6: i32, b_added_t7: i32, b_added_t8: i32, b_added_t9: i32, b_added_t10: i32,
+    b_added_t11: i32, b_added_t12: i32, b_added_t13: i32, b_added_t14: i32, b_added_t15: i32, b_changed_t0: i32, b_changed_t1: i32, b_changed_t2: i32,
+    b_changed_t3: i32, b_changed_t4: i32, b_changed_t5: i32, b_changed_t6: i32, b_changed_t7: i32, b_changed_t8: i32, b_changed_t9: i32, b_changed_t10: i32,
+    b_changed_t11: i32, b_changed_t12: i32, b_changed_t13: i32, b_changed_t14: i32, b_changed_t15: i32, res_has: i32, res_tick: i32, msg_tail: i32,
+    msg0: i32, msg1: i32, msg2: i32, msg3: i32, msg4: i32, msg5: i32, msg6: i32, msg7: i32,
+    msg8: i32, msg9: i32, msg10: i32, msg11: i32, msg12: i32, msg13: i32, msg14: i32, msg15: i32,
+}
+
+fn ecs_qd_world_new() -> EcsQdWorld {
+    return EcsQdWorld { next_id: 1, free_count: 0, gen0: 0, gen1: 0, gen2: 0, gen3: 0, gen4: 0, gen5: 0, gen6: 0, gen7: 0, gen8: 0, gen9: 0, gen10: 0, gen11: 0, gen12: 0, gen13: 0, gen14: 0, gen15: 0, free_id0: 0, free_id1: 0, free_id2: 0, free_id3: 0, free_id4: 0, free_id5: 0, free_id6: 0, free_id7: 0, free_id8: 0, free_id9: 0, free_id10: 0, free_id11: 0, free_id12: 0, free_id13: 0, free_id14: 0, free_id15: 0, occ0: 0, occ1: 0, occ2: 0, occ3: 0, occ4: 0, occ5: 0, occ6: 0, occ7: 0, occ8: 0, occ9: 0, occ10: 0, occ11: 0, occ12: 0, occ13: 0, occ14: 0, occ15: 0, change_tick: 1, a_count: 0, a_eid0: 0, a_eid1: 0, a_eid2: 0, a_eid3: 0, a_eid4: 0, a_eid5: 0, a_eid6: 0, a_eid7: 0, a_eid8: 0, a_eid9: 0, a_eid10: 0, a_eid11: 0, a_eid12: 0, a_eid13: 0, a_eid14: 0, a_eid15: 0, a_x0: 0, a_x1: 0, a_x2: 0, a_x3: 0, a_x4: 0, a_x5: 0, a_x6: 0, a_x7: 0, a_x8: 0, a_x9: 0, a_x10: 0, a_x11: 0, a_x12: 0, a_x13: 0, a_x14: 0, a_x15: 0, a_y0: 0, a_y1: 0, a_y2: 0, a_y3: 0, a_y4: 0, a_y5: 0, a_y6: 0, a_y7: 0, a_y8: 0, a_y9: 0, a_y10: 0, a_y11: 0, a_y12: 0, a_y13: 0, a_y14: 0, a_y15: 0, a_added_t0: 0, a_added_t1: 0, a_added_t2: 0, a_added_t3: 0, a_added_t4: 0, a_added_t5: 0, a_added_t6: 0, a_added_t7: 0, a_added_t8: 0, a_added_t9: 0, a_added_t10: 0, a_added_t11: 0, a_added_t12: 0, a_added_t13: 0, a_added_t14: 0, a_added_t15: 0, a_changed_t0: 0, a_changed_t1: 0, a_changed_t2: 0, a_changed_t3: 0, a_changed_t4: 0, a_changed_t5: 0, a_changed_t6: 0, a_changed_t7: 0, a_changed_t8: 0, a_changed_t9: 0, a_changed_t10: 0, a_changed_t11: 0, a_changed_t12: 0, a_changed_t13: 0, a_changed_t14: 0, a_changed_t15: 0, b_count: 0, b_eid0: 0, b_eid1: 0, b_eid2: 0, b_eid3: 0, b_eid4: 0, b_eid5: 0, b_eid6: 0, b_eid7: 0, b_eid8: 0, b_eid9: 0, b_eid10: 0, b_eid11: 0, b_eid12: 0, b_eid13: 0, b_eid14: 0, b_eid15: 0, b_x0: 0, b_x1: 0, b_x2: 0, b_x3: 0, b_x4: 0, b_x5: 0, b_x6: 0, b_x7: 0, b_x8: 0, b_x9: 0, b_x10: 0, b_x11: 0, b_x12: 0, b_x13: 0, b_x14: 0, b_x15: 0, b_y0: 0, b_y1: 0, b_y2: 0, b_y3: 0, b_y4: 0, b_y5: 0, b_y6: 0, b_y7: 0, b_y8: 0, b_y9: 0, b_y10: 0, b_y11: 0, b_y12: 0, b_y13: 0, b_y14: 0, b_y15: 0, b_added_t0: 0, b_added_t1: 0, b_added_t2: 0, b_added_t3: 0, b_added_t4: 0, b_added_t5: 0, b_added_t6: 0, b_added_t7: 0, b_added_t8: 0, b_added_t9: 0, b_added_t10: 0, b_added_t11: 0, b_added_t12: 0, b_added_t13: 0, b_added_t14: 0, b_added_t15: 0, b_changed_t0: 0, b_changed_t1: 0, b_changed_t2: 0, b_changed_t3: 0, b_changed_t4: 0, b_changed_t5: 0, b_changed_t6: 0, b_changed_t7: 0, b_changed_t8: 0, b_changed_t9: 0, b_changed_t10: 0, b_changed_t11: 0, b_changed_t12: 0, b_changed_t13: 0, b_changed_t14: 0, b_changed_t15: 0, res_has: 0, res_tick: 0, msg_tail: 0, msg0: 0, msg1: 0, msg2: 0, msg3: 0, msg4: 0, msg5: 0, msg6: 0, msg7: 0, msg8: 0, msg9: 0, msg10: 0, msg11: 0, msg12: 0, msg13: 0, msg14: 0, msg15: 0 };
+}
+
+fn ecs_qd_world_change_tick(w: EcsQdWorld) -> i32 { return w.change_tick; }
+fn ecs_qd_increment_tick(w0: EcsQdWorld) -> EcsQdWorld { w0.change_tick = w0.change_tick + 1; return w0; }
+
+fn _ecs_qd_gen_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.gen0; };
+    if idx == 1 { return w.gen1; };
+    if idx == 2 { return w.gen2; };
+    if idx == 3 { return w.gen3; };
+    if idx == 4 { return w.gen4; };
+    if idx == 5 { return w.gen5; };
+    if idx == 6 { return w.gen6; };
+    if idx == 7 { return w.gen7; };
+    if idx == 8 { return w.gen8; };
+    if idx == 9 { return w.gen9; };
+    if idx == 10 { return w.gen10; };
+    if idx == 11 { return w.gen11; };
+    if idx == 12 { return w.gen12; };
+    if idx == 13 { return w.gen13; };
+    if idx == 14 { return w.gen14; };
+    return w.gen15;
+}
+
+fn _ecs_qd_set_gen(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.gen0 = value; return w0; };
+    if idx == 1 { w0.gen1 = value; return w0; };
+    if idx == 2 { w0.gen2 = value; return w0; };
+    if idx == 3 { w0.gen3 = value; return w0; };
+    if idx == 4 { w0.gen4 = value; return w0; };
+    if idx == 5 { w0.gen5 = value; return w0; };
+    if idx == 6 { w0.gen6 = value; return w0; };
+    if idx == 7 { w0.gen7 = value; return w0; };
+    if idx == 8 { w0.gen8 = value; return w0; };
+    if idx == 9 { w0.gen9 = value; return w0; };
+    if idx == 10 { w0.gen10 = value; return w0; };
+    if idx == 11 { w0.gen11 = value; return w0; };
+    if idx == 12 { w0.gen12 = value; return w0; };
+    if idx == 13 { w0.gen13 = value; return w0; };
+    if idx == 14 { w0.gen14 = value; return w0; };
+    w0.gen15 = value;
+    return w0;
+}
+
+fn _ecs_qd_free_id_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.free_id0; };
+    if idx == 1 { return w.free_id1; };
+    if idx == 2 { return w.free_id2; };
+    if idx == 3 { return w.free_id3; };
+    if idx == 4 { return w.free_id4; };
+    if idx == 5 { return w.free_id5; };
+    if idx == 6 { return w.free_id6; };
+    if idx == 7 { return w.free_id7; };
+    if idx == 8 { return w.free_id8; };
+    if idx == 9 { return w.free_id9; };
+    if idx == 10 { return w.free_id10; };
+    if idx == 11 { return w.free_id11; };
+    if idx == 12 { return w.free_id12; };
+    if idx == 13 { return w.free_id13; };
+    if idx == 14 { return w.free_id14; };
+    return w.free_id15;
+}
+
+fn _ecs_qd_set_free_id(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.free_id0 = value; return w0; };
+    if idx == 1 { w0.free_id1 = value; return w0; };
+    if idx == 2 { w0.free_id2 = value; return w0; };
+    if idx == 3 { w0.free_id3 = value; return w0; };
+    if idx == 4 { w0.free_id4 = value; return w0; };
+    if idx == 5 { w0.free_id5 = value; return w0; };
+    if idx == 6 { w0.free_id6 = value; return w0; };
+    if idx == 7 { w0.free_id7 = value; return w0; };
+    if idx == 8 { w0.free_id8 = value; return w0; };
+    if idx == 9 { w0.free_id9 = value; return w0; };
+    if idx == 10 { w0.free_id10 = value; return w0; };
+    if idx == 11 { w0.free_id11 = value; return w0; };
+    if idx == 12 { w0.free_id12 = value; return w0; };
+    if idx == 13 { w0.free_id13 = value; return w0; };
+    if idx == 14 { w0.free_id14 = value; return w0; };
+    w0.free_id15 = value;
+    return w0;
+}
+
+fn _ecs_qd_occ_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.occ0; };
+    if idx == 1 { return w.occ1; };
+    if idx == 2 { return w.occ2; };
+    if idx == 3 { return w.occ3; };
+    if idx == 4 { return w.occ4; };
+    if idx == 5 { return w.occ5; };
+    if idx == 6 { return w.occ6; };
+    if idx == 7 { return w.occ7; };
+    if idx == 8 { return w.occ8; };
+    if idx == 9 { return w.occ9; };
+    if idx == 10 { return w.occ10; };
+    if idx == 11 { return w.occ11; };
+    if idx == 12 { return w.occ12; };
+    if idx == 13 { return w.occ13; };
+    if idx == 14 { return w.occ14; };
+    return w.occ15;
+}
+
+fn _ecs_qd_set_occ(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.occ0 = value; return w0; };
+    if idx == 1 { w0.occ1 = value; return w0; };
+    if idx == 2 { w0.occ2 = value; return w0; };
+    if idx == 3 { w0.occ3 = value; return w0; };
+    if idx == 4 { w0.occ4 = value; return w0; };
+    if idx == 5 { w0.occ5 = value; return w0; };
+    if idx == 6 { w0.occ6 = value; return w0; };
+    if idx == 7 { w0.occ7 = value; return w0; };
+    if idx == 8 { w0.occ8 = value; return w0; };
+    if idx == 9 { w0.occ9 = value; return w0; };
+    if idx == 10 { w0.occ10 = value; return w0; };
+    if idx == 11 { w0.occ11 = value; return w0; };
+    if idx == 12 { w0.occ12 = value; return w0; };
+    if idx == 13 { w0.occ13 = value; return w0; };
+    if idx == 14 { w0.occ14 = value; return w0; };
+    w0.occ15 = value;
+    return w0;
+}
+
+fn _ecs_qd_msg_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.msg0; };
+    if idx == 1 { return w.msg1; };
+    if idx == 2 { return w.msg2; };
+    if idx == 3 { return w.msg3; };
+    if idx == 4 { return w.msg4; };
+    if idx == 5 { return w.msg5; };
+    if idx == 6 { return w.msg6; };
+    if idx == 7 { return w.msg7; };
+    if idx == 8 { return w.msg8; };
+    if idx == 9 { return w.msg9; };
+    if idx == 10 { return w.msg10; };
+    if idx == 11 { return w.msg11; };
+    if idx == 12 { return w.msg12; };
+    if idx == 13 { return w.msg13; };
+    if idx == 14 { return w.msg14; };
+    return w.msg15;
+}
+
+fn _ecs_qd_set_msg(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.msg0 = value; return w0; };
+    if idx == 1 { w0.msg1 = value; return w0; };
+    if idx == 2 { w0.msg2 = value; return w0; };
+    if idx == 3 { w0.msg3 = value; return w0; };
+    if idx == 4 { w0.msg4 = value; return w0; };
+    if idx == 5 { w0.msg5 = value; return w0; };
+    if idx == 6 { w0.msg6 = value; return w0; };
+    if idx == 7 { w0.msg7 = value; return w0; };
+    if idx == 8 { w0.msg8 = value; return w0; };
+    if idx == 9 { w0.msg9 = value; return w0; };
+    if idx == 10 { w0.msg10 = value; return w0; };
+    if idx == 11 { w0.msg11 = value; return w0; };
+    if idx == 12 { w0.msg12 = value; return w0; };
+    if idx == 13 { w0.msg13 = value; return w0; };
+    if idx == 14 { w0.msg14 = value; return w0; };
+    w0.msg15 = value;
+    return w0;
+}
+
+fn _ecs_qd_a_eid_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.a_eid0; };
+    if idx == 1 { return w.a_eid1; };
+    if idx == 2 { return w.a_eid2; };
+    if idx == 3 { return w.a_eid3; };
+    if idx == 4 { return w.a_eid4; };
+    if idx == 5 { return w.a_eid5; };
+    if idx == 6 { return w.a_eid6; };
+    if idx == 7 { return w.a_eid7; };
+    if idx == 8 { return w.a_eid8; };
+    if idx == 9 { return w.a_eid9; };
+    if idx == 10 { return w.a_eid10; };
+    if idx == 11 { return w.a_eid11; };
+    if idx == 12 { return w.a_eid12; };
+    if idx == 13 { return w.a_eid13; };
+    if idx == 14 { return w.a_eid14; };
+    return w.a_eid15;
+}
+
+fn _ecs_qd_set_a_eid(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.a_eid0 = value; return w0; };
+    if idx == 1 { w0.a_eid1 = value; return w0; };
+    if idx == 2 { w0.a_eid2 = value; return w0; };
+    if idx == 3 { w0.a_eid3 = value; return w0; };
+    if idx == 4 { w0.a_eid4 = value; return w0; };
+    if idx == 5 { w0.a_eid5 = value; return w0; };
+    if idx == 6 { w0.a_eid6 = value; return w0; };
+    if idx == 7 { w0.a_eid7 = value; return w0; };
+    if idx == 8 { w0.a_eid8 = value; return w0; };
+    if idx == 9 { w0.a_eid9 = value; return w0; };
+    if idx == 10 { w0.a_eid10 = value; return w0; };
+    if idx == 11 { w0.a_eid11 = value; return w0; };
+    if idx == 12 { w0.a_eid12 = value; return w0; };
+    if idx == 13 { w0.a_eid13 = value; return w0; };
+    if idx == 14 { w0.a_eid14 = value; return w0; };
+    w0.a_eid15 = value;
+    return w0;
+}
+
+fn _ecs_qd_a_x_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.a_x0; };
+    if idx == 1 { return w.a_x1; };
+    if idx == 2 { return w.a_x2; };
+    if idx == 3 { return w.a_x3; };
+    if idx == 4 { return w.a_x4; };
+    if idx == 5 { return w.a_x5; };
+    if idx == 6 { return w.a_x6; };
+    if idx == 7 { return w.a_x7; };
+    if idx == 8 { return w.a_x8; };
+    if idx == 9 { return w.a_x9; };
+    if idx == 10 { return w.a_x10; };
+    if idx == 11 { return w.a_x11; };
+    if idx == 12 { return w.a_x12; };
+    if idx == 13 { return w.a_x13; };
+    if idx == 14 { return w.a_x14; };
+    return w.a_x15;
+}
+
+fn _ecs_qd_set_a_x(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.a_x0 = value; return w0; };
+    if idx == 1 { w0.a_x1 = value; return w0; };
+    if idx == 2 { w0.a_x2 = value; return w0; };
+    if idx == 3 { w0.a_x3 = value; return w0; };
+    if idx == 4 { w0.a_x4 = value; return w0; };
+    if idx == 5 { w0.a_x5 = value; return w0; };
+    if idx == 6 { w0.a_x6 = value; return w0; };
+    if idx == 7 { w0.a_x7 = value; return w0; };
+    if idx == 8 { w0.a_x8 = value; return w0; };
+    if idx == 9 { w0.a_x9 = value; return w0; };
+    if idx == 10 { w0.a_x10 = value; return w0; };
+    if idx == 11 { w0.a_x11 = value; return w0; };
+    if idx == 12 { w0.a_x12 = value; return w0; };
+    if idx == 13 { w0.a_x13 = value; return w0; };
+    if idx == 14 { w0.a_x14 = value; return w0; };
+    w0.a_x15 = value;
+    return w0;
+}
+
+fn _ecs_qd_a_y_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.a_y0; };
+    if idx == 1 { return w.a_y1; };
+    if idx == 2 { return w.a_y2; };
+    if idx == 3 { return w.a_y3; };
+    if idx == 4 { return w.a_y4; };
+    if idx == 5 { return w.a_y5; };
+    if idx == 6 { return w.a_y6; };
+    if idx == 7 { return w.a_y7; };
+    if idx == 8 { return w.a_y8; };
+    if idx == 9 { return w.a_y9; };
+    if idx == 10 { return w.a_y10; };
+    if idx == 11 { return w.a_y11; };
+    if idx == 12 { return w.a_y12; };
+    if idx == 13 { return w.a_y13; };
+    if idx == 14 { return w.a_y14; };
+    return w.a_y15;
+}
+
+fn _ecs_qd_set_a_y(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.a_y0 = value; return w0; };
+    if idx == 1 { w0.a_y1 = value; return w0; };
+    if idx == 2 { w0.a_y2 = value; return w0; };
+    if idx == 3 { w0.a_y3 = value; return w0; };
+    if idx == 4 { w0.a_y4 = value; return w0; };
+    if idx == 5 { w0.a_y5 = value; return w0; };
+    if idx == 6 { w0.a_y6 = value; return w0; };
+    if idx == 7 { w0.a_y7 = value; return w0; };
+    if idx == 8 { w0.a_y8 = value; return w0; };
+    if idx == 9 { w0.a_y9 = value; return w0; };
+    if idx == 10 { w0.a_y10 = value; return w0; };
+    if idx == 11 { w0.a_y11 = value; return w0; };
+    if idx == 12 { w0.a_y12 = value; return w0; };
+    if idx == 13 { w0.a_y13 = value; return w0; };
+    if idx == 14 { w0.a_y14 = value; return w0; };
+    w0.a_y15 = value;
+    return w0;
+}
+
+fn _ecs_qd_a_added_t_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.a_added_t0; };
+    if idx == 1 { return w.a_added_t1; };
+    if idx == 2 { return w.a_added_t2; };
+    if idx == 3 { return w.a_added_t3; };
+    if idx == 4 { return w.a_added_t4; };
+    if idx == 5 { return w.a_added_t5; };
+    if idx == 6 { return w.a_added_t6; };
+    if idx == 7 { return w.a_added_t7; };
+    if idx == 8 { return w.a_added_t8; };
+    if idx == 9 { return w.a_added_t9; };
+    if idx == 10 { return w.a_added_t10; };
+    if idx == 11 { return w.a_added_t11; };
+    if idx == 12 { return w.a_added_t12; };
+    if idx == 13 { return w.a_added_t13; };
+    if idx == 14 { return w.a_added_t14; };
+    return w.a_added_t15;
+}
+
+fn _ecs_qd_set_a_added_t(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.a_added_t0 = value; return w0; };
+    if idx == 1 { w0.a_added_t1 = value; return w0; };
+    if idx == 2 { w0.a_added_t2 = value; return w0; };
+    if idx == 3 { w0.a_added_t3 = value; return w0; };
+    if idx == 4 { w0.a_added_t4 = value; return w0; };
+    if idx == 5 { w0.a_added_t5 = value; return w0; };
+    if idx == 6 { w0.a_added_t6 = value; return w0; };
+    if idx == 7 { w0.a_added_t7 = value; return w0; };
+    if idx == 8 { w0.a_added_t8 = value; return w0; };
+    if idx == 9 { w0.a_added_t9 = value; return w0; };
+    if idx == 10 { w0.a_added_t10 = value; return w0; };
+    if idx == 11 { w0.a_added_t11 = value; return w0; };
+    if idx == 12 { w0.a_added_t12 = value; return w0; };
+    if idx == 13 { w0.a_added_t13 = value; return w0; };
+    if idx == 14 { w0.a_added_t14 = value; return w0; };
+    w0.a_added_t15 = value;
+    return w0;
+}
+
+fn _ecs_qd_a_changed_t_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.a_changed_t0; };
+    if idx == 1 { return w.a_changed_t1; };
+    if idx == 2 { return w.a_changed_t2; };
+    if idx == 3 { return w.a_changed_t3; };
+    if idx == 4 { return w.a_changed_t4; };
+    if idx == 5 { return w.a_changed_t5; };
+    if idx == 6 { return w.a_changed_t6; };
+    if idx == 7 { return w.a_changed_t7; };
+    if idx == 8 { return w.a_changed_t8; };
+    if idx == 9 { return w.a_changed_t9; };
+    if idx == 10 { return w.a_changed_t10; };
+    if idx == 11 { return w.a_changed_t11; };
+    if idx == 12 { return w.a_changed_t12; };
+    if idx == 13 { return w.a_changed_t13; };
+    if idx == 14 { return w.a_changed_t14; };
+    return w.a_changed_t15;
+}
+
+fn _ecs_qd_set_a_changed_t(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.a_changed_t0 = value; return w0; };
+    if idx == 1 { w0.a_changed_t1 = value; return w0; };
+    if idx == 2 { w0.a_changed_t2 = value; return w0; };
+    if idx == 3 { w0.a_changed_t3 = value; return w0; };
+    if idx == 4 { w0.a_changed_t4 = value; return w0; };
+    if idx == 5 { w0.a_changed_t5 = value; return w0; };
+    if idx == 6 { w0.a_changed_t6 = value; return w0; };
+    if idx == 7 { w0.a_changed_t7 = value; return w0; };
+    if idx == 8 { w0.a_changed_t8 = value; return w0; };
+    if idx == 9 { w0.a_changed_t9 = value; return w0; };
+    if idx == 10 { w0.a_changed_t10 = value; return w0; };
+    if idx == 11 { w0.a_changed_t11 = value; return w0; };
+    if idx == 12 { w0.a_changed_t12 = value; return w0; };
+    if idx == 13 { w0.a_changed_t13 = value; return w0; };
+    if idx == 14 { w0.a_changed_t14 = value; return w0; };
+    w0.a_changed_t15 = value;
+    return w0;
+}
+
+fn _ecs_qd_b_eid_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.b_eid0; };
+    if idx == 1 { return w.b_eid1; };
+    if idx == 2 { return w.b_eid2; };
+    if idx == 3 { return w.b_eid3; };
+    if idx == 4 { return w.b_eid4; };
+    if idx == 5 { return w.b_eid5; };
+    if idx == 6 { return w.b_eid6; };
+    if idx == 7 { return w.b_eid7; };
+    if idx == 8 { return w.b_eid8; };
+    if idx == 9 { return w.b_eid9; };
+    if idx == 10 { return w.b_eid10; };
+    if idx == 11 { return w.b_eid11; };
+    if idx == 12 { return w.b_eid12; };
+    if idx == 13 { return w.b_eid13; };
+    if idx == 14 { return w.b_eid14; };
+    return w.b_eid15;
+}
+
+fn _ecs_qd_set_b_eid(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.b_eid0 = value; return w0; };
+    if idx == 1 { w0.b_eid1 = value; return w0; };
+    if idx == 2 { w0.b_eid2 = value; return w0; };
+    if idx == 3 { w0.b_eid3 = value; return w0; };
+    if idx == 4 { w0.b_eid4 = value; return w0; };
+    if idx == 5 { w0.b_eid5 = value; return w0; };
+    if idx == 6 { w0.b_eid6 = value; return w0; };
+    if idx == 7 { w0.b_eid7 = value; return w0; };
+    if idx == 8 { w0.b_eid8 = value; return w0; };
+    if idx == 9 { w0.b_eid9 = value; return w0; };
+    if idx == 10 { w0.b_eid10 = value; return w0; };
+    if idx == 11 { w0.b_eid11 = value; return w0; };
+    if idx == 12 { w0.b_eid12 = value; return w0; };
+    if idx == 13 { w0.b_eid13 = value; return w0; };
+    if idx == 14 { w0.b_eid14 = value; return w0; };
+    w0.b_eid15 = value;
+    return w0;
+}
+
+fn _ecs_qd_b_x_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.b_x0; };
+    if idx == 1 { return w.b_x1; };
+    if idx == 2 { return w.b_x2; };
+    if idx == 3 { return w.b_x3; };
+    if idx == 4 { return w.b_x4; };
+    if idx == 5 { return w.b_x5; };
+    if idx == 6 { return w.b_x6; };
+    if idx == 7 { return w.b_x7; };
+    if idx == 8 { return w.b_x8; };
+    if idx == 9 { return w.b_x9; };
+    if idx == 10 { return w.b_x10; };
+    if idx == 11 { return w.b_x11; };
+    if idx == 12 { return w.b_x12; };
+    if idx == 13 { return w.b_x13; };
+    if idx == 14 { return w.b_x14; };
+    return w.b_x15;
+}
+
+fn _ecs_qd_set_b_x(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.b_x0 = value; return w0; };
+    if idx == 1 { w0.b_x1 = value; return w0; };
+    if idx == 2 { w0.b_x2 = value; return w0; };
+    if idx == 3 { w0.b_x3 = value; return w0; };
+    if idx == 4 { w0.b_x4 = value; return w0; };
+    if idx == 5 { w0.b_x5 = value; return w0; };
+    if idx == 6 { w0.b_x6 = value; return w0; };
+    if idx == 7 { w0.b_x7 = value; return w0; };
+    if idx == 8 { w0.b_x8 = value; return w0; };
+    if idx == 9 { w0.b_x9 = value; return w0; };
+    if idx == 10 { w0.b_x10 = value; return w0; };
+    if idx == 11 { w0.b_x11 = value; return w0; };
+    if idx == 12 { w0.b_x12 = value; return w0; };
+    if idx == 13 { w0.b_x13 = value; return w0; };
+    if idx == 14 { w0.b_x14 = value; return w0; };
+    w0.b_x15 = value;
+    return w0;
+}
+
+fn _ecs_qd_b_y_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.b_y0; };
+    if idx == 1 { return w.b_y1; };
+    if idx == 2 { return w.b_y2; };
+    if idx == 3 { return w.b_y3; };
+    if idx == 4 { return w.b_y4; };
+    if idx == 5 { return w.b_y5; };
+    if idx == 6 { return w.b_y6; };
+    if idx == 7 { return w.b_y7; };
+    if idx == 8 { return w.b_y8; };
+    if idx == 9 { return w.b_y9; };
+    if idx == 10 { return w.b_y10; };
+    if idx == 11 { return w.b_y11; };
+    if idx == 12 { return w.b_y12; };
+    if idx == 13 { return w.b_y13; };
+    if idx == 14 { return w.b_y14; };
+    return w.b_y15;
+}
+
+fn _ecs_qd_set_b_y(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.b_y0 = value; return w0; };
+    if idx == 1 { w0.b_y1 = value; return w0; };
+    if idx == 2 { w0.b_y2 = value; return w0; };
+    if idx == 3 { w0.b_y3 = value; return w0; };
+    if idx == 4 { w0.b_y4 = value; return w0; };
+    if idx == 5 { w0.b_y5 = value; return w0; };
+    if idx == 6 { w0.b_y6 = value; return w0; };
+    if idx == 7 { w0.b_y7 = value; return w0; };
+    if idx == 8 { w0.b_y8 = value; return w0; };
+    if idx == 9 { w0.b_y9 = value; return w0; };
+    if idx == 10 { w0.b_y10 = value; return w0; };
+    if idx == 11 { w0.b_y11 = value; return w0; };
+    if idx == 12 { w0.b_y12 = value; return w0; };
+    if idx == 13 { w0.b_y13 = value; return w0; };
+    if idx == 14 { w0.b_y14 = value; return w0; };
+    w0.b_y15 = value;
+    return w0;
+}
+
+fn _ecs_qd_b_added_t_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.b_added_t0; };
+    if idx == 1 { return w.b_added_t1; };
+    if idx == 2 { return w.b_added_t2; };
+    if idx == 3 { return w.b_added_t3; };
+    if idx == 4 { return w.b_added_t4; };
+    if idx == 5 { return w.b_added_t5; };
+    if idx == 6 { return w.b_added_t6; };
+    if idx == 7 { return w.b_added_t7; };
+    if idx == 8 { return w.b_added_t8; };
+    if idx == 9 { return w.b_added_t9; };
+    if idx == 10 { return w.b_added_t10; };
+    if idx == 11 { return w.b_added_t11; };
+    if idx == 12 { return w.b_added_t12; };
+    if idx == 13 { return w.b_added_t13; };
+    if idx == 14 { return w.b_added_t14; };
+    return w.b_added_t15;
+}
+
+fn _ecs_qd_set_b_added_t(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.b_added_t0 = value; return w0; };
+    if idx == 1 { w0.b_added_t1 = value; return w0; };
+    if idx == 2 { w0.b_added_t2 = value; return w0; };
+    if idx == 3 { w0.b_added_t3 = value; return w0; };
+    if idx == 4 { w0.b_added_t4 = value; return w0; };
+    if idx == 5 { w0.b_added_t5 = value; return w0; };
+    if idx == 6 { w0.b_added_t6 = value; return w0; };
+    if idx == 7 { w0.b_added_t7 = value; return w0; };
+    if idx == 8 { w0.b_added_t8 = value; return w0; };
+    if idx == 9 { w0.b_added_t9 = value; return w0; };
+    if idx == 10 { w0.b_added_t10 = value; return w0; };
+    if idx == 11 { w0.b_added_t11 = value; return w0; };
+    if idx == 12 { w0.b_added_t12 = value; return w0; };
+    if idx == 13 { w0.b_added_t13 = value; return w0; };
+    if idx == 14 { w0.b_added_t14 = value; return w0; };
+    w0.b_added_t15 = value;
+    return w0;
+}
+
+fn _ecs_qd_b_changed_t_at(w: EcsQdWorld, idx: i32) -> i32 {
+    if idx == 0 { return w.b_changed_t0; };
+    if idx == 1 { return w.b_changed_t1; };
+    if idx == 2 { return w.b_changed_t2; };
+    if idx == 3 { return w.b_changed_t3; };
+    if idx == 4 { return w.b_changed_t4; };
+    if idx == 5 { return w.b_changed_t5; };
+    if idx == 6 { return w.b_changed_t6; };
+    if idx == 7 { return w.b_changed_t7; };
+    if idx == 8 { return w.b_changed_t8; };
+    if idx == 9 { return w.b_changed_t9; };
+    if idx == 10 { return w.b_changed_t10; };
+    if idx == 11 { return w.b_changed_t11; };
+    if idx == 12 { return w.b_changed_t12; };
+    if idx == 13 { return w.b_changed_t13; };
+    if idx == 14 { return w.b_changed_t14; };
+    return w.b_changed_t15;
+}
+
+fn _ecs_qd_set_b_changed_t(w0: EcsQdWorld, idx: i32, value: i32) -> EcsQdWorld {
+    if idx == 0 { w0.b_changed_t0 = value; return w0; };
+    if idx == 1 { w0.b_changed_t1 = value; return w0; };
+    if idx == 2 { w0.b_changed_t2 = value; return w0; };
+    if idx == 3 { w0.b_changed_t3 = value; return w0; };
+    if idx == 4 { w0.b_changed_t4 = value; return w0; };
+    if idx == 5 { w0.b_changed_t5 = value; return w0; };
+    if idx == 6 { w0.b_changed_t6 = value; return w0; };
+    if idx == 7 { w0.b_changed_t7 = value; return w0; };
+    if idx == 8 { w0.b_changed_t8 = value; return w0; };
+    if idx == 9 { w0.b_changed_t9 = value; return w0; };
+    if idx == 10 { w0.b_changed_t10 = value; return w0; };
+    if idx == 11 { w0.b_changed_t11 = value; return w0; };
+    if idx == 12 { w0.b_changed_t12 = value; return w0; };
+    if idx == 13 { w0.b_changed_t13 = value; return w0; };
+    if idx == 14 { w0.b_changed_t14 = value; return w0; };
+    w0.b_changed_t15 = value;
+    return w0;
+}
+
+fn _ecs_qd_a_slot_of(w: EcsQdWorld, eid: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.a_count {
+        if _ecs_qd_a_eid_at(w, i) == eid { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _ecs_qd_b_slot_of(w: EcsQdWorld, eid: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.b_count {
+        if _ecs_qd_b_eid_at(w, i) == eid { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _ecs_qd_id_is_free(w: EcsQdWorld, id: i32) -> bool {
+    let i: i32 = 0;
+    while i < w.free_count { if _ecs_qd_free_id_at(w, i) == id { return true; }; i = i + 1; }
+    return false;
+}
+
+struct EcsQdSpawn { world: EcsQdWorld, entity: EcsQdEntity }
+fn ecs_qd_spawn_world(s: EcsQdSpawn) -> EcsQdWorld { return s.world; }
+fn ecs_qd_spawn_entity(s: EcsQdSpawn) -> EcsQdEntity { return s.entity; }
+
+fn ecs_qd_world_spawn(w0: EcsQdWorld) -> EcsQdSpawn {
+    if w0.free_count > 0 {
+        let nf = w0.free_count - 1;
+        let id = _ecs_qd_free_id_at(w0, nf);
+        w0.free_count = nf;
+        w0 = _ecs_qd_set_free_id(w0, nf, 0);
+        let gen = _ecs_qd_gen_at(w0, id);
+        return EcsQdSpawn { world: w0, entity: EcsQdEntity { id: id, generation: gen } };
+    };
+    if w0.next_id >= ECS_QD_CAP { return EcsQdSpawn { world: w0, entity: EcsQdEntity { id: -1, generation: 0 } }; };
+    let id = w0.next_id;
+    w0.next_id = id + 1;
+    let gen = _ecs_qd_gen_at(w0, id);
+    return EcsQdSpawn { world: w0, entity: EcsQdEntity { id: id, generation: gen } };
+}
+
+fn ecs_qd_is_alive(w: EcsQdWorld, e: EcsQdEntity) -> bool {
+    if e.id <= 0 { return false; };
+    if e.id >= ECS_QD_CAP { return false; };
+    if e.id >= w.next_id { return false; };
+    if _ecs_qd_id_is_free(w, e.id) { return false; };
+    return _ecs_qd_gen_at(w, e.id) == e.generation;
+}
+
+fn ecs_qd_world_entity_count(w: EcsQdWorld) -> i32 { return w.next_id - w.free_count - 1; }
+
+fn ecs_qd_insert_a(w0: EcsQdWorld, e: EcsQdEntity, x: i32, y: i32) -> EcsQdWorld {
+    if ecs_qd_is_alive(w0, e) != true { panic(8701); };
+    let slot = _ecs_qd_a_slot_of(w0, e.id);
+    if slot >= 0 {
+        w0 = _ecs_qd_set_a_x(w0, slot, x);
+        w0 = _ecs_qd_set_a_y(w0, slot, y);
+        w0 = _ecs_qd_set_a_changed_t(w0, slot, w0.change_tick);
+        return w0;
+    };
+    let ns = w0.a_count;
+    if ns >= ECS_QD_CAP { panic(8702); };
+    w0 = _ecs_qd_set_a_eid(w0, ns, e.id);
+    w0 = _ecs_qd_set_a_x(w0, ns, x);
+    w0 = _ecs_qd_set_a_y(w0, ns, y);
+    w0 = _ecs_qd_set_a_added_t(w0, ns, w0.change_tick);
+    w0 = _ecs_qd_set_a_changed_t(w0, ns, w0.change_tick);
+    w0.a_count = ns + 1;
+    return w0;
+}
+
+fn ecs_qd_has_a(w: EcsQdWorld, e: EcsQdEntity) -> bool {
+    if ecs_qd_is_alive(w, e) != true { return false; };
+    return _ecs_qd_a_slot_of(w, e.id) >= 0;
+}
+
+fn ecs_qd_get_a(w: EcsQdWorld, e: EcsQdEntity) -> EcsQdPos {
+    if ecs_qd_has_a(w, e) != true { panic(8901); };
+    let slot = _ecs_qd_a_slot_of(w, e.id);
+    return EcsQdPos { x: _ecs_qd_a_x_at(w, slot), y: _ecs_qd_a_y_at(w, slot) };
+}
+
+fn ecs_qd_remove_a(w0: EcsQdWorld, e: EcsQdEntity) -> EcsQdWorld {
+    let slot = _ecs_qd_a_slot_of(w0, e.id);
+    if slot < 0 { return w0; };
+    let last = w0.a_count - 1;
+    if slot != last {
+        let last_eid = _ecs_qd_a_eid_at(w0, last);
+        let last_x = _ecs_qd_a_x_at(w0, last);
+        let last_y = _ecs_qd_a_y_at(w0, last);
+        let last_added_t = _ecs_qd_a_added_t_at(w0, last);
+        let last_changed_t = _ecs_qd_a_changed_t_at(w0, last);
+        w0 = _ecs_qd_set_a_eid(w0, slot, last_eid);
+        w0 = _ecs_qd_set_a_x(w0, slot, last_x);
+        w0 = _ecs_qd_set_a_y(w0, slot, last_y);
+        w0 = _ecs_qd_set_a_added_t(w0, slot, last_added_t);
+        w0 = _ecs_qd_set_a_changed_t(w0, slot, last_changed_t);
+    };
+    w0 = _ecs_qd_set_a_eid(w0, last, 0);
+    w0 = _ecs_qd_set_a_x(w0, last, 0);
+    w0 = _ecs_qd_set_a_y(w0, last, 0);
+    w0 = _ecs_qd_set_a_added_t(w0, last, 0);
+    w0 = _ecs_qd_set_a_changed_t(w0, last, 0);
+    w0.a_count = last;
+    return w0;
+}
+
+fn ecs_qd_insert_b(w0: EcsQdWorld, e: EcsQdEntity, x: i32, y: i32) -> EcsQdWorld {
+    if ecs_qd_is_alive(w0, e) != true { panic(8701); };
+    let slot = _ecs_qd_b_slot_of(w0, e.id);
+    if slot >= 0 {
+        w0 = _ecs_qd_set_b_x(w0, slot, x);
+        w0 = _ecs_qd_set_b_y(w0, slot, y);
+        w0 = _ecs_qd_set_b_changed_t(w0, slot, w0.change_tick);
+        return w0;
+    };
+    let ns = w0.b_count;
+    if ns >= ECS_QD_CAP { panic(8702); };
+    w0 = _ecs_qd_set_b_eid(w0, ns, e.id);
+    w0 = _ecs_qd_set_b_x(w0, ns, x);
+    w0 = _ecs_qd_set_b_y(w0, ns, y);
+    w0 = _ecs_qd_set_b_added_t(w0, ns, w0.change_tick);
+    w0 = _ecs_qd_set_b_changed_t(w0, ns, w0.change_tick);
+    w0.b_count = ns + 1;
+    return w0;
+}
+
+fn ecs_qd_has_b(w: EcsQdWorld, e: EcsQdEntity) -> bool {
+    if ecs_qd_is_alive(w, e) != true { return false; };
+    return _ecs_qd_b_slot_of(w, e.id) >= 0;
+}
+
+fn ecs_qd_get_b(w: EcsQdWorld, e: EcsQdEntity) -> EcsQdVel {
+    if ecs_qd_has_b(w, e) != true { panic(8902); };
+    let slot = _ecs_qd_b_slot_of(w, e.id);
+    return EcsQdVel { x: _ecs_qd_b_x_at(w, slot), y: _ecs_qd_b_y_at(w, slot) };
+}
+
+fn ecs_qd_remove_b(w0: EcsQdWorld, e: EcsQdEntity) -> EcsQdWorld {
+    let slot = _ecs_qd_b_slot_of(w0, e.id);
+    if slot < 0 { return w0; };
+    let last = w0.b_count - 1;
+    if slot != last {
+        let last_eid = _ecs_qd_b_eid_at(w0, last);
+        let last_x = _ecs_qd_b_x_at(w0, last);
+        let last_y = _ecs_qd_b_y_at(w0, last);
+        let last_added_t = _ecs_qd_b_added_t_at(w0, last);
+        let last_changed_t = _ecs_qd_b_changed_t_at(w0, last);
+        w0 = _ecs_qd_set_b_eid(w0, slot, last_eid);
+        w0 = _ecs_qd_set_b_x(w0, slot, last_x);
+        w0 = _ecs_qd_set_b_y(w0, slot, last_y);
+        w0 = _ecs_qd_set_b_added_t(w0, slot, last_added_t);
+        w0 = _ecs_qd_set_b_changed_t(w0, slot, last_changed_t);
+    };
+    w0 = _ecs_qd_set_b_eid(w0, last, 0);
+    w0 = _ecs_qd_set_b_x(w0, last, 0);
+    w0 = _ecs_qd_set_b_y(w0, last, 0);
+    w0 = _ecs_qd_set_b_added_t(w0, last, 0);
+    w0 = _ecs_qd_set_b_changed_t(w0, last, 0);
+    w0.b_count = last;
+    return w0;
+}
+
+fn ecs_qd_despawn(w0: EcsQdWorld, e: EcsQdEntity) -> EcsQdWorld {
+    if ecs_qd_is_alive(w0, e) != true { return w0; };
+    w0 = ecs_qd_remove_a(w0, e);
+    w0 = ecs_qd_remove_b(w0, e);
+    let cg = _ecs_qd_gen_at(w0, e.id);
+    w0 = _ecs_qd_set_gen(w0, e.id, cg + 1);
+    let pos = w0.free_count;
+    w0 = _ecs_qd_set_free_id(w0, pos, e.id);
+    w0.free_count = pos + 1;
+    return w0;
+}
+
+fn ecs_qd_a_added_since(w: EcsQdWorld, e: EcsQdEntity, tick: i32) -> bool { let slot = _ecs_qd_a_slot_of(w, e.id); if slot < 0 { return false; }; return _ecs_qd_a_added_t_at(w, slot) > tick; }
+fn ecs_qd_a_changed_since(w: EcsQdWorld, e: EcsQdEntity, tick: i32) -> bool { let slot = _ecs_qd_a_slot_of(w, e.id); if slot < 0 { return false; }; return _ecs_qd_a_changed_t_at(w, slot) > tick; }
+
+struct EcsQdQueryA { count: i32, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32, x4: i32, y4: i32, x5: i32, y5: i32, x6: i32, y6: i32, x7: i32, y7: i32, x8: i32, y8: i32, x9: i32, y9: i32, x10: i32, y10: i32, x11: i32, y11: i32, x12: i32, y12: i32, x13: i32, y13: i32, x14: i32, y14: i32, x15: i32, y15: i32 }
+fn ecs_qd_query_a_count(q: EcsQdQueryA) -> i32 { return q.count; }
+fn ecs_qd_query_a_at(q: EcsQdQueryA, idx: i32) -> EcsQdPos {
+    if idx == 0 { return EcsQdPos { x: q.x0, y: q.y0 }; };
+    if idx == 1 { return EcsQdPos { x: q.x1, y: q.y1 }; };
+    if idx == 2 { return EcsQdPos { x: q.x2, y: q.y2 }; };
+    if idx == 3 { return EcsQdPos { x: q.x3, y: q.y3 }; };
+    if idx == 4 { return EcsQdPos { x: q.x4, y: q.y4 }; };
+    if idx == 5 { return EcsQdPos { x: q.x5, y: q.y5 }; };
+    if idx == 6 { return EcsQdPos { x: q.x6, y: q.y6 }; };
+    if idx == 7 { return EcsQdPos { x: q.x7, y: q.y7 }; };
+    if idx == 8 { return EcsQdPos { x: q.x8, y: q.y8 }; };
+    if idx == 9 { return EcsQdPos { x: q.x9, y: q.y9 }; };
+    if idx == 10 { return EcsQdPos { x: q.x10, y: q.y10 }; };
+    if idx == 11 { return EcsQdPos { x: q.x11, y: q.y11 }; };
+    if idx == 12 { return EcsQdPos { x: q.x12, y: q.y12 }; };
+    if idx == 13 { return EcsQdPos { x: q.x13, y: q.y13 }; };
+    if idx == 14 { return EcsQdPos { x: q.x14, y: q.y14 }; };
+    return EcsQdPos { x: q.x15, y: q.y15 };
+}
+fn _ecs_qd_qa_set_x(q0: EcsQdQueryA, idx: i32, value: i32) -> EcsQdQueryA {
+    if idx == 0 { q0.x0 = value; return q0; };
+    if idx == 1 { q0.x1 = value; return q0; };
+    if idx == 2 { q0.x2 = value; return q0; };
+    if idx == 3 { q0.x3 = value; return q0; };
+    if idx == 4 { q0.x4 = value; return q0; };
+    if idx == 5 { q0.x5 = value; return q0; };
+    if idx == 6 { q0.x6 = value; return q0; };
+    if idx == 7 { q0.x7 = value; return q0; };
+    if idx == 8 { q0.x8 = value; return q0; };
+    if idx == 9 { q0.x9 = value; return q0; };
+    if idx == 10 { q0.x10 = value; return q0; };
+    if idx == 11 { q0.x11 = value; return q0; };
+    if idx == 12 { q0.x12 = value; return q0; };
+    if idx == 13 { q0.x13 = value; return q0; };
+    if idx == 14 { q0.x14 = value; return q0; };
+    q0.x15 = value; return q0;
+}
+fn _ecs_qd_qa_set_y(q0: EcsQdQueryA, idx: i32, value: i32) -> EcsQdQueryA {
+    if idx == 0 { q0.y0 = value; return q0; };
+    if idx == 1 { q0.y1 = value; return q0; };
+    if idx == 2 { q0.y2 = value; return q0; };
+    if idx == 3 { q0.y3 = value; return q0; };
+    if idx == 4 { q0.y4 = value; return q0; };
+    if idx == 5 { q0.y5 = value; return q0; };
+    if idx == 6 { q0.y6 = value; return q0; };
+    if idx == 7 { q0.y7 = value; return q0; };
+    if idx == 8 { q0.y8 = value; return q0; };
+    if idx == 9 { q0.y9 = value; return q0; };
+    if idx == 10 { q0.y10 = value; return q0; };
+    if idx == 11 { q0.y11 = value; return q0; };
+    if idx == 12 { q0.y12 = value; return q0; };
+    if idx == 13 { q0.y13 = value; return q0; };
+    if idx == 14 { q0.y14 = value; return q0; };
+    q0.y15 = value; return q0;
+}
+fn ecs_qd_query_a(w: EcsQdWorld) -> EcsQdQueryA {
+    let q0 = EcsQdQueryA { count: 0, x0: 0, y0: 0, x1: 0, y1: 0, x2: 0, y2: 0, x3: 0, y3: 0, x4: 0, y4: 0, x5: 0, y5: 0, x6: 0, y6: 0, x7: 0, y7: 0, x8: 0, y8: 0, x9: 0, y9: 0, x10: 0, y10: 0, x11: 0, y11: 0, x12: 0, y12: 0, x13: 0, y13: 0, x14: 0, y14: 0, x15: 0, y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_qd_a_eid_at(w, i);
+        let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) };
+        if ecs_qd_is_alive(w, e) {
+            let out = q0.count; q0 = _ecs_qd_qa_set_x(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_qa_set_y(q0, out, _ecs_qd_a_y_at(w, i)); q0.count = out + 1;
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+
+fn ecs_qd_query_a_without_b(w: EcsQdWorld) -> EcsQdQueryA {
+    let q0 = EcsQdQueryA { count: 0, x0: 0, y0: 0, x1: 0, y1: 0, x2: 0, y2: 0, x3: 0, y3: 0, x4: 0, y4: 0, x5: 0, y5: 0, x6: 0, y6: 0, x7: 0, y7: 0, x8: 0, y8: 0, x9: 0, y9: 0, x10: 0, y10: 0, x11: 0, y11: 0, x12: 0, y12: 0, x13: 0, y13: 0, x14: 0, y14: 0, x15: 0, y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_qd_a_eid_at(w, i);
+        let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) };
+        if ecs_qd_is_alive(w, e) {
+            if ecs_qd_has_b(w, e) != true {
+                let out = q0.count; q0 = _ecs_qd_qa_set_x(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_qa_set_y(q0, out, _ecs_qd_a_y_at(w, i)); q0.count = out + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+
+struct EcsQdPairQuery { count: i32, eid0: i32, slot0: i32, ax0: i32, ay0: i32, bx0: i32, by0: i32, eid1: i32, slot1: i32, ax1: i32, ay1: i32, bx1: i32, by1: i32, eid2: i32, slot2: i32, ax2: i32, ay2: i32, bx2: i32, by2: i32, eid3: i32, slot3: i32, ax3: i32, ay3: i32, bx3: i32, by3: i32, eid4: i32, slot4: i32, ax4: i32, ay4: i32, bx4: i32, by4: i32, eid5: i32, slot5: i32, ax5: i32, ay5: i32, bx5: i32, by5: i32, eid6: i32, slot6: i32, ax6: i32, ay6: i32, bx6: i32, by6: i32, eid7: i32, slot7: i32, ax7: i32, ay7: i32, bx7: i32, by7: i32, eid8: i32, slot8: i32, ax8: i32, ay8: i32, bx8: i32, by8: i32, eid9: i32, slot9: i32, ax9: i32, ay9: i32, bx9: i32, by9: i32, eid10: i32, slot10: i32, ax10: i32, ay10: i32, bx10: i32, by10: i32, eid11: i32, slot11: i32, ax11: i32, ay11: i32, bx11: i32, by11: i32, eid12: i32, slot12: i32, ax12: i32, ay12: i32, bx12: i32, by12: i32, eid13: i32, slot13: i32, ax13: i32, ay13: i32, bx13: i32, by13: i32, eid14: i32, slot14: i32, ax14: i32, ay14: i32, bx14: i32, by14: i32, eid15: i32, slot15: i32, ax15: i32, ay15: i32, bx15: i32, by15: i32 }
+fn ecs_qd_pair_query_count(q: EcsQdPairQuery) -> i32 { return q.count; }
+fn ecs_qd_pair_query_a_at(q: EcsQdPairQuery, idx: i32) -> EcsQdPos {
+    if idx == 0 { return EcsQdPos { x: q.ax0, y: q.ay0 }; };
+    if idx == 1 { return EcsQdPos { x: q.ax1, y: q.ay1 }; };
+    if idx == 2 { return EcsQdPos { x: q.ax2, y: q.ay2 }; };
+    if idx == 3 { return EcsQdPos { x: q.ax3, y: q.ay3 }; };
+    if idx == 4 { return EcsQdPos { x: q.ax4, y: q.ay4 }; };
+    if idx == 5 { return EcsQdPos { x: q.ax5, y: q.ay5 }; };
+    if idx == 6 { return EcsQdPos { x: q.ax6, y: q.ay6 }; };
+    if idx == 7 { return EcsQdPos { x: q.ax7, y: q.ay7 }; };
+    if idx == 8 { return EcsQdPos { x: q.ax8, y: q.ay8 }; };
+    if idx == 9 { return EcsQdPos { x: q.ax9, y: q.ay9 }; };
+    if idx == 10 { return EcsQdPos { x: q.ax10, y: q.ay10 }; };
+    if idx == 11 { return EcsQdPos { x: q.ax11, y: q.ay11 }; };
+    if idx == 12 { return EcsQdPos { x: q.ax12, y: q.ay12 }; };
+    if idx == 13 { return EcsQdPos { x: q.ax13, y: q.ay13 }; };
+    if idx == 14 { return EcsQdPos { x: q.ax14, y: q.ay14 }; };
+    return EcsQdPos { x: q.ax15, y: q.ay15 };
+}
+fn ecs_qd_pair_query_b_at(q: EcsQdPairQuery, idx: i32) -> EcsQdVel {
+    if idx == 0 { return EcsQdVel { x: q.bx0, y: q.by0 }; };
+    if idx == 1 { return EcsQdVel { x: q.bx1, y: q.by1 }; };
+    if idx == 2 { return EcsQdVel { x: q.bx2, y: q.by2 }; };
+    if idx == 3 { return EcsQdVel { x: q.bx3, y: q.by3 }; };
+    if idx == 4 { return EcsQdVel { x: q.bx4, y: q.by4 }; };
+    if idx == 5 { return EcsQdVel { x: q.bx5, y: q.by5 }; };
+    if idx == 6 { return EcsQdVel { x: q.bx6, y: q.by6 }; };
+    if idx == 7 { return EcsQdVel { x: q.bx7, y: q.by7 }; };
+    if idx == 8 { return EcsQdVel { x: q.bx8, y: q.by8 }; };
+    if idx == 9 { return EcsQdVel { x: q.bx9, y: q.by9 }; };
+    if idx == 10 { return EcsQdVel { x: q.bx10, y: q.by10 }; };
+    if idx == 11 { return EcsQdVel { x: q.bx11, y: q.by11 }; };
+    if idx == 12 { return EcsQdVel { x: q.bx12, y: q.by12 }; };
+    if idx == 13 { return EcsQdVel { x: q.bx13, y: q.by13 }; };
+    if idx == 14 { return EcsQdVel { x: q.bx14, y: q.by14 }; };
+    return EcsQdVel { x: q.bx15, y: q.by15 };
+}
+fn ecs_qd_pair_query_entity_at(q: EcsQdPairQuery, idx: i32) -> EcsQdEntity {
+    if idx == 0 { return EcsQdEntity { id: q.eid0, generation: 0 }; };
+    if idx == 1 { return EcsQdEntity { id: q.eid1, generation: 0 }; };
+    if idx == 2 { return EcsQdEntity { id: q.eid2, generation: 0 }; };
+    if idx == 3 { return EcsQdEntity { id: q.eid3, generation: 0 }; };
+    if idx == 4 { return EcsQdEntity { id: q.eid4, generation: 0 }; };
+    if idx == 5 { return EcsQdEntity { id: q.eid5, generation: 0 }; };
+    if idx == 6 { return EcsQdEntity { id: q.eid6, generation: 0 }; };
+    if idx == 7 { return EcsQdEntity { id: q.eid7, generation: 0 }; };
+    if idx == 8 { return EcsQdEntity { id: q.eid8, generation: 0 }; };
+    if idx == 9 { return EcsQdEntity { id: q.eid9, generation: 0 }; };
+    if idx == 10 { return EcsQdEntity { id: q.eid10, generation: 0 }; };
+    if idx == 11 { return EcsQdEntity { id: q.eid11, generation: 0 }; };
+    if idx == 12 { return EcsQdEntity { id: q.eid12, generation: 0 }; };
+    if idx == 13 { return EcsQdEntity { id: q.eid13, generation: 0 }; };
+    if idx == 14 { return EcsQdEntity { id: q.eid14, generation: 0 }; };
+    return EcsQdEntity { id: q.eid15, generation: 0 };
+}
+fn ecs_qd_pair_query_a_slot_at(q: EcsQdPairQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.slot0; };
+    if idx == 1 { return q.slot1; };
+    if idx == 2 { return q.slot2; };
+    if idx == 3 { return q.slot3; };
+    if idx == 4 { return q.slot4; };
+    if idx == 5 { return q.slot5; };
+    if idx == 6 { return q.slot6; };
+    if idx == 7 { return q.slot7; };
+    if idx == 8 { return q.slot8; };
+    if idx == 9 { return q.slot9; };
+    if idx == 10 { return q.slot10; };
+    if idx == 11 { return q.slot11; };
+    if idx == 12 { return q.slot12; };
+    if idx == 13 { return q.slot13; };
+    if idx == 14 { return q.slot14; };
+    return q.slot15;
+}
+fn _ecs_qd_pq_set_eid(q0: EcsQdPairQuery, idx: i32, value: i32) -> EcsQdPairQuery {
+    if idx == 0 { q0.eid0 = value; return q0; };
+    if idx == 1 { q0.eid1 = value; return q0; };
+    if idx == 2 { q0.eid2 = value; return q0; };
+    if idx == 3 { q0.eid3 = value; return q0; };
+    if idx == 4 { q0.eid4 = value; return q0; };
+    if idx == 5 { q0.eid5 = value; return q0; };
+    if idx == 6 { q0.eid6 = value; return q0; };
+    if idx == 7 { q0.eid7 = value; return q0; };
+    if idx == 8 { q0.eid8 = value; return q0; };
+    if idx == 9 { q0.eid9 = value; return q0; };
+    if idx == 10 { q0.eid10 = value; return q0; };
+    if idx == 11 { q0.eid11 = value; return q0; };
+    if idx == 12 { q0.eid12 = value; return q0; };
+    if idx == 13 { q0.eid13 = value; return q0; };
+    if idx == 14 { q0.eid14 = value; return q0; };
+    q0.eid15 = value; return q0;
+}
+fn _ecs_qd_pq_set_slot(q0: EcsQdPairQuery, idx: i32, value: i32) -> EcsQdPairQuery {
+    if idx == 0 { q0.slot0 = value; return q0; };
+    if idx == 1 { q0.slot1 = value; return q0; };
+    if idx == 2 { q0.slot2 = value; return q0; };
+    if idx == 3 { q0.slot3 = value; return q0; };
+    if idx == 4 { q0.slot4 = value; return q0; };
+    if idx == 5 { q0.slot5 = value; return q0; };
+    if idx == 6 { q0.slot6 = value; return q0; };
+    if idx == 7 { q0.slot7 = value; return q0; };
+    if idx == 8 { q0.slot8 = value; return q0; };
+    if idx == 9 { q0.slot9 = value; return q0; };
+    if idx == 10 { q0.slot10 = value; return q0; };
+    if idx == 11 { q0.slot11 = value; return q0; };
+    if idx == 12 { q0.slot12 = value; return q0; };
+    if idx == 13 { q0.slot13 = value; return q0; };
+    if idx == 14 { q0.slot14 = value; return q0; };
+    q0.slot15 = value; return q0;
+}
+fn _ecs_qd_pq_set_ax(q0: EcsQdPairQuery, idx: i32, value: i32) -> EcsQdPairQuery {
+    if idx == 0 { q0.ax0 = value; return q0; };
+    if idx == 1 { q0.ax1 = value; return q0; };
+    if idx == 2 { q0.ax2 = value; return q0; };
+    if idx == 3 { q0.ax3 = value; return q0; };
+    if idx == 4 { q0.ax4 = value; return q0; };
+    if idx == 5 { q0.ax5 = value; return q0; };
+    if idx == 6 { q0.ax6 = value; return q0; };
+    if idx == 7 { q0.ax7 = value; return q0; };
+    if idx == 8 { q0.ax8 = value; return q0; };
+    if idx == 9 { q0.ax9 = value; return q0; };
+    if idx == 10 { q0.ax10 = value; return q0; };
+    if idx == 11 { q0.ax11 = value; return q0; };
+    if idx == 12 { q0.ax12 = value; return q0; };
+    if idx == 13 { q0.ax13 = value; return q0; };
+    if idx == 14 { q0.ax14 = value; return q0; };
+    q0.ax15 = value; return q0;
+}
+fn _ecs_qd_pq_set_ay(q0: EcsQdPairQuery, idx: i32, value: i32) -> EcsQdPairQuery {
+    if idx == 0 { q0.ay0 = value; return q0; };
+    if idx == 1 { q0.ay1 = value; return q0; };
+    if idx == 2 { q0.ay2 = value; return q0; };
+    if idx == 3 { q0.ay3 = value; return q0; };
+    if idx == 4 { q0.ay4 = value; return q0; };
+    if idx == 5 { q0.ay5 = value; return q0; };
+    if idx == 6 { q0.ay6 = value; return q0; };
+    if idx == 7 { q0.ay7 = value; return q0; };
+    if idx == 8 { q0.ay8 = value; return q0; };
+    if idx == 9 { q0.ay9 = value; return q0; };
+    if idx == 10 { q0.ay10 = value; return q0; };
+    if idx == 11 { q0.ay11 = value; return q0; };
+    if idx == 12 { q0.ay12 = value; return q0; };
+    if idx == 13 { q0.ay13 = value; return q0; };
+    if idx == 14 { q0.ay14 = value; return q0; };
+    q0.ay15 = value; return q0;
+}
+fn _ecs_qd_pq_set_bx(q0: EcsQdPairQuery, idx: i32, value: i32) -> EcsQdPairQuery {
+    if idx == 0 { q0.bx0 = value; return q0; };
+    if idx == 1 { q0.bx1 = value; return q0; };
+    if idx == 2 { q0.bx2 = value; return q0; };
+    if idx == 3 { q0.bx3 = value; return q0; };
+    if idx == 4 { q0.bx4 = value; return q0; };
+    if idx == 5 { q0.bx5 = value; return q0; };
+    if idx == 6 { q0.bx6 = value; return q0; };
+    if idx == 7 { q0.bx7 = value; return q0; };
+    if idx == 8 { q0.bx8 = value; return q0; };
+    if idx == 9 { q0.bx9 = value; return q0; };
+    if idx == 10 { q0.bx10 = value; return q0; };
+    if idx == 11 { q0.bx11 = value; return q0; };
+    if idx == 12 { q0.bx12 = value; return q0; };
+    if idx == 13 { q0.bx13 = value; return q0; };
+    if idx == 14 { q0.bx14 = value; return q0; };
+    q0.bx15 = value; return q0;
+}
+fn _ecs_qd_pq_set_by(q0: EcsQdPairQuery, idx: i32, value: i32) -> EcsQdPairQuery {
+    if idx == 0 { q0.by0 = value; return q0; };
+    if idx == 1 { q0.by1 = value; return q0; };
+    if idx == 2 { q0.by2 = value; return q0; };
+    if idx == 3 { q0.by3 = value; return q0; };
+    if idx == 4 { q0.by4 = value; return q0; };
+    if idx == 5 { q0.by5 = value; return q0; };
+    if idx == 6 { q0.by6 = value; return q0; };
+    if idx == 7 { q0.by7 = value; return q0; };
+    if idx == 8 { q0.by8 = value; return q0; };
+    if idx == 9 { q0.by9 = value; return q0; };
+    if idx == 10 { q0.by10 = value; return q0; };
+    if idx == 11 { q0.by11 = value; return q0; };
+    if idx == 12 { q0.by12 = value; return q0; };
+    if idx == 13 { q0.by13 = value; return q0; };
+    if idx == 14 { q0.by14 = value; return q0; };
+    q0.by15 = value; return q0;
+}
+fn ecs_qd_query_mut_a_b(w: EcsQdWorld) -> EcsQdPairQuery {
+    let q0 = EcsQdPairQuery { count: 0, eid0: 0, slot0: 0, ax0: 0, ay0: 0, bx0: 0, by0: 0, eid1: 0, slot1: 0, ax1: 0, ay1: 0, bx1: 0, by1: 0, eid2: 0, slot2: 0, ax2: 0, ay2: 0, bx2: 0, by2: 0, eid3: 0, slot3: 0, ax3: 0, ay3: 0, bx3: 0, by3: 0, eid4: 0, slot4: 0, ax4: 0, ay4: 0, bx4: 0, by4: 0, eid5: 0, slot5: 0, ax5: 0, ay5: 0, bx5: 0, by5: 0, eid6: 0, slot6: 0, ax6: 0, ay6: 0, bx6: 0, by6: 0, eid7: 0, slot7: 0, ax7: 0, ay7: 0, bx7: 0, by7: 0, eid8: 0, slot8: 0, ax8: 0, ay8: 0, bx8: 0, by8: 0, eid9: 0, slot9: 0, ax9: 0, ay9: 0, bx9: 0, by9: 0, eid10: 0, slot10: 0, ax10: 0, ay10: 0, bx10: 0, by10: 0, eid11: 0, slot11: 0, ax11: 0, ay11: 0, bx11: 0, by11: 0, eid12: 0, slot12: 0, ax12: 0, ay12: 0, bx12: 0, by12: 0, eid13: 0, slot13: 0, ax13: 0, ay13: 0, bx13: 0, by13: 0, eid14: 0, slot14: 0, ax14: 0, ay14: 0, bx14: 0, by14: 0, eid15: 0, slot15: 0, ax15: 0, ay15: 0, bx15: 0, by15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_qd_a_eid_at(w, i);
+        let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) };
+        if ecs_qd_is_alive(w, e) {
+            let bslot = _ecs_qd_b_slot_of(w, eid);
+            if bslot >= 0 {
+                let out = q0.count; q0 = _ecs_qd_pq_set_eid(q0, out, eid); q0 = _ecs_qd_pq_set_slot(q0, out, i);
+                q0 = _ecs_qd_pq_set_ax(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_pq_set_ay(q0, out, _ecs_qd_a_y_at(w, i));
+                q0 = _ecs_qd_pq_set_bx(q0, out, _ecs_qd_b_x_at(w, bslot)); q0 = _ecs_qd_pq_set_by(q0, out, _ecs_qd_b_y_at(w, bslot));
+                q0.count = out + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+
+fn ecs_qd_pair_write_a(w0: EcsQdWorld, e: EcsQdEntity, a_slot: i32, x: i32, y: i32) -> EcsQdWorld {
+    if ecs_qd_is_alive(w0, e) != true { return w0; };
+    if a_slot < 0 { return w0; };
+    w0 = _ecs_qd_set_a_x(w0, a_slot, x); w0 = _ecs_qd_set_a_y(w0, a_slot, y); w0 = _ecs_qd_set_a_changed_t(w0, a_slot, w0.change_tick); return w0;
+}
+
+fn ecs_qd_insert_resource(w0: EcsQdWorld, tick: i32) -> EcsQdWorld { w0.res_has = 1; w0.res_tick = tick; return w0; }
+fn ecs_qd_get_resource(w: EcsQdWorld) -> EcsQdTime { return EcsQdTime { tick: w.res_tick }; }
+struct EcsQdMessageReader { cursor: i32 }
+struct EcsQdRead { has_value: i32, amount: i32, cursor: i32 }
+fn ecs_qd_message_reader_new() -> EcsQdMessageReader { return EcsQdMessageReader { cursor: 0 }; }
+fn ecs_qd_message_reader_with_cursor(cursor: i32) -> EcsQdMessageReader { return EcsQdMessageReader { cursor: cursor }; }
+fn ecs_qd_read_has_value(r: EcsQdRead) -> i32 { return r.has_value; }
+fn ecs_qd_read_amount(r: EcsQdRead) -> i32 { return r.amount; }
+fn ecs_qd_read_cursor(r: EcsQdRead) -> i32 { return r.cursor; }
+fn ecs_qd_write_message(w0: EcsQdWorld, amount: i32) -> EcsQdWorld { if w0.msg_tail >= ECS_QD_CAP { panic(8703); }; w0 = _ecs_qd_set_msg(w0, w0.msg_tail, amount); w0.msg_tail = w0.msg_tail + 1; return w0; }
+fn ecs_qd_read_message(w: EcsQdWorld, reader: EcsQdMessageReader) -> EcsQdRead { if reader.cursor < w.msg_tail { return EcsQdRead { has_value: 1, amount: _ecs_qd_msg_at(w, reader.cursor), cursor: reader.cursor + 1 }; }; return EcsQdRead { has_value: 0, amount: 0, cursor: reader.cursor }; }
+
+// ── QueryDynamic-specific wrappers not present in the world_registry_typed template. ─────────
+struct EcsQdEntityAQuery { count: i32,
+    eid0: i32, gen0: i32, x0: i32, y0: i32, eid1: i32, gen1: i32, x1: i32, y1: i32,
+    eid2: i32, gen2: i32, x2: i32, y2: i32, eid3: i32, gen3: i32, x3: i32, y3: i32,
+    eid4: i32, gen4: i32, x4: i32, y4: i32, eid5: i32, gen5: i32, x5: i32, y5: i32,
+    eid6: i32, gen6: i32, x6: i32, y6: i32, eid7: i32, gen7: i32, x7: i32, y7: i32,
+    eid8: i32, gen8: i32, x8: i32, y8: i32, eid9: i32, gen9: i32, x9: i32, y9: i32,
+    eid10: i32, gen10: i32, x10: i32, y10: i32, eid11: i32, gen11: i32, x11: i32, y11: i32,
+    eid12: i32, gen12: i32, x12: i32, y12: i32, eid13: i32, gen13: i32, x13: i32, y13: i32,
+    eid14: i32, gen14: i32, x14: i32, y14: i32, eid15: i32, gen15: i32, x15: i32, y15: i32 }
+fn ecs_qd_entity_a_query_count(q: EcsQdEntityAQuery) -> i32 { return q.count; }
+fn ecs_qd_entity_a_query_entity_at(q: EcsQdEntityAQuery, idx: i32) -> EcsQdEntity {
+    if idx == 0 { return EcsQdEntity { id: q.eid0, generation: q.gen0 }; };
+    if idx == 1 { return EcsQdEntity { id: q.eid1, generation: q.gen1 }; };
+    if idx == 2 { return EcsQdEntity { id: q.eid2, generation: q.gen2 }; };
+    if idx == 3 { return EcsQdEntity { id: q.eid3, generation: q.gen3 }; };
+    if idx == 4 { return EcsQdEntity { id: q.eid4, generation: q.gen4 }; };
+    if idx == 5 { return EcsQdEntity { id: q.eid5, generation: q.gen5 }; };
+    if idx == 6 { return EcsQdEntity { id: q.eid6, generation: q.gen6 }; };
+    if idx == 7 { return EcsQdEntity { id: q.eid7, generation: q.gen7 }; };
+    if idx == 8 { return EcsQdEntity { id: q.eid8, generation: q.gen8 }; };
+    if idx == 9 { return EcsQdEntity { id: q.eid9, generation: q.gen9 }; };
+    if idx == 10 { return EcsQdEntity { id: q.eid10, generation: q.gen10 }; };
+    if idx == 11 { return EcsQdEntity { id: q.eid11, generation: q.gen11 }; };
+    if idx == 12 { return EcsQdEntity { id: q.eid12, generation: q.gen12 }; };
+    if idx == 13 { return EcsQdEntity { id: q.eid13, generation: q.gen13 }; };
+    if idx == 14 { return EcsQdEntity { id: q.eid14, generation: q.gen14 }; };
+    return EcsQdEntity { id: q.eid15, generation: q.gen15 };
+}
+fn ecs_qd_entity_a_query_value_at(q: EcsQdEntityAQuery, idx: i32) -> EcsQdPos {
+    if idx == 0 { return EcsQdPos { x: q.x0, y: q.y0 }; };
+    if idx == 1 { return EcsQdPos { x: q.x1, y: q.y1 }; };
+    if idx == 2 { return EcsQdPos { x: q.x2, y: q.y2 }; };
+    if idx == 3 { return EcsQdPos { x: q.x3, y: q.y3 }; };
+    if idx == 4 { return EcsQdPos { x: q.x4, y: q.y4 }; };
+    if idx == 5 { return EcsQdPos { x: q.x5, y: q.y5 }; };
+    if idx == 6 { return EcsQdPos { x: q.x6, y: q.y6 }; };
+    if idx == 7 { return EcsQdPos { x: q.x7, y: q.y7 }; };
+    if idx == 8 { return EcsQdPos { x: q.x8, y: q.y8 }; };
+    if idx == 9 { return EcsQdPos { x: q.x9, y: q.y9 }; };
+    if idx == 10 { return EcsQdPos { x: q.x10, y: q.y10 }; };
+    if idx == 11 { return EcsQdPos { x: q.x11, y: q.y11 }; };
+    if idx == 12 { return EcsQdPos { x: q.x12, y: q.y12 }; };
+    if idx == 13 { return EcsQdPos { x: q.x13, y: q.y13 }; };
+    if idx == 14 { return EcsQdPos { x: q.x14, y: q.y14 }; };
+    return EcsQdPos { x: q.x15, y: q.y15 };
+}
+fn _ecs_qd_ea_set(q0: EcsQdEntityAQuery, idx: i32, eid: i32, gen: i32, x: i32, y: i32) -> EcsQdEntityAQuery {
+    if idx == 0 { q0.eid0 = eid; q0.gen0 = gen; q0.x0 = x; q0.y0 = y; return q0; };
+    if idx == 1 { q0.eid1 = eid; q0.gen1 = gen; q0.x1 = x; q0.y1 = y; return q0; };
+    if idx == 2 { q0.eid2 = eid; q0.gen2 = gen; q0.x2 = x; q0.y2 = y; return q0; };
+    if idx == 3 { q0.eid3 = eid; q0.gen3 = gen; q0.x3 = x; q0.y3 = y; return q0; };
+    if idx == 4 { q0.eid4 = eid; q0.gen4 = gen; q0.x4 = x; q0.y4 = y; return q0; };
+    if idx == 5 { q0.eid5 = eid; q0.gen5 = gen; q0.x5 = x; q0.y5 = y; return q0; };
+    if idx == 6 { q0.eid6 = eid; q0.gen6 = gen; q0.x6 = x; q0.y6 = y; return q0; };
+    if idx == 7 { q0.eid7 = eid; q0.gen7 = gen; q0.x7 = x; q0.y7 = y; return q0; };
+    if idx == 8 { q0.eid8 = eid; q0.gen8 = gen; q0.x8 = x; q0.y8 = y; return q0; };
+    if idx == 9 { q0.eid9 = eid; q0.gen9 = gen; q0.x9 = x; q0.y9 = y; return q0; };
+    if idx == 10 { q0.eid10 = eid; q0.gen10 = gen; q0.x10 = x; q0.y10 = y; return q0; };
+    if idx == 11 { q0.eid11 = eid; q0.gen11 = gen; q0.x11 = x; q0.y11 = y; return q0; };
+    if idx == 12 { q0.eid12 = eid; q0.gen12 = gen; q0.x12 = x; q0.y12 = y; return q0; };
+    if idx == 13 { q0.eid13 = eid; q0.gen13 = gen; q0.x13 = x; q0.y13 = y; return q0; };
+    if idx == 14 { q0.eid14 = eid; q0.gen14 = gen; q0.x14 = x; q0.y14 = y; return q0; };
+    q0.eid15 = eid; q0.gen15 = gen; q0.x15 = x; q0.y15 = y; return q0;
+}
+fn ecs_qd_query_entity_a(w: EcsQdWorld) -> EcsQdEntityAQuery {
+    let q0 = EcsQdEntityAQuery { count: 0,
+        eid0: 0, gen0: 0, x0: 0, y0: 0, eid1: 0, gen1: 0, x1: 0, y1: 0,
+        eid2: 0, gen2: 0, x2: 0, y2: 0, eid3: 0, gen3: 0, x3: 0, y3: 0,
+        eid4: 0, gen4: 0, x4: 0, y4: 0, eid5: 0, gen5: 0, x5: 0, y5: 0,
+        eid6: 0, gen6: 0, x6: 0, y6: 0, eid7: 0, gen7: 0, x7: 0, y7: 0,
+        eid8: 0, gen8: 0, x8: 0, y8: 0, eid9: 0, gen9: 0, x9: 0, y9: 0,
+        eid10: 0, gen10: 0, x10: 0, y10: 0, eid11: 0, gen11: 0, x11: 0, y11: 0,
+        eid12: 0, gen12: 0, x12: 0, y12: 0, eid13: 0, gen13: 0, x13: 0, y13: 0,
+        eid14: 0, gen14: 0, x14: 0, y14: 0, eid15: 0, gen15: 0, x15: 0, y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_qd_a_eid_at(w, i);
+        let gen = _ecs_qd_gen_at(w, eid);
+        let e = EcsQdEntity { id: eid, generation: gen };
+        if ecs_qd_is_alive(w, e) {
+            let out = q0.count;
+            q0 = _ecs_qd_ea_set(q0, out, eid, gen, _ecs_qd_a_x_at(w, i), _ecs_qd_a_y_at(w, i));
+            q0.count = out + 1;
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+
+// Single-item mutable-A query is represented by pair query shape without B; accessor names reuse a-slot capture.
+fn ecs_qd_query_mut_a(w: EcsQdWorld) -> EcsQdPairQuery {
+    let q0 = EcsQdPairQuery { count: 0,
+        eid0: 0, slot0: 0, ax0: 0, ay0: 0, bx0: 0, by0: 0, eid1: 0, slot1: 0, ax1: 0, ay1: 0, bx1: 0, by1: 0,
+        eid2: 0, slot2: 0, ax2: 0, ay2: 0, bx2: 0, by2: 0, eid3: 0, slot3: 0, ax3: 0, ay3: 0, bx3: 0, by3: 0,
+        eid4: 0, slot4: 0, ax4: 0, ay4: 0, bx4: 0, by4: 0, eid5: 0, slot5: 0, ax5: 0, ay5: 0, bx5: 0, by5: 0,
+        eid6: 0, slot6: 0, ax6: 0, ay6: 0, bx6: 0, by6: 0, eid7: 0, slot7: 0, ax7: 0, ay7: 0, bx7: 0, by7: 0,
+        eid8: 0, slot8: 0, ax8: 0, ay8: 0, bx8: 0, by8: 0, eid9: 0, slot9: 0, ax9: 0, ay9: 0, bx9: 0, by9: 0,
+        eid10: 0, slot10: 0, ax10: 0, ay10: 0, bx10: 0, by10: 0, eid11: 0, slot11: 0, ax11: 0, ay11: 0, bx11: 0, by11: 0,
+        eid12: 0, slot12: 0, ax12: 0, ay12: 0, bx12: 0, by12: 0, eid13: 0, slot13: 0, ax13: 0, ay13: 0, bx13: 0, by13: 0,
+        eid14: 0, slot14: 0, ax14: 0, ay14: 0, bx14: 0, by14: 0, eid15: 0, slot15: 0, ax15: 0, ay15: 0, bx15: 0, by15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_qd_a_eid_at(w, i);
+        let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) };
+        if ecs_qd_is_alive(w, e) {
+            let out = q0.count; q0 = _ecs_qd_pq_set_eid(q0, out, eid); q0 = _ecs_qd_pq_set_slot(q0, out, i);
+            q0 = _ecs_qd_pq_set_ax(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_pq_set_ay(q0, out, _ecs_qd_a_y_at(w, i)); q0.count = out + 1;
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+fn ecs_qd_query_mut_a_write(w0: EcsQdWorld, e: EcsQdEntity, a_slot: i32, x: i32, y: i32) -> EcsQdWorld { return ecs_qd_pair_write_a(w0, e, a_slot, x, y); }
+fn ecs_qd_query_a_with_b(w: EcsQdWorld) -> EcsQdQueryA {
+    let q0 = EcsQdQueryA { count: 0, x0: 0, y0: 0, x1: 0, y1: 0, x2: 0, y2: 0, x3: 0, y3: 0, x4: 0, y4: 0, x5: 0, y5: 0, x6: 0, y6: 0, x7: 0, y7: 0, x8: 0, y8: 0, x9: 0, y9: 0, x10: 0, y10: 0, x11: 0, y11: 0, x12: 0, y12: 0, x13: 0, y13: 0, x14: 0, y14: 0, x15: 0, y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count { let eid = _ecs_qd_a_eid_at(w, i); let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) }; if ecs_qd_is_alive(w, e) { if ecs_qd_has_b(w, e) { let out = q0.count; q0 = _ecs_qd_qa_set_x(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_qa_set_y(q0, out, _ecs_qd_a_y_at(w, i)); q0.count = out + 1; }; }; i = i + 1; }
+    return q0;
+}
+fn ecs_qd_query_a_added(w: EcsQdWorld, since_tick: i32) -> EcsQdQueryA {
+    let q0 = EcsQdQueryA { count: 0, x0: 0, y0: 0, x1: 0, y1: 0, x2: 0, y2: 0, x3: 0, y3: 0, x4: 0, y4: 0, x5: 0, y5: 0, x6: 0, y6: 0, x7: 0, y7: 0, x8: 0, y8: 0, x9: 0, y9: 0, x10: 0, y10: 0, x11: 0, y11: 0, x12: 0, y12: 0, x13: 0, y13: 0, x14: 0, y14: 0, x15: 0, y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count { let eid = _ecs_qd_a_eid_at(w, i); let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) }; if ecs_qd_is_alive(w, e) { if ecs_qd_a_added_since(w, e, since_tick) { let out = q0.count; q0 = _ecs_qd_qa_set_x(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_qa_set_y(q0, out, _ecs_qd_a_y_at(w, i)); q0.count = out + 1; }; }; i = i + 1; }
+    return q0;
+}
+fn ecs_qd_query_a_changed(w: EcsQdWorld, since_tick: i32) -> EcsQdQueryA {
+    let q0 = EcsQdQueryA { count: 0, x0: 0, y0: 0, x1: 0, y1: 0, x2: 0, y2: 0, x3: 0, y3: 0, x4: 0, y4: 0, x5: 0, y5: 0, x6: 0, y6: 0, x7: 0, y7: 0, x8: 0, y8: 0, x9: 0, y9: 0, x10: 0, y10: 0, x11: 0, y11: 0, x12: 0, y12: 0, x13: 0, y13: 0, x14: 0, y14: 0, x15: 0, y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count { let eid = _ecs_qd_a_eid_at(w, i); let e = EcsQdEntity { id: eid, generation: _ecs_qd_gen_at(w, eid) }; if ecs_qd_is_alive(w, e) { if ecs_qd_a_changed_since(w, e, since_tick) { let out = q0.count; q0 = _ecs_qd_qa_set_x(q0, out, _ecs_qd_a_x_at(w, i)); q0 = _ecs_qd_qa_set_y(q0, out, _ecs_qd_a_y_at(w, i)); q0.count = out + 1; }; }; i = i + 1; }
+    return q0;
+}

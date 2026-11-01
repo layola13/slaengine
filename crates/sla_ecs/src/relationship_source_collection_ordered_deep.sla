@@ -1,0 +1,349 @@
+// Deepened Bevy ECS OrderedRelationshipSourceCollection for Vec<Entity>
+// (shallow lib/relationship_source_collection_ordered.sla deep;
+//  src/relationship/relationship_source_collection.rs OrderedRelationshipSourceCollection + Vec impl).
+//
+// The shallow modeled insert/remove_at as shift-stable. This deep variant matches Bevy's actual
+// Vec<Entity> impl precisely:
+//   insert(index, entity) = push then swap(index, last)        [reorders — NOT stable]
+//   remove_at(index)      = swap_remove(index)                 [reorders — NOT stable]
+//   insert_stable(index)  = shift-insert at index (clamp to end)
+//   remove_at_stable(index) = shift-remove at index
+//   sort()                = selection sort ascending
+//   insert_sorted(entity) = partition_point(<= entity) then insert_stable
+//   place_most_recent(index) = pop() then insert(min(index, len), popped)
+//   place(entity, index)  = position; remove(current); insert(min(index, len), entity)
+//   push_front(entity)    = insert(0, entity)
+//   push_back(entity)     = insert(cap, entity)  (clamp-to-end)
+//   pop_front()           = remove_at(0)
+//   pop_back()            = remove_at(len-1)
+// Base RelationshipSourceCollection for Vec<Entity>:
+//   add(entity) = push; removes-by-rposition; remove(entity) = stable Vec::remove at last matching idx
+//   contains / iter_at / len / is_empty / clear / extend_from_iter / with_capacity / reserve / shrink_to_fit
+//   source_to_remove_before_add -> None sentinel (-1) for Vec (one-to-many default)
+//
+// Model: EcsRscOrderedDeep — fixed cap-8 i64 entity slots + scalar count.
+
+const ECS_RSC_ORD_CAP_DEEP: i32 = 8;
+
+// === Result struct for remove ops (Option<Entity> modeled as found flag + entity) ===
+struct RscRemoveResultDeep {
+    found: i32,
+    entity: i64,
+}
+
+fn ecs_rsc_rr_found(r: RscRemoveResultDeep) -> i32 { return r.found; }
+fn ecs_rsc_rr_entity(r: RscRemoveResultDeep) -> i64 { return r.entity; }
+
+fn ecs_rsc_rr_none() -> RscRemoveResultDeep {
+    let r = RscRemoveResultDeep { found: 0, entity: -1 };
+    return r;
+}
+
+fn ecs_rsc_rr_some(entity: i64) -> RscRemoveResultDeep {
+    let r = RscRemoveResultDeep { found: 1, entity: entity };
+    return r;
+}
+
+// === Model ===
+struct EcsRscOrderedDeep {
+    e0: i64, e1: i64, e2: i64, e3: i64, e4: i64, e5: i64, e6: i64, e7: i64,
+    count: i32,
+}
+
+fn ecs_rsc_new() -> EcsRscOrderedDeep {
+    let c = EcsRscOrderedDeep {
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        count: 0,
+    };
+    return c;
+}
+
+fn ecs_rsc_with_capacity(_capacity: i32) -> EcsRscOrderedDeep {
+    // Fixed-cap model ignores requested capacity.
+    return ecs_rsc_new();
+}
+
+fn ecs_rsc_reserve(c: EcsRscOrderedDeep, _additional: i32) -> EcsRscOrderedDeep {
+    let _ = c;
+    return ecs_rsc_new();
+}
+
+fn ecs_rsc_shrink_to_fit(c: EcsRscOrderedDeep) -> EcsRscOrderedDeep {
+    let _ = c;
+    return ecs_rsc_new();
+}
+
+fn ecs_rsc_len(c: EcsRscOrderedDeep) -> i32 { return c.count; }
+
+fn ecs_rsc_is_empty(c: EcsRscOrderedDeep) -> bool { return c.count == 0; }
+
+fn ecs_rsc_count(c: EcsRscOrderedDeep) -> i32 { return c.count; }
+
+// slot read
+fn ecs_rsc_at(c: EcsRscOrderedDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.e0; };
+    if idx == 1 { return c.e1; };
+    if idx == 2 { return c.e2; };
+    if idx == 3 { return c.e3; };
+    if idx == 4 { return c.e4; };
+    if idx == 5 { return c.e5; };
+    if idx == 6 { return c.e6; };
+    if idx == 7 { return c.e7; };
+    return -1;
+}
+
+// slot write (i64 scalar — safe to reassign across branches)
+fn ecs_rsc_set(c: EcsRscOrderedDeep, idx: i32, v: i64) -> EcsRscOrderedDeep {
+    if idx == 0 { c.e0 = v; };
+    if idx == 1 { c.e1 = v; };
+    if idx == 2 { c.e2 = v; };
+    if idx == 3 { c.e3 = v; };
+    if idx == 4 { c.e4 = v; };
+    if idx == 5 { c.e5 = v; };
+    if idx == 6 { c.e6 = v; };
+    if idx == 7 { c.e7 = v; };
+    return c;
+}
+
+fn ecs_rsc_clear(c: EcsRscOrderedDeep) -> EcsRscOrderedDeep {
+    c.count = 0;
+    c = ecs_rsc_set(c, 0, 0);
+    c = ecs_rsc_set(c, 1, 0);
+    c = ecs_rsc_set(c, 2, 0);
+    c = ecs_rsc_set(c, 3, 0);
+    c = ecs_rsc_set(c, 4, 0);
+    c = ecs_rsc_set(c, 5, 0);
+    c = ecs_rsc_set(c, 6, 0);
+    c = ecs_rsc_set(c, 7, 0);
+    return c;
+}
+
+// contains(entity): linear scan.
+fn ecs_rsc_contains(c: EcsRscOrderedDeep, entity: i64) -> bool {
+    let i: i32 = 0;
+    while i < c.count {
+        if ecs_rsc_at(c, i) == entity { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// index_of(entity): first matching index, else -1.
+fn ecs_rsc_index_of(c: EcsRscOrderedDeep, entity: i64) -> i32 {
+    let i: i32 = 0;
+    while i < c.count {
+        if ecs_rsc_at(c, i) == entity { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// rposition(entity): LAST matching index, else -1. (Bevy Vec::remove scans from back.)
+fn ecs_rsc_rposition(c: EcsRscOrderedDeep, entity: i64) -> i32 {
+    let found: i32 = -1;
+    let i: i32 = 0;
+    while i < c.count {
+        if ecs_rsc_at(c, i) == entity { found = i; };
+        i = i + 1;
+    }
+    return found;
+}
+
+// add(entity): Vec::push. Returns true (Vec variant). Rejects at cap.
+fn ecs_rsc_add(c: EcsRscOrderedDeep, entity: i64) -> (EcsRscOrderedDeep, bool) {
+    if c.count >= ECS_RSC_ORD_CAP_DEEP { return (c, false); };
+    c = ecs_rsc_set(c, c.count, entity);
+    c.count = c.count + 1;
+    return (c, true);
+}
+
+// remove(entity): rposition; if found, stable Vec::remove at that index; returns whether removed.
+fn ecs_rsc_remove(c: EcsRscOrderedDeep, entity: i64) -> (EcsRscOrderedDeep, bool) {
+    let idx: i32 = ecs_rsc_rposition(c, entity);
+    if idx < 0 { return (c, false); };
+    c = ecs_rsc_stable_remove_at_inner(c, idx);
+    return (c, true);
+}
+
+// insert(index, entity): Bevy Vec::insert as push+swap. push then swap(index, last).
+fn ecs_rsc_insert(c: EcsRscOrderedDeep, index: i32, entity: i64) -> EcsRscOrderedDeep {
+    if c.count >= ECS_RSC_ORD_CAP_DEEP { return c; };
+    // push entity onto end
+    c = ecs_rsc_set(c, c.count, entity);
+    c.count = c.count + 1;
+    let last: i32 = c.count - 1;
+    // if index < new_len, swap(index, last)
+    if index < c.count {
+        if index >= 0 {
+            let a: i64 = ecs_rsc_at(c, index);
+            let b: i64 = ecs_rsc_at(c, last);
+            c = ecs_rsc_set(c, index, b);
+            c = ecs_rsc_set(c, last, a);
+        };
+    };
+    return c;
+}
+
+// internal: push_back semantics — clamp index to count, then insert.
+fn ecs_rsc_push_back(c: EcsRscOrderedDeep, entity: i64) -> EcsRscOrderedDeep {
+    return ecs_rsc_insert(c, ECS_RSC_ORD_CAP_DEEP, entity);
+}
+
+// push_front(entity) = insert(0, entity)
+fn ecs_rsc_push_front(c: EcsRscOrderedDeep, entity: i64) -> EcsRscOrderedDeep {
+    return ecs_rsc_insert(c, 0, entity);
+}
+
+// remove_at(index): Bevy swap_remove. Returns RscRemoveResultDeep.
+// OOB returns none. Else copy out entity at index, move last entity into index slot, drop count.
+fn ecs_rsc_remove_at(c: EcsRscOrderedDeep, index: i32) -> (EcsRscOrderedDeep, RscRemoveResultDeep) {
+    if index < 0 || index >= c.count {
+        return (c, ecs_rsc_rr_none());
+    };
+    let removed: i64 = ecs_rsc_at(c, index);
+    let last: i32 = c.count - 1;
+    if index != last {
+        let tail: i64 = ecs_rsc_at(c, last);
+        c = ecs_rsc_set(c, index, tail);
+    };
+    c = ecs_rsc_set(c, last, 0);
+    c.count = c.count - 1;
+    return (c, ecs_rsc_rr_some(removed));
+}
+
+// internal stable remove: shift trailing left by one (Vec::remove).
+fn ecs_rsc_stable_remove_at_inner(c: EcsRscOrderedDeep, index: i32) -> EcsRscOrderedDeep {
+    if index < 0 || index >= c.count { return c; };
+    let new_count: i32 = c.count - 1;
+    let i: i32 = index;
+    while i < new_count {
+        let shifted: i64 = ecs_rsc_at(c, i + 1);
+        c = ecs_rsc_set(c, i, shifted);
+        i = i + 1;
+    }
+    c = ecs_rsc_set(c, new_count, 0);
+    c.count = new_count;
+    return c;
+}
+
+// remove_at_stable(index): shift-remove; returns RscRemoveResultDeep.
+fn ecs_rsc_remove_at_stable(c: EcsRscOrderedDeep, index: i32) -> (EcsRscOrderedDeep, RscRemoveResultDeep) {
+    if index < 0 || index >= c.count {
+        return (c, ecs_rsc_rr_none());
+    };
+    let removed: i64 = ecs_rsc_at(c, index);
+    c = ecs_rsc_stable_remove_at_inner(c, index);
+    return (c, ecs_rsc_rr_some(removed));
+}
+
+// insert_stable(index, entity): shift-insert at clamped index (Bevy Vec::insert_stable = insert with shift).
+fn ecs_rsc_insert_stable(c: EcsRscOrderedDeep, index: i32, entity: i64) -> EcsRscOrderedDeep {
+    if c.count >= ECS_RSC_ORD_CAP_DEEP { return c; };
+    let place: i32 = index;
+    if place < 0 { let p = 0; place = p; };
+    if place > c.count { place = c.count; };
+    // shift trailing right by one from end down to place
+    let i: i32 = c.count;
+    while i > place {
+        let moved: i64 = ecs_rsc_at(c, i - 1);
+        c = ecs_rsc_set(c, i, moved);
+        i = i - 1;
+    }
+    c = ecs_rsc_set(c, place, entity);
+    c.count = c.count + 1;
+    return c;
+}
+
+// pop_front: remove_at(0) — swap_remove variant.
+fn ecs_rsc_pop_front(c: EcsRscOrderedDeep) -> (EcsRscOrderedDeep, RscRemoveResultDeep) {
+    return ecs_rsc_remove_at(c, 0);
+}
+
+// pop_back: if empty none else remove_at(len-1).
+fn ecs_rsc_pop_back(c: EcsRscOrderedDeep) -> (EcsRscOrderedDeep, RscRemoveResultDeep) {
+    if c.count == 0 { return (c, ecs_rsc_rr_none()); };
+    return ecs_rsc_remove_at(c, c.count - 1);
+}
+
+// sort(): selection sort ascending (sla has no Vec sort).
+fn ecs_rsc_sort(c: EcsRscOrderedDeep) -> EcsRscOrderedDeep {
+    let n: i32 = c.count;
+    let i: i32 = 0;
+    while i < n - 1 {
+        let min_idx: i32 = i;
+        let j: i32 = i + 1;
+        while j < n {
+            if ecs_rsc_at(c, j) < ecs_rsc_at(c, min_idx) { min_idx = j; };
+            j = j + 1;
+        }
+        if min_idx != i {
+            let tmp: i64 = ecs_rsc_at(c, i);
+            let mv: i64 = ecs_rsc_at(c, min_idx);
+            c = ecs_rsc_set(c, i, mv);
+            c = ecs_rsc_set(c, min_idx, tmp);
+        };
+        i = i + 1;
+    }
+    return c;
+}
+
+// insert_sorted(entity): partition_point(<= entity) then insert_stable.
+fn ecs_rsc_insert_sorted(c: EcsRscOrderedDeep, entity: i64) -> EcsRscOrderedDeep {
+    let place: i32 = c.count;
+    let i: i32 = 0;
+    while i < c.count {
+        if ecs_rsc_at(c, i) > entity {
+            place = i;
+            // break-equivalent: stop scanning
+            i = c.count;
+        } else {
+            i = i + 1;
+        }
+    }
+    return ecs_rsc_insert_stable(c, place, entity);
+}
+
+// place_most_recent(index): pop() then insert(min(index, len), popped).
+// pop here = swap_remove at last; equivalent to dropping the tail entity value.
+fn ecs_rsc_place_most_recent(c: EcsRscOrderedDeep, index: i32) -> EcsRscOrderedDeep {
+    if c.count == 0 { return c; };
+    let last: i32 = c.count - 1;
+    let popped: i64 = ecs_rsc_at(c, last);
+    c = ecs_rsc_set(c, last, 0);
+    c.count = c.count - 1;
+    // clamp index to current (post-pop) count
+    let target: i32 = index;
+    if target > c.count { target = c.count; };
+    if target < 0 { target = 0; };
+    return ecs_rsc_insert(c, target, popped);
+}
+
+// place(entity, index): position; remove(current) stable; insert(min(index, len), entity).
+fn ecs_rsc_place(c: EcsRscOrderedDeep, entity: i64, index: i32) -> EcsRscOrderedDeep {
+    let cur: i32 = ecs_rsc_index_of(c, entity);
+    if cur < 0 { return c; };
+    c = ecs_rsc_stable_remove_at_inner(c, cur);
+    let target: i32 = index;
+    if target > c.count { target = c.count; };
+    if target < 0 { target = 0; };
+    return ecs_rsc_insert(c, target, entity);
+}
+
+// extend_from_iter(entities cap-8): push every id (reject at cap).
+fn ecs_rsc_extend_from_iter(c: EcsRscOrderedDeep, entities: Vec<i64>) -> EcsRscOrderedDeep {
+    let n: i32 = len(entities) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if c.count >= ECS_RSC_ORD_CAP_DEEP { return c; };
+        c = ecs_rsc_set(c, c.count, entities[i]);
+        c.count = c.count + 1;
+        i = i + 1;
+    }
+    return c;
+}
+
+// source_to_remove_before_add: Vec is one-to-many -> None (sentinel -1).
+fn ecs_rsc_source_to_remove_before_add(c: EcsRscOrderedDeep) -> i64 {
+    let _ = c;
+    return -1;
+}

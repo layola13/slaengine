@@ -1,0 +1,194 @@
+// Bevy ECS FilteredAccessSet — query/access.rs (gaps not in lib/query_access_ops.sla).
+// Models FilteredAccessSet: combined Access + a Vec<FilteredAccess> with
+// new/combined_access/filtered_accesses/is_compatible/get_conflicts/get_conflicts_single/
+// add/add_resource_read/add_resource_write/add_unfiltered_read_all_components/add_unfiltered_write_all_components/
+// extend/read_all/write_all/clear.
+
+@import "query_access_ops.sla"
+
+struct EcsFilteredAccessSet {
+    combined: EcsAccessOps,
+    filtered: Vec<EcsFilteredAccess>,
+}
+
+fn ecs_fas_new() -> EcsFilteredAccessSet {
+    let s = EcsFilteredAccessSet { combined: ecs_access_ops_new(), filtered: Vec::new() };
+    return s;
+}
+
+// combined_access: returns the underlying unfiltered Access of the entire set.
+fn ecs_fas_combined_access(s: EcsFilteredAccessSet) -> EcsAccessOps {
+    return s.combined;
+}
+
+// filtered_accesses count + at-index accessor (Bevy exposes &[]; we expose a count + per-slot accessor).
+fn ecs_fas_filtered_accesses_count(s: EcsFilteredAccessSet) -> i32 {
+    return len(s.filtered) as i32;
+}
+
+fn ecs_fas_filtered_access_at(s: EcsFilteredAccessSet, idx: i32) -> EcsFilteredAccess {
+    return s.filtered[idx];
+}
+
+// add: appends a FilteredAccess to the set and extends the combined access.
+fn ecs_fas_add(s: EcsFilteredAccessSet, fa: EcsFilteredAccess) -> EcsFilteredAccessSet {
+    s.combined = ecs_access_ops_extend(s.combined, fa.access);
+    s.filtered.push(fa);
+    return s;
+}
+
+// add_resource_read: add a fresh FilteredAccess (read of id) to the set.
+fn ecs_fas_add_resource_read(s: EcsFilteredAccessSet, id: i32) -> EcsFilteredAccessSet {
+    let fa = ecs_filtered_access_new();
+    fa = ecs_filtered_access_add_read(fa, id);
+    return ecs_fas_add(s, fa);
+}
+
+fn ecs_fas_add_resource_write(s: EcsFilteredAccessSet, id: i32) -> EcsFilteredAccessSet {
+    let fa = ecs_filtered_access_new();
+    fa = ecs_filtered_access_add_write(fa, id);
+    return ecs_fas_add(s, fa);
+}
+
+// add_unfiltered_read_all_components: add a FilteredAccess whose access reads ALL components
+// — modelled by setting a sentinel record id = -1 with read; combined access records reads_count for that record.
+// We model the Bevy `Access::read_all()` semantics via a marker record behind id=-1.
+fn ecs_fas_add_unfiltered_read_all_components(s: EcsFilteredAccessSet) -> EcsFilteredAccessSet {
+    let fa = ecs_filtered_access_new();
+    fa = ecs_filtered_access_add_read(fa, -1);
+    return ecs_fas_add(s, fa);
+}
+
+fn ecs_fas_add_unfiltered_write_all_components(s: EcsFilteredAccessSet) -> EcsFilteredAccessSet {
+    let fa = ecs_filtered_access_new();
+    fa = ecs_filtered_access_add_write(fa, -1);
+    return ecs_fas_add(s, fa);
+}
+
+// extend: union combined accesses + append filtered accesses from other.
+fn ecs_fas_extend(s: EcsFilteredAccessSet, other: EcsFilteredAccessSet) -> EcsFilteredAccessSet {
+    s.combined = ecs_access_ops_extend(s.combined, other.combined);
+    let n: i32 = len(other.filtered) as i32;
+    let i: i32 = 0;
+    while i < n { s.filtered.push(other.filtered[i]); i = i + 1; }
+    return s;
+}
+
+// read_all: Bevy creates FilteredAccess::matches_everything() then access.read_all(); we add a FilteredAccess with read_of(-1) (read-all sentinel).
+fn ecs_fas_read_all(s: EcsFilteredAccessSet) -> EcsFilteredAccessSet {
+    let fa = ecs_filtered_access_matches_everything();
+    fa = ecs_filtered_access_add_read(fa, -1);
+    return ecs_fas_add(s, fa);
+}
+
+fn ecs_fas_write_all(s: EcsFilteredAccessSet) -> EcsFilteredAccessSet {
+    let fa = ecs_filtered_access_matches_everything();
+    fa = ecs_filtered_access_add_write(fa, -1);
+    return ecs_fas_add(s, fa);
+}
+
+// clear: empties combined + filtered.
+fn ecs_fas_clear(s: EcsFilteredAccessSet) -> EcsFilteredAccessSet {
+    let cleared = EcsFilteredAccessSet { combined: ecs_access_ops_new(), filtered: Vec::new() };
+    return cleared;
+}
+
+// is_compatible: coarse check on combined Access (no shared writes between self/other combined).
+// Bevy: combined_access.is_compatible? ; we delegate to a paired-access compatibility check.
+fn ecs_access_ops_is_compatible(a: EcsAccessOps, b: EcsAccessOps) -> bool {
+    // conflict iff a writes a id that b writes, OR a writes a id that b reads (or vice versa) — no conflict for shared reads.
+    let na: i32 = len(a.writes) as i32;
+    let i: i32 = 0;
+    while i < na {
+        let wid = a.writes[i];
+        // b writes wid ?
+        let bw_n: i32 = len(b.writes) as i32;
+        let j: i32 = 0;
+        while j < bw_n { if b.writes[j] == wid { return false; }; j = j + 1; }
+        // b reads wid ?
+        let br_n: i32 = len(b.reads) as i32;
+        let k: i32 = 0;
+        while k < br_n { if b.reads[k] == wid { return false; }; k = k + 1; }
+        i = i + 1;
+    }
+    let nb: i32 = len(b.writes) as i32;
+    let j: i32 = 0;
+    while j < nb {
+        let wid = b.writes[j];
+        let ar_n: i32 = len(a.reads) as i32;
+        let k: i32 = 0;
+        while k < ar_n { if a.reads[k] == wid { return false; }; k = k + 1; }
+        j = j + 1;
+    }
+    return true;
+}
+
+fn ecs_fas_is_compatible(s: EcsFilteredAccessSet, other: EcsFilteredAccessSet) -> bool {
+    if ecs_access_ops_is_compatible(s.combined, other.combined) {
+        return true;
+    };
+    // Fine-grained phase: every (filtered_a, filtered_b) pair must be compatible.
+    let na: i32 = len(s.filtered) as i32;
+    let nb: i32 = len(other.filtered) as i32;
+    let i: i32 = 0;
+    while i < na {
+        let fa = s.filtered[i];
+        let j: i32 = 0;
+        while j < nb {
+            let fb = other.filtered[j];
+            if !ecs_access_ops_is_compatible(fa.access, fb.access) { return false; };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// get_conflicts(other): coarse-incompatible ? walk every filter pair and add conflicts.
+fn ecs_fas_get_conflicts(s: EcsFilteredAccessSet, other: EcsFilteredAccessSet) -> EcsAccessConflicts {
+    let r = ecs_access_conflicts_individual_empty();
+    if ecs_access_ops_is_compatible(s.combined, other.combined) {
+        return r;
+    };
+    let na: i32 = len(s.filtered) as i32;
+    let nb: i32 = len(other.filtered) as i32;
+    let i: i32 = 0;
+    while i < na {
+        let fa = s.filtered[i];
+        let j: i32 = 0;
+        while j < nb {
+            let fb = other.filtered[j];
+            let pc = ecs_access_ops_get_conflicts(fa.access, fb.access);
+            r = ecs_access_conflicts_add(r, pc);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+// get_conflicts_single(filtered_access): combined-incompatible ? walk our filters and add conflicts against the passed FilteredAccess.
+fn ecs_fas_get_conflicts_single(s: EcsFilteredAccessSet, fa: EcsFilteredAccess) -> EcsAccessConflicts {
+    let r = ecs_access_conflicts_individual_empty();
+    if ecs_access_ops_is_compatible(s.combined, fa.access) {
+        return r;
+    };
+    let n: i32 = len(s.filtered) as i32;
+    let i: i32 = 0;
+    while i < n {
+        let mine = s.filtered[i];
+        let pc = ecs_access_ops_get_conflicts(mine.access, fa.access);
+        r = ecs_access_conflicts_add(r, pc);
+        i = i + 1;
+    }
+    return r;
+}
+
+// helper: combined reads-count / writes-count accessors (for test convenience)
+fn ecs_fas_combined_reads_count(s: EcsFilteredAccessSet) -> i32 {
+    return ecs_access_ops_reads_count(s.combined);
+}
+
+fn ecs_fas_combined_writes_count(s: EcsFilteredAccessSet) -> i32 {
+    return ecs_access_ops_writes_count(s.combined);
+}

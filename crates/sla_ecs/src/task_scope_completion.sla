@@ -1,0 +1,286 @@
+// Bevy TaskPool::Scope result-drain and drop-cancel model over explicit i32 tasks.
+//
+// Bevy stores scoped FallibleTask results in a queue. `scope` awaits them in
+// queue order, pushes successful values, resumes unwind on a task panic, and
+// relies on Scope::drop to cancel any tasks still left in the queue. This file
+// models that observable completion accounting without Rust async internals.
+@import "sa_std/vec.sa"
+
+struct EcsScopeCompletionQueueI32 {
+    values: Vec<i32>,
+    lanes: Vec<i64>,
+    states: Vec<i64>,
+}
+
+struct EcsScopeCompletionDrainResultI32 {
+    queue: EcsScopeCompletionQueueI32,
+    result_values: Vec<i32>,
+    result_lanes: Vec<i64>,
+    completed_count: i64,
+    panic_count: i64,
+    failed_catch_count: i64,
+    canceled_on_drop_count: i64,
+    awaiting_pending: bool,
+    resumed_panic: bool,
+    all_drained: bool,
+}
+
+struct EcsScopeCompletionDropResultI32 {
+    queue: EcsScopeCompletionQueueI32,
+    canceled_count: i64,
+}
+
+fn ecs_scope_completion_queue_i32_new() -> EcsScopeCompletionQueueI32 {
+    let values: Vec<i32> = Vec::new();
+    let lanes: Vec<i64> = Vec::new();
+    let states: Vec<i64> = Vec::new();
+    return EcsScopeCompletionQueueI32 { values: values, lanes: lanes, states: states };
+}
+
+fn ecs_scope_completion_queue_len_i32(queue: EcsScopeCompletionQueueI32) -> i64 {
+    return len(queue.states) as i64;
+}
+
+fn ecs_scope_completion_push_state_i32(queue: EcsScopeCompletionQueueI32, value: i32, lane: i64, state: i64) -> EcsScopeCompletionQueueI32 {
+    queue.values.push(value);
+    queue.lanes.push(lane);
+    queue.states.push(state);
+    return queue;
+}
+
+fn ecs_scope_completion_push_pending_i32(queue: EcsScopeCompletionQueueI32, value: i32, lane: i64) -> EcsScopeCompletionQueueI32 {
+    return ecs_scope_completion_push_state_i32(queue, value, lane, 0);
+}
+
+fn ecs_scope_completion_push_ok_i32(queue: EcsScopeCompletionQueueI32, value: i32, lane: i64) -> EcsScopeCompletionQueueI32 {
+    return ecs_scope_completion_push_state_i32(queue, value, lane, 1);
+}
+
+fn ecs_scope_completion_push_panic_i32(queue: EcsScopeCompletionQueueI32, payload_id: i32, lane: i64) -> EcsScopeCompletionQueueI32 {
+    return ecs_scope_completion_push_state_i32(queue, payload_id, lane, 2);
+}
+
+fn ecs_scope_completion_push_failed_catch_i32(queue: EcsScopeCompletionQueueI32, lane: i64) -> EcsScopeCompletionQueueI32 {
+    return ecs_scope_completion_push_state_i32(queue, 0, lane, 3);
+}
+
+fn ecs_scope_completion_complete_pending_at_i32(queue: EcsScopeCompletionQueueI32, index: i64, value: i32) -> EcsScopeCompletionQueueI32 {
+    if index < 0 { return queue; };
+    if index >= ecs_scope_completion_queue_len_i32(queue) { return queue; };
+    if queue.states[index] == 0 {
+        queue.values[index] = value;
+        queue.states[index] = 1;
+    };
+    return queue;
+}
+
+fn ecs_scope_completion_complete_pending_panic_at_i32(queue: EcsScopeCompletionQueueI32, index: i64, payload_id: i32) -> EcsScopeCompletionQueueI32 {
+    if index < 0 { return queue; };
+    if index >= ecs_scope_completion_queue_len_i32(queue) { return queue; };
+    if queue.states[index] == 0 {
+        queue.values[index] = payload_id;
+        queue.states[index] = 2;
+    };
+    return queue;
+}
+
+fn ecs_scope_completion_complete_pending_failed_catch_at_i32(queue: EcsScopeCompletionQueueI32, index: i64) -> EcsScopeCompletionQueueI32 {
+    if index < 0 { return queue; };
+    if index >= ecs_scope_completion_queue_len_i32(queue) { return queue; };
+    if queue.states[index] == 0 {
+        queue.values[index] = 0;
+        queue.states[index] = 3;
+    };
+    return queue;
+}
+
+fn ecs_scope_completion_slice_from_i32(queue: EcsScopeCompletionQueueI32, start: i64) -> EcsScopeCompletionQueueI32 {
+    let next = ecs_scope_completion_queue_i32_new();
+    let i = start;
+    let n = ecs_scope_completion_queue_len_i32(queue);
+    while i < n {
+        next.values.push(queue.values[i]);
+        next.lanes.push(queue.lanes[i]);
+        next.states.push(queue.states[i]);
+        i = i + 1;
+    }
+    return next;
+}
+
+fn ecs_scope_completion_drain_result_i32(queue: EcsScopeCompletionQueueI32, result_values: Vec<i32>, result_lanes: Vec<i64>, completed_count: i64, panic_count: i64, failed_catch_count: i64, canceled_on_drop_count: i64, awaiting_pending: bool, resumed_panic: bool, all_drained: bool) -> EcsScopeCompletionDrainResultI32 {
+    return EcsScopeCompletionDrainResultI32 { queue: queue, result_values: result_values, result_lanes: result_lanes, completed_count: completed_count, panic_count: panic_count, failed_catch_count: failed_catch_count, canceled_on_drop_count: canceled_on_drop_count, awaiting_pending: awaiting_pending, resumed_panic: resumed_panic, all_drained: all_drained };
+}
+
+fn ecs_scope_completion_drain_ready_i32(queue: EcsScopeCompletionQueueI32) -> EcsScopeCompletionDrainResultI32 {
+    let result_values: Vec<i32> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let completed_count: i64 = 0;
+    let panic_count: i64 = 0;
+    let failed_catch_count: i64 = 0;
+    let canceled_on_drop_count: i64 = 0;
+    let i: i64 = 0;
+    let n = ecs_scope_completion_queue_len_i32(queue);
+    while i < n {
+        let state = queue.states[i];
+        if state == 0 {
+            let remaining = ecs_scope_completion_slice_from_i32(queue, i);
+            return ecs_scope_completion_drain_result_i32(remaining, result_values, result_lanes, completed_count, panic_count, failed_catch_count, canceled_on_drop_count, true, false, false);
+        };
+        if state == 1 {
+            result_values.push(queue.values[i]);
+            result_lanes.push(queue.lanes[i]);
+            completed_count = completed_count + 1;
+        };
+        if state == 2 {
+            panic_count = panic_count + 1;
+            canceled_on_drop_count = n - i - 1;
+            return ecs_scope_completion_drain_result_i32(ecs_scope_completion_queue_i32_new(), result_values, result_lanes, completed_count, panic_count, failed_catch_count, canceled_on_drop_count, false, true, false);
+        };
+        if state == 3 {
+            failed_catch_count = failed_catch_count + 1;
+            canceled_on_drop_count = n - i - 1;
+            return ecs_scope_completion_drain_result_i32(ecs_scope_completion_queue_i32_new(), result_values, result_lanes, completed_count, panic_count, failed_catch_count, canceled_on_drop_count, false, true, false);
+        };
+        i = i + 1;
+    }
+    return ecs_scope_completion_drain_result_i32(ecs_scope_completion_queue_i32_new(), result_values, result_lanes, completed_count, panic_count, failed_catch_count, canceled_on_drop_count, false, false, true);
+}
+
+fn ecs_scope_completion_drop_i32(queue: EcsScopeCompletionQueueI32) -> EcsScopeCompletionDropResultI32 {
+    let canceled_count = ecs_scope_completion_queue_len_i32(queue);
+    return EcsScopeCompletionDropResultI32 { queue: ecs_scope_completion_queue_i32_new(), canceled_count: canceled_count };
+}
+
+@test "scope completion empty queue drains to empty results"() {
+    let queue = ecs_scope_completion_queue_i32_new();
+    let drained = ecs_scope_completion_drain_ready_i32(queue);
+    if drained.all_drained != true { panic(31910); };
+    if drained.completed_count != 0 { panic(31911); };
+    if len(drained.result_values) != 0 { panic(31912); };
+}
+
+@test "scope completion successful tasks preserve queue order and lanes"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_ok_i32(q0, 10, 0);
+    let q2 = ecs_scope_completion_push_ok_i32(q1, 20, 1);
+    let q3 = ecs_scope_completion_push_ok_i32(q2, 30, 2);
+    let drained = ecs_scope_completion_drain_ready_i32(q3);
+    if drained.completed_count != 3 { panic(31920); };
+    if drained.result_values[0] != 10 { panic(31921); };
+    if drained.result_values[1] != 20 { panic(31922); };
+    if drained.result_values[2] != 30 { panic(31923); };
+    if drained.result_lanes[0] != 0 { panic(31924); };
+    if drained.result_lanes[1] != 1 { panic(31925); };
+    if drained.result_lanes[2] != 2 { panic(31926); };
+}
+
+@test "scope completion pending first task blocks result drain"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_pending_i32(q0, 0, 0);
+    let q2 = ecs_scope_completion_push_ok_i32(q1, 40, 1);
+    let first = ecs_scope_completion_drain_ready_i32(q2);
+    if first.awaiting_pending != true { panic(31930); };
+    if first.completed_count != 0 { panic(31931); };
+    if ecs_scope_completion_queue_len_i32(first.queue) != 2 { panic(31932); };
+    let ready = ecs_scope_completion_complete_pending_at_i32(first.queue, 0, 35);
+    let second = ecs_scope_completion_drain_ready_i32(ready);
+    if second.completed_count != 2 { panic(31933); };
+    if second.result_values[0] != 35 { panic(31934); };
+    if second.result_values[1] != 40 { panic(31935); };
+}
+
+@test "scope completion panic resumes unwind and cancels remaining tasks"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_ok_i32(q0, 1, 0);
+    let q2 = ecs_scope_completion_push_panic_i32(q1, 99, 1);
+    let q3 = ecs_scope_completion_push_ok_i32(q2, 3, 2);
+    let drained = ecs_scope_completion_drain_ready_i32(q3);
+    if drained.resumed_panic != true { panic(31940); };
+    if drained.panic_count != 1 { panic(31941); };
+    if drained.completed_count != 1 { panic(31942); };
+    if drained.canceled_on_drop_count != 1 { panic(31943); };
+    if ecs_scope_completion_queue_len_i32(drained.queue) != 0 { panic(31944); };
+}
+
+@test "scope completion failed catch panics and cancels remaining tasks"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_failed_catch_i32(q0, 0);
+    let q2 = ecs_scope_completion_push_pending_i32(q1, 7, 1);
+    let drained = ecs_scope_completion_drain_ready_i32(q2);
+    if drained.resumed_panic != true { panic(31950); };
+    if drained.failed_catch_count != 1 { panic(31951); };
+    if drained.canceled_on_drop_count != 1 { panic(31952); };
+}
+
+@test "scope completion drop cancels queued tasks"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_pending_i32(q0, 1, 0);
+    let q2 = ecs_scope_completion_push_pending_i32(q1, 2, 1);
+    let dropped = ecs_scope_completion_drop_i32(q2);
+    if dropped.canceled_count != 2 { panic(31960); };
+    if ecs_scope_completion_queue_len_i32(dropped.queue) != 0 { panic(31961); };
+}
+
+@test "scope completion pending task can finish with panic"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_pending_i32(q0, 0, 0);
+    let q2 = ecs_scope_completion_push_ok_i32(q1, 22, 1);
+    let first = ecs_scope_completion_drain_ready_i32(q2);
+    if first.awaiting_pending != true { panic(31970); };
+    let failed = ecs_scope_completion_complete_pending_panic_at_i32(first.queue, 0, 91);
+    let drained = ecs_scope_completion_drain_ready_i32(failed);
+    if drained.resumed_panic != true { panic(31971); };
+    if drained.panic_count != 1 { panic(31972); };
+    if drained.completed_count != 0 { panic(31973); };
+    if drained.canceled_on_drop_count != 1 { panic(31974); };
+    if ecs_scope_completion_queue_len_i32(drained.queue) != 0 { panic(31975); };
+}
+
+@test "scope completion pending task can finish with failed catch"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_ok_i32(q0, 11, 0);
+    let q2 = ecs_scope_completion_push_pending_i32(q1, 0, 1);
+    let q3 = ecs_scope_completion_push_ok_i32(q2, 33, 2);
+    let first = ecs_scope_completion_drain_ready_i32(q3);
+    if first.awaiting_pending != true { panic(31980); };
+    if first.completed_count != 1 { panic(31981); };
+    let failed = ecs_scope_completion_complete_pending_failed_catch_at_i32(first.queue, 0);
+    let drained = ecs_scope_completion_drain_ready_i32(failed);
+    if drained.resumed_panic != true { panic(31982); };
+    if drained.failed_catch_count != 1 { panic(31983); };
+    if drained.completed_count != 0 { panic(31984); };
+    if drained.canceled_on_drop_count != 1 { panic(31985); };
+    if ecs_scope_completion_queue_len_i32(drained.queue) != 0 { panic(31986); };
+}
+
+@test "scope completion resolves multiple pending tasks in queue order"() {
+    let q0 = ecs_scope_completion_queue_i32_new();
+    let q1 = ecs_scope_completion_push_pending_i32(q0, 0, 0);
+    let q2 = ecs_scope_completion_push_pending_i32(q1, 0, 1);
+    let q3 = ecs_scope_completion_push_ok_i32(q2, 30, 2);
+    let first = ecs_scope_completion_drain_ready_i32(q3);
+    if first.awaiting_pending != true { panic(31990); };
+    if first.completed_count != 0 { panic(31991); };
+    if ecs_scope_completion_queue_len_i32(first.queue) != 3 { panic(31992); };
+
+    let first_ready = ecs_scope_completion_complete_pending_at_i32(first.queue, 0, 10);
+    let second = ecs_scope_completion_drain_ready_i32(first_ready);
+    if second.awaiting_pending != true { panic(31993); };
+    if second.completed_count != 1 { panic(31994); };
+    if second.result_values[0] != 10 { panic(31995); };
+    if second.result_lanes[0] != 0 { panic(31996); };
+    if ecs_scope_completion_queue_len_i32(second.queue) != 2 { panic(31997); };
+    if second.queue.lanes[0] != 1 { panic(31998); };
+    if second.queue.lanes[1] != 2 { panic(31999); };
+
+    let second_ready = ecs_scope_completion_complete_pending_at_i32(second.queue, 0, 20);
+    let third = ecs_scope_completion_drain_ready_i32(second_ready);
+    if third.all_drained != true { panic(32000); };
+    if third.awaiting_pending != false { panic(32001); };
+    if third.completed_count != 2 { panic(32002); };
+    if third.result_values[0] != 20 { panic(32003); };
+    if third.result_values[1] != 30 { panic(32004); };
+    if third.result_lanes[0] != 1 { panic(32005); };
+    if third.result_lanes[1] != 2 { panic(32006); };
+    if ecs_scope_completion_queue_len_i32(third.queue) != 0 { panic(32007); };
+}

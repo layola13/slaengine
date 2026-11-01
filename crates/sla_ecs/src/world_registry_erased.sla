@@ -1,0 +1,439 @@
+// Registry-owned type-erased component value columns.
+// Values are stored as raw boxed pointers plus type ids and drop functions, so
+// one world can hold multiple concrete component types behind registry ids.
+@import "world_registry.sla"
+@import "resource.sla"
+@import "messages.sla"
+@import "query_dynamic.sla"
+@import "box_drop.sla"
+@import "sa_std/core/box.sa"
+
+struct ErasedComponentValue {
+    type_id: i32,
+    raw: *u8,
+}
+
+struct ErasedComponentColumn {
+    component_id: i32,
+    type_id: i32,
+    drop_fn: fn(*u8) -> void,
+    entity_ids: Vec<i32>,
+    values: Vec<ErasedComponentValue>,
+}
+
+struct RegistryErasedWorld<R, M> {
+    registry: RegistryWorld,
+    columns: Vec<ErasedComponentColumn>,
+    resource: ResourceSlot<R>,
+    messages: Messages<M>,
+}
+
+struct RegistryErasedMut<T> {
+    entity: Entity,
+    component_id: i32,
+    type_id: i32,
+    slot: i64,
+    value: T,
+}
+
+struct RegistryErasedPair<A, B> {
+    entity: Entity,
+    first: A,
+    second: B,
+}
+
+struct RegistryErasedPairMut<A, B> {
+    first: RegistryErasedMut<A>,
+    second_component_id: i32,
+    second_type_id: i32,
+    second: B,
+}
+
+fn registry_erased_value_new<T>(type_id: i32, value: T) -> ErasedComponentValue {
+    let boxed = Box::new(value);
+    let raw = Box::into_raw(boxed) as *u8;
+    return ErasedComponentValue { type_id: type_id, raw: raw };
+}
+
+fn registry_erased_value_read<T>(value: ErasedComponentValue, type_id: i32) -> T {
+    if value.type_id != type_id { panic(9400); };
+    let typed = value.raw as *T;
+    return unsafe { *typed };
+}
+
+fn registry_erased_column_new(component_id: i32, type_id: i32, drop_fn: fn(*u8) -> void) -> ErasedComponentColumn {
+    let entity_ids: Vec<i32> = Vec::new();
+    let values: Vec<ErasedComponentValue> = Vec::new();
+    return ErasedComponentColumn { component_id: component_id, type_id: type_id, drop_fn: drop_fn, entity_ids: entity_ids, values: values };
+}
+
+fn registry_erased_world_new<R, M>(default_r: R, default_m: M) -> RegistryErasedWorld<R, M> {
+    let columns: Vec<ErasedComponentColumn> = Vec::new();
+    return RegistryErasedWorld<R, M> {
+        registry: registry_world_new(),
+        columns: columns,
+        resource: resource_slot_new<R>(default_r),
+        messages: messages_new<M>(default_m),
+    };
+}
+
+fn registry_erased_world_column_slot<R, M>(world: RegistryErasedWorld<R, M>, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.columns) as i64;
+    while i < cnt {
+        if world.columns[i].component_id == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn registry_erased_world_entity_slot<R, M>(world: RegistryErasedWorld<R, M>, column_slot: i64, entity: Entity) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.columns[column_slot].entity_ids) as i64;
+    while i < cnt {
+        if world.columns[column_slot].entity_ids[i] == entity.id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn registry_erased_world_register_table<R, M>(world: RegistryErasedWorld<R, M>, type_id: i32, drop_fn: fn(*u8) -> void) -> (RegistryErasedWorld<R, M>, ComponentInfo) {
+    let (registry, info) = registry_world_register_table(world.registry);
+    world.registry = registry;
+    world.columns.push(registry_erased_column_new(info.id, type_id, drop_fn));
+    return (world, info);
+}
+
+fn registry_erased_world_register_sparse_set<R, M>(world: RegistryErasedWorld<R, M>, type_id: i32, drop_fn: fn(*u8) -> void) -> (RegistryErasedWorld<R, M>, ComponentInfo) {
+    let (registry, info) = registry_world_register_sparse_set(world.registry);
+    world.registry = registry;
+    world.columns.push(registry_erased_column_new(info.id, type_id, drop_fn));
+    return (world, info);
+}
+
+fn registry_erased_world_spawn<R, M>(world: RegistryErasedWorld<R, M>) -> (RegistryErasedWorld<R, M>, Entity) {
+    let (registry, entity) = registry_world_spawn(world.registry);
+    world.registry = registry;
+    return (world, entity);
+}
+
+fn registry_erased_world_increment_tick<R, M>(world: RegistryErasedWorld<R, M>) -> RegistryErasedWorld<R, M> {
+    world.registry = registry_world_increment_tick(world.registry);
+    return world;
+}
+
+fn registry_erased_world_is_alive<R, M>(world: RegistryErasedWorld<R, M>, entity: Entity) -> bool {
+    return registry_world_is_alive(world.registry, entity);
+}
+
+fn registry_erased_world_has<R, M>(world: RegistryErasedWorld<R, M>, entity: Entity, component_id: i32) -> bool {
+    return registry_world_has_component(world.registry, entity, component_id);
+}
+
+fn registry_erased_world_insert<T, R, M>(world: RegistryErasedWorld<R, M>, entity: Entity, component_id: i32, type_id: i32, value: T) -> RegistryErasedWorld<R, M> {
+    let column_slot = registry_erased_world_column_slot<R, M>(world, component_id);
+    if column_slot < 0 { panic(9401); };
+    if world.columns[column_slot].type_id != type_id { panic(9402); };
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    let value_slot = registry_erased_world_entity_slot<R, M>(world, column_slot, entity);
+    if value_slot >= 0 {
+        let drop_fn = world.columns[column_slot].drop_fn;
+        drop_fn(world.columns[column_slot].values[value_slot].raw);
+        let erased = registry_erased_value_new<T>(type_id, value);
+        world.columns[column_slot].values[value_slot] = erased;
+        return world;
+    };
+    let erased = registry_erased_value_new<T>(type_id, value);
+    world.columns[column_slot].entity_ids.push(entity.id);
+    world.columns[column_slot].values.push(erased);
+    return world;
+}
+
+fn registry_erased_world_insert_erased_new<R, M>(world: RegistryErasedWorld<R, M>, entity: Entity, component_id: i32, value: ErasedComponentValue) -> RegistryErasedWorld<R, M> {
+    let column_slot = registry_erased_world_column_slot<R, M>(world, component_id);
+    if column_slot < 0 { panic(9406); };
+    if world.columns[column_slot].type_id != value.type_id { panic(9407); };
+    if registry_erased_world_entity_slot<R, M>(world, column_slot, entity) >= 0 { panic(9408); };
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    world.columns[column_slot].entity_ids.push(entity.id);
+    world.columns[column_slot].values.push(value);
+    return world;
+}
+
+fn registry_erased_world_replace_erased<R, M>(world: RegistryErasedWorld<R, M>, entity: Entity, component_id: i32, value: ErasedComponentValue) -> RegistryErasedWorld<R, M> {
+    let column_slot = registry_erased_world_column_slot<R, M>(world, component_id);
+    if column_slot < 0 { panic(9409); };
+    if world.columns[column_slot].type_id != value.type_id { panic(9410); };
+    let value_slot = registry_erased_world_entity_slot<R, M>(world, column_slot, entity);
+    if value_slot < 0 { panic(9411); };
+    let drop_fn = world.columns[column_slot].drop_fn;
+    drop_fn(world.columns[column_slot].values[value_slot].raw);
+    world.columns[column_slot].values[value_slot] = value;
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    return world;
+}
+
+fn registry_erased_world_get<T, R, M>(world: RegistryErasedWorld<R, M>, entity: Entity, component_id: i32, type_id: i32) -> T {
+    if registry_erased_world_has<R, M>(world, entity, component_id) != true { panic(9403); };
+    let column_slot = registry_erased_world_column_slot<R, M>(world, component_id);
+    if column_slot < 0 { panic(9404); };
+    let value_slot = registry_erased_world_entity_slot<R, M>(world, column_slot, entity);
+    if value_slot < 0 { panic(9405); };
+    return registry_erased_value_read<T>(world.columns[column_slot].values[value_slot], type_id);
+}
+
+fn registry_erased_world_remove<R, M>(world: RegistryErasedWorld<R, M>, entity: Entity, component_id: i32) -> RegistryErasedWorld<R, M> {
+    let column_slot = registry_erased_world_column_slot<R, M>(world, component_id);
+    if column_slot < 0 { return world; };
+    let value_slot = registry_erased_world_entity_slot<R, M>(world, column_slot, entity);
+    if value_slot < 0 { return world; };
+    let drop_fn = world.columns[column_slot].drop_fn;
+    drop_fn(world.columns[column_slot].values[value_slot].raw);
+    let last = (len(world.columns[column_slot].entity_ids) as i64) - 1;
+    if value_slot != last {
+        world.columns[column_slot].entity_ids[value_slot] = world.columns[column_slot].entity_ids[last];
+        world.columns[column_slot].values[value_slot] = world.columns[column_slot].values[last];
+    };
+    let removed_id = world.columns[column_slot].entity_ids.remove(last);
+    let removed_value = world.columns[column_slot].values.remove(last);
+    world.registry = registry_world_remove_component(world.registry, entity, component_id);
+    return world;
+}
+
+fn registry_erased_world_query<T, R, M>(world: RegistryErasedWorld<R, M>, component_id: i32, type_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_component(world.registry, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: registry_erased_world_get<T, R, M>(world, entity, component_id, type_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_query_without<T, R, M>(world: RegistryErasedWorld<R, M>, component_id: i32, type_id: i32, without_component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_with_without(world.registry, component_id, without_component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: registry_erased_world_get<T, R, M>(world, entity, component_id, type_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_query_added<T, R, M>(world: RegistryErasedWorld<R, M>, component_id: i32, type_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_component(world.registry, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if registry_world_component_added_since(world.registry, entity, component_id, tick) {
+            query.items.push(EntityItem<T> { entity: entity, value: registry_erased_world_get<T, R, M>(world, entity, component_id, type_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_query_changed<T, R, M>(world: RegistryErasedWorld<R, M>, component_id: i32, type_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_changed_since(world.registry, component_id, tick);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: registry_erased_world_get<T, R, M>(world, entity, component_id, type_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_query_pair<A, B, R, M>(world: RegistryErasedWorld<R, M>, first_component_id: i32, first_type_id: i32, second_component_id: i32, second_type_id: i32) -> Query<RegistryErasedPair<A, B>> {
+    let query = query_new<RegistryErasedPair<A, B>>();
+    let entities = registry_world_query_component(world.registry, first_component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if registry_erased_world_has<R, M>(world, entity, second_component_id) {
+            query.items.push(RegistryErasedPair<A, B> {
+                entity: entity,
+                first: registry_erased_world_get<A, R, M>(world, entity, first_component_id, first_type_id),
+                second: registry_erased_world_get<B, R, M>(world, entity, second_component_id, second_type_id),
+            });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_query_pair_without<A, B, R, M>(world: RegistryErasedWorld<R, M>, first_component_id: i32, first_type_id: i32, second_component_id: i32, second_type_id: i32, without_component_id: i32) -> Query<RegistryErasedPair<A, B>> {
+    let query = query_new<RegistryErasedPair<A, B>>();
+    let pairs = registry_erased_world_query_pair<A, B, R, M>(world, first_component_id, first_type_id, second_component_id, second_type_id);
+    let i: i64 = 0;
+    let cnt = len(pairs.items) as i64;
+    while i < cnt {
+        let item = pairs.items[i];
+        if registry_erased_world_has<R, M>(world, item.entity, without_component_id) != true {
+            query.items.push(item);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_query_pair_mut_first<A, B, R, M>(world: RegistryErasedWorld<R, M>, first_component_id: i32, first_type_id: i32, second_component_id: i32, second_type_id: i32) -> Query<RegistryErasedPairMut<A, B>> {
+    let query = query_new<RegistryErasedPairMut<A, B>>();
+    let entities = registry_world_query_component(world.registry, first_component_id);
+    let column_slot = registry_erased_world_column_slot<R, M>(world, first_component_id);
+    if column_slot < 0 { return query; };
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if registry_erased_world_has<R, M>(world, entity, second_component_id) {
+            let value_slot = registry_erased_world_entity_slot<R, M>(world, column_slot, entity);
+            query.items.push(RegistryErasedPairMut<A, B> {
+                first: RegistryErasedMut<A> {
+                    entity: entity,
+                    component_id: first_component_id,
+                    type_id: first_type_id,
+                    slot: value_slot,
+                    value: registry_erased_world_get<A, R, M>(world, entity, first_component_id, first_type_id),
+                },
+                second_component_id: second_component_id,
+                second_type_id: second_type_id,
+                second: registry_erased_world_get<B, R, M>(world, entity, second_component_id, second_type_id),
+            });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_erased_world_write<T, R, M>(world: RegistryErasedWorld<R, M>, item: RegistryErasedMut<T>, value: T) -> RegistryErasedWorld<R, M> {
+    if registry_erased_world_is_alive<R, M>(world, item.entity) != true { return world; };
+    let column_slot = registry_erased_world_column_slot<R, M>(world, item.component_id);
+    if column_slot < 0 { return world; };
+    let drop_fn = world.columns[column_slot].drop_fn;
+    drop_fn(world.columns[column_slot].values[item.slot].raw);
+    world.columns[column_slot].values[item.slot] = registry_erased_value_new<T>(item.type_id, value);
+    world.registry = registry_world_insert_component(world.registry, item.entity, item.component_id);
+    return world;
+}
+
+fn registry_erased_world_pair_write_first<A, B, R, M>(world: RegistryErasedWorld<R, M>, item: RegistryErasedPairMut<A, B>, value: A) -> RegistryErasedWorld<R, M> {
+    return registry_erased_world_write<A, R, M>(world, item.first, value);
+}
+
+fn registry_erased_world_despawn<R, M>(world: RegistryErasedWorld<R, M>, entity: Entity) -> RegistryErasedWorld<R, M> {
+    if registry_erased_world_is_alive<R, M>(world, entity) != true { return world; };
+    let i: i64 = 0;
+    let cnt = len(world.columns) as i64;
+    while i < cnt {
+        let component_id = world.columns[i].component_id;
+        world = registry_erased_world_remove<R, M>(world, entity, component_id);
+        i = i + 1;
+    }
+    world.registry = registry_world_despawn(world.registry, entity);
+    return world;
+}
+
+fn registry_erased_world_insert_resource<R, M>(world: RegistryErasedWorld<R, M>, value: R) -> RegistryErasedWorld<R, M> {
+    world.resource = resource_insert<R>(world.resource, value);
+    return world;
+}
+
+fn registry_erased_world_get_resource<R, M>(world: RegistryErasedWorld<R, M>) -> R {
+    return resource_get<R>(world.resource);
+}
+
+fn registry_erased_world_write_message<R, M>(world: RegistryErasedWorld<R, M>, value: M) -> RegistryErasedWorld<R, M> {
+    world.messages = messages_write<M>(world.messages, value);
+    return world;
+}
+
+fn registry_erased_world_read_message<R, M>(world: RegistryErasedWorld<R, M>, reader: MessageReader, default_value: M) -> MessageRead<M> {
+    return messages_read_next<M>(world.messages, reader, default_value);
+}
+
+const ERASED_TEST_POS_TYPE: i32 = 101;
+const ERASED_TEST_VEL_TYPE: i32 = 102;
+const ERASED_TEST_MARKER_TYPE: i32 = 103;
+
+struct ErasedTestPos { x: i32, y: i32 }
+struct ErasedTestVel { x: i32, y: i32 }
+struct ErasedTestMarker { value: i32 }
+struct ErasedTestTime { tick: i32 }
+struct ErasedTestEvent { amount: i32 }
+
+fn erased_test_time_default() -> ErasedTestTime { return ErasedTestTime { tick: 0 }; }
+fn erased_test_event_default() -> ErasedTestEvent { return ErasedTestEvent { amount: 0 }; }
+
+fn erased_test_world_new() -> RegistryErasedWorld<ErasedTestTime, ErasedTestEvent> {
+    return registry_erased_world_new<ErasedTestTime, ErasedTestEvent>(erased_test_time_default(), erased_test_event_default());
+}
+
+@test "registry erased world stores multiple concrete component types"() {
+    let w0 = erased_test_world_new();
+    let (w1, position) = registry_erased_world_register_table<ErasedTestTime, ErasedTestEvent>(w0, ERASED_TEST_POS_TYPE, ecs_box_drop<ErasedTestPos>);
+    let (w2, velocity) = registry_erased_world_register_table<ErasedTestTime, ErasedTestEvent>(w1, ERASED_TEST_VEL_TYPE, ecs_box_drop<ErasedTestVel>);
+    let (w3, marker) = registry_erased_world_register_sparse_set<ErasedTestTime, ErasedTestEvent>(w2, ERASED_TEST_MARKER_TYPE, ecs_box_drop<ErasedTestMarker>);
+    let (w4, e1) = registry_erased_world_spawn<ErasedTestTime, ErasedTestEvent>(w3);
+    let (w5, e2) = registry_erased_world_spawn<ErasedTestTime, ErasedTestEvent>(w4);
+    let w6 = registry_erased_world_insert<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w5, e1, position.id, ERASED_TEST_POS_TYPE, ErasedTestPos { x: 1, y: 0 });
+    let w7 = registry_erased_world_insert<ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w6, e1, velocity.id, ERASED_TEST_VEL_TYPE, ErasedTestVel { x: 4, y: 0 });
+    let w8 = registry_erased_world_insert<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w7, e2, position.id, ERASED_TEST_POS_TYPE, ErasedTestPos { x: 9, y: 0 });
+    let w9 = registry_erased_world_insert<ErasedTestMarker, ErasedTestTime, ErasedTestEvent>(w8, e2, marker.id, ERASED_TEST_MARKER_TYPE, ErasedTestMarker { value: 1 });
+    let pos = registry_erased_world_get<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w9, e1, position.id, ERASED_TEST_POS_TYPE);
+    let vel = registry_erased_world_get<ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w9, e1, velocity.id, ERASED_TEST_VEL_TYPE);
+    let mark = registry_erased_world_get<ErasedTestMarker, ErasedTestTime, ErasedTestEvent>(w9, e2, marker.id, ERASED_TEST_MARKER_TYPE);
+    if pos.x != 1 { panic(9450); };
+    if vel.x != 4 { panic(9451); };
+    if mark.value != 1 { panic(9452); };
+    let positions = registry_erased_world_query<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w9, position.id, ERASED_TEST_POS_TYPE);
+    if len(positions.items) != 2 { panic(9453); };
+    let unmarked = registry_erased_world_query_without<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w9, position.id, ERASED_TEST_POS_TYPE, marker.id);
+    if len(unmarked.items) != 1 { panic(9454); };
+    if unmarked.items[0].entity.id != e1.id { panic(9455); };
+    let added = registry_erased_world_query_added<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w9, position.id, ERASED_TEST_POS_TYPE, 0);
+    if len(added.items) != 2 { panic(9456); };
+}
+
+@test "registry erased world pair query writeback and cleanup"() {
+    let w0 = erased_test_world_new();
+    let (w1, position) = registry_erased_world_register_table<ErasedTestTime, ErasedTestEvent>(w0, ERASED_TEST_POS_TYPE, ecs_box_drop<ErasedTestPos>);
+    let (w2, velocity) = registry_erased_world_register_table<ErasedTestTime, ErasedTestEvent>(w1, ERASED_TEST_VEL_TYPE, ecs_box_drop<ErasedTestVel>);
+    let (w3, entity) = registry_erased_world_spawn<ErasedTestTime, ErasedTestEvent>(w2);
+    let w4 = registry_erased_world_insert<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w3, entity, position.id, ERASED_TEST_POS_TYPE, ErasedTestPos { x: 2, y: 0 });
+    let w5 = registry_erased_world_insert<ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w4, entity, velocity.id, ERASED_TEST_VEL_TYPE, ErasedTestVel { x: 5, y: 0 });
+    let before = w5.registry.change_tick;
+    let w6 = registry_erased_world_increment_tick<ErasedTestTime, ErasedTestEvent>(w5);
+    let pairs = registry_erased_world_query_pair<ErasedTestPos, ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w6, position.id, ERASED_TEST_POS_TYPE, velocity.id, ERASED_TEST_VEL_TYPE);
+    if len(pairs.items) != 1 { panic(9460); };
+    if pairs.items[0].first.x + pairs.items[0].second.x != 7 { panic(9461); };
+    let pairs_without_missing = registry_erased_world_query_pair_without<ErasedTestPos, ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w6, position.id, ERASED_TEST_POS_TYPE, velocity.id, ERASED_TEST_VEL_TYPE, 999);
+    if len(pairs_without_missing.items) != 1 { panic(9468); };
+    let mut_pairs = registry_erased_world_query_pair_mut_first<ErasedTestPos, ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w6, position.id, ERASED_TEST_POS_TYPE, velocity.id, ERASED_TEST_VEL_TYPE);
+    let item = mut_pairs.items[0];
+    let w7 = registry_erased_world_pair_write_first<ErasedTestPos, ErasedTestVel, ErasedTestTime, ErasedTestEvent>(w6, item, ErasedTestPos { x: item.first.value.x + item.second.x, y: 0 });
+    let out = registry_erased_world_get<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w7, entity, position.id, ERASED_TEST_POS_TYPE);
+    if out.x != 7 { panic(9462); };
+    let changed = registry_erased_world_query_changed<ErasedTestPos, ErasedTestTime, ErasedTestEvent>(w7, position.id, ERASED_TEST_POS_TYPE, before);
+    if len(changed.items) != 1 { panic(9463); };
+    let w8 = registry_erased_world_insert_resource<ErasedTestTime, ErasedTestEvent>(w7, ErasedTestTime { tick: w7.registry.change_tick });
+    let w9 = registry_erased_world_write_message<ErasedTestTime, ErasedTestEvent>(w8, ErasedTestEvent { amount: 6 });
+    let w10 = registry_erased_world_despawn<ErasedTestTime, ErasedTestEvent>(w9, entity);
+    if registry_erased_world_is_alive<ErasedTestTime, ErasedTestEvent>(w10, entity) != false { panic(9464); };
+    if registry_erased_world_has<ErasedTestTime, ErasedTestEvent>(w10, entity, position.id) != false { panic(9465); };
+    let time = registry_erased_world_get_resource<ErasedTestTime, ErasedTestEvent>(w10);
+    let event = registry_erased_world_read_message<ErasedTestTime, ErasedTestEvent>(w10, message_reader_new(), erased_test_event_default());
+    if time.tick != 2 { panic(9466); };
+    if event.value.amount != 6 { panic(9467); };
+}

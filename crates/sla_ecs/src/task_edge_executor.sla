@@ -1,0 +1,249 @@
+// Bevy edge_executor-style scheduler/waker queue model over explicit i32 tasks.
+//
+// Bevy's vendored edge_executor schedules a Runnable immediately on spawn,
+// wakes a registered executor waker, and try_tick polls exactly one scheduled
+// runnable. Pending futures may schedule themselves again. This module models
+// those observable queue and wake semantics without implementing Rust Future
+// or Waker internals.
+@import "sa_std/vec.sa"
+@import "task_handle.sla"
+
+struct EcsEdgeExecutorI32 {
+    is_local: bool,
+    capacity: i64,
+    next_task_id: i64,
+    scheduled_ids: Vec<i64>,
+    scheduled_values: Vec<i32>,
+    scheduled_remaining_polls: Vec<i64>,
+    completed_ids: Vec<i64>,
+    completed_values: Vec<i32>,
+    waker_registered: bool,
+    waker_register_count: i64,
+    wake_count: i64,
+    spawned_count: i64,
+    schedule_count: i64,
+    poll_count: i64,
+    overflow_count: i64,
+}
+
+struct EcsEdgeExecutorSpawnResultI32 {
+    executor: EcsEdgeExecutorI32,
+    handle: EcsTaskHandleI32,
+    spawned: bool,
+    overflow: bool,
+}
+
+struct EcsEdgeExecutorTickResultI32 {
+    executor: EcsEdgeExecutorI32,
+    ticked: bool,
+    completed: bool,
+    task_id: i64,
+    value: i32,
+}
+
+struct EcsEdgeExecutorRunResultI32 {
+    executor: EcsEdgeExecutorI32,
+    ready: bool,
+    value: i32,
+    ticked_count: i64,
+}
+
+fn ecs_edge_executor_i32_new_with_local(capacity: i64, is_local: bool) -> EcsEdgeExecutorI32 {
+    let cap = capacity;
+    if cap < 0 { cap = 0; };
+    let scheduled_ids: Vec<i64> = Vec::new();
+    let scheduled_values: Vec<i32> = Vec::new();
+    let scheduled_remaining_polls: Vec<i64> = Vec::new();
+    let completed_ids: Vec<i64> = Vec::new();
+    let completed_values: Vec<i32> = Vec::new();
+    return EcsEdgeExecutorI32 { is_local: is_local, capacity: cap, next_task_id: 0, scheduled_ids: scheduled_ids, scheduled_values: scheduled_values, scheduled_remaining_polls: scheduled_remaining_polls, completed_ids: completed_ids, completed_values: completed_values, waker_registered: false, waker_register_count: 0, wake_count: 0, spawned_count: 0, schedule_count: 0, poll_count: 0, overflow_count: 0 };
+}
+
+fn ecs_edge_executor_i32_new(capacity: i64) -> EcsEdgeExecutorI32 {
+    return ecs_edge_executor_i32_new_with_local(capacity, false);
+}
+
+fn ecs_edge_local_executor_i32_new(capacity: i64) -> EcsEdgeExecutorI32 {
+    return ecs_edge_executor_i32_new_with_local(capacity, true);
+}
+
+fn ecs_edge_executor_spawn_result_i32(executor: EcsEdgeExecutorI32, handle: EcsTaskHandleI32, spawned: bool, overflow: bool) -> EcsEdgeExecutorSpawnResultI32 {
+    return EcsEdgeExecutorSpawnResultI32 { executor: executor, handle: handle, spawned: spawned, overflow: overflow };
+}
+
+fn ecs_edge_executor_tick_result_i32(executor: EcsEdgeExecutorI32, ticked: bool, completed: bool, task_id: i64, value: i32) -> EcsEdgeExecutorTickResultI32 {
+    return EcsEdgeExecutorTickResultI32 { executor: executor, ticked: ticked, completed: completed, task_id: task_id, value: value };
+}
+
+fn ecs_edge_executor_scheduled_count_i32(executor: EcsEdgeExecutorI32) -> i64 {
+    return len(executor.scheduled_ids) as i64;
+}
+
+fn ecs_edge_executor_completed_count_i32(executor: EcsEdgeExecutorI32) -> i64 {
+    return len(executor.completed_ids) as i64;
+}
+
+fn ecs_edge_executor_task_completed_slot_i32(executor: EcsEdgeExecutorI32, handle: EcsTaskHandleI32) -> i64 {
+    let i: i64 = 0;
+    let n = len(executor.completed_ids) as i64;
+    while i < n {
+        if executor.completed_ids[i] == handle.task_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_edge_executor_task_is_finished_i32(executor: EcsEdgeExecutorI32, handle: EcsTaskHandleI32) -> bool {
+    return ecs_edge_executor_task_completed_slot_i32(executor, handle) >= 0;
+}
+
+fn ecs_edge_executor_task_value_or_i32(executor: EcsEdgeExecutorI32, handle: EcsTaskHandleI32, default_value: i32) -> i32 {
+    let slot = ecs_edge_executor_task_completed_slot_i32(executor, handle);
+    if slot < 0 { return default_value; };
+    return executor.completed_values[slot];
+}
+
+fn ecs_edge_executor_register_waker_i32(executor: EcsEdgeExecutorI32) -> EcsEdgeExecutorI32 {
+    executor.waker_registered = true;
+    executor.waker_register_count = executor.waker_register_count + 1;
+    return executor;
+}
+
+fn ecs_edge_executor_schedule_i32(executor: EcsEdgeExecutorI32, task_id: i64, value: i32, remaining_polls: i64) -> EcsEdgeExecutorSpawnResultI32 {
+    if ecs_edge_executor_scheduled_count_i32(executor) >= executor.capacity {
+        executor.overflow_count = executor.overflow_count + 1;
+        return ecs_edge_executor_spawn_result_i32(executor, ecs_task_handle_i32(task_id), false, true);
+    };
+    executor.scheduled_ids.push(task_id);
+    executor.scheduled_values.push(value);
+    executor.scheduled_remaining_polls.push(remaining_polls);
+    executor.schedule_count = executor.schedule_count + 1;
+    if executor.waker_registered {
+        executor.wake_count = executor.wake_count + 1;
+        executor.waker_registered = false;
+    };
+    return ecs_edge_executor_spawn_result_i32(executor, ecs_task_handle_i32(task_id), true, false);
+}
+
+fn ecs_edge_executor_spawn_i32(executor: EcsEdgeExecutorI32, value: i32, polls_needed: i64) -> EcsEdgeExecutorSpawnResultI32 {
+    let remaining = polls_needed;
+    if remaining < 1 { remaining = 1; };
+    let task_id = executor.next_task_id;
+    executor.next_task_id = executor.next_task_id + 1;
+    executor.spawned_count = executor.spawned_count + 1;
+    return ecs_edge_executor_schedule_i32(executor, task_id, value, remaining);
+}
+
+fn ecs_edge_executor_without_scheduled_front_i32(executor: EcsEdgeExecutorI32) -> EcsEdgeExecutorI32 {
+    let ids: Vec<i64> = Vec::new();
+    let values: Vec<i32> = Vec::new();
+    let polls: Vec<i64> = Vec::new();
+    let i: i64 = 1;
+    let n = len(executor.scheduled_ids) as i64;
+    while i < n {
+        ids.push(executor.scheduled_ids[i]);
+        values.push(executor.scheduled_values[i]);
+        polls.push(executor.scheduled_remaining_polls[i]);
+        i = i + 1;
+    }
+    executor.scheduled_ids = ids;
+    executor.scheduled_values = values;
+    executor.scheduled_remaining_polls = polls;
+    return executor;
+}
+
+fn ecs_edge_executor_try_tick_i32(executor: EcsEdgeExecutorI32) -> EcsEdgeExecutorTickResultI32 {
+    if ecs_edge_executor_scheduled_count_i32(executor) <= 0 {
+        return ecs_edge_executor_tick_result_i32(executor, false, false, -1, 0);
+    };
+    let task_id = executor.scheduled_ids[0];
+    let value = executor.scheduled_values[0];
+    let remaining = executor.scheduled_remaining_polls[0];
+    executor = ecs_edge_executor_without_scheduled_front_i32(executor);
+    executor.poll_count = executor.poll_count + 1;
+    if remaining <= 1 {
+        executor.completed_ids.push(task_id);
+        executor.completed_values.push(value);
+        return ecs_edge_executor_tick_result_i32(executor, true, true, task_id, value);
+    };
+    let scheduled = ecs_edge_executor_schedule_i32(executor, task_id, value, remaining - 1);
+    return ecs_edge_executor_tick_result_i32(scheduled.executor, true, false, task_id, value);
+}
+
+fn ecs_edge_executor_run_until_task_ready_i32(executor: EcsEdgeExecutorI32, handle: EcsTaskHandleI32) -> EcsEdgeExecutorRunResultI32 {
+    let ticked_count: i64 = 0;
+    while ecs_edge_executor_task_is_finished_i32(executor, handle) != true {
+        let tick = ecs_edge_executor_try_tick_i32(executor);
+        executor = tick.executor;
+        if tick.ticked {
+            ticked_count = ticked_count + 1;
+        } else {
+            return EcsEdgeExecutorRunResultI32 { executor: executor, ready: false, value: 0, ticked_count: ticked_count };
+        };
+    }
+    return EcsEdgeExecutorRunResultI32 { executor: executor, ready: true, value: ecs_edge_executor_task_value_or_i32(executor, handle, 0), ticked_count: ticked_count };
+}
+
+@test "edge executor try tick is false when no runnable is scheduled"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let tick = ecs_edge_executor_try_tick_i32(executor);
+    if tick.ticked { panic(31810); };
+    if tick.task_id != -1 { panic(31811); };
+}
+
+@test "edge executor spawn schedules and wakes registered waker"() {
+    let executor0 = ecs_edge_executor_i32_new(4);
+    let executor1 = ecs_edge_executor_register_waker_i32(executor0);
+    let spawn = ecs_edge_executor_spawn_i32(executor1, 10, 1);
+    if spawn.spawned != true { panic(31820); };
+    if spawn.executor.wake_count != 1 { panic(31821); };
+    if spawn.executor.waker_registered { panic(31822); };
+    let tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    if tick.completed != true { panic(31823); };
+    if ecs_edge_executor_task_value_or_i32(tick.executor, spawn.handle, -1) != 10 { panic(31824); };
+}
+
+@test "edge executor try tick polls one runnable and reschedules pending"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 20, 2);
+    let first = ecs_edge_executor_try_tick_i32(spawn.executor);
+    if first.ticked != true { panic(31830); };
+    if first.completed { panic(31831); };
+    if ecs_edge_executor_scheduled_count_i32(first.executor) != 1 { panic(31832); };
+    if first.executor.poll_count != 1 { panic(31833); };
+    let second = ecs_edge_executor_try_tick_i32(first.executor);
+    if second.completed != true { panic(31834); };
+    if ecs_edge_executor_task_is_finished_i32(second.executor, spawn.handle) != true { panic(31835); };
+    if second.executor.poll_count != 2 { panic(31836); };
+}
+
+@test "edge executor run until task ready mirrors await task progress"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 6, 3);
+    let run = ecs_edge_executor_run_until_task_ready_i32(spawn.executor, spawn.handle);
+    if run.ready != true { panic(31840); };
+    if run.value != 6 { panic(31841); };
+    if run.ticked_count != 3 { panic(31842); };
+    if ecs_edge_executor_completed_count_i32(run.executor) != 1 { panic(31843); };
+}
+
+@test "edge local executors keep queues independent"() {
+    let first0 = ecs_edge_local_executor_i32_new(4);
+    let second0 = ecs_edge_local_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(first0, 30, 1);
+    let other_tick = ecs_edge_executor_try_tick_i32(second0);
+    if other_tick.ticked { panic(31850); };
+    let first_tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    if first_tick.completed != true { panic(31851); };
+    if ecs_edge_executor_task_value_or_i32(first_tick.executor, spawn.handle, -1) != 30 { panic(31852); };
+}
+
+@test "edge executor records queue capacity overflow"() {
+    let executor = ecs_edge_executor_i32_new(1);
+    let first = ecs_edge_executor_spawn_i32(executor, 1, 2);
+    let second = ecs_edge_executor_spawn_i32(first.executor, 2, 1);
+    if second.spawned { panic(31860); };
+    if second.overflow != true { panic(31861); };
+    if second.executor.overflow_count != 1 { panic(31862); };
+    if ecs_edge_executor_scheduled_count_i32(second.executor) != 1 { panic(31863); };
+}

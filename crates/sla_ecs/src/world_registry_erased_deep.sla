@@ -1,0 +1,1438 @@
+// Deep tests bed for lib/world_registry_erased.sla (Batch 385).
+// Mirrors shallow `lib/world_registry_erased.sla`'s `RegistryErasedWorld<R, M>` registry world as a
+// SELF-CONTAINED fixed-cap variant (no `@import` -- the registry/column storage, resource slot,
+// message slot, and typed (pos/vel/marker) component columns are all inlined). The erased "any
+// concrete type" surface is reified here as three concrete typed columns keyed by `type_id`
+// (ERASED_TEST_POS_TYPE, ERASED_TEST_VEL_TYPE, ERASED_TEST_MARKER_TYPE) -- matching the shallow's
+// two `@test`s which exercise only these three types + the ErasedTestTime resource + ErasedTestEvent
+// message. Wrapper structs expose scalar accessors (no tuple-return destructuring in tests).
+//
+// Storage:
+// - cap-16 entities, each with a generation + alive-bit, monotone `next_entity`.
+// - cap-8 component columns: each carries (comp_id, type_id, storage_kind, present_bit per entity,
+//   added_tick per entity, changed_tick per entity).
+// - Per-typed component storage: since only Pos/Vel/Marker concrete types are exercised, the world
+// carries cap-8 typed-column snapshots for each type. A column slot index (0..7) maps to a typed
+// store keyed by the column's type_id; each typed store cap-16 entity rows of (x, y) or (value).
+// - One resource slot (ErasedTestTime) + one message slot (ErasedTestEvent) + a message counter.
+// - A monotone change_tick that register/insert/despawn/increment_tick advance, matching shallow.
+
+const ECS_REG_CAP_ENTITIES: i32 = 16;
+const ECS_REG_CAP_COLUMNS: i32 = 8;
+const ECS_REG_TYPE_POS: i32 = 101;
+const ECS_REG_TYPE_VEL: i32 = 102;
+const ECS_REG_TYPE_MARKER: i32 = 103;
+const ECS_REG_STORAGE_TABLE: i32 = 0;
+const ECS_REG_STORAGE_SPARSE: i32 = 1;
+const ECS_REG_TICK_NONE: i32 = 999999;
+
+struct EcsRegEntityDeep { id: i32, generation: i32 }
+
+fn ecs_reg_entity_eq_deep(a: EcsRegEntityDeep, b: EcsRegEntityDeep) -> bool {
+    if a.id != b.id { return false; };
+    if a.generation != b.generation { return false; };
+    return true;
+}
+
+fn ecs_reg_entity_id_deep(a: EcsRegEntityDeep) -> i32 { return a.id; }
+fn ecs_reg_entity_gen_deep(a: EcsRegEntityDeep) -> i32 { return a.generation; }
+
+fn ecs_reg_entity_new(id: i32, generation: i32) -> EcsRegEntityDeep {
+    return EcsRegEntityDeep { id: id, generation: generation };
+}
+
+// ── Typed concrete component structs (mirrors shallow ErasedTestPos / ErasedTestVel /
+//    ErasedTestMarker + the resource ErasedTestTime + message ErasedTestEvent). ──────────────
+struct EcsRegPosDeep { x: i32, y: i32 }
+struct EcsRegVelDeep { x: i32, y: i32 }
+struct EcsRegMarkerDeep { value: i32 }
+
+fn ecs_reg_pos_deep_new(x: i32, y: i32) -> EcsRegPosDeep { return EcsRegPosDeep { x: x, y: y }; }
+fn ecs_reg_vel_deep_new(x: i32, y: i32) -> EcsRegVelDeep { return EcsRegVelDeep { x: x, y: y }; }
+fn ecs_reg_marker_deep_new(value: i32) -> EcsRegMarkerDeep { return EcsRegMarkerDeep { value: value }; }
+
+fn ecs_reg_pos_deep_x(r: EcsRegPosDeep) -> i32 { return r.x; }
+fn ecs_reg_pos_deep_y(r: EcsRegPosDeep) -> i32 { return r.y; }
+fn ecs_reg_vel_deep_x(r: EcsRegVelDeep) -> i32 { return r.x; }
+fn ecs_reg_vel_deep_y(r: EcsRegVelDeep) -> i32 { return r.y; }
+fn ecs_reg_marker_deep_value(r: EcsRegMarkerDeep) -> i32 { return r.value; }
+
+struct EcsRegTimeDeep { tick: i32 }
+struct EcsRegEventDeep { amount: i32 }
+
+fn ecs_reg_time_deep_new(tick: i32) -> EcsRegTimeDeep { return EcsRegTimeDeep { tick: tick }; }
+fn ecs_reg_time_deep_tick(r: EcsRegTimeDeep) -> i32 { return r.tick; }
+fn ecs_reg_event_deep_new(amount: i32) -> EcsRegEventDeep { return EcsRegEventDeep { amount: amount }; }
+fn ecs_reg_event_deep_amount(r: EcsRegEventDeep) -> i32 { return r.amount; }
+
+// ── Component-info wrapper (mirrors shallow `ComponentInfo { id }`). ────────────────────────
+struct EcsRegCompInfoDeep { id: i32 }
+fn ecs_reg_comp_info_id_deep(r: EcsRegCompInfoDeep) -> i32 { return r.id; }
+
+// ── Register wrapper (returns world + info so tests can chain register calls without tuple
+//    destructuring -- Batch 373 rule). Mirrors Batch 383 `_w`-suffix register pattern. ──────
+struct EcsRegRegisterDeep { world: EcsRegWorldDeep, info: EcsRegCompInfoDeep }
+fn ecs_reg_register_world_deep(r: EcsRegRegisterDeep) -> EcsRegWorldDeep { return r.world; }
+fn ecs_reg_register_info_deep(r: EcsRegRegisterDeep) -> EcsRegCompInfoDeep { return r.info; }
+
+// ── Spawn wrapper (mirrors shallow `(world, entity)` registry_world_spawn). ─────────────────
+struct EcsRegSpawnDeep { world: EcsRegWorldDeep, entity: EcsRegEntityDeep }
+fn ecs_reg_spawn_world_deep(r: EcsRegSpawnDeep) -> EcsRegWorldDeep { return r.world; }
+fn ecs_reg_spawn_entity_deep(r: EcsRegSpawnDeep) -> EcsRegEntityDeep { return r.entity; }
+
+// ── World: cap-16 entities x cap-8 columns. Each column has per-entity:
+//   present0..7 bitmasks (cap-8 columns, i32 bitmask over cap-16 entities),
+//   added_tick0..7 (per-column flat cap-16 per-entity), changed_tick0..7 likewise.
+// Typed storage is kept in three parallel arrays per type (cap-8 columns * cap-16 entity rows);
+// each typed-cell holds a (x, y) or (value) -- represented as a single i32 pair stored as
+// (valLo, valHi) for Pos/Vel (where valLo = x, valHi = y), and a single val (= value) for Marker.
+// Per-column-per-entity typed storage is itself a cap-16 array per column; since we have cap-8
+// columns max and cap-4 typed-column slots per type suffice for the test (3 columns), we lay out
+// per-column typed arrays keyed entirely by column index (0..7) -- one massive parallel block per
+// type, each carrying cap-8 columns x cap-16 rows. To keep the struct literal sane, we use a flat
+// naming: `pos_x_{col}_{eid}` is dense but unwieldy; instead we expose `pos_col0_x0 .. pos_col0_x15`
+// blocks for col 0..7 -> that is cap-8 * cap-16 = 128 fields per type. Compactly we keep typed storage
+// INSIDE per-column wrapper structs `EcsRegColDeepPos { x0..x15, y0..y15 }` (one per col) and have the
+// world hold `pos_col0..pos_col7` EcsRegColDeepPos slots, Vel likewise, Marker single-valued per col.
+//
+// Field-assign on the world's typed slots is done in cascade-of-return cascade helpers.
+struct EcsRegColDeepPos {
+    x0: i32, x1: i32, x2: i32, x3: i32, x4: i32, x5: i32, x6: i32, x7: i32,
+    x8: i32, x9: i32, x10: i32, x11: i32, x12: i32, x13: i32, x14: i32, x15: i32,
+    y0: i32, y1: i32, y2: i32, y3: i32, y4: i32, y5: i32, y6: i32, y7: i32,
+    y8: i32, y9: i32, y10: i32, y11: i32, y12: i32, y13: i32, y14: i32, y15: i32
+}
+
+fn _ecs_reg_col_pos_empty() -> EcsRegColDeepPos {
+    return EcsRegColDeepPos {
+        x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
+        x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
+        y0: 0, y1: 0, y2: 0, y3: 0, y4: 0, y5: 0, y6: 0, y7: 0,
+        y8: 0, y9: 0, y10: 0, y11: 0, y12: 0, y13: 0, y14: 0, y15: 0
+    };
+}
+
+fn _ecs_reg_col_pos_x_at(col: EcsRegColDeepPos, eid: i32) -> i32 {
+    if eid == 0 { return col.x0; };
+    if eid == 1 { return col.x1; };
+    if eid == 2 { return col.x2; };
+    if eid == 3 { return col.x3; };
+    if eid == 4 { return col.x4; };
+    if eid == 5 { return col.x5; };
+    if eid == 6 { return col.x6; };
+    if eid == 7 { return col.x7; };
+    if eid == 8 { return col.x8; };
+    if eid == 9 { return col.x9; };
+    if eid == 10 { return col.x10; };
+    if eid == 11 { return col.x11; };
+    if eid == 12 { return col.x12; };
+    if eid == 13 { return col.x13; };
+    if eid == 14 { return col.x14; };
+    return col.x15;
+}
+
+fn _ecs_reg_col_pos_y_at(col: EcsRegColDeepPos, eid: i32) -> i32 {
+    if eid == 0 { return col.y0; };
+    if eid == 1 { return col.y1; };
+    if eid == 2 { return col.y2; };
+    if eid == 3 { return col.y3; };
+    if eid == 4 { return col.y4; };
+    if eid == 5 { return col.y5; };
+    if eid == 6 { return col.y6; };
+    if eid == 7 { return col.y7; };
+    if eid == 8 { return col.y8; };
+    if eid == 9 { return col.y9; };
+    if eid == 10 { return col.y10; };
+    if eid == 11 { return col.y11; };
+    if eid == 12 { return col.y12; };
+    if eid == 13 { return col.y13; };
+    if eid == 14 { return col.y14; };
+    return col.y15;
+}
+
+fn _ecs_reg_col_pos_set_x(col0: EcsRegColDeepPos, eid: i32, value: i32) -> EcsRegColDeepPos {
+    if eid == 0 { col0.x0 = value; return col0; };
+    if eid == 1 { col0.x1 = value; return col0; };
+    if eid == 2 { col0.x2 = value; return col0; };
+    if eid == 3 { col0.x3 = value; return col0; };
+    if eid == 4 { col0.x4 = value; return col0; };
+    if eid == 5 { col0.x5 = value; return col0; };
+    if eid == 6 { col0.x6 = value; return col0; };
+    if eid == 7 { col0.x7 = value; return col0; };
+    if eid == 8 { col0.x8 = value; return col0; };
+    if eid == 9 { col0.x9 = value; return col0; };
+    if eid == 10 { col0.x10 = value; return col0; };
+    if eid == 11 { col0.x11 = value; return col0; };
+    if eid == 12 { col0.x12 = value; return col0; };
+    if eid == 13 { col0.x13 = value; return col0; };
+    if eid == 14 { col0.x14 = value; return col0; };
+    col0.x15 = value;
+    return col0;
+}
+
+fn _ecs_reg_col_pos_set_y(col0: EcsRegColDeepPos, eid: i32, value: i32) -> EcsRegColDeepPos {
+    if eid == 0 { col0.y0 = value; return col0; };
+    if eid == 1 { col0.y1 = value; return col0; };
+    if eid == 2 { col0.y2 = value; return col0; };
+    if eid == 3 { col0.y3 = value; return col0; };
+    if eid == 4 { col0.y4 = value; return col0; };
+    if eid == 5 { col0.y5 = value; return col0; };
+    if eid == 6 { col0.y6 = value; return col0; };
+    if eid == 7 { col0.y7 = value; return col0; };
+    if eid == 8 { col0.y8 = value; return col0; };
+    if eid == 9 { col0.y9 = value; return col0; };
+    if eid == 10 { col0.y10 = value; return col0; };
+    if eid == 11 { col0.y11 = value; return col0; };
+    if eid == 12 { col0.y12 = value; return col0; };
+    if eid == 13 { col0.y13 = value; return col0; };
+    if eid == 14 { col0.y14 = value; return col0; };
+    col0.y15 = value;
+    return col0;
+}
+
+// ── Vel column: same shape as Pos. ───────────────────────────────────────────────────────────
+struct EcsRegColDeepVel {
+    x0: i32, x1: i32, x2: i32, x3: i32, x4: i32, x5: i32, x6: i32, x7: i32,
+    x8: i32, x9: i32, x10: i32, x11: i32, x12: i32, x13: i32, x14: i32, x15: i32,
+    y0: i32, y1: i32, y2: i32, y3: i32, y4: i32, y5: i32, y6: i32, y7: i32,
+    y8: i32, y9: i32, y10: i32, y11: i32, y12: i32, y13: i32, y14: i32, y15: i32
+}
+
+fn _ecs_reg_col_vel_empty() -> EcsRegColDeepVel {
+    return EcsRegColDeepVel {
+        x0: 0, x1: 0, x2: 0, x3: 0, x4: 0, x5: 0, x6: 0, x7: 0,
+        x8: 0, x9: 0, x10: 0, x11: 0, x12: 0, x13: 0, x14: 0, x15: 0,
+        y0: 0, y1: 0, y2: 0, y3: 0, y4: 0, y5: 0, y6: 0, y7: 0,
+        y8: 0, y9: 0, y10: 0, y11: 0, y12: 0, y13: 0, y14: 0, y15: 0
+    };
+}
+
+fn _ecs_reg_col_vel_x_at(col: EcsRegColDeepVel, eid: i32) -> i32 {
+    if eid == 0 { return col.x0; };
+    if eid == 1 { return col.x1; };
+    if eid == 2 { return col.x2; };
+    if eid == 3 { return col.x3; };
+    if eid == 4 { return col.x4; };
+    if eid == 5 { return col.x5; };
+    if eid == 6 { return col.x6; };
+    if eid == 7 { return col.x7; };
+    if eid == 8 { return col.x8; };
+    if eid == 9 { return col.x9; };
+    if eid == 10 { return col.x10; };
+    if eid == 11 { return col.x11; };
+    if eid == 12 { return col.x12; };
+    if eid == 13 { return col.x13; };
+    if eid == 14 { return col.x14; };
+    return col.x15;
+}
+
+fn _ecs_reg_col_vel_y_at(col: EcsRegColDeepVel, eid: i32) -> i32 {
+    if eid == 0 { return col.y0; };
+    if eid == 1 { return col.y1; };
+    if eid == 2 { return col.y2; };
+    if eid == 3 { return col.y3; };
+    if eid == 4 { return col.y4; };
+    if eid == 5 { return col.y5; };
+    if eid == 6 { return col.y6; };
+    if eid == 7 { return col.y7; };
+    if eid == 8 { return col.y8; };
+    if eid == 9 { return col.y9; };
+    if eid == 10 { return col.y10; };
+    if eid == 11 { return col.y11; };
+    if eid == 12 { return col.y12; };
+    if eid == 13 { return col.y13; };
+    if eid == 14 { return col.y14; };
+    return col.y15;
+}
+
+fn _ecs_reg_col_vel_set_x(col0: EcsRegColDeepVel, eid: i32, value: i32) -> EcsRegColDeepVel {
+    if eid == 0 { col0.x0 = value; return col0; };
+    if eid == 1 { col0.x1 = value; return col0; };
+    if eid == 2 { col0.x2 = value; return col0; };
+    if eid == 3 { col0.x3 = value; return col0; };
+    if eid == 4 { col0.x4 = value; return col0; };
+    if eid == 5 { col0.x5 = value; return col0; };
+    if eid == 6 { col0.x6 = value; return col0; };
+    if eid == 7 { col0.x7 = value; return col0; };
+    if eid == 8 { col0.x8 = value; return col0; };
+    if eid == 9 { col0.x9 = value; return col0; };
+    if eid == 10 { col0.x10 = value; return col0; };
+    if eid == 11 { col0.x11 = value; return col0; };
+    if eid == 12 { col0.x12 = value; return col0; };
+    if eid == 13 { col0.x13 = value; return col0; };
+    if eid == 14 { col0.x14 = value; return col0; };
+    col0.x15 = value;
+    return col0;
+}
+
+fn _ecs_reg_col_vel_set_y(col0: EcsRegColDeepVel, eid: i32, value: i32) -> EcsRegColDeepVel {
+    if eid == 0 { col0.y0 = value; return col0; };
+    if eid == 1 { col0.y1 = value; return col0; };
+    if eid == 2 { col0.y2 = value; return col0; };
+    if eid == 3 { col0.y3 = value; return col0; };
+    if eid == 4 { col0.y4 = value; return col0; };
+    if eid == 5 { col0.y5 = value; return col0; };
+    if eid == 6 { col0.y6 = value; return col0; };
+    if eid == 7 { col0.y7 = value; return col0; };
+    if eid == 8 { col0.y8 = value; return col0; };
+    if eid == 9 { col0.y9 = value; return col0; };
+    if eid == 10 { col0.y10 = value; return col0; };
+    if eid == 11 { col0.y11 = value; return col0; };
+    if eid == 12 { col0.y12 = value; return col0; };
+    if eid == 13 { col0.y13 = value; return col0; };
+    if eid == 14 { col0.y14 = value; return col0; };
+    col0.y15 = value;
+    return col0;
+}
+
+// ── Marker column: single i32 value per eid. ────────────────────────────────────────────────
+struct EcsRegColDeepMarker {
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32
+}
+
+fn _ecs_reg_col_marker_empty() -> EcsRegColDeepMarker {
+    return EcsRegColDeepMarker {
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        v8: 0, v9: 0, v10: 0, v11: 0, v12: 0, v13: 0, v14: 0, v15: 0
+    };
+}
+
+fn _ecs_reg_col_marker_v_at(col: EcsRegColDeepMarker, eid: i32) -> i32 {
+    if eid == 0 { return col.v0; };
+    if eid == 1 { return col.v1; };
+    if eid == 2 { return col.v2; };
+    if eid == 3 { return col.v3; };
+    if eid == 4 { return col.v4; };
+    if eid == 5 { return col.v5; };
+    if eid == 6 { return col.v6; };
+    if eid == 7 { return col.v7; };
+    if eid == 8 { return col.v8; };
+    if eid == 9 { return col.v9; };
+    if eid == 10 { return col.v10; };
+    if eid == 11 { return col.v11; };
+    if eid == 12 { return col.v12; };
+    if eid == 13 { return col.v13; };
+    if eid == 14 { return col.v14; };
+    return col.v15;
+}
+
+fn _ecs_reg_col_marker_set_v(col0: EcsRegColDeepMarker, eid: i32, value: i32) -> EcsRegColDeepMarker {
+    if eid == 0 { col0.v0 = value; return col0; };
+    if eid == 1 { col0.v1 = value; return col0; };
+    if eid == 2 { col0.v2 = value; return col0; };
+    if eid == 3 { col0.v3 = value; return col0; };
+    if eid == 4 { col0.v4 = value; return col0; };
+    if eid == 5 { col0.v5 = value; return col0; };
+    if eid == 6 { col0.v6 = value; return col0; };
+    if eid == 7 { col0.v7 = value; return col0; };
+    if eid == 8 { col0.v8 = value; return col0; };
+    if eid == 9 { col0.v9 = value; return col0; };
+    if eid == 10 { col0.v10 = value; return col0; };
+    if eid == 11 { col0.v11 = value; return col0; };
+    if eid == 12 { col0.v12 = value; return col0; };
+    if eid == 13 { col0.v13 = value; return col0; };
+    if eid == 14 { col0.v14 = value; return col0; };
+    col0.v15 = value;
+    return col0;
+}
+
+// ── The world. cap-16 entities, cap-8 component columns. Per column:
+//   comp_id (the registered component id), type_id (101=pos/102=vel/103=marker),
+//   storage (0=table, 1=sparse), present (i32 bitmask over cap-16 entity slots),
+//   added_tick (single i32 shared across the column -- the tick the column was registered at),
+//   changed_tick (single i32 shared -- the tick the latest insert/replace touched any entity).
+// Per-entity additions/changes are tracked per-entity via `added_tick_e_{col}_{eid}` flat blocks;
+// we expose them as cap-8 columns each with cap-16 flat per-entity added->tick i32 fields held in
+// EcsRegColTick structs (one per column for added, one per column for changed). The shared
+// `added_tick`/`changed_tick` per column are convenience shortcuts NOT used by the test (the test
+// queries query_added_since(tick=0) and query_changed_since(tick=before) -- comparing per-entity tick).
+struct EcsRegColTickE {
+    t0: i32, t1: i32, t2: i32, t3: i32, t4: i32, t5: i32, t6: i32, t7: i32,
+    t8: i32, t9: i32, t10: i32, t11: i32, t12: i32, t13: i32, t14: i32, t15: i32
+}
+
+fn _ecs_reg_col_ticke_empty() -> EcsRegColTickE {
+    return EcsRegColTickE {
+        t0: 0, t1: 0, t2: 0, t3: 0, t4: 0, t5: 0, t6: 0, t7: 0,
+        t8: 0, t9: 0, t10: 0, t11: 0, t12: 0, t13: 0, t14: 0, t15: 0
+    };
+}
+
+fn _ecs_reg_col_ticke_at(col: EcsRegColTickE, eid: i32) -> i32 {
+    if eid == 0 { return col.t0; };
+    if eid == 1 { return col.t1; };
+    if eid == 2 { return col.t2; };
+    if eid == 3 { return col.t3; };
+    if eid == 4 { return col.t4; };
+    if eid == 5 { return col.t5; };
+    if eid == 6 { return col.t6; };
+    if eid == 7 { return col.t7; };
+    if eid == 8 { return col.t8; };
+    if eid == 9 { return col.t9; };
+    if eid == 10 { return col.t10; };
+    if eid == 11 { return col.t11; };
+    if eid == 12 { return col.t12; };
+    if eid == 13 { return col.t13; };
+    if eid == 14 { return col.t14; };
+    return col.t15;
+}
+
+fn _ecs_reg_col_ticke_set(col0: EcsRegColTickE, eid: i32, value: i32) -> EcsRegColTickE {
+    if eid == 0 { col0.t0 = value; return col0; };
+    if eid == 1 { col0.t1 = value; return col0; };
+    if eid == 2 { col0.t2 = value; return col0; };
+    if eid == 3 { col0.t3 = value; return col0; };
+    if eid == 4 { col0.t4 = value; return col0; };
+    if eid == 5 { col0.t5 = value; return col0; };
+    if eid == 6 { col0.t6 = value; return col0; };
+    if eid == 7 { col0.t7 = value; return col0; };
+    if eid == 8 { col0.t8 = value; return col0; };
+    if eid == 9 { col0.t9 = value; return col0; };
+    if eid == 10 { col0.t10 = value; return col0; };
+    if eid == 11 { col0.t11 = value; return col0; };
+    if eid == 12 { col0.t12 = value; return col0; };
+    if eid == 13 { col0.t13 = value; return col0; };
+    if eid == 14 { col0.t14 = value; return col0; };
+    col0.t15 = value;
+    return col0;
+}
+
+// ── The world. cap-16 entities, cap-8 columns. ───────────────────────────────────────────────
+struct EcsRegWorldDeep {
+    // Entity registry (cap-16).
+    gen0: i32, gen1: i32, gen2: i32, gen3: i32, gen4: i32, gen5: i32, gen6: i32, gen7: i32,
+    gen8: i32, gen9: i32, gen10: i32, gen11: i32, gen12: i32, gen13: i32, gen14: i32, gen15: i32,
+    alive0: i32, alive1: i32, alive2: i32, alive3: i32, alive4: i32, alive5: i32, alive6: i32, alive7: i32,
+    alive8: i32, alive9: i32, alive10: i32, alive11: i32, alive12: i32, alive13: i32, alive14: i32, alive15: i32,
+    next_entity: i32,
+    entity_count: i32,
+    change_tick: i32,
+    // Component columns (cap-8). Each registered column gets a free slot 0..7.
+    comp_count: i32,
+    comp_id0: i32, comp_id1: i32, comp_id2: i32, comp_id3: i32, comp_id4: i32, comp_id5: i32, comp_id6: i32, comp_id7: i32,
+    type_id0: i32, type_id1: i32, type_id2: i32, type_id3: i32, type_id4: i32, type_id5: i32, type_id6: i32, type_id7: i32,
+    storage0: i32, storage1: i32, storage2: i32, storage3: i32, storage4: i32, storage5: i32, storage6: i32, storage7: i32,
+    present0: i32, present1: i32, present2: i32, present3: i32, present4: i32, present5: i32, present6: i32, present7: i32,
+    // Per-entity added-tick / changed-tick per column.
+    added0: EcsRegColTickE, added1: EcsRegColTickE, added2: EcsRegColTickE, added3: EcsRegColTickE,
+    added4: EcsRegColTickE, added5: EcsRegColTickE, added6: EcsRegColTickE, added7: EcsRegColTickE,
+    changed0: EcsRegColTickE, changed1: EcsRegColTickE, changed2: EcsRegColTickE, changed3: EcsRegColTickE,
+    changed4: EcsRegColTickE, changed5: EcsRegColTickE, changed6: EcsRegColTickE, changed7: EcsRegColTickE,
+    // Typed storage slots (cap-8 columns per type).
+    pos_col0: EcsRegColDeepPos, pos_col1: EcsRegColDeepPos, pos_col2: EcsRegColDeepPos, pos_col3: EcsRegColDeepPos,
+    pos_col4: EcsRegColDeepPos, pos_col5: EcsRegColDeepPos, pos_col6: EcsRegColDeepPos, pos_col7: EcsRegColDeepPos,
+    vel_col0: EcsRegColDeepVel, vel_col1: EcsRegColDeepVel, vel_col2: EcsRegColDeepVel, vel_col3: EcsRegColDeepVel,
+    vel_col4: EcsRegColDeepVel, vel_col5: EcsRegColDeepVel, vel_col6: EcsRegColDeepVel, vel_col7: EcsRegColDeepVel,
+    marker_col0: EcsRegColDeepMarker, marker_col1: EcsRegColDeepMarker, marker_col2: EcsRegColDeepMarker, marker_col3: EcsRegColDeepMarker,
+    marker_col4: EcsRegColDeepMarker, marker_col5: EcsRegColDeepMarker, marker_col6: EcsRegColDeepMarker, marker_col7: EcsRegColDeepMarker,
+    // Resource slot (single typed resource: ErasedTestTime).
+    res_time_tick: i32,
+    res_time_set: i32,
+    // Message slot (single typed message: ErasedTestEvent) and a counter.
+    msg_event_amount: i32,
+    msg_count: i32
+}
+
+fn ecs_reg_world_deep_new() -> EcsRegWorldDeep {
+    return EcsRegWorldDeep {
+        gen0: 0, gen1: 0, gen2: 0, gen3: 0, gen4: 0, gen5: 0, gen6: 0, gen7: 0,
+        gen8: 0, gen9: 0, gen10: 0, gen11: 0, gen12: 0, gen13: 0, gen14: 0, gen15: 0,
+        alive0: 0, alive1: 0, alive2: 0, alive3: 0, alive4: 0, alive5: 0, alive6: 0, alive7: 0,
+        alive8: 0, alive9: 0, alive10: 0, alive11: 0, alive12: 0, alive13: 0, alive14: 0, alive15: 0,
+        next_entity: 0, entity_count: 0, change_tick: 0,
+        comp_count: 0,
+        comp_id0: -1, comp_id1: -1, comp_id2: -1, comp_id3: -1, comp_id4: -1, comp_id5: -1, comp_id6: -1, comp_id7: -1,
+        type_id0: -1, type_id1: -1, type_id2: -1, type_id3: -1, type_id4: -1, type_id5: -1, type_id6: -1, type_id7: -1,
+        storage0: -1, storage1: -1, storage2: -1, storage3: -1, storage4: -1, storage5: -1, storage6: -1, storage7: -1,
+        present0: 0, present1: 0, present2: 0, present3: 0, present4: 0, present5: 0, present6: 0, present7: 0,
+        added0: _ecs_reg_col_ticke_empty(), added1: _ecs_reg_col_ticke_empty(), added2: _ecs_reg_col_ticke_empty(), added3: _ecs_reg_col_ticke_empty(),
+        added4: _ecs_reg_col_ticke_empty(), added5: _ecs_reg_col_ticke_empty(), added6: _ecs_reg_col_ticke_empty(), added7: _ecs_reg_col_ticke_empty(),
+        changed0: _ecs_reg_col_ticke_empty(), changed1: _ecs_reg_col_ticke_empty(), changed2: _ecs_reg_col_ticke_empty(), changed3: _ecs_reg_col_ticke_empty(),
+        changed4: _ecs_reg_col_ticke_empty(), changed5: _ecs_reg_col_ticke_empty(), changed6: _ecs_reg_col_ticke_empty(), changed7: _ecs_reg_col_ticke_empty(),
+        pos_col0: _ecs_reg_col_pos_empty(), pos_col1: _ecs_reg_col_pos_empty(), pos_col2: _ecs_reg_col_pos_empty(), pos_col3: _ecs_reg_col_pos_empty(),
+        pos_col4: _ecs_reg_col_pos_empty(), pos_col5: _ecs_reg_col_pos_empty(), pos_col6: _ecs_reg_col_pos_empty(), pos_col7: _ecs_reg_col_pos_empty(),
+        vel_col0: _ecs_reg_col_vel_empty(), vel_col1: _ecs_reg_col_vel_empty(), vel_col2: _ecs_reg_col_vel_empty(), vel_col3: _ecs_reg_col_vel_empty(),
+        vel_col4: _ecs_reg_col_vel_empty(), vel_col5: _ecs_reg_col_vel_empty(), vel_col6: _ecs_reg_col_vel_empty(), vel_col7: _ecs_reg_col_vel_empty(),
+        marker_col0: _ecs_reg_col_marker_empty(), marker_col1: _ecs_reg_col_marker_empty(), marker_col2: _ecs_reg_col_marker_empty(), marker_col3: _ecs_reg_col_marker_empty(),
+        marker_col4: _ecs_reg_col_marker_empty(), marker_col5: _ecs_reg_col_marker_empty(), marker_col6: _ecs_reg_col_marker_empty(), marker_col7: _ecs_reg_col_marker_empty(),
+        res_time_tick: 0, res_time_set: 0,
+        msg_event_amount: 0, msg_count: 0
+    };
+}
+
+// ── Per-entity gen/alive accessors (16-case cascade-of-return). ───────────────────────────────
+fn _ecs_reg_world_deep_gen_at(w: EcsRegWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.gen0; };
+    if eid == 1 { return w.gen1; };
+    if eid == 2 { return w.gen2; };
+    if eid == 3 { return w.gen3; };
+    if eid == 4 { return w.gen4; };
+    if eid == 5 { return w.gen5; };
+    if eid == 6 { return w.gen6; };
+    if eid == 7 { return w.gen7; };
+    if eid == 8 { return w.gen8; };
+    if eid == 9 { return w.gen9; };
+    if eid == 10 { return w.gen10; };
+    if eid == 11 { return w.gen11; };
+    if eid == 12 { return w.gen12; };
+    if eid == 13 { return w.gen13; };
+    if eid == 14 { return w.gen14; };
+    return w.gen15;
+}
+
+fn _ecs_reg_world_deep_set_gen(w0: EcsRegWorldDeep, eid: i32, value: i32) -> EcsRegWorldDeep {
+    if eid == 0 { w0.gen0 = value; return w0; };
+    if eid == 1 { w0.gen1 = value; return w0; };
+    if eid == 2 { w0.gen2 = value; return w0; };
+    if eid == 3 { w0.gen3 = value; return w0; };
+    if eid == 4 { w0.gen4 = value; return w0; };
+    if eid == 5 { w0.gen5 = value; return w0; };
+    if eid == 6 { w0.gen6 = value; return w0; };
+    if eid == 7 { w0.gen7 = value; return w0; };
+    if eid == 8 { w0.gen8 = value; return w0; };
+    if eid == 9 { w0.gen9 = value; return w0; };
+    if eid == 10 { w0.gen10 = value; return w0; };
+    if eid == 11 { w0.gen11 = value; return w0; };
+    if eid == 12 { w0.gen12 = value; return w0; };
+    if eid == 13 { w0.gen13 = value; return w0; };
+    if eid == 14 { w0.gen14 = value; return w0; };
+    w0.gen15 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_alive_at(w: EcsRegWorldDeep, eid: i32) -> i32 {
+    if eid == 0 { return w.alive0; };
+    if eid == 1 { return w.alive1; };
+    if eid == 2 { return w.alive2; };
+    if eid == 3 { return w.alive3; };
+    if eid == 4 { return w.alive4; };
+    if eid == 5 { return w.alive5; };
+    if eid == 6 { return w.alive6; };
+    if eid == 7 { return w.alive7; };
+    if eid == 8 { return w.alive8; };
+    if eid == 9 { return w.alive9; };
+    if eid == 10 { return w.alive10; };
+    if eid == 11 { return w.alive11; };
+    if eid == 12 { return w.alive12; };
+    if eid == 13 { return w.alive13; };
+    if eid == 14 { return w.alive14; };
+    return w.alive15;
+}
+
+fn _ecs_reg_world_deep_set_alive(w0: EcsRegWorldDeep, eid: i32, value: i32) -> EcsRegWorldDeep {
+    if eid == 0 { w0.alive0 = value; return w0; };
+    if eid == 1 { w0.alive1 = value; return w0; };
+    if eid == 2 { w0.alive2 = value; return w0; };
+    if eid == 3 { w0.alive3 = value; return w0; };
+    if eid == 4 { w0.alive4 = value; return w0; };
+    if eid == 5 { w0.alive5 = value; return w0; };
+    if eid == 6 { w0.alive6 = value; return w0; };
+    if eid == 7 { w0.alive7 = value; return w0; };
+    if eid == 8 { w0.alive8 = value; return w0; };
+    if eid == 9 { w0.alive9 = value; return w0; };
+    if eid == 10 { w0.alive10 = value; return w0; };
+    if eid == 11 { w0.alive11 = value; return w0; };
+    if eid == 12 { w0.alive12 = value; return w0; };
+    if eid == 13 { w0.alive13 = value; return w0; };
+    if eid == 14 { w0.alive14 = value; return w0; };
+    w0.alive15 = value;
+    return w0;
+}
+
+// ── Per-column scalar accessors (8-case cascade-of-return). ───────────────────────────────────
+fn _ecs_reg_world_deep_comp_id_at(w: EcsRegWorldDeep, col: i32) -> i32 {
+    if col == 0 { return w.comp_id0; };
+    if col == 1 { return w.comp_id1; };
+    if col == 2 { return w.comp_id2; };
+    if col == 3 { return w.comp_id3; };
+    if col == 4 { return w.comp_id4; };
+    if col == 5 { return w.comp_id5; };
+    if col == 6 { return w.comp_id6; };
+    return w.comp_id7;
+}
+
+fn _ecs_reg_world_deep_set_comp_id(w0: EcsRegWorldDeep, col: i32, value: i32) -> EcsRegWorldDeep {
+    if col == 0 { w0.comp_id0 = value; return w0; };
+    if col == 1 { w0.comp_id1 = value; return w0; };
+    if col == 2 { w0.comp_id2 = value; return w0; };
+    if col == 3 { w0.comp_id3 = value; return w0; };
+    if col == 4 { w0.comp_id4 = value; return w0; };
+    if col == 5 { w0.comp_id5 = value; return w0; };
+    if col == 6 { w0.comp_id6 = value; return w0; };
+    w0.comp_id7 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_type_id_at(w: EcsRegWorldDeep, col: i32) -> i32 {
+    if col == 0 { return w.type_id0; };
+    if col == 1 { return w.type_id1; };
+    if col == 2 { return w.type_id2; };
+    if col == 3 { return w.type_id3; };
+    if col == 4 { return w.type_id4; };
+    if col == 5 { return w.type_id5; };
+    if col == 6 { return w.type_id6; };
+    return w.type_id7;
+}
+
+fn _ecs_reg_world_deep_set_type_id(w0: EcsRegWorldDeep, col: i32, value: i32) -> EcsRegWorldDeep {
+    if col == 0 { w0.type_id0 = value; return w0; };
+    if col == 1 { w0.type_id1 = value; return w0; };
+    if col == 2 { w0.type_id2 = value; return w0; };
+    if col == 3 { w0.type_id3 = value; return w0; };
+    if col == 4 { w0.type_id4 = value; return w0; };
+    if col == 5 { w0.type_id5 = value; return w0; };
+    if col == 6 { w0.type_id6 = value; return w0; };
+    w0.type_id7 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_storage_at(w: EcsRegWorldDeep, col: i32) -> i32 {
+    if col == 0 { return w.storage0; };
+    if col == 1 { return w.storage1; };
+    if col == 2 { return w.storage2; };
+    if col == 3 { return w.storage3; };
+    if col == 4 { return w.storage4; };
+    if col == 5 { return w.storage5; };
+    if col == 6 { return w.storage6; };
+    return w.storage7;
+}
+
+fn _ecs_reg_world_deep_set_storage(w0: EcsRegWorldDeep, col: i32, value: i32) -> EcsRegWorldDeep {
+    if col == 0 { w0.storage0 = value; return w0; };
+    if col == 1 { w0.storage1 = value; return w0; };
+    if col == 2 { w0.storage2 = value; return w0; };
+    if col == 3 { w0.storage3 = value; return w0; };
+    if col == 4 { w0.storage4 = value; return w0; };
+    if col == 5 { w0.storage5 = value; return w0; };
+    if col == 6 { w0.storage6 = value; return w0; };
+    w0.storage7 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_present_at(w: EcsRegWorldDeep, col: i32) -> i32 {
+    if col == 0 { return w.present0; };
+    if col == 1 { return w.present1; };
+    if col == 2 { return w.present2; };
+    if col == 3 { return w.present3; };
+    if col == 4 { return w.present4; };
+    if col == 5 { return w.present5; };
+    if col == 6 { return w.present6; };
+    return w.present7;
+}
+
+fn _ecs_reg_world_deep_set_present(w0: EcsRegWorldDeep, col: i32, value: i32) -> EcsRegWorldDeep {
+    if col == 0 { w0.present0 = value; return w0; };
+    if col == 1 { w0.present1 = value; return w0; };
+    if col == 2 { w0.present2 = value; return w0; };
+    if col == 3 { w0.present3 = value; return w0; };
+    if col == 4 { w0.present4 = value; return w0; };
+    if col == 5 { w0.present5 = value; return w0; };
+    if col == 6 { w0.present6 = value; return w0; };
+    w0.present7 = value;
+    return w0;
+}
+
+// ── Per-column per-entity tick-tick accessors (added / changed). ──────────────────────────────
+fn _ecs_reg_world_deep_added_at(w: EcsRegWorldDeep, col: i32) -> EcsRegColTickE {
+    if col == 0 { return w.added0; };
+    if col == 1 { return w.added1; };
+    if col == 2 { return w.added2; };
+    if col == 3 { return w.added3; };
+    if col == 4 { return w.added4; };
+    if col == 5 { return w.added5; };
+    if col == 6 { return w.added6; };
+    return w.added7;
+}
+
+fn _ecs_reg_world_deep_set_added(w0: EcsRegWorldDeep, col: i32, value: EcsRegColTickE) -> EcsRegWorldDeep {
+    if col == 0 { w0.added0 = value; return w0; };
+    if col == 1 { w0.added1 = value; return w0; };
+    if col == 2 { w0.added2 = value; return w0; };
+    if col == 3 { w0.added3 = value; return w0; };
+    if col == 4 { w0.added4 = value; return w0; };
+    if col == 5 { w0.added5 = value; return w0; };
+    if col == 6 { w0.added6 = value; return w0; };
+    w0.added7 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_changed_at(w: EcsRegWorldDeep, col: i32) -> EcsRegColTickE {
+    if col == 0 { return w.changed0; };
+    if col == 1 { return w.changed1; };
+    if col == 2 { return w.changed2; };
+    if col == 3 { return w.changed3; };
+    if col == 4 { return w.changed4; };
+    if col == 5 { return w.changed5; };
+    if col == 6 { return w.changed6; };
+    return w.changed7;
+}
+
+fn _ecs_reg_world_deep_set_changed(w0: EcsRegWorldDeep, col: i32, value: EcsRegColTickE) -> EcsRegWorldDeep {
+    if col == 0 { w0.changed0 = value; return w0; };
+    if col == 1 { w0.changed1 = value; return w0; };
+    if col == 2 { w0.changed2 = value; return w0; };
+    if col == 3 { w0.changed3 = value; return w0; };
+    if col == 4 { w0.changed4 = value; return w0; };
+    if col == 5 { w0.changed5 = value; return w0; };
+    if col == 6 { w0.changed6 = value; return w0; };
+    w0.changed7 = value;
+    return w0;
+}
+
+// ── Per-column typed-slot accessors + setters. ───────────────────────────────────────────────
+fn _ecs_reg_world_deep_pos_col_at(w: EcsRegWorldDeep, col: i32) -> EcsRegColDeepPos {
+    if col == 0 { return w.pos_col0; };
+    if col == 1 { return w.pos_col1; };
+    if col == 2 { return w.pos_col2; };
+    if col == 3 { return w.pos_col3; };
+    if col == 4 { return w.pos_col4; };
+    if col == 5 { return w.pos_col5; };
+    if col == 6 { return w.pos_col6; };
+    return w.pos_col7;
+}
+
+fn _ecs_reg_world_deep_set_pos_col(w0: EcsRegWorldDeep, col: i32, value: EcsRegColDeepPos) -> EcsRegWorldDeep {
+    if col == 0 { w0.pos_col0 = value; return w0; };
+    if col == 1 { w0.pos_col1 = value; return w0; };
+    if col == 2 { w0.pos_col2 = value; return w0; };
+    if col == 3 { w0.pos_col3 = value; return w0; };
+    if col == 4 { w0.pos_col4 = value; return w0; };
+    if col == 5 { w0.pos_col5 = value; return w0; };
+    if col == 6 { w0.pos_col6 = value; return w0; };
+    w0.pos_col7 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_vel_col_at(w: EcsRegWorldDeep, col: i32) -> EcsRegColDeepVel {
+    if col == 0 { return w.vel_col0; };
+    if col == 1 { return w.vel_col1; };
+    if col == 2 { return w.vel_col2; };
+    if col == 3 { return w.vel_col3; };
+    if col == 4 { return w.vel_col4; };
+    if col == 5 { return w.vel_col5; };
+    if col == 6 { return w.vel_col6; };
+    return w.vel_col7;
+}
+
+fn _ecs_reg_world_deep_set_vel_col(w0: EcsRegWorldDeep, col: i32, value: EcsRegColDeepVel) -> EcsRegWorldDeep {
+    if col == 0 { w0.vel_col0 = value; return w0; };
+    if col == 1 { w0.vel_col1 = value; return w0; };
+    if col == 2 { w0.vel_col2 = value; return w0; };
+    if col == 3 { w0.vel_col3 = value; return w0; };
+    if col == 4 { w0.vel_col4 = value; return w0; };
+    if col == 5 { w0.vel_col5 = value; return w0; };
+    if col == 6 { w0.vel_col6 = value; return w0; };
+    w0.vel_col7 = value;
+    return w0;
+}
+
+fn _ecs_reg_world_deep_marker_col_at(w: EcsRegWorldDeep, col: i32) -> EcsRegColDeepMarker {
+    if col == 0 { return w.marker_col0; };
+    if col == 1 { return w.marker_col1; };
+    if col == 2 { return w.marker_col2; };
+    if col == 3 { return w.marker_col3; };
+    if col == 4 { return w.marker_col4; };
+    if col == 5 { return w.marker_col5; };
+    if col == 6 { return w.marker_col6; };
+    return w.marker_col7;
+}
+
+fn _ecs_reg_world_deep_set_marker_col(w0: EcsRegWorldDeep, col: i32, value: EcsRegColDeepMarker) -> EcsRegWorldDeep {
+    if col == 0 { w0.marker_col0 = value; return w0; };
+    if col == 1 { w0.marker_col1 = value; return w0; };
+    if col == 2 { w0.marker_col2 = value; return w0; };
+    if col == 3 { w0.marker_col3 = value; return w0; };
+    if col == 4 { w0.marker_col4 = value; return w0; };
+    if col == 5 { w0.marker_col5 = value; return w0; };
+    if col == 6 { w0.marker_col6 = value; return w0; };
+    w0.marker_col7 = value;
+    return w0;
+}
+
+// ── Bit helpers for the per-column `present` bitmask over cap-16 entities. ───────────────────
+fn _ecs_reg_bit_mask(eid: i32) -> i32 {
+    if eid == 0 { return 1; };
+    if eid == 1 { return 2; };
+    if eid == 2 { return 4; };
+    if eid == 3 { return 8; };
+    if eid == 4 { return 16; };
+    if eid == 5 { return 32; };
+    if eid == 6 { return 64; };
+    if eid == 7 { return 128; };
+    if eid == 8 { return 256; };
+    if eid == 9 { return 512; };
+    if eid == 10 { return 1024; };
+    if eid == 11 { return 2048; };
+    if eid == 12 { return 4096; };
+    if eid == 13 { return 8192; };
+    if eid == 14 { return 16384; };
+    return 32768;
+}
+
+fn _ecs_reg_bit_clear_mask(eid: i32) -> i32 {
+    // signed-NOT forms: present' = present & ~mask.
+    if eid == 0 { return -2; };
+    if eid == 1 { return -3; };
+    if eid == 2 { return -5; };
+    if eid == 3 { return -9; };
+    if eid == 4 { return -17; };
+    if eid == 5 { return -33; };
+    if eid == 6 { return -65; };
+    if eid == 7 { return -129; };
+    if eid == 8 { return -257; };
+    if eid == 9 { return -513; };
+    if eid == 10 { return -1025; };
+    if eid == 11 { return -2049; };
+    if eid == 12 { return -4097; };
+    if eid == 13 { return -8193; };
+    if eid == 14 { return -16385; };
+    return -32769;
+}
+
+fn _ecs_reg_bit_set(present: i32, eid: i32) -> i32 { return present | _ecs_reg_bit_mask(eid); }
+fn _ecs_reg_bit_clear(present: i32, eid: i32) -> i32 { return present & _ecs_reg_bit_clear_mask(eid); }
+fn _ecs_reg_bit_has(present: i32, eid: i32) -> bool {
+    if (present & _ecs_reg_bit_mask(eid)) != 0 { return true; };
+    return false;
+}
+
+// ── Look up a column index by component id (recursive read-only scan of cap-8 column slots). ───
+fn _ecs_reg_world_deep_find_col(w: EcsRegWorldDeep, comp_id: i32, col: i32) -> i32 {
+    if col >= w.comp_count { return -1; };
+    if _ecs_reg_world_deep_comp_id_at(w, col) == comp_id { return col; };
+    return _ecs_reg_world_deep_find_col(w, comp_id, col + 1);
+}
+
+fn ecs_reg_world_deep_component_count(w: EcsRegWorldDeep) -> i32 { return w.comp_count; }
+fn ecs_reg_world_deep_entity_count(w: EcsRegWorldDeep) -> i32 { return w.entity_count; }
+fn ecs_reg_world_deep_change_tick(w: EcsRegWorldDeep) -> i32 { return w.change_tick; }
+fn ecs_reg_world_deep_increment_tick(w0: EcsRegWorldDeep) -> EcsRegWorldDeep {
+    w0.change_tick = w0.change_tick + 1;
+    return w0;
+}
+
+// ── Spawn: allocate next_entity++ slot, mark alive + entity_count++. cap-16 silent reject. ────
+fn ecs_reg_world_deep_spawn(w0: EcsRegWorldDeep) -> EcsRegSpawnDeep {
+    if w0.next_entity >= ECS_REG_CAP_ENTITIES {
+        return _ecs_reg_spawn_wrap(w0, ecs_reg_entity_new(-1, 0));
+    };
+    let eid = w0.next_entity;
+    w0.next_entity = w0.next_entity + 1;
+    let w1 = _ecs_reg_world_deep_set_alive(w0, eid, 1);
+    w1.entity_count = w1.entity_count + 1;
+    return _ecs_reg_spawn_wrap(w1, ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w1, eid)));
+}
+
+fn _ecs_reg_spawn_wrap(world: EcsRegWorldDeep, entity: EcsRegEntityDeep) -> EcsRegSpawnDeep {
+    return EcsRegSpawnDeep { world: world, entity: entity };
+}
+
+// Spawn `count` entities sequentially, returning the world. Used by tests to fill the cap-16 entity
+// pool without writing 16 explicit let-ladder chains.
+fn ecs_reg_world_deep_spawn_many(w0: EcsRegWorldDeep, count: i32) -> EcsRegWorldDeep {
+    if count <= 0 { return w0; };
+    let sp = ecs_reg_world_deep_spawn(w0);
+    let w1 = ecs_reg_spawn_world_deep(sp);
+    return ecs_reg_world_deep_spawn_many(w1, count - 1);
+}
+
+// Register `count` pos-typed columns sequentially, returning the world. Used by tests to fill cap-8.
+fn ecs_reg_world_deep_register_many(w0: EcsRegWorldDeep, count: i32) -> EcsRegWorldDeep {
+    if count <= 0 { return w0; };
+    let rp = ecs_reg_world_deep_register_table(w0, ECS_REG_TYPE_POS);
+    let w1 = ecs_reg_register_world_deep(rp);
+    return ecs_reg_world_deep_register_many(w1, count - 1);
+}
+
+
+fn ecs_reg_world_deep_is_alive(w: EcsRegWorldDeep, e: EcsRegEntityDeep) -> bool {
+    if e.id < 0 { return false; };
+    if e.id >= ECS_REG_CAP_ENTITIES { return false; };
+    if _ecs_reg_world_deep_alive_at(w, e.id) != 1 { return false; };
+    if _ecs_reg_world_deep_gen_at(w, e.id) != e.generation { return false; };
+    return true;
+}
+
+// ── Register: append a new column in the next free slot. cap-8 silent reject (returns info.id=-1).
+// The shallow registers at increment_tick time; the test asserts the components' ids are stable.
+//   register_table(w, type)        -> (world, ComponentInfo { id = comp_count })
+//   register_sparse_set(w, type)   -> (world, ComponentInfo { id = comp_count })
+// We bump change_tick to match shallow's "register advances tick" framing. ─────────────────────
+fn _ecs_reg_world_deep_register(w0: EcsRegWorldDeep, type_id: i32, storage: i32) -> EcsRegRegisterDeep {
+    let cap = ECS_REG_CAP_COLUMNS;
+    if w0.comp_count >= cap {
+        return _ecs_reg_register_wrap(w0, ecs_reg_comp_info_new(-1));
+    };
+    let slot = w0.comp_count;
+    let w1 = _ecs_reg_world_deep_set_comp_id(w0, slot, slot);
+    let w2 = _ecs_reg_world_deep_set_type_id(w1, slot, type_id);
+    let w3 = _ecs_reg_world_deep_set_storage(w2, slot, storage);
+    let w4 = _ecs_reg_world_deep_set_present(w3, slot, 0);
+    w4.comp_count = w4.comp_count + 1;
+    w4.change_tick = w4.change_tick + 1;
+    return _ecs_reg_register_wrap(w4, ecs_reg_comp_info_new(slot));
+}
+
+fn ecs_reg_comp_info_new(id: i32) -> EcsRegCompInfoDeep { return EcsRegCompInfoDeep { id: id }; }
+
+fn _ecs_reg_register_wrap(world: EcsRegWorldDeep, info: EcsRegCompInfoDeep) -> EcsRegRegisterDeep {
+    return EcsRegRegisterDeep { world: world, info: info };
+}
+
+fn ecs_reg_world_deep_register_table(w0: EcsRegWorldDeep, type_id: i32) -> EcsRegRegisterDeep {
+    return _ecs_reg_world_deep_register(w0, type_id, ECS_REG_STORAGE_TABLE);
+}
+
+fn ecs_reg_world_deep_register_sparse_set(w0: EcsRegWorldDeep, type_id: i32) -> EcsRegRegisterDeep {
+    return _ecs_reg_world_deep_register(w0, type_id, ECS_REG_STORAGE_SPARSE);
+}
+
+// ── Has: present bit set in the column matched by comp_id (and entity alive). ─────────────────
+fn ecs_reg_world_deep_has(w: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32) -> bool {
+    if ecs_reg_world_deep_is_alive(w, e) != true { return false; };
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return false; };
+    return _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, col), e.id);
+}
+
+// ── Per-type insert: writes the typed value into the matched column's typed-slot, sets the
+//    present bit, sets added[ent]=tick IF NOT already present (mirrors shallow insert semantics
+//    where insert into absent records added_tick; replace when already present), sets changed[ent].
+// Updates changed_only (when already_present==true) OR both added+changed (when first insertion).
+// Two distinct entrypoints to avoid the Batch 378 SA-swallow bug for field-assign inside an if-guard:
+// `set_changed_only` writes only `changed`; `set_added_and_changed` writes both.  We dispatch
+// externally instead of branching internally so neither branch is an if-guard field-assign chain.
+fn _ecs_reg_world_deep_insert_set_tick(w0: EcsRegWorldDeep, col: i32, eid: i32, tick: i32, was_present: bool) -> EcsRegWorldDeep {
+    if was_present != true {
+        return _ecs_reg_world_deep_set_added_and_changed(w0, col, eid, tick);
+    };
+    return _ecs_reg_world_deep_set_changed_only(w0, col, eid, tick);
+}
+
+fn _ecs_reg_world_deep_set_added_and_changed(w0: EcsRegWorldDeep, col: i32, eid: i32, tick: i32) -> EcsRegWorldDeep {
+    let cur_added = _ecs_reg_world_deep_added_at(w0, col);
+    let added_upd = _ecs_reg_col_ticke_set(cur_added, eid, tick);
+    let w1 = _ecs_reg_world_deep_set_added(w0, col, added_upd);
+    let cur_changed = _ecs_reg_world_deep_changed_at(w1, col);
+    let changed_upd = _ecs_reg_col_ticke_set(cur_changed, eid, tick);
+    return _ecs_reg_world_deep_set_changed(w1, col, changed_upd);
+}
+
+fn _ecs_reg_world_deep_set_changed_only(w0: EcsRegWorldDeep, col: i32, eid: i32, tick: i32) -> EcsRegWorldDeep {
+    let cur_changed = _ecs_reg_world_deep_changed_at(w0, col);
+    let changed_upd = _ecs_reg_col_ticke_set(cur_changed, eid, tick);
+    return _ecs_reg_world_deep_set_changed(w0, col, changed_upd);
+}
+
+fn ecs_reg_world_deep_insert_pos(w0: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32, value: EcsRegPosDeep) -> EcsRegWorldDeep {
+    if ecs_reg_world_deep_is_alive(w0, e) != true { return w0; };
+    let col = _ecs_reg_world_deep_find_col(w0, comp_id, 0);
+    if col < 0 { return w0; };
+    let was_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w0, col), e.id);
+    let cur_col = _ecs_reg_world_deep_pos_col_at(w0, col);
+    let with_x = _ecs_reg_col_pos_set_x(cur_col, e.id, value.x);
+    let with_y = _ecs_reg_col_pos_set_y(with_x, e.id, value.y);
+    let w1 = _ecs_reg_world_deep_set_pos_col(w0, col, with_y);
+    let present = _ecs_reg_bit_set(_ecs_reg_world_deep_present_at(w1, col), e.id);
+    let w2 = _ecs_reg_world_deep_set_present(w1, col, present);
+    return _ecs_reg_world_deep_insert_set_tick(w2, col, e.id, w0.change_tick, was_present);
+}
+
+fn ecs_reg_world_deep_insert_vel(w0: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32, value: EcsRegVelDeep) -> EcsRegWorldDeep {
+    if ecs_reg_world_deep_is_alive(w0, e) != true { return w0; };
+    let col = _ecs_reg_world_deep_find_col(w0, comp_id, 0);
+    if col < 0 { return w0; };
+    let was_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w0, col), e.id);
+    let cur_col = _ecs_reg_world_deep_vel_col_at(w0, col);
+    let with_x = _ecs_reg_col_vel_set_x(cur_col, e.id, value.x);
+    let with_y = _ecs_reg_col_vel_set_y(with_x, e.id, value.y);
+    let w1 = _ecs_reg_world_deep_set_vel_col(w0, col, with_y);
+    let present = _ecs_reg_bit_set(_ecs_reg_world_deep_present_at(w1, col), e.id);
+    let w2 = _ecs_reg_world_deep_set_present(w1, col, present);
+    return _ecs_reg_world_deep_insert_set_tick(w2, col, e.id, w0.change_tick, was_present);
+}
+
+fn ecs_reg_world_deep_insert_marker(w0: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32, value: EcsRegMarkerDeep) -> EcsRegWorldDeep {
+    if ecs_reg_world_deep_is_alive(w0, e) != true { return w0; };
+    let col = _ecs_reg_world_deep_find_col(w0, comp_id, 0);
+    if col < 0 { return w0; };
+    let was_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w0, col), e.id);
+    let cur_col = _ecs_reg_world_deep_marker_col_at(w0, col);
+    let with_v = _ecs_reg_col_marker_set_v(cur_col, e.id, value.value);
+    let w1 = _ecs_reg_world_deep_set_marker_col(w0, col, with_v);
+    let present = _ecs_reg_bit_set(_ecs_reg_world_deep_present_at(w1, col), e.id);
+    let w2 = _ecs_reg_world_deep_set_present(w1, col, present);
+    return _ecs_reg_world_deep_insert_set_tick(w2, col, e.id, w0.change_tick, was_present);
+}
+
+// ── Per-type get: read the typed value from the matched column's typed-slot. ──────────────────
+fn ecs_reg_world_deep_get_pos(w: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32) -> EcsRegPosDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return ecs_reg_pos_deep_new(0, 0); };
+    let slot = _ecs_reg_world_deep_pos_col_at(w, col);
+    return ecs_reg_pos_deep_new(_ecs_reg_col_pos_x_at(slot, e.id), _ecs_reg_col_pos_y_at(slot, e.id));
+}
+
+fn ecs_reg_world_deep_get_vel(w: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32) -> EcsRegVelDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return ecs_reg_vel_deep_new(0, 0); };
+    let slot = _ecs_reg_world_deep_vel_col_at(w, col);
+    return ecs_reg_vel_deep_new(_ecs_reg_col_vel_x_at(slot, e.id), _ecs_reg_col_vel_y_at(slot, e.id));
+}
+
+fn ecs_reg_world_deep_get_marker(w: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32) -> EcsRegMarkerDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return ecs_reg_marker_deep_new(0); };
+    let slot = _ecs_reg_world_deep_marker_col_at(w, col);
+    return ecs_reg_marker_deep_new(_ecs_reg_col_marker_v_at(slot, e.id));
+}
+
+// ── Remove: clear the present bit + clear the changed/added tick for the entity. Writes the typed
+//    slot back to 0 for tidiness (matching shallow's Vec retain drop semantics). ───────────────
+fn ecs_reg_world_deep_remove(w0: EcsRegWorldDeep, e: EcsRegEntityDeep, comp_id: i32) -> EcsRegWorldDeep {
+    if ecs_reg_world_deep_is_alive(w0, e) != true { return w0; };
+    let col = _ecs_reg_world_deep_find_col(w0, comp_id, 0);
+    if col < 0 { return w0; };
+    let present = _ecs_reg_bit_clear(_ecs_reg_world_deep_present_at(w0, col), e.id);
+    let w1 = _ecs_reg_world_deep_set_present(w0, col, present);
+    let cur_added = _ecs_reg_world_deep_added_at(w1, col);
+    let cur_changed = _ecs_reg_world_deep_changed_at(w1, col);
+    let added_upd = _ecs_reg_col_ticke_set(cur_added, e.id, ECS_REG_TICK_NONE);
+    let changed_upd = _ecs_reg_col_ticke_set(cur_changed, e.id, ECS_REG_TICK_NONE);
+    let w2 = _ecs_reg_world_deep_set_added(w1, col, added_upd);
+    let w3 = _ecs_reg_world_deep_set_changed(w2, col, changed_upd);
+    let type_id = _ecs_reg_world_deep_type_id_at(w3, col);
+    if type_id == ECS_REG_TYPE_POS {
+        let cur_col = _ecs_reg_world_deep_pos_col_at(w3, col);
+        let cleared = _ecs_reg_col_pos_set_y(_ecs_reg_col_pos_set_x(cur_col, e.id, 0), e.id, 0);
+        return _ecs_reg_world_deep_set_pos_col(w3, col, cleared);
+    };
+    if type_id == ECS_REG_TYPE_VEL {
+        let cur_col = _ecs_reg_world_deep_vel_col_at(w3, col);
+        let cleared = _ecs_reg_col_vel_set_y(_ecs_reg_col_vel_set_x(cur_col, e.id, 0), e.id, 0);
+        return _ecs_reg_world_deep_set_vel_col(w3, col, cleared);
+    };
+    let cur_col = _ecs_reg_world_deep_marker_col_at(w3, col);
+    let cleared = _ecs_reg_col_marker_set_v(cur_col, e.id, 0);
+    return _ecs_reg_world_deep_set_marker_col(w3, col, cleared);
+}
+
+// ── Despawn: alive=0, gen+1, entity_count--. Removes all present components for the entity before
+//    death so subsequent `has` checks return false. ───────────────────────────────────────────
+fn _ecs_reg_world_deep_despawn_cols(w0: EcsRegWorldDeep, e: EcsRegEntityDeep, col: i32) -> EcsRegWorldDeep {
+    if col >= ECS_REG_CAP_COLUMNS { return w0; };
+    if col >= w0.comp_count { return w0; };
+    if _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w0, col), e.id) {
+        let comp_id = _ecs_reg_world_deep_comp_id_at(w0, col);
+        let w1 = ecs_reg_world_deep_remove(w0, e, comp_id);
+        return _ecs_reg_world_deep_despawn_cols(w1, e, col + 1);
+    };
+    return _ecs_reg_world_deep_despawn_cols(w0, e, col + 1);
+}
+
+fn ecs_reg_world_deep_despawn(w0: EcsRegWorldDeep, e: EcsRegEntityDeep) -> EcsRegWorldDeep {
+    if ecs_reg_world_deep_is_alive(w0, e) != true { return w0; };
+    let w1 = _ecs_reg_world_deep_despawn_cols(w0, e, 0);
+    let w2 = _ecs_reg_world_deep_set_alive(w1, e.id, 0);
+    let g = _ecs_reg_world_deep_gen_at(w2, e.id);
+    let w3 = _ecs_reg_world_deep_set_gen(w2, e.id, g + 1);
+    w3.entity_count = w3.entity_count - 1;
+    return w3;
+}
+
+// ── Query results: cap-16 matched entities. Mirrors shallow `Query<EntityItem<T>>`. ──────────
+struct EcsRegQueryDeep { count: i32, e0: EcsRegEntityDeep, e1: EcsRegEntityDeep, e2: EcsRegEntityDeep, e3: EcsRegEntityDeep, e4: EcsRegEntityDeep, e5: EcsRegEntityDeep, e6: EcsRegEntityDeep, e7: EcsRegEntityDeep, e8: EcsRegEntityDeep, e9: EcsRegEntityDeep, e10: EcsRegEntityDeep, e11: EcsRegEntityDeep, e12: EcsRegEntityDeep, e13: EcsRegEntityDeep, e14: EcsRegEntityDeep, e15: EcsRegEntityDeep }
+
+fn _ecs_reg_query_empty() -> EcsRegQueryDeep {
+    return EcsRegQueryDeep {
+        count: 0,
+        e0: ecs_reg_entity_new(-1, 0), e1: ecs_reg_entity_new(-1, 0), e2: ecs_reg_entity_new(-1, 0), e3: ecs_reg_entity_new(-1, 0),
+        e4: ecs_reg_entity_new(-1, 0), e5: ecs_reg_entity_new(-1, 0), e6: ecs_reg_entity_new(-1, 0), e7: ecs_reg_entity_new(-1, 0),
+        e8: ecs_reg_entity_new(-1, 0), e9: ecs_reg_entity_new(-1, 0), e10: ecs_reg_entity_new(-1, 0), e11: ecs_reg_entity_new(-1, 0),
+        e12: ecs_reg_entity_new(-1, 0), e13: ecs_reg_entity_new(-1, 0), e14: ecs_reg_entity_new(-1, 0), e15: ecs_reg_entity_new(-1, 0)
+    };
+}
+
+fn ecs_reg_query_deep_count(r: EcsRegQueryDeep) -> i32 { return r.count; }
+
+fn ecs_reg_query_deep_at(r: EcsRegQueryDeep, idx: i32) -> EcsRegEntityDeep {
+    if idx == 0 { return r.e0; };
+    if idx == 1 { return r.e1; };
+    if idx == 2 { return r.e2; };
+    if idx == 3 { return r.e3; };
+    if idx == 4 { return r.e4; };
+    if idx == 5 { return r.e5; };
+    if idx == 6 { return r.e6; };
+    if idx == 7 { return r.e7; };
+    if idx == 8 { return r.e8; };
+    if idx == 9 { return r.e9; };
+    if idx == 10 { return r.e10; };
+    if idx == 11 { return r.e11; };
+    if idx == 12 { return r.e12; };
+    if idx == 13 { return r.e13; };
+    if idx == 14 { return r.e14; };
+    return r.e15;
+}
+
+fn _ecs_reg_query_push(r0: EcsRegQueryDeep, k: i32, ent: EcsRegEntityDeep) -> EcsRegQueryDeep {
+    if r0.count >= ECS_REG_CAP_ENTITIES { return r0; };
+    if k == 0 { r0.e0 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 1 { r0.e1 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 2 { r0.e2 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 3 { r0.e3 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 4 { r0.e4 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 5 { r0.e5 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 6 { r0.e6 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 7 { r0.e7 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 8 { r0.e8 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 9 { r0.e9 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 10 { r0.e10 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 11 { r0.e11 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 12 { r0.e12 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 13 { r0.e13 = ent; r0.count = r0.count + 1; return r0; };
+    if k == 14 { r0.e14 = ent; r0.count = r0.count + 1; return r0; };
+    r0.e15 = ent;
+    r0.count = r0.count + 1;
+    return r0;
+}
+
+// Recursive entity scan: walk every alive entity slot 0..15 and push into the acc when the predicate
+// matches. Uses (orig_w) so inserts at the world snapshot before the scan are visible. ──────────
+fn _ecs_reg_query_scan(w: EcsRegWorldDeep, acc0: EcsRegQueryDeep, eid: i32, col: i32) -> EcsRegQueryDeep {
+    if eid >= ECS_REG_CAP_ENTITIES { return acc0; };
+    if _ecs_reg_world_deep_alive_at(w, eid) != 1 { return _ecs_reg_query_scan(w, acc0, eid + 1, col); };
+    if _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, col), eid) {
+        let ent = ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w, eid));
+        let acc1 = _ecs_reg_query_push(acc0, acc0.count, ent);
+        return _ecs_reg_query_scan(w, acc1, eid + 1, col);
+    };
+    return _ecs_reg_query_scan(w, acc0, eid + 1, col);
+}
+
+// query: all alive entities with the component.
+fn ecs_reg_world_deep_query(w: EcsRegWorldDeep, comp_id: i32) -> EcsRegQueryDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return _ecs_reg_query_empty(); };
+    return _ecs_reg_query_scan(w, _ecs_reg_query_empty(), 0, col);
+}
+
+// query_without: all alive entities WITH comp_id but WITHOUT without_comp_id.
+fn _ecs_reg_query_without_scan(w: EcsRegWorldDeep, acc0: EcsRegQueryDeep, eid: i32, col: i32, without_col: i32) -> EcsRegQueryDeep {
+    if eid >= ECS_REG_CAP_ENTITIES { return acc0; };
+    if _ecs_reg_world_deep_alive_at(w, eid) != 1 { return _ecs_reg_query_without_scan(w, acc0, eid + 1, col, without_col); };
+    let with = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, col), eid);
+    let without_present = if without_col < 0 { false; } else { _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, without_col), eid); };
+    if with == true {
+        if without_present != true {
+            let ent = ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w, eid));
+            let acc1 = _ecs_reg_query_push(acc0, acc0.count, ent);
+            return _ecs_reg_query_without_scan(w, acc1, eid + 1, col, without_col);
+        };
+    };
+    return _ecs_reg_query_without_scan(w, acc0, eid + 1, col, without_col);
+}
+
+fn ecs_reg_world_deep_query_without(w: EcsRegWorldDeep, comp_id: i32, without_comp_id: i32) -> EcsRegQueryDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return _ecs_reg_query_empty(); };
+    let without_col = _ecs_reg_world_deep_find_col(w, without_comp_id, 0);
+    return _ecs_reg_query_without_scan(w, _ecs_reg_query_empty(), 0, col, without_col);
+}
+
+// query_added_since: all alive entities whose added_tick for the column is > since_tick.
+fn _ecs_reg_query_added_scan(w: EcsRegWorldDeep, acc0: EcsRegQueryDeep, eid: i32, col: i32, since_tick: i32) -> EcsRegQueryDeep {
+    if eid >= ECS_REG_CAP_ENTITIES { return acc0; };
+    if _ecs_reg_world_deep_alive_at(w, eid) != 1 { return _ecs_reg_query_added_scan(w, acc0, eid + 1, col, since_tick); };
+    let added = _ecs_reg_col_ticke_at(_ecs_reg_world_deep_added_at(w, col), eid);
+    if added > since_tick {
+        let ent = ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w, eid));
+        let acc1 = _ecs_reg_query_push(acc0, acc0.count, ent);
+        return _ecs_reg_query_added_scan(w, acc1, eid + 1, col, since_tick);
+    };
+    return _ecs_reg_query_added_scan(w, acc0, eid + 1, col, since_tick);
+}
+
+fn ecs_reg_world_deep_query_added(w: EcsRegWorldDeep, comp_id: i32, since_tick: i32) -> EcsRegQueryDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return _ecs_reg_query_empty(); };
+    return _ecs_reg_query_added_scan(w, _ecs_reg_query_empty(), 0, col, since_tick);
+}
+
+// query_changed_since: all alive entities whose changed_tick for the column is > since_tick.
+fn _ecs_reg_query_changed_scan(w: EcsRegWorldDeep, acc0: EcsRegQueryDeep, eid: i32, col: i32, since_tick: i32) -> EcsRegQueryDeep {
+    if eid >= ECS_REG_CAP_ENTITIES { return acc0; };
+    if _ecs_reg_world_deep_alive_at(w, eid) != 1 { return _ecs_reg_query_changed_scan(w, acc0, eid + 1, col, since_tick); };
+    let changed = _ecs_reg_col_ticke_at(_ecs_reg_world_deep_changed_at(w, col), eid);
+    if changed > since_tick {
+        let ent = ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w, eid));
+        let acc1 = _ecs_reg_query_push(acc0, acc0.count, ent);
+        return _ecs_reg_query_changed_scan(w, acc1, eid + 1, col, since_tick);
+    };
+    return _ecs_reg_query_changed_scan(w, acc0, eid + 1, col, since_tick);
+}
+
+fn ecs_reg_world_deep_query_changed(w: EcsRegWorldDeep, comp_id: i32, since_tick: i32) -> EcsRegQueryDeep {
+    let col = _ecs_reg_world_deep_find_col(w, comp_id, 0);
+    if col < 0 { return _ecs_reg_query_empty(); };
+    return _ecs_reg_query_changed_scan(w, _ecs_reg_query_empty(), 0, col, since_tick);
+}
+
+// ── Pair query: all alive entities WITH both first_col AND second_col. Pair is exposed as the
+//    shallow's `(first, second)` plus the matched entity; since SLA tests can't tuple-destructure,
+//    we surface triple-pairfield structs EcsRegPairDeep with scalar field accessors `_entity`,
+//    `_first_*`, `_second_*` and the pair query wraps them in EcsRegPairQueryDeep { count, p0..p15 }.
+struct EcsRegPairDeepPosVel {
+    entity: EcsRegEntityDeep,
+    first: EcsRegPosDeep,
+    second: EcsRegVelDeep
+}
+
+fn ecs_reg_pair_deep_pos_vel_entity(p: EcsRegPairDeepPosVel) -> EcsRegEntityDeep { return p.entity; }
+fn ecs_reg_pair_deep_pos_vel_first(p: EcsRegPairDeepPosVel) -> EcsRegPosDeep { return p.first; }
+fn ecs_reg_pair_deep_pos_vel_second(p: EcsRegPairDeepPosVel) -> EcsRegVelDeep { return p.second; }
+
+struct EcsRegPairQueryDeepPosVel {
+    count: i32,
+    p0: EcsRegPairDeepPosVel, p1: EcsRegPairDeepPosVel, p2: EcsRegPairDeepPosVel, p3: EcsRegPairDeepPosVel,
+    p4: EcsRegPairDeepPosVel, p5: EcsRegPairDeepPosVel, p6: EcsRegPairDeepPosVel, p7: EcsRegPairDeepPosVel,
+    p8: EcsRegPairDeepPosVel, p9: EcsRegPairDeepPosVel, p10: EcsRegPairDeepPosVel, p11: EcsRegPairDeepPosVel,
+    p12: EcsRegPairDeepPosVel, p13: EcsRegPairDeepPosVel, p14: EcsRegPairDeepPosVel, p15: EcsRegPairDeepPosVel
+}
+
+fn _ecs_reg_pair_query_empty() -> EcsRegPairQueryDeepPosVel {
+    let z = EcsRegPairDeepPosVel { entity: ecs_reg_entity_new(-1, 0), first: ecs_reg_pos_deep_new(0, 0), second: ecs_reg_vel_deep_new(0, 0) };
+    return EcsRegPairQueryDeepPosVel {
+        count: 0,
+        p0: z, p1: z, p2: z, p3: z, p4: z, p5: z, p6: z, p7: z, p8: z, p9: z, p10: z, p11: z, p12: z, p13: z, p14: z, p15: z
+    };
+}
+
+fn ecs_reg_pair_query_deep_count(r: EcsRegPairQueryDeepPosVel) -> i32 { return r.count; }
+fn ecs_reg_pair_query_deep_at(r: EcsRegPairQueryDeepPosVel, idx: i32) -> EcsRegPairDeepPosVel {
+    if idx == 0 { return r.p0; };
+    if idx == 1 { return r.p1; };
+    if idx == 2 { return r.p2; };
+    if idx == 3 { return r.p3; };
+    if idx == 4 { return r.p4; };
+    if idx == 5 { return r.p5; };
+    if idx == 6 { return r.p6; };
+    if idx == 7 { return r.p7; };
+    if idx == 8 { return r.p8; };
+    if idx == 9 { return r.p9; };
+    if idx == 10 { return r.p10; };
+    if idx == 11 { return r.p11; };
+    if idx == 12 { return r.p12; };
+    if idx == 13 { return r.p13; };
+    if idx == 14 { return r.p14; };
+    return r.p15;
+}
+
+// `query_pair` walks alive entities with both first_col+ttype=pos and second_col type=vel. Test 2
+// uses position (id=0) + velocity (id=1).
+fn _ecs_reg_pair_pos_vel_scan(w: EcsRegWorldDeep, acc0: EcsRegPairQueryDeepPosVel, eid: i32, first_col: i32, second_col: i32, without_col: i32) -> EcsRegPairQueryDeepPosVel {
+    if eid >= ECS_REG_CAP_ENTITIES { return acc0; };
+    if _ecs_reg_world_deep_alive_at(w, eid) != 1 { return _ecs_reg_pair_pos_vel_scan(w, acc0, eid + 1, first_col, second_col, without_col); };
+    let first_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, first_col), eid);
+    let second_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, second_col), eid);
+    let first_ok = first_present == true;
+    let second_ok = second_present == true;
+    let without_present = if without_col < 0 { false; } else { _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, without_col), eid); };
+    let without_ok = without_present != true;
+    if first_ok == true {
+        if second_ok == true {
+            if without_ok == true {
+                let pos = _ecs_reg_world_deep_pos_col_at(w, first_col);
+                let vel = _ecs_reg_world_deep_vel_col_at(w, second_col);
+                let pair = EcsRegPairDeepPosVel {
+                    entity: ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w, eid)),
+                    first: ecs_reg_pos_deep_new(_ecs_reg_col_pos_x_at(pos, eid), _ecs_reg_col_pos_y_at(pos, eid)),
+                    second: ecs_reg_vel_deep_new(_ecs_reg_col_vel_x_at(vel, eid), _ecs_reg_col_vel_y_at(vel, eid))
+                };
+                return _ecs_reg_pair_pos_vel_push(acc0, acc0.count, pair, eid);
+            };
+        };
+    };
+    return _ecs_reg_pair_pos_vel_scan(w, acc0, eid + 1, first_col, second_col, without_col);
+}
+
+fn _ecs_reg_pair_pos_vel_push(r0: EcsRegPairQueryDeepPosVel, k: i32, pair: EcsRegPairDeepPosVel, eid: i32) -> EcsRegPairQueryDeepPosVel {
+    if r0.count >= ECS_REG_CAP_ENTITIES { return r0; };
+    if k == 0 { r0.p0 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 1 { r0.p1 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 2 { r0.p2 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 3 { r0.p3 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 4 { r0.p4 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 5 { r0.p5 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 6 { r0.p6 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 7 { r0.p7 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 8 { r0.p8 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 9 { r0.p9 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 10 { r0.p10 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 11 { r0.p11 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 12 { r0.p12 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 13 { r0.p13 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 14 { r0.p14 = pair; r0.count = r0.count + 1; return r0; };
+    r0.p15 = pair;
+    r0.count = r0.count + 1;
+    return r0;
+}
+
+fn ecs_reg_world_deep_query_pair_pos_vel(w: EcsRegWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsRegPairQueryDeepPosVel {
+    let first_col = _ecs_reg_world_deep_find_col(w, first_comp_id, 0);
+    let second_col = _ecs_reg_world_deep_find_col(w, second_comp_id, 0);
+    if first_col < 0 { return _ecs_reg_pair_query_empty(); };
+    if second_col < 0 { return _ecs_reg_pair_query_empty(); };
+    return _ecs_reg_pair_pos_vel_scan(w, _ecs_reg_pair_query_empty(), 0, first_col, second_col, -1);
+}
+
+fn ecs_reg_world_deep_query_pair_pos_vel_without(w: EcsRegWorldDeep, first_comp_id: i32, second_comp_id: i32, without_comp_id: i32) -> EcsRegPairQueryDeepPosVel {
+    let first_col = _ecs_reg_world_deep_find_col(w, first_comp_id, 0);
+    let second_col = _ecs_reg_world_deep_find_col(w, second_comp_id, 0);
+    if first_col < 0 { return _ecs_reg_pair_query_empty(); };
+    if second_col < 0 { return _ecs_reg_pair_query_empty(); };
+    let without_col = _ecs_reg_world_deep_find_col(w, without_comp_id, 0);
+    return _ecs_reg_pair_pos_vel_scan(w, _ecs_reg_pair_query_empty(), 0, first_col, second_col, without_col);
+}
+
+// ── Pair_mutable view (mirrors RegistryErasedPairMut<A, B>): exposes the same pair result plus
+//    the entity/component ids captured at query time. Tests then call `pair_write_first` to
+//    write back via the captured ids. ──────────────────────────────────────────────────────────
+struct EcsRegPairMutDeepPosVel {
+    entity: EcsRegEntityDeep,
+    first: EcsRegPosDeep,
+    second: EcsRegVelDeep,
+    first_comp_id: i32
+}
+
+fn ecs_reg_pair_mut_pos_vel_entity(p: EcsRegPairMutDeepPosVel) -> EcsRegEntityDeep { return p.entity; }
+fn ecs_reg_pair_mut_pos_vel_first(p: EcsRegPairMutDeepPosVel) -> EcsRegPosDeep { return p.first; }
+fn ecs_reg_pair_mut_pos_vel_second(p: EcsRegPairMutDeepPosVel) -> EcsRegVelDeep { return p.second; }
+fn ecs_reg_pair_mut_pos_vel_first_comp_id(p: EcsRegPairMutDeepPosVel) -> i32 { return p.first_comp_id; }
+
+struct EcsRegPairMutQueryDeepPosVel {
+    count: i32,
+    p0: EcsRegPairMutDeepPosVel, p1: EcsRegPairMutDeepPosVel, p2: EcsRegPairMutDeepPosVel, p3: EcsRegPairMutDeepPosVel,
+    p4: EcsRegPairMutDeepPosVel, p5: EcsRegPairMutDeepPosVel, p6: EcsRegPairMutDeepPosVel, p7: EcsRegPairMutDeepPosVel,
+    p8: EcsRegPairMutDeepPosVel, p9: EcsRegPairMutDeepPosVel, p10: EcsRegPairMutDeepPosVel, p11: EcsRegPairMutDeepPosVel,
+    p12: EcsRegPairMutDeepPosVel, p13: EcsRegPairMutDeepPosVel, p14: EcsRegPairMutDeepPosVel, p15: EcsRegPairMutDeepPosVel
+}
+
+fn _ecs_reg_pair_mut_query_empty() -> EcsRegPairMutQueryDeepPosVel {
+    let z = EcsRegPairMutDeepPosVel { entity: ecs_reg_entity_new(-1, 0), first: ecs_reg_pos_deep_new(0, 0), second: ecs_reg_vel_deep_new(0, 0), first_comp_id: -1 };
+    return EcsRegPairMutQueryDeepPosVel {
+        count: 0,
+        p0: z, p1: z, p2: z, p3: z, p4: z, p5: z, p6: z, p7: z, p8: z, p9: z, p10: z, p11: z, p12: z, p13: z, p14: z, p15: z
+    };
+}
+
+fn ecs_reg_pair_mut_query_deep_count(r: EcsRegPairMutQueryDeepPosVel) -> i32 { return r.count; }
+fn ecs_reg_pair_mut_query_deep_at(r: EcsRegPairMutQueryDeepPosVel, idx: i32) -> EcsRegPairMutDeepPosVel {
+    if idx == 0 { return r.p0; };
+    if idx == 1 { return r.p1; };
+    if idx == 2 { return r.p2; };
+    if idx == 3 { return r.p3; };
+    if idx == 4 { return r.p4; };
+    if idx == 5 { return r.p5; };
+    if idx == 6 { return r.p6; };
+    if idx == 7 { return r.p7; };
+    if idx == 8 { return r.p8; };
+    if idx == 9 { return r.p9; };
+    if idx == 10 { return r.p10; };
+    if idx == 11 { return r.p11; };
+    if idx == 12 { return r.p12; };
+    if idx == 13 { return r.p13; };
+    if idx == 14 { return r.p14; };
+    return r.p15;
+}
+
+fn _ecs_reg_pair_mut_pos_vel_push(r0: EcsRegPairMutQueryDeepPosVel, k: i32, pair: EcsRegPairMutDeepPosVel) -> EcsRegPairMutQueryDeepPosVel {
+    if r0.count >= ECS_REG_CAP_ENTITIES { return r0; };
+    if k == 0 { r0.p0 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 1 { r0.p1 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 2 { r0.p2 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 3 { r0.p3 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 4 { r0.p4 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 5 { r0.p5 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 6 { r0.p6 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 7 { r0.p7 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 8 { r0.p8 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 9 { r0.p9 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 10 { r0.p10 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 11 { r0.p11 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 12 { r0.p12 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 13 { r0.p13 = pair; r0.count = r0.count + 1; return r0; };
+    if k == 14 { r0.p14 = pair; r0.count = r0.count + 1; return r0; };
+    r0.p15 = pair;
+    r0.count = r0.count + 1;
+    return r0;
+}
+
+fn ecs_reg_world_deep_query_pair_mut_pos_vel(w: EcsRegWorldDeep, first_comp_id: i32, second_comp_id: i32) -> EcsRegPairMutQueryDeepPosVel {
+    let first_col = _ecs_reg_world_deep_find_col(w, first_comp_id, 0);
+    let second_col = _ecs_reg_world_deep_find_col(w, second_comp_id, 0);
+    let acc0 = _ecs_reg_pair_mut_query_empty();
+    if first_col < 0 { return acc0; };
+    if second_col < 0 { return acc0; };
+    return _ecs_reg_pair_mut_pos_vel_scan(w, acc0, 0, first_col, second_col);
+}
+
+fn _ecs_reg_pair_mut_pos_vel_scan(w: EcsRegWorldDeep, acc0: EcsRegPairMutQueryDeepPosVel, eid: i32, first_col: i32, second_col: i32) -> EcsRegPairMutQueryDeepPosVel {
+    if eid >= ECS_REG_CAP_ENTITIES { return acc0; };
+    if _ecs_reg_world_deep_alive_at(w, eid) != 1 { return _ecs_reg_pair_mut_pos_vel_scan(w, acc0, eid + 1, first_col, second_col); };
+    let first_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, first_col), eid);
+    let second_present = _ecs_reg_bit_has(_ecs_reg_world_deep_present_at(w, second_col), eid);
+    if first_present == true {
+        if second_present == true {
+            let pos = _ecs_reg_world_deep_pos_col_at(w, first_col);
+            let vel = _ecs_reg_world_deep_vel_col_at(w, second_col);
+            let pair = EcsRegPairMutDeepPosVel {
+                entity: ecs_reg_entity_new(eid, _ecs_reg_world_deep_gen_at(w, eid)),
+                first: ecs_reg_pos_deep_new(_ecs_reg_col_pos_x_at(pos, eid), _ecs_reg_col_pos_y_at(pos, eid)),
+                second: ecs_reg_vel_deep_new(_ecs_reg_col_vel_x_at(vel, eid), _ecs_reg_col_vel_y_at(vel, eid)),
+                first_comp_id: _ecs_reg_world_deep_comp_id_at(w, first_col)
+            };
+            return _ecs_reg_pair_mut_pos_vel_push(acc0, acc0.count, pair);
+        };
+    };
+    return _ecs_reg_pair_mut_pos_vel_scan(w, acc0, eid + 1, first_col, second_col);
+}
+
+// ── Pair write-back: write the new pos value into the captured first_comp_id column for the
+//    captured entity. Bumps change_tick (write_message tests read change_tick post-write). ─────
+fn ecs_reg_world_deep_pair_write_first_pos_vel(w0: EcsRegWorldDeep, item: EcsRegPairMutDeepPosVel, value: EcsRegPosDeep) -> EcsRegWorldDeep {
+    return ecs_reg_world_deep_insert_pos(w0, item.entity, item.first_comp_id, value);
+}
+
+// ── Resource: single typed ErasedTestTime slot. insert/get/set. ───────────────────────────────
+fn ecs_reg_world_deep_insert_resource(w0: EcsRegWorldDeep, value: EcsRegTimeDeep) -> EcsRegWorldDeep {
+    w0.res_time_tick = value.tick;
+    w0.res_time_set = 1;
+    return w0;
+}
+
+fn ecs_reg_world_deep_get_resource(w: EcsRegWorldDeep) -> EcsRegTimeDeep {
+    return ecs_reg_time_deep_new(w.res_time_tick);
+}
+
+// ── Message: single typed ErasedTestEvent slot with a monotone count. read returns the latest.
+fn ecs_reg_world_deep_write_message(w0: EcsRegWorldDeep, value: EcsRegEventDeep) -> EcsRegWorldDeep {
+    w0.msg_event_amount = value.amount;
+    w0.msg_count = w0.msg_count + 1;
+    return w0;
+}
+
+// Mirrors shallow MessageRead<M> wrapper. A fresh reader sees the current amount + count minus the
+// reader's start position; we expose the single latest message via `message_read_count`/`amount`.
+struct EcsRegMessageReadDeep { amount: i32, count: i32 }
+
+fn ecs_reg_message_read_amount(r: EcsRegMessageReadDeep) -> i32 { return r.amount; }
+fn ecs_reg_message_read_count(r: EcsRegMessageReadDeep) -> i32 { return r.count; }
+
+fn ecs_reg_world_deep_read_message(w: EcsRegWorldDeep, default_value: EcsRegEventDeep) -> EcsRegMessageReadDeep {
+    if w.msg_count == 0 {
+        return EcsRegMessageReadDeep { amount: default_value.amount, count: 0 };
+    };
+    return EcsRegMessageReadDeep { amount: w.msg_event_amount, count: w.msg_count };
+}
+

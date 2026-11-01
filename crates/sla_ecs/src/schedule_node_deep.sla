@@ -1,0 +1,752 @@
+// Deepened Bevy ECS schedule::node surface.
+// Mirrors src/schedule/node.rs: CompactNodeId packing round-trips, Systems::get_conflicting_systems
+// algorithm, SystemSets partial-condition uninit ranges, SystemNode Option wrapper.
+// Shallow lib/schedule_node.sla and lib/schedule_node_sets.sla keep the basic containers;
+// this file models the algorithmic and packing contracts faithfully.
+
+// === Compact key packing ===
+// Bevy stores KeyData + is_system flags instead of the full NodeId enum in graph edges.
+// We model KeyData as an i64 key id.
+
+const ECS_DIR_INCOMING: i32 = 0;
+const ECS_DIR_OUTGOING: i32 = 1;
+
+struct EcsCompactNodeDirDeep {
+    key: i64,
+    is_system: bool,
+    direction: i32,
+}
+
+struct EcsNodeIdDeep {
+    is_system: bool,
+    key: i64,
+}
+
+fn ecs_node_id_deep_system(key: i64) -> EcsNodeIdDeep {
+    return EcsNodeIdDeep { is_system: true, key: key };
+}
+
+fn ecs_node_id_deep_set(key: i64) -> EcsNodeIdDeep {
+    return EcsNodeIdDeep { is_system: false, key: key };
+}
+
+fn ecs_node_id_deep_is_system(n: EcsNodeIdDeep) -> bool { return n.is_system; }
+fn ecs_node_id_deep_is_set(n: EcsNodeIdDeep) -> bool { return n.is_system != true; }
+fn ecs_node_id_deep_key(n: EcsNodeIdDeep) -> i64 { return n.key; }
+
+fn ecs_node_id_deep_eq(a: EcsNodeIdDeep, b: EcsNodeIdDeep) -> bool {
+    return a.is_system == b.is_system && a.key == b.key;
+}
+
+// From<(NodeId, Direction)> for CompactNodeIdAndDirection
+fn ecs_compact_node_dir_from(id: EcsNodeIdDeep, direction: i32) -> EcsCompactNodeDirDeep {
+    return EcsCompactNodeDirDeep {
+        key: id.key,
+        is_system: id.is_system,
+        direction: direction,
+    };
+}
+
+// From<CompactNodeIdAndDirection> for (NodeId, Direction)
+fn ecs_compact_node_dir_into(c: EcsCompactNodeDirDeep) -> (EcsNodeIdDeep, i32) {
+    let n = EcsNodeIdDeep { is_system: c.is_system, key: c.key };
+    return (n, c.direction);
+}
+
+fn ecs_compact_node_dir_key(c: EcsCompactNodeDirDeep) -> i64 { return c.key; }
+fn ecs_compact_node_dir_is_system(c: EcsCompactNodeDirDeep) -> bool { return c.is_system; }
+fn ecs_compact_node_dir_direction(c: EcsCompactNodeDirDeep) -> i32 { return c.direction; }
+
+// CompactNodeIdPair
+struct EcsCompactNodePairDeep {
+    key_a: i64,
+    key_b: i64,
+    is_system_a: bool,
+    is_system_b: bool,
+}
+
+fn ecs_compact_node_pair_from(a: EcsNodeIdDeep, b: EcsNodeIdDeep) -> EcsCompactNodePairDeep {
+    return EcsCompactNodePairDeep {
+        key_a: a.key,
+        key_b: b.key,
+        is_system_a: a.is_system,
+        is_system_b: b.is_system,
+    };
+}
+
+fn ecs_compact_node_pair_into(p: EcsCompactNodePairDeep) -> (EcsNodeIdDeep, EcsNodeIdDeep) {
+    let a = EcsNodeIdDeep { is_system: p.is_system_a, key: p.key_a };
+    let b = EcsNodeIdDeep { is_system: p.is_system_b, key: p.key_b };
+    return (a, b);
+}
+
+fn ecs_compact_node_pair_eq(p: EcsCompactNodePairDeep, q: EcsCompactNodePairDeep) -> bool {
+    return p.key_a == q.key_a && p.key_b == q.key_b && p.is_system_a == q.is_system_a && p.is_system_b == q.is_system_b;
+}
+
+// Round-trip helpers used by tests
+fn ecs_compact_node_dir_roundtrip(id: EcsNodeIdDeep, direction: i32) -> (bool, EcsNodeIdDeep, i32) {
+    let c = ecs_compact_node_dir_from(id, direction);
+    let r = ecs_compact_node_dir_into(c);
+    let ok = ecs_node_id_deep_eq(r.0, id) && r.1 == direction;
+    return (ok, r.0, r.1);
+}
+
+fn ecs_compact_node_pair_roundtrip(a: EcsNodeIdDeep, b: EcsNodeIdDeep) -> (bool, EcsNodeIdDeep, EcsNodeIdDeep) {
+    let p = ecs_compact_node_pair_from(a, b);
+    let r = ecs_compact_node_pair_into(p);
+    let ok = ecs_node_id_deep_eq(r.0, a) && ecs_node_id_deep_eq(r.1, b);
+    return (ok, r.0, r.1);
+}
+
+// === SystemNode Option wrapper ===
+// SystemNode { inner: Option<SystemWithAccess> } — get returns None if removed/empty.
+struct EcsSystemNodeDeep {
+    has_inner: bool,
+    system_key: i64,
+    is_exclusive: bool,
+    access_initialized: bool,
+}
+
+fn ecs_system_node_deep_new(system_key: i64, is_exclusive: bool) -> EcsSystemNodeDeep {
+    return EcsSystemNodeDeep {
+        has_inner: true,
+        system_key: system_key,
+        is_exclusive: is_exclusive,
+        access_initialized: false,
+    };
+}
+
+fn ecs_system_node_deep_empty() -> EcsSystemNodeDeep {
+    return EcsSystemNodeDeep {
+        has_inner: false,
+        system_key: -1,
+        is_exclusive: false,
+        access_initialized: false,
+    };
+}
+
+fn ecs_system_node_deep_get(n: EcsSystemNodeDeep) -> (bool, i64, bool) {
+    if n.has_inner != true { return (false, -1, false); };
+    return (true, n.system_key, n.is_exclusive);
+}
+
+fn ecs_system_node_deep_clear(n: EcsSystemNodeDeep) -> EcsSystemNodeDeep {
+    n.has_inner = false;
+    n.system_key = -1;
+    n.is_exclusive = false;
+    n.access_initialized = false;
+    return n;
+}
+
+fn ecs_system_node_deep_set_access_initialized(n: EcsSystemNodeDeep) -> EcsSystemNodeDeep {
+    if n.has_inner { n.access_initialized = true; };
+    return n;
+}
+
+fn ecs_system_node_deep_access_initialized(n: EcsSystemNodeDeep) -> bool {
+    return n.has_inner && n.access_initialized;
+}
+
+// === Access model for conflict detection ===
+struct EcsAccessDeep {
+    is_exclusive: bool,
+    reads: Vec<i64>,
+    writes: Vec<i64>,
+    reads_all: bool,
+    writes_all: bool,
+}
+
+fn ecs_access_deep_new() -> EcsAccessDeep {
+    return EcsAccessDeep {
+        is_exclusive: false,
+        reads: Vec::new(),
+        writes: Vec::new(),
+        reads_all: false,
+        writes_all: false,
+    };
+}
+
+fn ecs_access_deep_exclusive() -> EcsAccessDeep {
+    let a = ecs_access_deep_new();
+    a.is_exclusive = true;
+    return a;
+}
+
+fn ecs_access_deep_add_read(a: EcsAccessDeep, id: i64) -> EcsAccessDeep {
+    a.reads.push(id);
+    return a;
+}
+
+fn ecs_access_deep_add_write(a: EcsAccessDeep, id: i64) -> EcsAccessDeep {
+    a.writes.push(id);
+    return a;
+}
+
+fn ecs_access_deep_set_reads_all(a: EcsAccessDeep) -> EcsAccessDeep {
+    a.reads_all = true;
+    return a;
+}
+
+fn ecs_access_deep_set_writes_all(a: EcsAccessDeep) -> EcsAccessDeep {
+    a.writes_all = true;
+    return a;
+}
+
+fn ecs_access_deep_is_exclusive(a: EcsAccessDeep) -> bool { return a.is_exclusive; }
+
+fn ecs_vec_contains_i64(v: Vec<i64>, x: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// is_compatible: false if conflict
+fn ecs_access_deep_is_compatible(a: EcsAccessDeep, b: EcsAccessDeep) -> bool {
+    if a.is_exclusive || b.is_exclusive { return false; };
+    if a.writes_all || b.writes_all { return false; };
+    if a.reads_all && (len(b.writes) as i64) > 0 { return false; };
+    if b.reads_all && (len(a.writes) as i64) > 0 { return false; };
+    let i: i64 = 0;
+    let nw: i64 = len(a.writes) as i64;
+    while i < nw {
+        let w = a.writes[i];
+        if ecs_vec_contains_i64(b.writes, w) { return false; };
+        if ecs_vec_contains_i64(b.reads, w) { return false; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let nr: i64 = len(a.reads) as i64;
+    while j < nr {
+        let r = a.reads[j];
+        if ecs_vec_contains_i64(b.writes, r) { return false; };
+        j = j + 1;
+    }
+    return true;
+}
+
+// get_conflicts: (is_individual, component_ids)
+// is_individual=false means AccessConflicts::All (empty component list conflict)
+fn ecs_access_deep_get_conflicts(a: EcsAccessDeep, b: EcsAccessDeep) -> (bool, Vec<i64>) {
+    if a.writes_all || b.writes_all { return (false, Vec::new()); };
+    if a.reads_all || b.reads_all { return (false, Vec::new()); };
+    let conflicts: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let nw: i64 = len(a.writes) as i64;
+    while i < nw {
+        let w = a.writes[i];
+        if ecs_vec_contains_i64(b.writes, w) || ecs_vec_contains_i64(b.reads, w) {
+            if ecs_vec_contains_i64(conflicts, w) != true { conflicts.push(w); };
+        };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let nr: i64 = len(a.reads) as i64;
+    while j < nr {
+        let r = a.reads[j];
+        if ecs_vec_contains_i64(b.writes, r) {
+            if ecs_vec_contains_i64(conflicts, r) != true { conflicts.push(r); };
+        };
+        j = j + 1;
+    }
+    return (true, conflicts);
+}
+
+// === ConflictingSystems result ===
+struct EcsConflictItemDeep {
+    a: i64,
+    b: i64,
+    // empty components means World-level / All / exclusive conflict
+    components: Vec<i64>,
+}
+
+struct EcsConflictingSystemsDeep {
+    items: Vec<EcsConflictItemDeep>,
+}
+
+fn ecs_conflicting_systems_deep_new() -> EcsConflictingSystemsDeep {
+    return EcsConflictingSystemsDeep { items: Vec::new() };
+}
+
+fn ecs_conflicting_systems_deep_len(c: EcsConflictingSystemsDeep) -> i64 {
+    return len(c.items) as i64;
+}
+
+fn ecs_conflicting_systems_deep_is_empty(c: EcsConflictingSystemsDeep) -> bool {
+    return len(c.items) == 0;
+}
+
+fn ecs_conflicting_systems_deep_get(c: EcsConflictingSystemsDeep, i: i64) -> EcsConflictItemDeep {
+    if i < 0 || i >= (len(c.items) as i64) {
+        return EcsConflictItemDeep { a: -1, b: -1, components: Vec::new() };
+    };
+    return c.items[i];
+}
+
+fn ecs_conflict_item_a(it: EcsConflictItemDeep) -> i64 { return it.a; }
+fn ecs_conflict_item_b(it: EcsConflictItemDeep) -> i64 { return it.b; }
+fn ecs_conflict_item_component_count(it: EcsConflictItemDeep) -> i64 { return len(it.components) as i64; }
+fn ecs_conflict_item_component_at(it: EcsConflictItemDeep, i: i64) -> i64 {
+    if i < 0 || i >= (len(it.components) as i64) { return -1; };
+    return it.components[i];
+}
+
+// check_if_not_empty: Ok if empty, Err(AmbiguousSystemConflictsWarning) if not
+fn ecs_conflicting_systems_deep_check_if_not_empty(c: EcsConflictingSystemsDeep) -> (bool, i64) {
+    // (ok, warning_count)
+    if len(c.items) == 0 { return (true, 0); };
+    return (false, len(c.items) as i64);
+}
+
+// === Systems::get_conflicting_systems algorithm ===
+// Inputs (flattened for SLA):
+//   system_keys: list of system keys (parallel to accesses)
+//   accesses: parallel access records
+//   disconnected_pairs: flattened (a,b,a,b,...) pairs from DagAnalysis.disconnected()
+//   ambiguous_with_pairs: flattened undirected edges that should be skipped
+//   ambiguous_with_all: system keys that ignore all ambiguity
+//   ignored_component_ids: components filtered out of Individual conflicts
+//
+// Bevy logic:
+// for each disconnected pair (a,b):
+//   skip if ambiguous_with edge or either key in ambiguous_with_all
+//   if exclusive either side => push (a,b, empty)
+//   else if !compatible:
+//     Individual(conflicts) => filter ignored, push if non-empty
+//     All => push (a,b, empty)
+fn ecs_systems_get_conflicting_systems(
+    system_keys: Vec<i64>,
+    exclusive_flags: Vec<bool>,
+    reads_lists: Vec<Vec<i64>>,
+    writes_lists: Vec<Vec<i64>>,
+    reads_all_flags: Vec<bool>,
+    writes_all_flags: Vec<bool>,
+    disconnected_pairs: Vec<i64>,
+    ambiguous_with_pairs: Vec<i64>,
+    ambiguous_with_all: Vec<i64>,
+    ignored_component_ids: Vec<i64>
+) -> EcsConflictingSystemsDeep {
+    let out = ecs_conflicting_systems_deep_new();
+    let pair_n: i64 = len(disconnected_pairs) as i64;
+    let pi: i64 = 0;
+    while pi + 1 < pair_n {
+        let a = disconnected_pairs[pi];
+        let b = disconnected_pairs[pi + 1];
+        pi = pi + 2;
+        if ecs_systems_has_ambiguous_with(ambiguous_with_pairs, a, b) { continue; };
+        if ecs_vec_contains_i64(ambiguous_with_all, a) { continue; };
+        if ecs_vec_contains_i64(ambiguous_with_all, b) { continue; };
+        let ai = ecs_systems_index_of(system_keys, a);
+        let bi = ecs_systems_index_of(system_keys, b);
+        if ai < 0 || bi < 0 { continue; };
+        if exclusive_flags[ai] || exclusive_flags[bi] {
+            out.items.push(EcsConflictItemDeep { a: a, b: b, components: Vec::new() });
+            continue;
+        };
+        let acc_a = ecs_access_from_lists(
+            exclusive_flags[ai],
+            reads_lists[ai],
+            writes_lists[ai],
+            reads_all_flags[ai],
+            writes_all_flags[ai]
+        );
+        let acc_b = ecs_access_from_lists(
+            exclusive_flags[bi],
+            reads_lists[bi],
+            writes_lists[bi],
+            reads_all_flags[bi],
+            writes_all_flags[bi]
+        );
+        if ecs_access_deep_is_compatible(acc_a, acc_b) { continue; };
+        let conf = ecs_access_deep_get_conflicts(acc_a, acc_b);
+        if conf.0 != true {
+            // AccessConflicts::All
+            out.items.push(EcsConflictItemDeep { a: a, b: b, components: Vec::new() });
+            continue;
+        };
+        // Individual: filter ignored
+        let filtered: Vec<i64> = Vec::new();
+        let ci: i64 = 0;
+        let cn: i64 = len(conf.1) as i64;
+        while ci < cn {
+            let id = conf.1[ci];
+            if ecs_vec_contains_i64(ignored_component_ids, id) != true {
+                filtered.push(id);
+            };
+            ci = ci + 1;
+        }
+        if (len(filtered) as i64) > 0 {
+            out.items.push(EcsConflictItemDeep { a: a, b: b, components: filtered });
+        };
+    }
+    return out;
+}
+
+fn ecs_access_from_lists(is_exclusive: bool, reads: Vec<i64>, writes: Vec<i64>, reads_all: bool, writes_all: bool) -> EcsAccessDeep {
+    return EcsAccessDeep {
+        is_exclusive: is_exclusive,
+        reads: reads,
+        writes: writes,
+        reads_all: reads_all,
+        writes_all: writes_all,
+    };
+}
+
+fn ecs_systems_index_of(keys: Vec<i64>, key: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(keys) as i64;
+    while i < n {
+        if keys[i] == key { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// undirected edge check in flattened pairs
+fn ecs_systems_has_ambiguous_with(pairs: Vec<i64>, a: i64, b: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(pairs) as i64;
+    while i + 1 < n {
+        let x = pairs[i];
+        let y = pairs[i + 1];
+        if (x == a && y == b) || (x == b && y == a) { return true; };
+        i = i + 2;
+    }
+    return false;
+}
+
+// === SystemSets partial condition uninit ranges ===
+// Bevy tracks UninitializedSet { key, uninitialized_conditions: Range<usize> }
+// so configure_sets can append conditions multiple times and only init the new slice.
+struct EcsUninitializedSetDeep {
+    key: i64,
+    start: i64,
+    end: i64,
+}
+
+struct EcsSystemSetsDeep {
+    // parallel arrays: set_id, is_system_type
+    set_ids: Vec<i64>,
+    is_system_type: Vec<bool>,
+    // conditions per set: flattened as condition_ids[set][i]
+    condition_counts: Vec<i64>,
+    // store conditions as parallel (set_key, condition_id) stream + rebuild by count
+    // simpler: one Vec per set via flattened condition_ids with offsets
+    // We keep a flat list of Vecs by set index via a single flat stream + starts.
+    // Practical model: conditions_flat is not used; we store condition_ids as
+    // nested via a side map of counts and a global list of (set_key, cond_id).
+    cond_set_keys: Vec<i64>,
+    cond_ids: Vec<i64>,
+    uninit: Vec<EcsUninitializedSetDeep>,
+    // map set_id -> key (index)
+    map_set_ids: Vec<i64>,
+    map_keys: Vec<i64>,
+}
+
+fn ecs_system_sets_deep_new() -> EcsSystemSetsDeep {
+    return EcsSystemSetsDeep {
+        set_ids: Vec::new(),
+        is_system_type: Vec::new(),
+        condition_counts: Vec::new(),
+        cond_set_keys: Vec::new(),
+        cond_ids: Vec::new(),
+        uninit: Vec::new(),
+        map_set_ids: Vec::new(),
+        map_keys: Vec::new(),
+    };
+}
+
+fn ecs_system_sets_deep_len(s: EcsSystemSetsDeep) -> i64 { return len(s.set_ids) as i64; }
+fn ecs_system_sets_deep_is_empty(s: EcsSystemSetsDeep) -> bool { return len(s.set_ids) == 0; }
+fn ecs_system_sets_deep_uninit_count(s: EcsSystemSetsDeep) -> i64 { return len(s.uninit) as i64; }
+fn ecs_system_sets_deep_is_initialized(s: EcsSystemSetsDeep) -> bool { return len(s.uninit) == 0; }
+
+fn ecs_system_sets_deep_map_find(s: EcsSystemSetsDeep, set_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(s.map_set_ids) as i64;
+    while i < n {
+        if s.map_set_ids[i] == set_id { return s.map_keys[i]; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_system_sets_deep_contains(s: EcsSystemSetsDeep, set_id: i64) -> bool {
+    return ecs_system_sets_deep_map_find(s, set_id) >= 0;
+}
+
+fn ecs_system_sets_deep_get_key_or_insert(s: EcsSystemSetsDeep, set_id: i64) -> (EcsSystemSetsDeep, i64) {
+    let existing = ecs_system_sets_deep_map_find(s, set_id);
+    if existing >= 0 { return (s, existing); };
+    let key = len(s.set_ids) as i64;
+    s.set_ids.push(set_id);
+    s.is_system_type.push(false);
+    s.condition_counts.push(0);
+    s.map_set_ids.push(set_id);
+    s.map_keys.push(key);
+    return (s, key);
+}
+
+fn ecs_system_sets_deep_set_system_type(s: EcsSystemSetsDeep, key: i64, is_st: bool) -> EcsSystemSetsDeep {
+    if key >= 0 && key < (len(s.is_system_type) as i64) {
+        s.is_system_type[key] = is_st;
+    };
+    return s;
+}
+
+fn ecs_system_sets_deep_is_system_type(s: EcsSystemSetsDeep, key: i64) -> bool {
+    if key < 0 || key >= (len(s.is_system_type) as i64) { return false; };
+    return s.is_system_type[key];
+}
+
+// insert(set, new_conditions): append conditions and queue UninitializedSet range
+fn ecs_system_sets_deep_insert(s: EcsSystemSetsDeep, set_id: i64, new_condition_ids: Vec<i64>) -> (EcsSystemSetsDeep, i64) {
+    let r = ecs_system_sets_deep_get_key_or_insert(s, set_id);
+    s = r.0;
+    let key = r.1;
+    let n_new: i64 = len(new_condition_ids) as i64;
+    if n_new > 0 {
+        let start = s.condition_counts[key];
+        let i: i64 = 0;
+        while i < n_new {
+            s.cond_set_keys.push(key);
+            s.cond_ids.push(new_condition_ids[i]);
+            i = i + 1;
+        }
+        s.condition_counts[key] = start + n_new;
+        s.uninit.push(EcsUninitializedSetDeep {
+            key: key,
+            start: start,
+            end: start + n_new,
+        });
+    };
+    return (s, key);
+}
+
+fn ecs_system_sets_deep_condition_count(s: EcsSystemSetsDeep, key: i64) -> i64 {
+    if key < 0 || key >= (len(s.condition_counts) as i64) { return 0; };
+    return s.condition_counts[key];
+}
+
+fn ecs_system_sets_deep_has_conditions(s: EcsSystemSetsDeep, key: i64) -> bool {
+    return ecs_system_sets_deep_condition_count(s, key) > 0;
+}
+
+// conditions for a set in insertion order among that set
+fn ecs_system_sets_deep_conditions_for(s: EcsSystemSetsDeep, key: i64) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(s.cond_set_keys) as i64;
+    while i < n {
+        if s.cond_set_keys[i] == key { out.push(s.cond_ids[i]); };
+        i = i + 1;
+    }
+    return out;
+}
+
+// initialize: drain uninit ranges (only those slices of conditions are "initialized")
+// We track initialized_end per set via condition_counts already fully present; uninit empty = done.
+fn ecs_system_sets_deep_initialize(s: EcsSystemSetsDeep) -> EcsSystemSetsDeep {
+    s.uninit = Vec::new();
+    return s;
+}
+
+// uninit range accessors for tests
+fn ecs_system_sets_deep_uninit_at(s: EcsSystemSetsDeep, i: i64) -> EcsUninitializedSetDeep {
+    if i < 0 || i >= (len(s.uninit) as i64) {
+        return EcsUninitializedSetDeep { key: -1, start: 0, end: 0 };
+    };
+    return s.uninit[i];
+}
+
+fn ecs_uninit_set_key(u: EcsUninitializedSetDeep) -> i64 { return u.key; }
+fn ecs_uninit_set_start(u: EcsUninitializedSetDeep) -> i64 { return u.start; }
+fn ecs_uninit_set_end(u: EcsUninitializedSetDeep) -> i64 { return u.end; }
+fn ecs_uninit_set_len(u: EcsUninitializedSetDeep) -> i64 { return u.end - u.start; }
+
+// check_type_set_ambiguity:
+// for each system-type set: if instances > 1 AND relations > 0 => error
+// relations = before + after + ambiguous_with edge counts involving the set
+fn ecs_system_sets_deep_check_type_set_ambiguity(
+    s: EcsSystemSetsDeep,
+    set_keys: Vec<i64>,
+    instance_counts: Vec<i64>,
+    relation_counts: Vec<i64>
+) -> (bool, i64) {
+    // (ok, error_set_key) — ok=false means SystemTypeSetAmbiguityError(key)
+    let i: i64 = 0;
+    let n: i64 = len(set_keys) as i64;
+    while i < n {
+        let key = set_keys[i];
+        if ecs_system_sets_deep_is_system_type(s, key) {
+            if instance_counts[i] > 1 && relation_counts[i] > 0 {
+                return (false, key);
+            };
+        };
+        i = i + 1;
+    }
+    return (true, -1);
+}
+
+// === Systems insert/remove/initialize surface (slotmap-like) ===
+struct EcsSystemsDeep {
+    // key is index into nodes; free list not modeled (monotonic insert)
+    has_node: Vec<bool>,
+    system_keys_meta: Vec<i64>, // stored system identity
+    exclusive: Vec<bool>,
+    access_init: Vec<bool>,
+    // conditions: parallel lists of condition ids per key
+    cond_counts: Vec<i64>,
+    cond_key_stream: Vec<i64>,
+    cond_id_stream: Vec<i64>,
+    uninit: Vec<i64>,
+    next_key: i64,
+}
+
+fn ecs_systems_deep_new() -> EcsSystemsDeep {
+    return EcsSystemsDeep {
+        has_node: Vec::new(),
+        system_keys_meta: Vec::new(),
+        exclusive: Vec::new(),
+        access_init: Vec::new(),
+        cond_counts: Vec::new(),
+        cond_key_stream: Vec::new(),
+        cond_id_stream: Vec::new(),
+        uninit: Vec::new(),
+        next_key: 0,
+    };
+}
+
+fn ecs_systems_deep_len(s: EcsSystemsDeep) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n: i64 = len(s.has_node) as i64;
+    while i < n {
+        if s.has_node[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_systems_deep_is_empty(s: EcsSystemsDeep) -> bool {
+    return ecs_systems_deep_len(s) == 0;
+}
+
+fn ecs_systems_deep_is_initialized(s: EcsSystemsDeep) -> bool {
+    return len(s.uninit) == 0;
+}
+
+fn ecs_systems_deep_uninit_count(s: EcsSystemsDeep) -> i64 {
+    return len(s.uninit) as i64;
+}
+
+// insert(system, conditions) -> key; queues uninit
+fn ecs_systems_deep_insert(s: EcsSystemsDeep, system_id: i64, is_exclusive: bool, condition_ids: Vec<i64>) -> (EcsSystemsDeep, i64) {
+    let key = s.next_key;
+    s.next_key = s.next_key + 1;
+    // grow arrays to key+1
+    while (len(s.has_node) as i64) <= key {
+        s.has_node.push(false);
+        s.system_keys_meta.push(-1);
+        s.exclusive.push(false);
+        s.access_init.push(false);
+        s.cond_counts.push(0);
+    }
+    s.has_node[key] = true;
+    s.system_keys_meta[key] = system_id;
+    s.exclusive[key] = is_exclusive;
+    s.access_init[key] = false;
+    let cn: i64 = len(condition_ids) as i64;
+    s.cond_counts[key] = cn;
+    let i: i64 = 0;
+    while i < cn {
+        s.cond_key_stream.push(key);
+        s.cond_id_stream.push(condition_ids[i]);
+        i = i + 1;
+    }
+    s.uninit.push(key);
+    return (s, key);
+}
+
+fn ecs_systems_deep_get(s: EcsSystemsDeep, key: i64) -> (bool, i64, bool) {
+    if key < 0 || key >= (len(s.has_node) as i64) { return (false, -1, false); };
+    if s.has_node[key] != true { return (false, -1, false); };
+    return (true, s.system_keys_meta[key], s.exclusive[key]);
+}
+
+fn ecs_systems_deep_has_conditions(s: EcsSystemsDeep, key: i64) -> bool {
+    if key < 0 || key >= (len(s.cond_counts) as i64) { return false; };
+    return s.cond_counts[key] > 0;
+}
+
+fn ecs_systems_deep_condition_count(s: EcsSystemsDeep, key: i64) -> i64 {
+    if key < 0 || key >= (len(s.cond_counts) as i64) { return 0; };
+    return s.cond_counts[key];
+}
+
+fn ecs_systems_deep_remove(s: EcsSystemsDeep, key: i64) -> (EcsSystemsDeep, bool) {
+    let found = false;
+    if key >= 0 && key < (len(s.has_node) as i64) {
+        if s.has_node[key] {
+            s.has_node[key] = false;
+            s.system_keys_meta[key] = -1;
+            s.exclusive[key] = false;
+            s.access_init[key] = false;
+            s.cond_counts[key] = 0;
+            found = true;
+        };
+    };
+    // remove from uninit
+    let new_uninit: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(s.uninit) as i64;
+    while i < n {
+        if s.uninit[i] != key { new_uninit.push(s.uninit[i]); }
+        else { found = true; };
+        i = i + 1;
+    }
+    s.uninit = new_uninit;
+    // filter condition streams for this key
+    let new_ck: Vec<i64> = Vec::new();
+    let new_ci: Vec<i64> = Vec::new();
+    let j: i64 = 0;
+    let m: i64 = len(s.cond_key_stream) as i64;
+    while j < m {
+        if s.cond_key_stream[j] != key {
+            new_ck.push(s.cond_key_stream[j]);
+            new_ci.push(s.cond_id_stream[j]);
+        } else {
+            found = true;
+        };
+        j = j + 1;
+    }
+    s.cond_key_stream = new_ck;
+    s.cond_id_stream = new_ci;
+    return (s, found);
+}
+
+// initialize: drain uninit, mark access_init true
+fn ecs_systems_deep_initialize(s: EcsSystemsDeep) -> EcsSystemsDeep {
+    let i: i64 = 0;
+    let n: i64 = len(s.uninit) as i64;
+    while i < n {
+        let key = s.uninit[i];
+        if key >= 0 && key < (len(s.has_node) as i64) {
+            if s.has_node[key] {
+                s.access_init[key] = true;
+            };
+        };
+        i = i + 1;
+    }
+    s.uninit = Vec::new();
+    return s;
+}
+
+fn ecs_systems_deep_access_initialized(s: EcsSystemsDeep, key: i64) -> bool {
+    if key < 0 || key >= (len(s.access_init) as i64) { return false; };
+    return s.has_node[key] && s.access_init[key];
+}

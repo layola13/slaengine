@@ -1,0 +1,259 @@
+// Deepened Bevy ECS observer condition surface.
+// Mirrors src/observer/condition.rs:
+//   ObserverCondition { initialize, check } — unwrap_or(false) on system failure
+//   ObserverWithCondition { system, conditions, run_if, take_conditions }
+//   AND semantics; chained run_if does NOT short-circuit (all conditions evaluated)
+//   take_conditions maps BoxedCondition → ObserverCondition and yields (system, conditions)
+// Shallow lib/observer_condition.sla retained.
+
+// === Single ObserverCondition ===
+struct EcsOcConditionDeep {
+    initialized: bool,
+    // modeled condition system: fixed bool result + optional fail (run_unsafe Err → false)
+    result: bool,
+    fail: bool,
+    check_count: i64,
+    last_result: bool,
+    system_id: i64,
+}
+
+fn ecs_oc_condition_new(system_id: i64, result: bool) -> EcsOcConditionDeep {
+    return EcsOcConditionDeep {
+        initialized: false,
+        result: result,
+        fail: false,
+        check_count: 0,
+        last_result: false,
+        system_id: system_id,
+    };
+}
+
+fn ecs_oc_condition_from_boxed(system_id: i64, result: bool) -> EcsOcConditionDeep {
+    // from_boxed starts uninitialized like new
+    return ecs_oc_condition_new(system_id, result);
+}
+
+fn ecs_oc_condition_set_fail(c: EcsOcConditionDeep, fail: bool) -> EcsOcConditionDeep {
+    c.fail = fail;
+    return c;
+}
+
+fn ecs_oc_condition_set_result(c: EcsOcConditionDeep, result: bool) -> EcsOcConditionDeep {
+    c.result = result;
+    return c;
+}
+
+fn ecs_oc_condition_initialize(c: EcsOcConditionDeep) -> EcsOcConditionDeep {
+    c.initialized = true;
+    return c;
+}
+
+fn ecs_oc_condition_is_initialized(c: EcsOcConditionDeep) -> bool { return c.initialized; }
+fn ecs_oc_condition_system_id(c: EcsOcConditionDeep) -> i64 { return c.system_id; }
+fn ecs_oc_condition_check_count(c: EcsOcConditionDeep) -> i64 { return c.check_count; }
+fn ecs_oc_condition_last_result(c: EcsOcConditionDeep) -> bool { return c.last_result; }
+fn ecs_oc_condition_result(c: EcsOcConditionDeep) -> bool { return c.result; }
+fn ecs_oc_condition_fail(c: EcsOcConditionDeep) -> bool { return c.fail; }
+
+// check: requires initialized; fail → false (unwrap_or(false)); always bumps check_count when initialized
+fn ecs_oc_condition_check(c: EcsOcConditionDeep) -> (EcsOcConditionDeep, bool) {
+    if c.initialized != true {
+        return (c, false);
+    };
+    c.check_count = c.check_count + 1;
+    if c.fail {
+        c.last_result = false;
+        return (c, false);
+    };
+    c.last_result = c.result;
+    return (c, c.result);
+}
+
+// === ObserverWithCondition (up to 4 conditions, fixed slots — no Vec move issues) ===
+struct EcsOcWithConditionDeep {
+    system_id: i64,
+    event_type: i64,
+    bundle_type: i64,
+    // condition slots as raw results before take; after take become ObserverConditions
+    c0_id: i64, c0_result: bool, c0_fail: bool, c0_init: bool, c0_checks: i64,
+    c1_id: i64, c1_result: bool, c1_fail: bool, c1_init: bool, c1_checks: i64,
+    c2_id: i64, c2_result: bool, c2_fail: bool, c2_init: bool, c2_checks: i64,
+    c3_id: i64, c3_result: bool, c3_fail: bool, c3_init: bool, c3_checks: i64,
+    cond_len: i32,
+    taken: bool,
+}
+
+fn ecs_oc_with_new(system_id: i64, event_type: i64, bundle_type: i64) -> EcsOcWithConditionDeep {
+    return EcsOcWithConditionDeep {
+        system_id: system_id,
+        event_type: event_type,
+        bundle_type: bundle_type,
+        c0_id: 0, c0_result: true, c0_fail: false, c0_init: false, c0_checks: 0,
+        c1_id: 0, c1_result: true, c1_fail: false, c1_init: false, c1_checks: 0,
+        c2_id: 0, c2_result: true, c2_fail: false, c2_init: false, c2_checks: 0,
+        c3_id: 0, c3_result: true, c3_fail: false, c3_init: false, c3_checks: 0,
+        cond_len: 0,
+        taken: false,
+    };
+}
+
+fn ecs_oc_with_system_id(o: EcsOcWithConditionDeep) -> i64 { return o.system_id; }
+fn ecs_oc_with_event_type(o: EcsOcWithConditionDeep) -> i64 { return o.event_type; }
+fn ecs_oc_with_bundle_type(o: EcsOcWithConditionDeep) -> i64 { return o.bundle_type; }
+fn ecs_oc_with_cond_len(o: EcsOcWithConditionDeep) -> i32 { return o.cond_len; }
+fn ecs_oc_with_taken(o: EcsOcWithConditionDeep) -> bool { return o.taken; }
+
+// run_if: push another condition (AND)
+fn ecs_oc_with_run_if(o: EcsOcWithConditionDeep, cond_system_id: i64, result: bool) -> EcsOcWithConditionDeep {
+    if o.taken { return o; };
+    if o.cond_len == 0 {
+        o.c0_id = cond_system_id;
+        o.c0_result = result;
+        o.cond_len = 1;
+        return o;
+    };
+    if o.cond_len == 1 {
+        o.c1_id = cond_system_id;
+        o.c1_result = result;
+        o.cond_len = 2;
+        return o;
+    };
+    if o.cond_len == 2 {
+        o.c2_id = cond_system_id;
+        o.c2_result = result;
+        o.cond_len = 3;
+        return o;
+    };
+    if o.cond_len == 3 {
+        o.c3_id = cond_system_id;
+        o.c3_result = result;
+        o.cond_len = 4;
+        return o;
+    };
+    return o;
+}
+
+fn ecs_oc_with_set_fail_at(o: EcsOcWithConditionDeep, idx: i32, fail: bool) -> EcsOcWithConditionDeep {
+    if idx == 0 { o.c0_fail = fail; return o; };
+    if idx == 1 { o.c1_fail = fail; return o; };
+    if idx == 2 { o.c2_fail = fail; return o; };
+    if idx == 3 { o.c3_fail = fail; return o; };
+    return o;
+}
+
+// take_conditions: yield system + mark conditions as ObserverCondition (uninitialized)
+// returns (system_id, cond_len, updated with taken=true)
+fn ecs_oc_with_take(o: EcsOcWithConditionDeep) -> (i64, i32, EcsOcWithConditionDeep) {
+    let sys = o.system_id;
+    let n = o.cond_len;
+    o.taken = true;
+    // conditions remain as slots; init flags false until initialize_all
+    o.c0_init = false;
+    o.c1_init = false;
+    o.c2_init = false;
+    o.c3_init = false;
+    return (sys, n, o);
+}
+
+fn ecs_oc_with_initialize_all(o: EcsOcWithConditionDeep) -> EcsOcWithConditionDeep {
+    if o.cond_len >= 1 { o.c0_init = true; };
+    if o.cond_len >= 2 { o.c1_init = true; };
+    if o.cond_len >= 3 { o.c2_init = true; };
+    if o.cond_len >= 4 { o.c3_init = true; };
+    return o;
+}
+
+// Evaluate one slot: returns (updated o, result, checked)
+fn ecs_oc_with_check_slot(o: EcsOcWithConditionDeep, idx: i32) -> (EcsOcWithConditionDeep, bool) {
+    if idx == 0 {
+        if o.c0_init != true { return (o, false); };
+        o.c0_checks = o.c0_checks + 1;
+        if o.c0_fail { return (o, false); };
+        return (o, o.c0_result);
+    };
+    if idx == 1 {
+        if o.c1_init != true { return (o, false); };
+        o.c1_checks = o.c1_checks + 1;
+        if o.c1_fail { return (o, false); };
+        return (o, o.c1_result);
+    };
+    if idx == 2 {
+        if o.c2_init != true { return (o, false); };
+        o.c2_checks = o.c2_checks + 1;
+        if o.c2_fail { return (o, false); };
+        return (o, o.c2_result);
+    };
+    if idx == 3 {
+        if o.c3_init != true { return (o, false); };
+        o.c3_checks = o.c3_checks + 1;
+        if o.c3_fail { return (o, false); };
+        return (o, o.c3_result);
+    };
+    return (o, false);
+}
+
+fn ecs_oc_with_slot_checks(o: EcsOcWithConditionDeep, idx: i32) -> i64 {
+    if idx == 0 { return o.c0_checks; };
+    if idx == 1 { return o.c1_checks; };
+    if idx == 2 { return o.c2_checks; };
+    if idx == 3 { return o.c3_checks; };
+    return 0;
+}
+
+// AND fold without short-circuit: always evaluates every condition
+struct EcsOcFoldDeep {
+    should_run: bool,
+    evaluated: i32,
+    true_count: i32,
+}
+
+fn ecs_oc_fold_should(f: EcsOcFoldDeep) -> bool { return f.should_run; }
+fn ecs_oc_fold_evaluated(f: EcsOcFoldDeep) -> i32 { return f.evaluated; }
+fn ecs_oc_fold_true_count(f: EcsOcFoldDeep) -> i32 { return f.true_count; }
+
+fn ecs_oc_with_eval_and(o: EcsOcWithConditionDeep) -> (EcsOcWithConditionDeep, EcsOcFoldDeep) {
+    let should = true;
+    let evaluated: i32 = 0;
+    let true_count: i32 = 0;
+    let n = o.cond_len;
+    if n >= 1 {
+        let r0 = ecs_oc_with_check_slot(o, 0);
+        o = r0.0;
+        evaluated = evaluated + 1;
+        if r0.1 { true_count = true_count + 1; };
+        should = should && r0.1;
+    };
+    if n >= 2 {
+        let r1 = ecs_oc_with_check_slot(o, 1);
+        o = r1.0;
+        evaluated = evaluated + 1;
+        if r1.1 { true_count = true_count + 1; };
+        should = should && r1.1;
+    };
+    if n >= 3 {
+        let r2 = ecs_oc_with_check_slot(o, 2);
+        o = r2.0;
+        evaluated = evaluated + 1;
+        if r2.1 { true_count = true_count + 1; };
+        should = should && r2.1;
+    };
+    if n >= 4 {
+        let r3 = ecs_oc_with_check_slot(o, 3);
+        o = r3.0;
+        evaluated = evaluated + 1;
+        if r3.1 { true_count = true_count + 1; };
+        should = should && r3.1;
+    };
+    let fold = EcsOcFoldDeep {
+        should_run: should,
+        evaluated: evaluated,
+        true_count: true_count,
+    };
+    return (o, fold);
+}
+
+// Combined initialize+eval helper used by registration hook
+fn ecs_oc_with_ready_eval(o: EcsOcWithConditionDeep) -> (EcsOcWithConditionDeep, EcsOcFoldDeep) {
+    o = ecs_oc_with_initialize_all(o);
+    return ecs_oc_with_eval_and(o);
+}

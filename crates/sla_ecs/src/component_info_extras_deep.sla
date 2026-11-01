@@ -1,0 +1,426 @@
+// Deepened Bevy ECS ComponentInfo + Components registry extras.
+// Mirrors src/component/info.rs:
+//   ComponentInfo id/name/mutable/type_id/storage/is_send_and_sync/hooks/required
+//   Components len/is_empty/num_queued/num_registered/get_info/get_id/is_id_valid
+//   init_component / init_resource / queue_component / register_queued
+// Fixed capacity: 8 component slots. Shallow lib/component_info_extras.sla retained.
+
+const ECS_CIE_STORAGE_TABLE: i32 = 0;
+const ECS_CIE_STORAGE_SPARSE: i32 = 1;
+
+const ECS_CIE_ERR_OK: i32 = 0;
+const ECS_CIE_ERR_MISSING: i32 = 1;
+const ECS_CIE_ERR_FULL: i32 = 2;
+const ECS_CIE_ERR_NOT_REGISTERED: i32 = 3;
+
+struct EcsCieInfoDeep {
+    id: i32,
+    name_id: i64,
+    mutable: bool,
+    type_id: i64,
+    has_type_id: bool,
+    storage_type: i32,
+    is_send_and_sync: bool,
+    is_resource: bool,
+    registered: bool,
+    hook_mask: i64,
+    clone_behavior: i32,
+    required_count: i32,
+    required_by_count: i32,
+}
+
+fn ecs_cie_info_empty() -> EcsCieInfoDeep {
+    return EcsCieInfoDeep {
+        id: -1, name_id: 0, mutable: true, type_id: 0, has_type_id: false,
+        storage_type: ECS_CIE_STORAGE_TABLE, is_send_and_sync: true, is_resource: false,
+        registered: false, hook_mask: 0, clone_behavior: 1, required_count: 0, required_by_count: 0,
+    };
+}
+
+fn ecs_cie_info_id(i: EcsCieInfoDeep) -> i32 { return i.id; }
+fn ecs_cie_info_name(i: EcsCieInfoDeep) -> i64 { return i.name_id; }
+fn ecs_cie_info_mutable(i: EcsCieInfoDeep) -> bool { return i.mutable; }
+fn ecs_cie_info_type_id(i: EcsCieInfoDeep) -> i64 { return i.type_id; }
+fn ecs_cie_info_has_type_id(i: EcsCieInfoDeep) -> bool { return i.has_type_id; }
+fn ecs_cie_info_storage(i: EcsCieInfoDeep) -> i32 { return i.storage_type; }
+fn ecs_cie_info_is_send(i: EcsCieInfoDeep) -> bool { return i.is_send_and_sync; }
+fn ecs_cie_info_is_resource(i: EcsCieInfoDeep) -> bool { return i.is_resource; }
+fn ecs_cie_info_registered(i: EcsCieInfoDeep) -> bool { return i.registered; }
+fn ecs_cie_info_has_hooks(i: EcsCieInfoDeep) -> bool { return i.hook_mask > 0; }
+fn ecs_cie_info_hook_mask(i: EcsCieInfoDeep) -> i64 { return i.hook_mask; }
+fn ecs_cie_info_clone_behavior(i: EcsCieInfoDeep) -> i32 { return i.clone_behavior; }
+fn ecs_cie_info_required_count(i: EcsCieInfoDeep) -> i32 { return i.required_count; }
+fn ecs_cie_info_required_by_count(i: EcsCieInfoDeep) -> i32 { return i.required_by_count; }
+
+fn ecs_cie_info_rebuild(
+    id: i32, name_id: i64, mutable: bool, type_id: i64, has_type_id: bool,
+    storage_type: i32, is_send_and_sync: bool, is_resource: bool, registered: bool,
+    hook_mask: i64, clone_behavior: i32, required_count: i32, required_by_count: i32
+) -> EcsCieInfoDeep {
+    return EcsCieInfoDeep {
+        id: id, name_id: name_id, mutable: mutable, type_id: type_id, has_type_id: has_type_id,
+        storage_type: storage_type, is_send_and_sync: is_send_and_sync, is_resource: is_resource,
+        registered: registered, hook_mask: hook_mask, clone_behavior: clone_behavior,
+        required_count: required_count, required_by_count: required_by_count,
+    };
+}
+
+fn ecs_cie_info_with_hooks(i: EcsCieInfoDeep, hook_mask: i64) -> EcsCieInfoDeep {
+    return ecs_cie_info_rebuild(
+        i.id, i.name_id, i.mutable, i.type_id, i.has_type_id, i.storage_type, i.is_send_and_sync,
+        i.is_resource, i.registered, hook_mask, i.clone_behavior, i.required_count, i.required_by_count
+    );
+}
+
+fn ecs_cie_info_with_required(i: EcsCieInfoDeep, required_count: i32, required_by_count: i32) -> EcsCieInfoDeep {
+    return ecs_cie_info_rebuild(
+        i.id, i.name_id, i.mutable, i.type_id, i.has_type_id, i.storage_type, i.is_send_and_sync,
+        i.is_resource, i.registered, i.hook_mask, i.clone_behavior, required_count, required_by_count
+    );
+}
+
+fn ecs_cie_info_with_clone_behavior(i: EcsCieInfoDeep, clone_behavior: i32) -> EcsCieInfoDeep {
+    return ecs_cie_info_rebuild(
+        i.id, i.name_id, i.mutable, i.type_id, i.has_type_id, i.storage_type, i.is_send_and_sync,
+        i.is_resource, i.registered, i.hook_mask, clone_behavior, i.required_count, i.required_by_count
+    );
+}
+
+// Components registry: 8 fixed slots
+struct EcsCieDeep {
+    s0: EcsCieInfoDeep, s1: EcsCieInfoDeep, s2: EcsCieInfoDeep, s3: EcsCieInfoDeep,
+    s4: EcsCieInfoDeep, s5: EcsCieInfoDeep, s6: EcsCieInfoDeep, s7: EcsCieInfoDeep,
+    len: i32,
+    queued_count: i32,
+    resource_count: i32,
+}
+
+fn ecs_cie_deep_new() -> EcsCieDeep {
+    return EcsCieDeep {
+        s0: ecs_cie_info_empty(), s1: ecs_cie_info_empty(), s2: ecs_cie_info_empty(), s3: ecs_cie_info_empty(),
+        s4: ecs_cie_info_empty(), s5: ecs_cie_info_empty(), s6: ecs_cie_info_empty(), s7: ecs_cie_info_empty(),
+        len: 0, queued_count: 0, resource_count: 0,
+    };
+}
+
+fn ecs_cie_deep_len(c: EcsCieDeep) -> i32 { return c.len; }
+fn ecs_cie_deep_is_empty(c: EcsCieDeep) -> bool { return c.len == 0; }
+fn ecs_cie_deep_num_queued(c: EcsCieDeep) -> i32 { return c.queued_count; }
+fn ecs_cie_deep_any_queued(c: EcsCieDeep) -> bool { return c.queued_count > 0; }
+fn ecs_cie_deep_resource_count(c: EcsCieDeep) -> i32 { return c.resource_count; }
+
+fn ecs_cie_deep_num_registered(c: EcsCieDeep) -> i32 {
+    return c.len - c.queued_count;
+}
+
+fn ecs_cie_deep_any_registered(c: EcsCieDeep) -> bool {
+    return ecs_cie_deep_num_registered(c) > 0;
+}
+
+fn ecs_cie_deep_rebuild(
+    s0: EcsCieInfoDeep, s1: EcsCieInfoDeep, s2: EcsCieInfoDeep, s3: EcsCieInfoDeep,
+    s4: EcsCieInfoDeep, s5: EcsCieInfoDeep, s6: EcsCieInfoDeep, s7: EcsCieInfoDeep,
+    len: i32, queued_count: i32, resource_count: i32
+) -> EcsCieDeep {
+    return EcsCieDeep {
+        s0: s0, s1: s1, s2: s2, s3: s3, s4: s4, s5: s5, s6: s6, s7: s7,
+        len: len, queued_count: queued_count, resource_count: resource_count,
+    };
+}
+
+fn ecs_cie_deep_set_slot(c: EcsCieDeep, idx: i32, info: EcsCieInfoDeep) -> EcsCieDeep {
+    if idx == 0 {
+        return ecs_cie_deep_rebuild(info, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 1 {
+        return ecs_cie_deep_rebuild(c.s0, info, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 2 {
+        return ecs_cie_deep_rebuild(c.s0, c.s1, info, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 3 {
+        return ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, info, c.s4, c.s5, c.s6, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 4 {
+        return ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, info, c.s5, c.s6, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 5 {
+        return ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, info, c.s6, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 6 {
+        return ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, info, c.s7, c.len, c.queued_count, c.resource_count);
+    };
+    if idx == 7 {
+        return ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, info, c.len, c.queued_count, c.resource_count);
+    };
+    return c;
+}
+
+fn ecs_cie_deep_get_slot(c: EcsCieDeep, idx: i32) -> EcsCieInfoDeep {
+    if idx == 0 { return c.s0; };
+    if idx == 1 { return c.s1; };
+    if idx == 2 { return c.s2; };
+    if idx == 3 { return c.s3; };
+    if idx == 4 { return c.s4; };
+    if idx == 5 { return c.s5; };
+    if idx == 6 { return c.s6; };
+    if idx == 7 { return c.s7; };
+    return ecs_cie_info_empty();
+}
+
+struct EcsCieGetDeep {
+    ok: bool,
+    err: i32,
+    info: EcsCieInfoDeep,
+    world: EcsCieDeep,
+    id: i32,
+}
+
+fn ecs_cie_get_ok(g: EcsCieGetDeep) -> bool { return g.ok; }
+fn ecs_cie_get_err(g: EcsCieGetDeep) -> i32 { return g.err; }
+fn ecs_cie_get_info(g: EcsCieGetDeep) -> EcsCieInfoDeep { return g.info; }
+fn ecs_cie_get_world(g: EcsCieGetDeep) -> EcsCieDeep { return g.world; }
+fn ecs_cie_get_id(g: EcsCieGetDeep) -> i32 { return g.id; }
+
+fn ecs_cie_get_fail(c: EcsCieDeep, err: i32) -> EcsCieGetDeep {
+    return EcsCieGetDeep { ok: false, err: err, info: ecs_cie_info_empty(), world: c, id: -1 };
+}
+
+fn ecs_cie_get_ok_val(c: EcsCieDeep, info: EcsCieInfoDeep, id: i32) -> EcsCieGetDeep {
+    return EcsCieGetDeep { ok: true, err: ECS_CIE_ERR_OK, info: info, world: c, id: id };
+}
+
+fn ecs_cie_deep_is_id_valid(c: EcsCieDeep, id: i32) -> bool {
+    if id < 0 { return false; };
+    if id >= c.len { return false; };
+    let info = ecs_cie_deep_get_slot(c, id);
+    return info.registered;
+}
+
+fn ecs_cie_deep_get_info(c: EcsCieDeep, id: i32) -> EcsCieGetDeep {
+    if id < 0 { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    if id >= c.len { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    let info = ecs_cie_deep_get_slot(c, id);
+    if info.registered != true { return ecs_cie_get_fail(c, ECS_CIE_ERR_NOT_REGISTERED); };
+    return ecs_cie_get_ok_val(c, info, id);
+}
+
+fn ecs_cie_deep_get_name(c: EcsCieDeep, id: i32) -> EcsCieGetDeep {
+    return ecs_cie_deep_get_info(c, id);
+}
+
+fn ecs_cie_deep_find_type_id(c: EcsCieDeep, type_id: i64) -> i32 {
+    if c.len >= 1 {
+        if c.s0.has_type_id {
+            if c.s0.type_id == type_id { return 0; };
+        };
+    };
+    if c.len >= 2 {
+        if c.s1.has_type_id {
+            if c.s1.type_id == type_id { return 1; };
+        };
+    };
+    if c.len >= 3 {
+        if c.s2.has_type_id {
+            if c.s2.type_id == type_id { return 2; };
+        };
+    };
+    if c.len >= 4 {
+        if c.s3.has_type_id {
+            if c.s3.type_id == type_id { return 3; };
+        };
+    };
+    if c.len >= 5 {
+        if c.s4.has_type_id {
+            if c.s4.type_id == type_id { return 4; };
+        };
+    };
+    if c.len >= 6 {
+        if c.s5.has_type_id {
+            if c.s5.type_id == type_id { return 5; };
+        };
+    };
+    if c.len >= 7 {
+        if c.s6.has_type_id {
+            if c.s6.type_id == type_id { return 6; };
+        };
+    };
+    if c.len >= 8 {
+        if c.s7.has_type_id {
+            if c.s7.type_id == type_id { return 7; };
+        };
+    };
+    return -1;
+}
+
+fn ecs_cie_deep_get_id(c: EcsCieDeep, type_id: i64) -> EcsCieGetDeep {
+    let idx = ecs_cie_deep_find_type_id(c, type_id);
+    if idx < 0 { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    let info = ecs_cie_deep_get_slot(c, idx);
+    return ecs_cie_get_ok_val(c, info, idx);
+}
+
+fn ecs_cie_deep_get_valid_id(c: EcsCieDeep, type_id: i64) -> EcsCieGetDeep {
+    let g = ecs_cie_deep_get_id(c, type_id);
+    if g.ok != true { return g; };
+    if g.info.registered != true { return ecs_cie_get_fail(c, ECS_CIE_ERR_NOT_REGISTERED); };
+    return g;
+}
+
+fn ecs_cie_deep_get_resource_id(c: EcsCieDeep, type_id: i64) -> EcsCieGetDeep {
+    let g = ecs_cie_deep_get_id(c, type_id);
+    if g.ok != true { return g; };
+    if g.info.is_resource != true { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    return g;
+}
+
+fn ecs_cie_deep_push(
+    c: EcsCieDeep, name_id: i64, type_id: i64, has_type_id: bool, mutable: bool,
+    storage_type: i32, is_send: bool, is_resource: bool, registered: bool, clone_behavior: i32
+) -> EcsCieGetDeep {
+    if c.len >= 8 { return ecs_cie_get_fail(c, ECS_CIE_ERR_FULL); };
+    let id = c.len;
+    let info = ecs_cie_info_rebuild(
+        id, name_id, mutable, type_id, has_type_id, storage_type, is_send, is_resource,
+        registered, 0, clone_behavior, 0, 0
+    );
+    let q = c.queued_count;
+    let rc = c.resource_count;
+    if registered != true {
+        let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len + 1, q + 1, rc);
+        let c3 = ecs_cie_deep_set_slot(c2, id, info);
+        return ecs_cie_get_ok_val(c3, info, id);
+    };
+    if is_resource {
+        let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len + 1, q, rc + 1);
+        let c3 = ecs_cie_deep_set_slot(c2, id, info);
+        return ecs_cie_get_ok_val(c3, info, id);
+    };
+    let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len + 1, q, rc);
+    let c3 = ecs_cie_deep_set_slot(c2, id, info);
+    return ecs_cie_get_ok_val(c3, info, id);
+}
+
+fn ecs_cie_deep_init_component(
+    c: EcsCieDeep, name_id: i64, type_id: i64, mutable: bool, storage_type: i32, is_send: bool
+) -> EcsCieGetDeep {
+    // reuse existing type_id if present and registered
+    let existing = ecs_cie_deep_find_type_id(c, type_id);
+    if existing >= 0 {
+        let info = ecs_cie_deep_get_slot(c, existing);
+        if info.registered {
+            return ecs_cie_get_ok_val(c, info, existing);
+        };
+    };
+    return ecs_cie_deep_push(c, name_id, type_id, true, mutable, storage_type, is_send, false, true, 1);
+}
+
+fn ecs_cie_deep_init_resource(c: EcsCieDeep, name_id: i64, type_id: i64) -> EcsCieGetDeep {
+    let existing = ecs_cie_deep_find_type_id(c, type_id);
+    if existing >= 0 {
+        let info = ecs_cie_deep_get_slot(c, existing);
+        if info.registered {
+            if info.is_resource {
+                return ecs_cie_get_ok_val(c, info, existing);
+            };
+        };
+    };
+    return ecs_cie_deep_push(c, name_id, type_id, true, true, ECS_CIE_STORAGE_TABLE, true, true, true, 1);
+}
+
+fn ecs_cie_deep_queue_component(c: EcsCieDeep, name_id: i64, type_id: i64, mutable: bool) -> EcsCieGetDeep {
+    return ecs_cie_deep_push(c, name_id, type_id, true, mutable, ECS_CIE_STORAGE_TABLE, true, false, false, 1);
+}
+
+fn ecs_cie_deep_register_queued(c: EcsCieDeep, id: i32) -> EcsCieGetDeep {
+    if id < 0 { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    if id >= c.len { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    let info = ecs_cie_deep_get_slot(c, id);
+    if info.registered { return ecs_cie_get_ok_val(c, info, id); };
+    let info2 = ecs_cie_info_rebuild(
+        info.id, info.name_id, info.mutable, info.type_id, info.has_type_id, info.storage_type,
+        info.is_send_and_sync, info.is_resource, true, info.hook_mask, info.clone_behavior,
+        info.required_count, info.required_by_count
+    );
+    let q_next = c.queued_count - 1;
+    if q_next < 0 {
+        if info2.is_resource {
+            let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, 0, c.resource_count + 1);
+            let c3 = ecs_cie_deep_set_slot(c2, id, info2);
+            return ecs_cie_get_ok_val(c3, info2, id);
+        };
+        let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, 0, c.resource_count);
+        let c3 = ecs_cie_deep_set_slot(c2, id, info2);
+        return ecs_cie_get_ok_val(c3, info2, id);
+    };
+    if info2.is_resource {
+        let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, q_next, c.resource_count + 1);
+        let c3 = ecs_cie_deep_set_slot(c2, id, info2);
+        return ecs_cie_get_ok_val(c3, info2, id);
+    };
+    let c2 = ecs_cie_deep_rebuild(c.s0, c.s1, c.s2, c.s3, c.s4, c.s5, c.s6, c.s7, c.len, q_next, c.resource_count);
+    let c3 = ecs_cie_deep_set_slot(c2, id, info2);
+    return ecs_cie_get_ok_val(c3, info2, id);
+}
+
+fn ecs_cie_deep_set_hooks(c: EcsCieDeep, id: i32, hook_mask: i64) -> EcsCieGetDeep {
+    if id < 0 { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    if id >= c.len { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    let info = ecs_cie_info_with_hooks(ecs_cie_deep_get_slot(c, id), hook_mask);
+    let c2 = ecs_cie_deep_set_slot(c, id, info);
+    return ecs_cie_get_ok_val(c2, info, id);
+}
+
+fn ecs_cie_deep_set_required(c: EcsCieDeep, id: i32, required_count: i32, required_by_count: i32) -> EcsCieGetDeep {
+    if id < 0 { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    if id >= c.len { return ecs_cie_get_fail(c, ECS_CIE_ERR_MISSING); };
+    let info = ecs_cie_info_with_required(ecs_cie_deep_get_slot(c, id), required_count, required_by_count);
+    let c2 = ecs_cie_deep_set_slot(c, id, info);
+    return ecs_cie_get_ok_val(c2, info, id);
+}
+
+// count registered with storage_type
+fn ecs_cie_deep_count_storage(c: EcsCieDeep, storage_type: i32) -> i32 {
+    let n: i32 = 0;
+    if c.len >= 1 {
+        if c.s0.registered {
+            if c.s0.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 2 {
+        if c.s1.registered {
+            if c.s1.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 3 {
+        if c.s2.registered {
+            if c.s2.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 4 {
+        if c.s3.registered {
+            if c.s3.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 5 {
+        if c.s4.registered {
+            if c.s4.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 6 {
+        if c.s5.registered {
+            if c.s5.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 7 {
+        if c.s6.registered {
+            if c.s6.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    if c.len >= 8 {
+        if c.s7.registered {
+            if c.s7.storage_type == storage_type { n = n + 1; };
+        };
+    };
+    return n;
+}

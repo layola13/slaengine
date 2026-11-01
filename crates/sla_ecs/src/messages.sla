@@ -1,0 +1,1234 @@
+// Fixed-capacity typed message queue. This mirrors Bevy's Messages<T> concept
+// at the semantic level: writers append, readers keep independent cursors.
+@import "sa_std/vec.sa"
+
+struct Messages<T> {
+    count: i64,
+    next_id: i64,
+    current_start_id: i64,
+    ids: [i64; 16],
+    values: [T; 16],
+}
+
+struct MessageId<T> {
+    value: i64,
+}
+
+struct MessageReader {
+    cursor: i64,
+}
+
+struct MessageWriter<T> {
+    values: Vec<T>,
+}
+
+struct MessageRead<T> {
+    has_value: bool,
+    value: T,
+    reader: MessageReader,
+}
+
+struct MessageReadWithId<T> {
+    has_value: bool,
+    value: T,
+    id: i64,
+    reader: MessageReader,
+}
+
+struct MessageReadWithMessageId<T> {
+    has_value: bool,
+    value: T,
+    id: MessageId<T>,
+    reader: MessageReader,
+}
+
+struct MessageWrite<T> {
+    messages: Messages<T>,
+    id: i64,
+}
+
+struct MessageWriteWithMessageId<T> {
+    messages: Messages<T>,
+    id: MessageId<T>,
+}
+
+struct MessageBatchWrite<T> {
+    messages: Messages<T>,
+    first_id: i64,
+    count: i64,
+}
+
+struct MessageBatchWriteWithMessageId<T> {
+    messages: Messages<T>,
+    first_id: MessageId<T>,
+    count: i64,
+}
+
+struct MessageDrain<T> {
+    messages: Messages<T>,
+    count: i64,
+    ids: [i64; 16],
+    values: [T; 16],
+}
+
+struct MessageDrainItems<T> {
+    count: i64,
+    ids: [i64; 16],
+    values: [T; 16],
+}
+
+struct MessageMut<T> {
+    index: i64,
+    value: T,
+}
+
+struct MessageMutRead<T> {
+    has_value: bool,
+    item: MessageMut<T>,
+    reader: MessageReader,
+}
+
+struct MessageMutReadWithId<T> {
+    has_value: bool,
+    item: MessageMut<T>,
+    id: i64,
+    reader: MessageReader,
+}
+
+struct MessageMutReadWithMessageId<T> {
+    has_value: bool,
+    item: MessageMut<T>,
+    id: MessageId<T>,
+    reader: MessageReader,
+}
+
+fn message_id_new(id: i64) -> i64 {
+    return id;
+}
+
+fn message_id_none() -> i64 {
+    return message_id_new(-1);
+}
+
+fn message_id_eq(left: i64, right: i64) -> bool {
+    return left == right;
+}
+
+fn message_id_lt(left: i64, right: i64) -> bool {
+    return left < right;
+}
+
+fn message_id_value(id: i64) -> i64 {
+    return id;
+}
+
+fn message_id_typed_new<T>(id: i64) -> MessageId<T> {
+    return MessageId<T> { value: message_id_new(id) };
+}
+
+fn message_id_typed_none<T>() -> MessageId<T> {
+    return message_id_typed_new<T>(-1);
+}
+
+fn message_id_typed_eq<T>(left: MessageId<T>, right: MessageId<T>) -> bool {
+    return message_id_eq(left.value, right.value);
+}
+
+fn message_id_typed_lt<T>(left: MessageId<T>, right: MessageId<T>) -> bool {
+    return message_id_lt(left.value, right.value);
+}
+
+fn message_id_typed_value<T>(id: MessageId<T>) -> i64 {
+    return message_id_value(id.value);
+}
+
+fn messages_new<T>(default_value: T) -> Messages<T> {
+    return Messages<T> {
+        count: 0,
+        next_id: 0,
+        current_start_id: 0,
+        ids: [-1; 16],
+        values: [default_value; 16],
+    };
+}
+
+fn message_reader_new() -> MessageReader {
+    return MessageReader { cursor: 0 };
+}
+
+fn messages_get_cursor<T>(messages: Messages<T>) -> MessageReader {
+    return message_reader_new();
+}
+
+fn message_reader_current<T>(messages: Messages<T>) -> MessageReader {
+    return MessageReader { cursor: messages.next_id };
+}
+
+fn messages_get_cursor_current<T>(messages: Messages<T>) -> MessageReader {
+    return message_reader_current<T>(messages);
+}
+
+fn message_reader_current_update<T>(messages: Messages<T>) -> MessageReader {
+    return MessageReader { cursor: messages.current_start_id };
+}
+
+fn message_writer_new<T>() -> MessageWriter<T> {
+    let values: Vec<T> = Vec::new();
+    return MessageWriter<T> { values: values };
+}
+
+fn message_writer_send<T>(writer: MessageWriter<T>, value: T) -> MessageWriter<T> {
+    writer.values.push(value);
+    return writer;
+}
+
+fn message_writer_write<T>(writer: MessageWriter<T>, value: T) -> MessageWriter<T> {
+    return message_writer_send<T>(writer, value);
+}
+
+fn message_writer_write_default<T>(writer: MessageWriter<T>, default_value: T) -> MessageWriter<T> {
+    return message_writer_write<T>(writer, default_value);
+}
+
+fn message_writer_len<T>(writer: MessageWriter<T>) -> i64 {
+    return len(writer.values) as i64;
+}
+
+fn message_writer_is_empty<T>(writer: MessageWriter<T>) -> bool {
+    return message_writer_len<T>(writer) == 0;
+}
+
+fn message_writer_clear<T>(writer: MessageWriter<T>) -> MessageWriter<T> {
+    return message_writer_new<T>();
+}
+
+fn message_writer_append<T>(writer: MessageWriter<T>, other: MessageWriter<T>) -> MessageWriter<T> {
+    let i: i64 = 0;
+    let cnt = len(other.values) as i64;
+    while i < cnt {
+        writer.values.push(other.values[i]);
+        i = i + 1;
+    }
+    return writer;
+}
+
+fn message_writer_write_batch<T>(writer: MessageWriter<T>, other: MessageWriter<T>) -> MessageWriter<T> {
+    return message_writer_append<T>(writer, other);
+}
+
+fn messages_write_with_id<T>(messages: Messages<T>, value: T) -> MessageWrite<T> {
+    let slot = messages.count;
+    if slot >= 16 { panic(6001); };
+    let id = message_id_new(messages.next_id);
+    messages.ids[slot] = message_id_value(id);
+    messages.values[slot] = value;
+    messages.count = slot + 1;
+    messages.next_id = messages.next_id + 1;
+    return MessageWrite<T> { messages: messages, id: id };
+}
+
+fn messages_write<T>(messages: Messages<T>, value: T) -> Messages<T> {
+    let written = messages_write_with_id<T>(messages, value);
+    return written.messages;
+}
+
+fn messages_write_default<T>(messages: Messages<T>, default_value: T) -> MessageWrite<T> {
+    return messages_write_with_id<T>(messages, default_value);
+}
+
+fn messages_write_with_message_id<T>(messages: Messages<T>, value: T) -> MessageWriteWithMessageId<T> {
+    let written = messages_write_with_id<T>(messages, value);
+    return MessageWriteWithMessageId<T> { messages: written.messages, id: message_id_typed_new<T>(written.id) };
+}
+
+fn messages_write_default_with_message_id<T>(messages: Messages<T>, default_value: T) -> MessageWriteWithMessageId<T> {
+    return messages_write_with_message_id<T>(messages, default_value);
+}
+
+fn messages_write_batch<T>(messages: Messages<T>, writer: MessageWriter<T>) -> MessageBatchWrite<T> {
+    let i: i64 = 0;
+    let cnt = len(writer.values) as i64;
+    let first_id = messages.next_id;
+    while i < cnt {
+        messages = messages_write<T>(messages, writer.values[i]);
+        i = i + 1;
+    }
+    return MessageBatchWrite<T> { messages: messages, first_id: first_id, count: cnt };
+}
+
+fn message_batch_write_id_at<T>(batch: MessageBatchWrite<T>, index: i64) -> i64 {
+    if index < 0 { return message_id_none(); };
+    if index >= batch.count { return message_id_none(); };
+    return message_id_new(batch.first_id + index);
+}
+
+fn message_batch_write_len<T>(batch: MessageBatchWrite<T>) -> i64 {
+    return batch.count;
+}
+
+fn message_batch_write_is_empty<T>(batch: MessageBatchWrite<T>) -> bool {
+    return batch.count == 0;
+}
+
+fn message_batch_write_last_id<T>(batch: MessageBatchWrite<T>) -> i64 {
+    if batch.count <= 0 { return message_id_none(); };
+    return message_id_new(batch.first_id + batch.count - 1);
+}
+
+fn messages_write_batch_with_message_id<T>(messages: Messages<T>, writer: MessageWriter<T>) -> MessageBatchWriteWithMessageId<T> {
+    let written = messages_write_batch<T>(messages, writer);
+    return MessageBatchWriteWithMessageId<T> { messages: written.messages, first_id: message_id_typed_new<T>(written.first_id), count: written.count };
+}
+
+fn message_batch_write_message_id_at<T>(batch: MessageBatchWriteWithMessageId<T>, index: i64) -> MessageId<T> {
+    if index < 0 { return message_id_typed_none<T>(); };
+    if index >= batch.count { return message_id_typed_none<T>(); };
+    return message_id_typed_new<T>(batch.first_id.value + index);
+}
+
+fn message_batch_write_message_id_len<T>(batch: MessageBatchWriteWithMessageId<T>) -> i64 {
+    return batch.count;
+}
+
+fn message_batch_write_message_id_is_empty<T>(batch: MessageBatchWriteWithMessageId<T>) -> bool {
+    return batch.count == 0;
+}
+
+fn message_batch_write_last_message_id<T>(batch: MessageBatchWriteWithMessageId<T>) -> MessageId<T> {
+    if batch.count <= 0 { return message_id_typed_none<T>(); };
+    return message_id_typed_new<T>(batch.first_id.value + batch.count - 1);
+}
+
+fn messages_apply_writer<T>(messages: Messages<T>, writer: MessageWriter<T>) -> Messages<T> {
+    let written = messages_write_batch<T>(messages, writer);
+    return written.messages;
+}
+
+fn messages_read_next<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageRead<T> {
+    let i: i64 = 0;
+    while i < messages.count {
+        let id = messages.ids[i];
+        if id >= reader.cursor {
+            let value = messages.values[i];
+            reader.cursor = id + 1;
+            return MessageRead<T> { has_value: true, value: value, reader: reader };
+        };
+        i = i + 1;
+    }
+    return MessageRead<T> { has_value: false, value: default_value, reader: reader };
+}
+
+fn messages_read_next_with_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageReadWithId<T> {
+    let i: i64 = 0;
+    while i < messages.count {
+        let stored_id = messages.ids[i];
+        if stored_id >= reader.cursor {
+            let value = messages.values[i];
+            let id = message_id_new(stored_id);
+            reader.cursor = stored_id + 1;
+            return MessageReadWithId<T> { has_value: true, value: value, id: id, reader: reader };
+        };
+        i = i + 1;
+    }
+    return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: reader };
+}
+
+fn messages_get_message<T>(messages: Messages<T>, id: i64, default_value: T) -> MessageReadWithId<T> {
+    let i: i64 = 0;
+    let reader = MessageReader { cursor: messages.count };
+    while i < messages.count {
+        if messages.ids[i] == message_id_value(id) {
+            return MessageReadWithId<T> { has_value: true, value: messages.values[i], id: id, reader: reader };
+        };
+        i = i + 1;
+    }
+    return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: reader };
+}
+
+fn messages_read_next_with_message_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageReadWithMessageId<T> {
+    let read = messages_read_next_with_id<T>(messages, reader, default_value);
+    return MessageReadWithMessageId<T> { has_value: read.has_value, value: read.value, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_get_message_id<T>(messages: Messages<T>, id: MessageId<T>, default_value: T) -> MessageReadWithMessageId<T> {
+    let read = messages_get_message<T>(messages, id.value, default_value);
+    return MessageReadWithMessageId<T> { has_value: read.has_value, value: read.value, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_len<T>(messages: Messages<T>) -> i64 {
+    return messages.count;
+}
+
+fn messages_is_empty<T>(messages: Messages<T>) -> bool {
+    return messages.count == 0;
+}
+
+fn messages_clear<T>(messages: Messages<T>) -> Messages<T> {
+    messages.count = 0;
+    messages.current_start_id = messages.next_id;
+    return messages;
+}
+
+fn messages_update<T>(messages: Messages<T>) -> Messages<T> {
+    let read: i64 = 0;
+    let write: i64 = 0;
+    while read < messages.count {
+        if messages.ids[read] >= messages.current_start_id {
+            messages.ids[write] = messages.ids[read];
+            messages.values[write] = messages.values[read];
+            write = write + 1;
+        };
+        read = read + 1;
+    }
+    messages.count = write;
+    messages.current_start_id = messages.next_id;
+    return messages;
+}
+
+fn messages_update_drain<T>(messages: Messages<T>, default_value: T) -> MessageDrain<T> {
+    let read: i64 = 0;
+    let write: i64 = 0;
+    let drained_count: i64 = 0;
+    let drained_ids = [-1; 16];
+    let drained_values = [default_value; 16];
+    while read < messages.count {
+        if messages.ids[read] < messages.current_start_id {
+            drained_ids[drained_count] = messages.ids[read];
+            drained_values[drained_count] = messages.values[read];
+            drained_count = drained_count + 1;
+        } else {
+            messages.ids[write] = messages.ids[read];
+            messages.values[write] = messages.values[read];
+            write = write + 1;
+        };
+        read = read + 1;
+    }
+    messages.count = write;
+    messages.current_start_id = messages.next_id;
+    return MessageDrain<T> { messages: messages, count: drained_count, ids: drained_ids, values: drained_values };
+}
+
+fn messages_drain<T>(messages: Messages<T>, default_value: T) -> MessageDrain<T> {
+    let i: i64 = 0;
+    let drained_ids = [-1; 16];
+    let drained_values = [default_value; 16];
+    while i < messages.count {
+        drained_ids[i] = messages.ids[i];
+        drained_values[i] = messages.values[i];
+        i = i + 1;
+    }
+    let drained_count = messages.count;
+    messages.count = 0;
+    messages.current_start_id = messages.next_id;
+    return MessageDrain<T> { messages: messages, count: drained_count, ids: drained_ids, values: drained_values };
+}
+
+fn messages_current_update_len<T>(messages: Messages<T>) -> i64 {
+    let i: i64 = 0;
+    let result: i64 = 0;
+    while i < messages.count {
+        if messages.ids[i] >= messages.current_start_id {
+            result = result + 1;
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+fn messages_message_count<T>(messages: Messages<T>) -> i64 {
+    return messages.next_id;
+}
+
+fn messages_oldest_message_count<T>(messages: Messages<T>) -> i64 {
+    return messages_oldest_id<T>(messages);
+}
+
+fn messages_current_update_message_at<T>(messages: Messages<T>, index: i64, default_value: T) -> MessageReadWithId<T> {
+    if index < 0 { return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: MessageReader { cursor: messages.current_start_id } }; };
+    let i: i64 = 0;
+    let current_index: i64 = 0;
+    while i < messages.count {
+        let stored_id = messages.ids[i];
+        if stored_id >= messages.current_start_id {
+            if current_index == index {
+                return MessageReadWithId<T> { has_value: true, value: messages.values[i], id: stored_id, reader: MessageReader { cursor: stored_id + 1 } };
+            };
+            current_index = current_index + 1;
+        };
+        i = i + 1;
+    }
+    return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: MessageReader { cursor: messages.next_id } };
+}
+
+fn messages_current_update_message_id_at<T>(messages: Messages<T>, index: i64, default_value: T) -> MessageReadWithMessageId<T> {
+    let read = messages_current_update_message_at<T>(messages, index, default_value);
+    return MessageReadWithMessageId<T> { has_value: read.has_value, value: read.value, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_reader_len<T>(messages: Messages<T>, reader: MessageReader) -> i64 {
+    let i: i64 = 0;
+    let result: i64 = 0;
+    while i < messages.count {
+        if messages.ids[i] >= reader.cursor {
+            result = result + 1;
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+fn messages_oldest_id<T>(messages: Messages<T>) -> i64 {
+    if messages.count == 0 { return messages.next_id; };
+    return messages.ids[0];
+}
+
+fn messages_reader_missed<T>(messages: Messages<T>, reader: MessageReader) -> i64 {
+    let oldest = messages_oldest_id<T>(messages);
+    if reader.cursor >= oldest { return 0; };
+    return oldest - reader.cursor;
+}
+
+fn messages_reader_is_empty<T>(messages: Messages<T>, reader: MessageReader) -> bool {
+    return messages_reader_len<T>(messages, reader) == 0;
+}
+
+fn messages_reader_clear<T>(reader: MessageReader, messages: Messages<T>) -> MessageReader {
+    reader.cursor = messages.next_id;
+    return reader;
+}
+
+fn messages_reader_count<T>(messages: Messages<T>, reader: MessageReader) -> (MessageReader, i64) {
+    let count = messages_reader_len<T>(messages, reader);
+    reader = messages_reader_clear<T>(reader, messages);
+    return (reader, count);
+}
+
+fn messages_reader_nth_with_id<T>(messages: Messages<T>, reader: MessageReader, index: i64, default_value: T) -> MessageReadWithId<T> {
+    if index < 0 { return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: reader }; };
+    let i: i64 = 0;
+    let seen: i64 = 0;
+    while i < messages.count {
+        let stored_id = messages.ids[i];
+        if stored_id >= reader.cursor {
+            if seen == index {
+                reader.cursor = stored_id + 1;
+                return MessageReadWithId<T> { has_value: true, value: messages.values[i], id: message_id_new(stored_id), reader: reader };
+            };
+            seen = seen + 1;
+        };
+        i = i + 1;
+    }
+    reader = messages_reader_clear<T>(reader, messages);
+    return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: reader };
+}
+
+fn messages_reader_nth<T>(messages: Messages<T>, reader: MessageReader, index: i64, default_value: T) -> MessageRead<T> {
+    let read = messages_reader_nth_with_id<T>(messages, reader, index, default_value);
+    return MessageRead<T> { has_value: read.has_value, value: read.value, reader: read.reader };
+}
+
+fn messages_reader_nth_with_message_id<T>(messages: Messages<T>, reader: MessageReader, index: i64, default_value: T) -> MessageReadWithMessageId<T> {
+    let read = messages_reader_nth_with_id<T>(messages, reader, index, default_value);
+    return MessageReadWithMessageId<T> { has_value: read.has_value, value: read.value, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_reader_last_with_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageReadWithId<T> {
+    let unread = messages_reader_len<T>(messages, reader);
+    if unread <= 0 { return MessageReadWithId<T> { has_value: false, value: default_value, id: message_id_none(), reader: reader }; };
+    return messages_reader_nth_with_id<T>(messages, reader, unread - 1, default_value);
+}
+
+fn messages_reader_last<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageRead<T> {
+    let read = messages_reader_last_with_id<T>(messages, reader, default_value);
+    return MessageRead<T> { has_value: read.has_value, value: read.value, reader: read.reader };
+}
+
+fn messages_reader_last_with_message_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageReadWithMessageId<T> {
+    let read = messages_reader_last_with_id<T>(messages, reader, default_value);
+    return MessageReadWithMessageId<T> { has_value: read.has_value, value: read.value, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_mutator_len<T>(messages: Messages<T>, reader: MessageReader) -> i64 {
+    return messages_reader_len<T>(messages, reader);
+}
+
+fn messages_mutator_is_empty<T>(messages: Messages<T>, reader: MessageReader) -> bool {
+    return messages_reader_is_empty<T>(messages, reader);
+}
+
+fn messages_mutator_clear<T>(reader: MessageReader, messages: Messages<T>) -> MessageReader {
+    return messages_reader_clear<T>(reader, messages);
+}
+
+fn messages_mutator_count<T>(messages: Messages<T>, reader: MessageReader) -> (MessageReader, i64) {
+    return messages_reader_count<T>(messages, reader);
+}
+
+fn messages_mutator_read_next<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageMutRead<T> {
+    let i: i64 = 0;
+    while i < messages.count {
+        let id = messages.ids[i];
+        if id >= reader.cursor {
+            let item = MessageMut<T> { index: i, value: messages.values[i] };
+            reader.cursor = id + 1;
+            return MessageMutRead<T> { has_value: true, item: item, reader: reader };
+        };
+        i = i + 1;
+    }
+    let item = MessageMut<T> { index: -1, value: default_value };
+    return MessageMutRead<T> { has_value: false, item: item, reader: reader };
+}
+
+fn messages_mutator_read_next_with_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageMutReadWithId<T> {
+    let i: i64 = 0;
+    while i < messages.count {
+        let stored_id = messages.ids[i];
+        if stored_id >= reader.cursor {
+            let item = MessageMut<T> { index: i, value: messages.values[i] };
+            let id = message_id_new(stored_id);
+            reader.cursor = stored_id + 1;
+            return MessageMutReadWithId<T> { has_value: true, item: item, id: id, reader: reader };
+        };
+        i = i + 1;
+    }
+    let item = MessageMut<T> { index: -1, value: default_value };
+    return MessageMutReadWithId<T> { has_value: false, item: item, id: message_id_none(), reader: reader };
+}
+
+fn messages_mutator_read_next_with_message_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageMutReadWithMessageId<T> {
+    let read = messages_mutator_read_next_with_id<T>(messages, reader, default_value);
+    return MessageMutReadWithMessageId<T> { has_value: read.has_value, item: read.item, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_mutator_nth_with_id<T>(messages: Messages<T>, reader: MessageReader, index: i64, default_value: T) -> MessageMutReadWithId<T> {
+    if index < 0 { return MessageMutReadWithId<T> { has_value: false, item: MessageMut<T> { index: -1, value: default_value }, id: message_id_none(), reader: reader }; };
+    let i: i64 = 0;
+    let seen: i64 = 0;
+    while i < messages.count {
+        let stored_id = messages.ids[i];
+        if stored_id >= reader.cursor {
+            if seen == index {
+                let item = MessageMut<T> { index: i, value: messages.values[i] };
+                reader.cursor = stored_id + 1;
+                return MessageMutReadWithId<T> { has_value: true, item: item, id: message_id_new(stored_id), reader: reader };
+            };
+            seen = seen + 1;
+        };
+        i = i + 1;
+    }
+    reader = messages_mutator_clear<T>(reader, messages);
+    return MessageMutReadWithId<T> { has_value: false, item: MessageMut<T> { index: -1, value: default_value }, id: message_id_none(), reader: reader };
+}
+
+fn messages_mutator_nth<T>(messages: Messages<T>, reader: MessageReader, index: i64, default_value: T) -> MessageMutRead<T> {
+    let read = messages_mutator_nth_with_id<T>(messages, reader, index, default_value);
+    return MessageMutRead<T> { has_value: read.has_value, item: read.item, reader: read.reader };
+}
+
+fn messages_mutator_nth_with_message_id<T>(messages: Messages<T>, reader: MessageReader, index: i64, default_value: T) -> MessageMutReadWithMessageId<T> {
+    let read = messages_mutator_nth_with_id<T>(messages, reader, index, default_value);
+    return MessageMutReadWithMessageId<T> { has_value: read.has_value, item: read.item, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_mutator_last_with_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageMutReadWithId<T> {
+    let unread = messages_mutator_len<T>(messages, reader);
+    if unread <= 0 { return MessageMutReadWithId<T> { has_value: false, item: MessageMut<T> { index: -1, value: default_value }, id: message_id_none(), reader: reader }; };
+    return messages_mutator_nth_with_id<T>(messages, reader, unread - 1, default_value);
+}
+
+fn messages_mutator_last<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageMutRead<T> {
+    let read = messages_mutator_last_with_id<T>(messages, reader, default_value);
+    return MessageMutRead<T> { has_value: read.has_value, item: read.item, reader: read.reader };
+}
+
+fn messages_mutator_last_with_message_id<T>(messages: Messages<T>, reader: MessageReader, default_value: T) -> MessageMutReadWithMessageId<T> {
+    let read = messages_mutator_last_with_id<T>(messages, reader, default_value);
+    return MessageMutReadWithMessageId<T> { has_value: read.has_value, item: read.item, id: message_id_typed_new<T>(read.id), reader: read.reader };
+}
+
+fn messages_mutator_write_back<T>(messages: Messages<T>, item: MessageMut<T>) -> Messages<T> {
+    if item.index < 0 { panic(2430); };
+    if item.index >= messages.count { panic(2431); };
+    messages.values[item.index] = item.value;
+    return messages;
+}
+
+fn messages_mutator_write<T>(messages: Messages<T>, value: T) -> Messages<T> {
+    return messages_write<T>(messages, value);
+}
+
+fn messages_mutator_write_with_id<T>(messages: Messages<T>, value: T) -> MessageWrite<T> {
+    return messages_write_with_id<T>(messages, value);
+}
+
+fn messages_mutator_write_with_message_id<T>(messages: Messages<T>, value: T) -> MessageWriteWithMessageId<T> {
+    return messages_write_with_message_id<T>(messages, value);
+}
+
+fn messages_mutator_write_batch<T>(messages: Messages<T>, writer: MessageWriter<T>) -> MessageBatchWrite<T> {
+    return messages_write_batch<T>(messages, writer);
+}
+
+fn messages_mutator_write_batch_with_message_id<T>(messages: Messages<T>, writer: MessageWriter<T>) -> MessageBatchWriteWithMessageId<T> {
+    return messages_write_batch_with_message_id<T>(messages, writer);
+}
+
+fn messages_mutator_write_default<T>(messages: Messages<T>, default_value: T) -> MessageWrite<T> {
+    return messages_write_default<T>(messages, default_value);
+}
+
+fn messages_mutator_write_default_with_message_id<T>(messages: Messages<T>, default_value: T) -> MessageWriteWithMessageId<T> {
+    return messages_write_default_with_message_id<T>(messages, default_value);
+}
+
+struct TestDamageMessage {
+    amount: i32,
+}
+
+fn test_damage_messages_new() -> Messages<TestDamageMessage> {
+    return messages_new<TestDamageMessage>(TestDamageMessage { amount: 0 });
+}
+
+fn test_damage_default() -> TestDamageMessage {
+    return TestDamageMessage { amount: 0 };
+}
+
+@test "messages generic constructor"() {
+    let m = messages_new<TestDamageMessage>(test_damage_default());
+    if m.count != 0 { panic(2390); };
+    if m.next_id != 0 { panic(2450); };
+    if m.current_start_id != 0 { panic(2497); };
+    if messages_len<TestDamageMessage>(m) != 0 { panic(2451); };
+    if messages_is_empty<TestDamageMessage>(m) != true { panic(2452); };
+    if messages_message_count<TestDamageMessage>(m) != 0 { panic(2589); };
+    if messages_oldest_message_count<TestDamageMessage>(m) != 0 { panic(2590); };
+}
+
+@test "messages writer appends"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    if m2.count != 2 { panic(2400); };
+    if m2.next_id != 2 { panic(2453); };
+    if m2.ids[0] != 0 { panic(2454); };
+    if m2.ids[1] != 1 { panic(2455); };
+    if messages_message_count<TestDamageMessage>(m2) != 2 { panic(2591); };
+    if messages_oldest_message_count<TestDamageMessage>(m2) != 0 { panic(2592); };
+}
+
+@test "messages write returns monotonic ids and supports direct lookup"() {
+    let m0 = test_damage_messages_new();
+    let w1 = messages_write_with_id<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let w2 = messages_write_with_id<TestDamageMessage>(w1.messages, TestDamageMessage { amount: 7 });
+    if w1.id != 0 { panic(2456); };
+    if w2.id != 1 { panic(2457); };
+    if message_id_eq(w1.id, w2.id) { panic(2458); };
+    if message_id_lt(w1.id, w2.id) != true { panic(2459); };
+    let found = messages_get_message<TestDamageMessage>(w2.messages, w1.id, test_damage_default());
+    if found.has_value != true { panic(2460); };
+    if found.value.amount != 5 { panic(2461); };
+    let missing = messages_get_message<TestDamageMessage>(w2.messages, message_id_new(99), test_damage_default());
+    if missing.has_value { panic(2462); };
+}
+
+@test "message writer param batches appends"() {
+    let m0 = test_damage_messages_new();
+    let w0 = message_writer_new<TestDamageMessage>();
+    let w1 = message_writer_send<TestDamageMessage>(w0, TestDamageMessage { amount: 3 });
+    let w2 = message_writer_send<TestDamageMessage>(w1, TestDamageMessage { amount: 9 });
+    let m1 = messages_apply_writer<TestDamageMessage>(m0, w2);
+    let r0 = message_reader_new();
+    let read1 = messages_read_next<TestDamageMessage>(m1, r0, test_damage_default());
+    let read2 = messages_read_next<TestDamageMessage>(m1, read1.reader, test_damage_default());
+    if read1.value.amount != 3 { panic(2420); };
+    if read2.value.amount != 9 { panic(2421); };
+}
+
+@test "message writer Bevy aliases and buffer helpers"() {
+    let writer0 = message_writer_new<TestDamageMessage>();
+    if message_writer_is_empty<TestDamageMessage>(writer0) != true { panic(2620); };
+    let writer1 = message_writer_write<TestDamageMessage>(writer0, TestDamageMessage { amount: 3 });
+    let writer2 = message_writer_write_default<TestDamageMessage>(writer1, TestDamageMessage { amount: 5 });
+    if message_writer_len<TestDamageMessage>(writer2) != 2 { panic(2621); };
+    if message_writer_is_empty<TestDamageMessage>(writer2) { panic(2622); };
+
+    let extra0 = message_writer_new<TestDamageMessage>();
+    let extra1 = message_writer_send<TestDamageMessage>(extra0, TestDamageMessage { amount: 7 });
+    let writer3 = message_writer_write_batch<TestDamageMessage>(writer2, extra1);
+    if message_writer_len<TestDamageMessage>(writer3) != 3 { panic(2623); };
+
+    let m0 = test_damage_messages_new();
+    let batch = messages_write_batch<TestDamageMessage>(m0, writer3);
+    if batch.messages.values[0].amount != 3 { panic(2624); };
+    if batch.messages.values[1].amount != 5 { panic(2625); };
+    if batch.messages.values[2].amount != 7 { panic(2626); };
+
+    let cleared = message_writer_clear<TestDamageMessage>(writer3);
+    if message_writer_is_empty<TestDamageMessage>(cleared) != true { panic(2627); };
+}
+
+@test "messages write batch returns contiguous ids"() {
+    let m0 = test_damage_messages_new();
+    let first = messages_write_with_id<TestDamageMessage>(m0, TestDamageMessage { amount: 1 });
+    if first.id != 0 { panic(2547); };
+    let writer0 = message_writer_new<TestDamageMessage>();
+    let writer1 = message_writer_send<TestDamageMessage>(writer0, TestDamageMessage { amount: 3 });
+    let writer2 = message_writer_send<TestDamageMessage>(writer1, TestDamageMessage { amount: 5 });
+    let batch = messages_write_batch<TestDamageMessage>(first.messages, writer2);
+    if batch.first_id != 1 { panic(2548); };
+    if batch.count != 2 { panic(2549); };
+    if message_batch_write_id_at<TestDamageMessage>(batch, 0) != 1 { panic(2550); };
+    if message_batch_write_id_at<TestDamageMessage>(batch, 1) != 2 { panic(2551); };
+    if message_batch_write_id_at<TestDamageMessage>(batch, 2) != -1 { panic(2552); };
+    if batch.messages.next_id != 3 { panic(2553); };
+
+    let read1 = messages_read_next_with_id<TestDamageMessage>(batch.messages, MessageReader { cursor: 1 }, test_damage_default());
+    let read2 = messages_read_next_with_id<TestDamageMessage>(batch.messages, read1.reader, test_damage_default());
+    if read1.id != 1 { panic(2554); };
+    if read1.value.amount != 3 { panic(2555); };
+    if read2.id != 2 { panic(2556); };
+    if read2.value.amount != 5 { panic(2557); };
+
+    let empty_writer = message_writer_new<TestDamageMessage>();
+    let empty = messages_write_batch<TestDamageMessage>(batch.messages, empty_writer);
+    if empty.first_id != 3 { panic(2558); };
+    if empty.count != 0 { panic(2559); };
+    if empty.messages.next_id != 3 { panic(2560); };
+}
+
+@test "message batch id range helpers match WriteBatchIds behavior"() {
+    let m0 = test_damage_messages_new();
+    let writer0 = message_writer_new<TestDamageMessage>();
+    let writer1 = message_writer_send<TestDamageMessage>(writer0, TestDamageMessage { amount: 3 });
+    let writer2 = message_writer_send<TestDamageMessage>(writer1, TestDamageMessage { amount: 5 });
+    let batch = messages_write_batch<TestDamageMessage>(m0, writer2);
+    if message_batch_write_len<TestDamageMessage>(batch) != 2 { panic(2628); };
+    if message_batch_write_is_empty<TestDamageMessage>(batch) { panic(2629); };
+    if message_batch_write_last_id<TestDamageMessage>(batch) != 1 { panic(2630); };
+
+    let typed = messages_write_batch_with_message_id<TestDamageMessage>(batch.messages, writer2);
+    if message_batch_write_message_id_len<TestDamageMessage>(typed) != 2 { panic(2631); };
+    if message_batch_write_message_id_is_empty<TestDamageMessage>(typed) { panic(2632); };
+    if message_id_typed_value<TestDamageMessage>(message_batch_write_last_message_id<TestDamageMessage>(typed)) != 3 { panic(2633); };
+
+    let empty_writer = message_writer_new<TestDamageMessage>();
+    let empty = messages_write_batch<TestDamageMessage>(typed.messages, empty_writer);
+    if message_batch_write_is_empty<TestDamageMessage>(empty) != true { panic(2634); };
+    if message_batch_write_last_id<TestDamageMessage>(empty) != -1 { panic(2635); };
+}
+
+@test "messages write default returns id"() {
+    let m0 = test_damage_messages_new();
+    let written = messages_write_default<TestDamageMessage>(m0, TestDamageMessage { amount: 42 });
+    if written.id != 0 { panic(2561); };
+    if written.messages.next_id != 1 { panic(2562); };
+    let found = messages_get_message<TestDamageMessage>(written.messages, written.id, test_damage_default());
+    if found.has_value != true { panic(2563); };
+    if found.value.amount != 42 { panic(2564); };
+}
+
+@test "messages typed MessageId wrappers preserve ids"() {
+    let m0 = test_damage_messages_new();
+    let w1 = messages_write_with_message_id<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let w2 = messages_write_with_message_id<TestDamageMessage>(w1.messages, TestDamageMessage { amount: 7 });
+    if message_id_typed_value<TestDamageMessage>(w1.id) != 0 { panic(2565); };
+    if message_id_typed_value<TestDamageMessage>(w2.id) != 1 { panic(2566); };
+    if message_id_typed_eq<TestDamageMessage>(w1.id, w2.id) { panic(2567); };
+    if message_id_typed_lt<TestDamageMessage>(w1.id, w2.id) != true { panic(2568); };
+
+    let found = messages_get_message_id<TestDamageMessage>(w2.messages, w1.id, test_damage_default());
+    if found.has_value != true { panic(2569); };
+    if found.value.amount != 5 { panic(2570); };
+    if message_id_typed_value<TestDamageMessage>(found.id) != 0 { panic(2571); };
+
+    let writer0 = message_writer_new<TestDamageMessage>();
+    let writer1 = message_writer_send<TestDamageMessage>(writer0, TestDamageMessage { amount: 11 });
+    let writer2 = message_writer_send<TestDamageMessage>(writer1, TestDamageMessage { amount: 13 });
+    let batch = messages_write_batch_with_message_id<TestDamageMessage>(w2.messages, writer2);
+    let batch_first = message_batch_write_message_id_at<TestDamageMessage>(batch, 0);
+    let batch_second = message_batch_write_message_id_at<TestDamageMessage>(batch, 1);
+    let batch_missing = message_batch_write_message_id_at<TestDamageMessage>(batch, 2);
+    if message_id_typed_value<TestDamageMessage>(batch.first_id) != 2 { panic(2572); };
+    if message_id_typed_value<TestDamageMessage>(batch_first) != 2 { panic(2573); };
+    if message_id_typed_value<TestDamageMessage>(batch_second) != 3 { panic(2574); };
+    if message_id_typed_value<TestDamageMessage>(batch_missing) != -1 { panic(2575); };
+
+    let read = messages_read_next_with_message_id<TestDamageMessage>(batch.messages, MessageReader { cursor: 2 }, test_damage_default());
+    if read.has_value != true { panic(2576); };
+    if read.value.amount != 11 { panic(2577); };
+    if message_id_typed_value<TestDamageMessage>(read.id) != 2 { panic(2578); };
+
+    let mut_read = messages_mutator_read_next_with_message_id<TestDamageMessage>(batch.messages, MessageReader { cursor: 3 }, test_damage_default());
+    if mut_read.has_value != true { panic(2579); };
+    if mut_read.item.value.amount != 13 { panic(2580); };
+    if message_id_typed_value<TestDamageMessage>(mut_read.id) != 3 { panic(2581); };
+}
+
+@test "message reader cursor advances independently"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let r0 = message_reader_new();
+    let r_other = message_reader_new();
+    let read1 = messages_read_next<TestDamageMessage>(m2, r0, test_damage_default());
+    if read1.has_value != true { panic(2410); };
+    if read1.value.amount != 5 { panic(2411); };
+    let read2 = messages_read_next<TestDamageMessage>(m2, read1.reader, test_damage_default());
+    if read2.has_value != true { panic(2412); };
+    if read2.value.amount != 7 { panic(2413); };
+    let read3 = messages_read_next<TestDamageMessage>(m2, read2.reader, test_damage_default());
+    if read3.has_value != false { panic(2414); };
+
+    let other = messages_read_next<TestDamageMessage>(m2, r_other, test_damage_default());
+    if other.value.amount != 5 { panic(2415); };
+}
+
+@test "message reader read with id preserves send order"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let read1 = messages_read_next_with_id<TestDamageMessage>(m2, message_reader_new(), test_damage_default());
+    let read2 = messages_read_next_with_id<TestDamageMessage>(m2, read1.reader, test_damage_default());
+    let read3 = messages_read_next_with_id<TestDamageMessage>(m2, read2.reader, test_damage_default());
+    if read1.has_value != true { panic(2463); };
+    if read1.id != 0 { panic(2464); };
+    if read1.value.amount != 5 { panic(2465); };
+    if read2.has_value != true { panic(2466); };
+    if read2.id != 1 { panic(2467); };
+    if read2.value.amount != 7 { panic(2468); };
+    if read3.has_value { panic(2469); };
+    if read3.id != -1 { panic(2470); };
+
+    let current = message_reader_current<TestDamageMessage>(m2);
+    if messages_reader_is_empty<TestDamageMessage>(m2, current) != true { panic(2471); };
+    let m3 = messages_write<TestDamageMessage>(m2, TestDamageMessage { amount: 11 });
+    let read_current = messages_read_next_with_id<TestDamageMessage>(m3, current, test_damage_default());
+    if read_current.has_value != true { panic(2472); };
+    if read_current.id != 2 { panic(2473); };
+    if read_current.value.amount != 11 { panic(2474); };
+}
+
+@test "messages get cursor aliases match Bevy semantics"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let from_start = messages_get_cursor<TestDamageMessage>(m2);
+    let read_start = messages_read_next_with_id<TestDamageMessage>(m2, from_start, test_damage_default());
+    if read_start.has_value != true { panic(2582); };
+    if read_start.id != 0 { panic(2583); };
+    if read_start.value.amount != 5 { panic(2584); };
+    let current = messages_get_cursor_current<TestDamageMessage>(m2);
+    if messages_reader_is_empty<TestDamageMessage>(m2, current) != true { panic(2585); };
+    let m3 = messages_write<TestDamageMessage>(m2, TestDamageMessage { amount: 11 });
+    let read_current = messages_read_next_with_id<TestDamageMessage>(m3, current, test_damage_default());
+    if read_current.has_value != true { panic(2586); };
+    if read_current.id != 2 { panic(2587); };
+    if read_current.value.amount != 11 { panic(2588); };
+}
+
+@test "message reader len empty and clear support populated readers"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let r0 = message_reader_new();
+    if messages_reader_len<TestDamageMessage>(m2, r0) != 2 { panic(2440); };
+    if messages_reader_is_empty<TestDamageMessage>(m2, r0) { panic(2441); };
+    let read1 = messages_read_next<TestDamageMessage>(m2, r0, test_damage_default());
+    if messages_reader_len<TestDamageMessage>(m2, read1.reader) != 1 { panic(2442); };
+    let r_clear = messages_reader_clear<TestDamageMessage>(read1.reader, m2);
+    if messages_reader_is_empty<TestDamageMessage>(m2, r_clear) != true { panic(2443); };
+    if messages_reader_len<TestDamageMessage>(m2, r_clear) != 0 { panic(2444); };
+}
+
+@test "message reader count nth and last consume cursors"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let m3 = messages_write<TestDamageMessage>(m2, TestDamageMessage { amount: 11 });
+
+    let (count_reader, count) = messages_reader_count<TestDamageMessage>(m3, message_reader_new());
+    if count != 3 { panic(2636); };
+    if messages_reader_is_empty<TestDamageMessage>(m3, count_reader) != true { panic(2637); };
+
+    let nth = messages_reader_nth_with_message_id<TestDamageMessage>(m3, message_reader_new(), 1, test_damage_default());
+    if nth.has_value != true { panic(2638); };
+    if message_id_typed_value<TestDamageMessage>(nth.id) != 1 { panic(2639); };
+    if nth.value.amount != 7 { panic(2640); };
+    let after_nth = messages_read_next_with_id<TestDamageMessage>(m3, nth.reader, test_damage_default());
+    if after_nth.id != 2 { panic(2641); };
+    if after_nth.value.amount != 11 { panic(2642); };
+
+    let missing = messages_reader_nth_with_id<TestDamageMessage>(m3, message_reader_new(), 99, test_damage_default());
+    if missing.has_value { panic(2643); };
+    if messages_reader_is_empty<TestDamageMessage>(m3, missing.reader) != true { panic(2644); };
+
+    let last = messages_reader_last_with_message_id<TestDamageMessage>(m3, message_reader_new(), test_damage_default());
+    if last.has_value != true { panic(2645); };
+    if message_id_typed_value<TestDamageMessage>(last.id) != 2 { panic(2646); };
+    if last.value.amount != 11 { panic(2647); };
+    if messages_reader_is_empty<TestDamageMessage>(m3, last.reader) != true { panic(2648); };
+}
+
+@test "message mutator reads writes modifies and clears"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let reader0 = message_reader_new();
+    if messages_mutator_len<TestDamageMessage>(m2, reader0) != 2 { panic(2432); };
+    if messages_mutator_is_empty<TestDamageMessage>(m2, reader0) { panic(2433); };
+
+    let first = messages_mutator_read_next<TestDamageMessage>(m2, reader0, test_damage_default());
+    if first.has_value != true { panic(2434); };
+    if first.item.value.amount != 5 { panic(2435); };
+    first.item.value.amount = first.item.value.amount + 100;
+    let m3 = messages_mutator_write_back<TestDamageMessage>(m2, first.item);
+    let m4 = messages_mutator_write<TestDamageMessage>(m3, TestDamageMessage { amount: 9 });
+
+    let check0 = messages_read_next<TestDamageMessage>(m4, message_reader_new(), test_damage_default());
+    let check1 = messages_read_next<TestDamageMessage>(m4, check0.reader, test_damage_default());
+    let check2 = messages_read_next<TestDamageMessage>(m4, check1.reader, test_damage_default());
+    if check0.value.amount != 105 { panic(2436); };
+    if check1.value.amount != 7 { panic(2437); };
+    if check2.value.amount != 9 { panic(2438); };
+
+    let reader1 = messages_mutator_clear<TestDamageMessage>(first.reader, m4);
+    if messages_mutator_is_empty<TestDamageMessage>(m4, reader1) != true { panic(2439); };
+}
+
+@test "message mutator read with id keeps ids stable after writeback"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let first = messages_mutator_read_next_with_id<TestDamageMessage>(m2, message_reader_new(), test_damage_default());
+    if first.has_value != true { panic(2475); };
+    if first.id != 0 { panic(2476); };
+    first.item.value.amount = 15;
+    let m3 = messages_mutator_write_back<TestDamageMessage>(m2, first.item);
+    let found = messages_get_message<TestDamageMessage>(m3, first.id, test_damage_default());
+    if found.has_value != true { panic(2477); };
+    if found.value.amount != 15 { panic(2478); };
+    let second = messages_mutator_read_next_with_id<TestDamageMessage>(m3, first.reader, test_damage_default());
+    if second.id != 1 { panic(2479); };
+    if second.item.value.amount != 7 { panic(2480); };
+}
+
+@test "message mutator count nth and last consume cursors"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_write<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 7 });
+    let m3 = messages_write<TestDamageMessage>(m2, TestDamageMessage { amount: 11 });
+
+    let (count_reader, count) = messages_mutator_count<TestDamageMessage>(m3, message_reader_new());
+    if count != 3 { panic(2649); };
+    if messages_mutator_is_empty<TestDamageMessage>(m3, count_reader) != true { panic(2650); };
+
+    let nth = messages_mutator_nth_with_message_id<TestDamageMessage>(m3, message_reader_new(), 1, test_damage_default());
+    if nth.has_value != true { panic(2651); };
+    if message_id_typed_value<TestDamageMessage>(nth.id) != 1 { panic(2652); };
+    if nth.item.value.amount != 7 { panic(2653); };
+    nth.item.value.amount = 70;
+    let m4 = messages_mutator_write_back<TestDamageMessage>(m3, nth.item);
+    let found = messages_get_message<TestDamageMessage>(m4, 1, test_damage_default());
+    if found.value.amount != 70 { panic(2654); };
+    let after_nth = messages_mutator_read_next_with_id<TestDamageMessage>(m4, nth.reader, test_damage_default());
+    if after_nth.id != 2 { panic(2655); };
+
+    let missing = messages_mutator_nth_with_id<TestDamageMessage>(m4, message_reader_new(), 99, test_damage_default());
+    if missing.has_value { panic(2656); };
+    if messages_mutator_is_empty<TestDamageMessage>(m4, missing.reader) != true { panic(2657); };
+
+    let last = messages_mutator_last_with_message_id<TestDamageMessage>(m4, message_reader_new(), test_damage_default());
+    if last.has_value != true { panic(2658); };
+    if message_id_typed_value<TestDamageMessage>(last.id) != 2 { panic(2659); };
+    if last.item.value.amount != 11 { panic(2660); };
+    if messages_mutator_is_empty<TestDamageMessage>(m4, last.reader) != true { panic(2661); };
+}
+
+@test "message mutator write batch and default return typed ids"() {
+    let m0 = test_damage_messages_new();
+    let w0 = messages_mutator_write_with_message_id<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    if message_id_typed_value<TestDamageMessage>(w0.id) != 0 { panic(2605); };
+
+    let writer0 = message_writer_new<TestDamageMessage>();
+    let writer1 = message_writer_send<TestDamageMessage>(writer0, TestDamageMessage { amount: 7 });
+    let writer2 = message_writer_send<TestDamageMessage>(writer1, TestDamageMessage { amount: 9 });
+    let batch = messages_mutator_write_batch_with_message_id<TestDamageMessage>(w0.messages, writer2);
+    if message_id_typed_value<TestDamageMessage>(batch.first_id) != 1 { panic(2606); };
+    if batch.count != 2 { panic(2607); };
+    if message_id_typed_value<TestDamageMessage>(message_batch_write_message_id_at<TestDamageMessage>(batch, 0)) != 1 { panic(2608); };
+    if message_id_typed_value<TestDamageMessage>(message_batch_write_message_id_at<TestDamageMessage>(batch, 1)) != 2 { panic(2609); };
+
+    let defaulted = messages_mutator_write_default_with_message_id<TestDamageMessage>(batch.messages, test_damage_default());
+    if message_id_typed_value<TestDamageMessage>(defaulted.id) != 3 { panic(2610); };
+    if messages_message_count<TestDamageMessage>(defaulted.messages) != 4 { panic(2611); };
+
+    let r0 = messages_mutator_read_next_with_message_id<TestDamageMessage>(defaulted.messages, message_reader_new(), test_damage_default());
+    let r1 = messages_mutator_read_next_with_message_id<TestDamageMessage>(defaulted.messages, r0.reader, test_damage_default());
+    let r2 = messages_mutator_read_next_with_message_id<TestDamageMessage>(defaulted.messages, r1.reader, test_damage_default());
+    let r3 = messages_mutator_read_next_with_message_id<TestDamageMessage>(defaulted.messages, r2.reader, test_damage_default());
+    if message_id_typed_value<TestDamageMessage>(r0.id) != 0 { panic(2612); };
+    if r0.item.value.amount != 5 { panic(2613); };
+    if message_id_typed_value<TestDamageMessage>(r1.id) != 1 { panic(2614); };
+    if r1.item.value.amount != 7 { panic(2615); };
+    if message_id_typed_value<TestDamageMessage>(r2.id) != 2 { panic(2616); };
+    if r2.item.value.amount != 9 { panic(2617); };
+    if message_id_typed_value<TestDamageMessage>(r3.id) != 3 { panic(2618); };
+    if r3.item.value.amount != 0 { panic(2619); };
+}
+
+@test "messages clear removes stored messages without reusing ids"() {
+    let m0 = test_damage_messages_new();
+    let w1 = messages_write_with_id<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let m1 = messages_clear<TestDamageMessage>(w1.messages);
+    if messages_len<TestDamageMessage>(m1) != 0 { panic(2481); };
+    if messages_is_empty<TestDamageMessage>(m1) != true { panic(2482); };
+    let missed = messages_get_message<TestDamageMessage>(m1, w1.id, test_damage_default());
+    if missed.has_value { panic(2483); };
+    let w2 = messages_write_with_id<TestDamageMessage>(m1, TestDamageMessage { amount: 9 });
+    if w2.id != 1 { panic(2484); };
+}
+
+@test "message reader cursor is global id not physical slot"() {
+    let m0 = test_damage_messages_new();
+    let w1 = messages_write_with_id<TestDamageMessage>(m0, TestDamageMessage { amount: 5 });
+    let read1 = messages_read_next_with_id<TestDamageMessage>(w1.messages, message_reader_new(), test_damage_default());
+    if read1.id != 0 { panic(2485); };
+    if read1.reader.cursor != 1 { panic(2486); };
+
+    let m1 = messages_clear<TestDamageMessage>(w1.messages);
+    if messages_reader_len<TestDamageMessage>(m1, read1.reader) != 0 { panic(2487); };
+    if messages_reader_missed<TestDamageMessage>(m1, message_reader_new()) != 1 { panic(2488); };
+
+    let w2 = messages_write_with_id<TestDamageMessage>(m1, TestDamageMessage { amount: 9 });
+    if w2.id != 1 { panic(2489); };
+    if messages_reader_len<TestDamageMessage>(w2.messages, read1.reader) != 1 { panic(2490); };
+    let read2 = messages_read_next_with_id<TestDamageMessage>(w2.messages, read1.reader, test_damage_default());
+    if read2.has_value != true { panic(2491); };
+    if read2.id != 1 { panic(2492); };
+    if read2.value.amount != 9 { panic(2493); };
+
+    let current = message_reader_current<TestDamageMessage>(w2.messages);
+    if current.cursor != 2 { panic(2494); };
+    let w3 = messages_write<TestDamageMessage>(w2.messages, TestDamageMessage { amount: 11 });
+    let read_current = messages_read_next_with_id<TestDamageMessage>(w3, current, test_damage_default());
+    if read_current.id != 2 { panic(2495); };
+    if read_current.value.amount != 11 { panic(2496); };
+}
+
+@test "messages update keeps current buffer and drops older buffer"() {
+    let m0 = test_damage_messages_new();
+    if messages_current_update_len<TestDamageMessage>(m0) != 0 { panic(2498); };
+
+    let m1 = messages_update<TestDamageMessage>(m0);
+    if messages_len<TestDamageMessage>(m1) != 0 { panic(2499); };
+    if messages_current_update_len<TestDamageMessage>(m1) != 0 { panic(2500); };
+
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 1 });
+    if messages_len<TestDamageMessage>(m2) != 1 { panic(2501); };
+    if messages_current_update_len<TestDamageMessage>(m2) != 1 { panic(2502); };
+
+    let m3 = messages_update<TestDamageMessage>(m2);
+    if messages_len<TestDamageMessage>(m3) != 1 { panic(2503); };
+    if messages_current_update_len<TestDamageMessage>(m3) != 0 { panic(2504); };
+
+    let m4 = messages_write<TestDamageMessage>(m3, TestDamageMessage { amount: 2 });
+    let m5 = messages_write<TestDamageMessage>(m4, TestDamageMessage { amount: 3 });
+    if messages_len<TestDamageMessage>(m5) != 3 { panic(2505); };
+    if messages_current_update_len<TestDamageMessage>(m5) != 2 { panic(2506); };
+    if messages_message_count<TestDamageMessage>(m5) != 3 { panic(2593); };
+    if messages_oldest_message_count<TestDamageMessage>(m5) != 0 { panic(2594); };
+
+    let current_at0 = messages_current_update_message_at<TestDamageMessage>(m5, 0, test_damage_default());
+    let current_at1 = messages_current_update_message_id_at<TestDamageMessage>(m5, 1, test_damage_default());
+    let current_at2 = messages_current_update_message_at<TestDamageMessage>(m5, 2, test_damage_default());
+    if current_at0.has_value != true { panic(2595); };
+    if current_at0.id != 1 { panic(2596); };
+    if current_at0.value.amount != 2 { panic(2597); };
+    if current_at1.has_value != true { panic(2598); };
+    if message_id_typed_value<TestDamageMessage>(current_at1.id) != 2 { panic(2599); };
+    if current_at1.value.amount != 3 { panic(2600); };
+    if current_at2.has_value { panic(2601); };
+    if current_at2.id != -1 { panic(2602); };
+
+    let current_reader = message_reader_current_update<TestDamageMessage>(m5);
+    let current1 = messages_read_next_with_id<TestDamageMessage>(m5, current_reader, test_damage_default());
+    let current2 = messages_read_next_with_id<TestDamageMessage>(m5, current1.reader, test_damage_default());
+    let current3 = messages_read_next_with_id<TestDamageMessage>(m5, current2.reader, test_damage_default());
+    if current1.id != 1 { panic(2507); };
+    if current1.value.amount != 2 { panic(2508); };
+    if current2.id != 2 { panic(2509); };
+    if current2.value.amount != 3 { panic(2510); };
+    if current3.has_value { panic(2511); };
+
+    let m6 = messages_update<TestDamageMessage>(m5);
+    if messages_len<TestDamageMessage>(m6) != 2 { panic(2512); };
+    if messages_current_update_len<TestDamageMessage>(m6) != 0 { panic(2513); };
+    if messages_oldest_message_count<TestDamageMessage>(m6) != 1 { panic(2603); };
+    if messages_reader_missed<TestDamageMessage>(m6, message_reader_new()) != 1 { panic(2514); };
+    let old = messages_get_message<TestDamageMessage>(m6, message_id_new(0), test_damage_default());
+    if old.has_value { panic(2515); };
+    let kept = messages_get_message<TestDamageMessage>(m6, message_id_new(1), test_damage_default());
+    if kept.has_value != true { panic(2516); };
+    if kept.value.amount != 2 { panic(2517); };
+
+    let m7 = messages_update<TestDamageMessage>(m6);
+    if messages_len<TestDamageMessage>(m7) != 0 { panic(2518); };
+    if messages_oldest_message_count<TestDamageMessage>(m7) != 3 { panic(2604); };
+    if messages_reader_missed<TestDamageMessage>(m7, message_reader_new()) != 3 { panic(2519); };
+}
+
+@test "messages update drain returns older buffer and keeps current"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_update<TestDamageMessage>(m0);
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 1 });
+    let m3 = messages_update<TestDamageMessage>(m2);
+    let m4 = messages_write<TestDamageMessage>(m3, TestDamageMessage { amount: 2 });
+    let m5 = messages_write<TestDamageMessage>(m4, TestDamageMessage { amount: 3 });
+
+    let d1 = messages_update_drain<TestDamageMessage>(m5, test_damage_default());
+    if d1.count != 1 { panic(2520); };
+    if d1.ids[0] != 0 { panic(2521); };
+    if d1.values[0].amount != 1 { panic(2522); };
+    if messages_len<TestDamageMessage>(d1.messages) != 2 { panic(2523); };
+    if messages_current_update_len<TestDamageMessage>(d1.messages) != 0 { panic(2524); };
+    let kept1 = messages_get_message<TestDamageMessage>(d1.messages, message_id_new(1), test_damage_default());
+    let kept2 = messages_get_message<TestDamageMessage>(d1.messages, message_id_new(2), test_damage_default());
+    if kept1.value.amount != 2 { panic(2525); };
+    if kept2.value.amount != 3 { panic(2526); };
+
+    let d2 = messages_update_drain<TestDamageMessage>(d1.messages, test_damage_default());
+    if d2.count != 2 { panic(2527); };
+    if d2.ids[0] != 1 { panic(2528); };
+    if d2.ids[1] != 2 { panic(2529); };
+    if d2.values[0].amount != 2 { panic(2530); };
+    if d2.values[1].amount != 3 { panic(2531); };
+    if messages_len<TestDamageMessage>(d2.messages) != 0 { panic(2532); };
+    if messages_reader_missed<TestDamageMessage>(d2.messages, message_reader_new()) != 3 { panic(2533); };
+}
+
+@test "messages drain returns all retained messages and clears"() {
+    let m0 = test_damage_messages_new();
+    let m1 = messages_update<TestDamageMessage>(m0);
+    let m2 = messages_write<TestDamageMessage>(m1, TestDamageMessage { amount: 1 });
+    let m3 = messages_update<TestDamageMessage>(m2);
+    let m4 = messages_write<TestDamageMessage>(m3, TestDamageMessage { amount: 2 });
+    let m5 = messages_write<TestDamageMessage>(m4, TestDamageMessage { amount: 3 });
+
+    let drained = messages_drain<TestDamageMessage>(m5, test_damage_default());
+    if drained.count != 3 { panic(2534); };
+    if drained.ids[0] != 0 { panic(2535); };
+    if drained.ids[1] != 1 { panic(2536); };
+    if drained.ids[2] != 2 { panic(2537); };
+    if drained.values[0].amount != 1 { panic(2538); };
+    if drained.values[1].amount != 2 { panic(2539); };
+    if drained.values[2].amount != 3 { panic(2540); };
+    if messages_len<TestDamageMessage>(drained.messages) != 0 { panic(2541); };
+    if drained.messages.next_id != 3 { panic(2542); };
+    if drained.messages.current_start_id != 3 { panic(2543); };
+    if messages_reader_missed<TestDamageMessage>(drained.messages, message_reader_new()) != 3 { panic(2544); };
+
+    let after = messages_write<TestDamageMessage>(drained.messages, TestDamageMessage { amount: 4 });
+    let read_after = messages_read_next_with_id<TestDamageMessage>(after, MessageReader { cursor: 3 }, test_damage_default());
+    if read_after.id != 3 { panic(2545); };
+    if read_after.value.amount != 4 { panic(2546); };
+}

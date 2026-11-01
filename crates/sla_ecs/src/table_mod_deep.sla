@@ -1,0 +1,665 @@
+// Deepened Bevy ECS storage Table / Tables collection (src/storage/table/mod.rs).
+// Shallow: lib/table_mod.sla (Vec-backed Table + TableId + TableRow + Tables collection).
+//
+// The deep variant mirrors the shallow surface with a fixed-cap structured storage: cap-4
+// component columns × cap-8 entity rows (parallel-array flattened — per column 8 data cells +
+// 8 added-tick cells + 8 changed-tick cells, plus a component-id per column). No Vec, no
+// recursion. Tuple-return callsites (allocate, get, set, get_added_tick, get_changed_tick,
+// swap_remove, get_entity_at_row, tables_get, tables_create) are exposed as scalar wrapper
+// structs — Batch 373 observation: `let (a, b) = tuple_fn()` destructuring retroactively corrupts
+// prior assertions on the SA backend. Field-assign on struct-by-value params is SLA-legal on SA
+// (verified in Batch 374) so allocate/set/swap_remove use direct field-assign (no slot-view
+// rebuild). Cap reject is silent (returns the struct unchanged, ok=false) to mirror the
+// `if row < 0 / row >= n` guards returning `(t, false)`.
+//
+// Intentional leave-outs: no Vec backing (replaced by fixed-cap slot buffer); no real heap
+// allocation; columns are zero-initialised data (drop fn always reported as present — N/A here,
+// get_drop_for mirrors the shallow's has_column predicate).
+//
+// Field layout (cap-4 cols x cap-8 rows):
+//   id: i32, capacity: i64
+//   entity0..entity7: i64, entity_count: i32
+//   comp_id0..comp_id3: i32, column_count: i32
+//   col0_data0..col0_data7 i64, col0_added0..col0_added7 i64, col0_changed0..col0_changed7 i64
+//   col1_data0..col1_data7 i64, col1_added0..col1_added7 i64, col1_changed0..col1_changed7 i64
+//   col2_data0..col2_data7 i64, col2_added0..col2_added7 i64, col2_changed0..col2_changed7 i64
+//   col3_data0..col3_data7 i64, col3_added0..col3_added7 i64, col3_changed0..col3_changed7 i64
+
+const ECS_TABLE_DEEP_COL_CAP: i32 = 4;
+const ECS_TABLE_DEEP_ROW_CAP: i32 = 8;
+const ECS_TABLES_DEEP_CAP: i32 = 8;
+
+struct EcsTableIdDeep { value: i32 }
+
+fn ecs_table_id_deep_new(value: i32) -> EcsTableIdDeep {
+    return EcsTableIdDeep { value: value };
+}
+fn ecs_table_id_deep_value(id: EcsTableIdDeep) -> i32 { return id.value; }
+fn ecs_table_id_deep_index(id: EcsTableIdDeep) -> i32 { return id.value; }
+
+struct EcsTableRowDeep { value: i32 }
+
+fn ecs_table_row_deep_new(value: i32) -> EcsTableRowDeep {
+    return EcsTableRowDeep { value: value };
+}
+fn ecs_table_row_deep_value(r: EcsTableRowDeep) -> i32 { return r.value; }
+fn ecs_table_row_deep_index(r: EcsTableRowDeep) -> i32 { return r.value; }
+
+struct EcsTableDeep {
+    id: i32,
+    capacity: i64,
+    entity0: i64, entity1: i64, entity2: i64, entity3: i64,
+    entity4: i64, entity5: i64, entity6: i64, entity7: i64,
+    entity_count: i32,
+    comp_id0: i32, comp_id1: i32, comp_id2: i32, comp_id3: i32,
+    column_count: i32,
+    col0_data0: i64, col0_data1: i64, col0_data2: i64, col0_data3: i64, col0_data4: i64, col0_data5: i64, col0_data6: i64, col0_data7: i64,
+    col0_added0: i64, col0_added1: i64, col0_added2: i64, col0_added3: i64, col0_added4: i64, col0_added5: i64, col0_added6: i64, col0_added7: i64,
+    col0_changed0: i64, col0_changed1: i64, col0_changed2: i64, col0_changed3: i64, col0_changed4: i64, col0_changed5: i64, col0_changed6: i64, col0_changed7: i64,
+    col1_data0: i64, col1_data1: i64, col1_data2: i64, col1_data3: i64, col1_data4: i64, col1_data5: i64, col1_data6: i64, col1_data7: i64,
+    col1_added0: i64, col1_added1: i64, col1_added2: i64, col1_added3: i64, col1_added4: i64, col1_added5: i64, col1_added6: i64, col1_added7: i64,
+    col1_changed0: i64, col1_changed1: i64, col1_changed2: i64, col1_changed3: i64, col1_changed4: i64, col1_changed5: i64, col1_changed6: i64, col1_changed7: i64,
+    col2_data0: i64, col2_data1: i64, col2_data2: i64, col2_data3: i64, col2_data4: i64, col2_data5: i64, col2_data6: i64, col2_data7: i64,
+    col2_added0: i64, col2_added1: i64, col2_added2: i64, col2_added3: i64, col2_added4: i64, col2_added5: i64, col2_added6: i64, col2_added7: i64,
+    col2_changed0: i64, col2_changed1: i64, col2_changed2: i64, col2_changed3: i64, col2_changed4: i64, col2_changed5: i64, col2_changed6: i64, col2_changed7: i64,
+    col3_data0: i64, col3_data1: i64, col3_data2: i64, col3_data3: i64, col3_data4: i64, col3_data5: i64, col3_data6: i64, col3_data7: i64,
+    col3_added0: i64, col3_added1: i64, col3_added2: i64, col3_added3: i64, col3_added4: i64, col3_added5: i64, col3_added6: i64, col3_added7: i64,
+    col3_changed0: i64, col3_changed1: i64, col3_changed2: i64, col3_changed3: i64, col3_changed4: i64, col3_changed5: i64, col3_changed6: i64, col3_changed7: i64,
+}
+
+fn _ecs_table_deep_zeros() -> EcsTableDeep {
+    return EcsTableDeep {
+        id: 0, capacity: 0,
+        entity0: 0, entity1: 0, entity2: 0, entity3: 0,
+        entity4: 0, entity5: 0, entity6: 0, entity7: 0,
+        entity_count: 0,
+        comp_id0: 0, comp_id1: 0, comp_id2: 0, comp_id3: 0,
+        column_count: 0,
+        col0_data0: 0, col0_data1: 0, col0_data2: 0, col0_data3: 0, col0_data4: 0, col0_data5: 0, col0_data6: 0, col0_data7: 0,
+        col0_added0: 0, col0_added1: 0, col0_added2: 0, col0_added3: 0, col0_added4: 0, col0_added5: 0, col0_added6: 0, col0_added7: 0,
+        col0_changed0: 0, col0_changed1: 0, col0_changed2: 0, col0_changed3: 0, col0_changed4: 0, col0_changed5: 0, col0_changed6: 0, col0_changed7: 0,
+        col1_data0: 0, col1_data1: 0, col1_data2: 0, col1_data3: 0, col1_data4: 0, col1_data5: 0, col1_data6: 0, col1_data7: 0,
+        col1_added0: 0, col1_added1: 0, col1_added2: 0, col1_added3: 0, col1_added4: 0, col1_added5: 0, col1_added6: 0, col1_added7: 0,
+        col1_changed0: 0, col1_changed1: 0, col1_changed2: 0, col1_changed3: 0, col1_changed4: 0, col1_changed5: 0, col1_changed6: 0, col1_changed7: 0,
+        col2_data0: 0, col2_data1: 0, col2_data2: 0, col2_data3: 0, col2_data4: 0, col2_data5: 0, col2_data6: 0, col2_data7: 0,
+        col2_added0: 0, col2_added1: 0, col2_added2: 0, col2_added3: 0, col2_added4: 0, col2_added5: 0, col2_added6: 0, col2_added7: 0,
+        col2_changed0: 0, col2_changed1: 0, col2_changed2: 0, col2_changed3: 0, col2_changed4: 0, col2_changed5: 0, col2_changed6: 0, col2_changed7: 0,
+        col3_data0: 0, col3_data1: 0, col3_data2: 0, col3_data3: 0, col3_data4: 0, col3_data5: 0, col3_data6: 0, col3_data7: 0,
+        col3_added0: 0, col3_added1: 0, col3_added2: 0, col3_added3: 0, col3_added4: 0, col3_added5: 0, col3_added6: 0, col3_added7: 0,
+        col3_changed0: 0, col3_changed1: 0, col3_changed2: 0, col3_changed3: 0, col3_changed4: 0, col3_changed5: 0, col3_changed6: 0, col3_changed7: 0,
+    };
+}
+
+fn ecs_table_deep_new(id: i32, capacity: i64) -> EcsTableDeep {
+    let t = _ecs_table_deep_zeros();
+    t.id = id;
+    t.capacity = capacity;
+    return t;
+}
+
+fn ecs_table_deep_id(t: EcsTableDeep) -> i32 { return t.id; }
+fn ecs_table_deep_entity_count(t: EcsTableDeep) -> i64 { return t.entity_count as i64; }
+fn ecs_table_deep_entity_capacity(t: EcsTableDeep) -> i64 { return t.capacity; }
+fn ecs_table_deep_component_count(t: EcsTableDeep) -> i64 { return t.column_count as i64; }
+fn ecs_table_deep_is_empty(t: EcsTableDeep) -> bool { return t.entity_count == 0; }
+
+// get entity by row — returns i64 directly (used by some readers); -1 sentinel for out-of-range.
+fn ecs_table_deep_entity_at(t: EcsTableDeep, idx: i32) -> i64 {
+    if idx < 0 { return -1; };
+    if idx >= t.entity_count { return -1; };
+    if idx == 0 { return t.entity0; };
+    if idx == 1 { return t.entity1; };
+    if idx == 2 { return t.entity2; };
+    if idx == 3 { return t.entity3; };
+    if idx == 4 { return t.entity4; };
+    if idx == 5 { return t.entity5; };
+    if idx == 6 { return t.entity6; };
+    return t.entity7;
+}
+
+// add_column: store component_id into the next column slot — cap-4 reject mirrors the silent
+// (push would never reject in the shallow, but our cap-4 boundary returns the table unchanged).
+fn ecs_table_deep_add_column(t: EcsTableDeep, component_id: i32) -> EcsTableDeep {
+    if t.column_count >= ECS_TABLE_DEEP_COL_CAP { return t; };
+    if t.column_count == 0 { t.comp_id0 = component_id; };
+    if t.column_count == 1 { t.comp_id1 = component_id; };
+    if t.column_count == 2 { t.comp_id2 = component_id; };
+    if t.column_count == 3 { t.comp_id3 = component_id; };
+    t.column_count = t.column_count + 1;
+    return t;
+}
+
+fn ecs_table_deep_has_column(t: EcsTableDeep, component_id: i32) -> bool {
+    if t.column_count > 0 && t.comp_id0 == component_id { return true; };
+    if t.column_count > 1 && t.comp_id1 == component_id { return true; };
+    if t.column_count > 2 && t.comp_id2 == component_id { return true; };
+    if t.column_count > 3 && t.comp_id3 == component_id { return true; };
+    return false;
+}
+
+fn ecs_table_deep_get_column_index(t: EcsTableDeep, component_id: i32) -> i64 {
+    if t.column_count > 0 && t.comp_id0 == component_id { return 0; };
+    if t.column_count > 1 && t.comp_id1 == component_id { return 1; };
+    if t.column_count > 2 && t.comp_id2 == component_id { return 2; };
+    if t.column_count > 3 && t.comp_id3 == component_id { return 3; };
+    return -1;
+}
+
+// set column-cell helper: write the data cell for (col_idx, row_idx). col_idx 0..3, row_idx 0..7.
+fn _ecs_table_deep_set_col_data(t: EcsTableDeep, col_idx: i64, row_idx: i32, value: i64) -> EcsTableDeep {
+    if col_idx == 0 {
+        if row_idx == 0 { t.col0_data0 = value; };
+        if row_idx == 1 { t.col0_data1 = value; };
+        if row_idx == 2 { t.col0_data2 = value; };
+        if row_idx == 3 { t.col0_data3 = value; };
+        if row_idx == 4 { t.col0_data4 = value; };
+        if row_idx == 5 { t.col0_data5 = value; };
+        if row_idx == 6 { t.col0_data6 = value; };
+        if row_idx == 7 { t.col0_data7 = value; };
+    };
+    if col_idx == 1 {
+        if row_idx == 0 { t.col1_data0 = value; };
+        if row_idx == 1 { t.col1_data1 = value; };
+        if row_idx == 2 { t.col1_data2 = value; };
+        if row_idx == 3 { t.col1_data3 = value; };
+        if row_idx == 4 { t.col1_data4 = value; };
+        if row_idx == 5 { t.col1_data5 = value; };
+        if row_idx == 6 { t.col1_data6 = value; };
+        if row_idx == 7 { t.col1_data7 = value; };
+    };
+    if col_idx == 2 {
+        if row_idx == 0 { t.col2_data0 = value; };
+        if row_idx == 1 { t.col2_data1 = value; };
+        if row_idx == 2 { t.col2_data2 = value; };
+        if row_idx == 3 { t.col2_data3 = value; };
+        if row_idx == 4 { t.col2_data4 = value; };
+        if row_idx == 5 { t.col2_data5 = value; };
+        if row_idx == 6 { t.col2_data6 = value; };
+        if row_idx == 7 { t.col2_data7 = value; };
+    };
+    if col_idx == 3 {
+        if row_idx == 0 { t.col3_data0 = value; };
+        if row_idx == 1 { t.col3_data1 = value; };
+        if row_idx == 2 { t.col3_data2 = value; };
+        if row_idx == 3 { t.col3_data3 = value; };
+        if row_idx == 4 { t.col3_data4 = value; };
+        if row_idx == 5 { t.col3_data5 = value; };
+        if row_idx == 6 { t.col3_data6 = value; };
+        if row_idx == 7 { t.col3_data7 = value; };
+    };
+    return t;
+}
+
+fn _ecs_table_deep_set_col_added(t: EcsTableDeep, col_idx: i64, row_idx: i32, value: i64) -> EcsTableDeep {
+    if col_idx == 0 {
+        if row_idx == 0 { t.col0_added0 = value; };
+        if row_idx == 1 { t.col0_added1 = value; };
+        if row_idx == 2 { t.col0_added2 = value; };
+        if row_idx == 3 { t.col0_added3 = value; };
+        if row_idx == 4 { t.col0_added4 = value; };
+        if row_idx == 5 { t.col0_added5 = value; };
+        if row_idx == 6 { t.col0_added6 = value; };
+        if row_idx == 7 { t.col0_added7 = value; };
+    };
+    if col_idx == 1 {
+        if row_idx == 0 { t.col1_added0 = value; };
+        if row_idx == 1 { t.col1_added1 = value; };
+        if row_idx == 2 { t.col1_added2 = value; };
+        if row_idx == 3 { t.col1_added3 = value; };
+        if row_idx == 4 { t.col1_added4 = value; };
+        if row_idx == 5 { t.col1_added5 = value; };
+        if row_idx == 6 { t.col1_added6 = value; };
+        if row_idx == 7 { t.col1_added7 = value; };
+    };
+    if col_idx == 2 {
+        if row_idx == 0 { t.col2_added0 = value; };
+        if row_idx == 1 { t.col2_added1 = value; };
+        if row_idx == 2 { t.col2_added2 = value; };
+        if row_idx == 3 { t.col2_added3 = value; };
+        if row_idx == 4 { t.col2_added4 = value; };
+        if row_idx == 5 { t.col2_added5 = value; };
+        if row_idx == 6 { t.col2_added6 = value; };
+        if row_idx == 7 { t.col2_added7 = value; };
+    };
+    if col_idx == 3 {
+        if row_idx == 0 { t.col3_added0 = value; };
+        if row_idx == 1 { t.col3_added1 = value; };
+        if row_idx == 2 { t.col3_added2 = value; };
+        if row_idx == 3 { t.col3_added3 = value; };
+        if row_idx == 4 { t.col3_added4 = value; };
+        if row_idx == 5 { t.col3_added5 = value; };
+        if row_idx == 6 { t.col3_added6 = value; };
+        if row_idx == 7 { t.col3_added7 = value; };
+    };
+    return t;
+}
+
+fn _ecs_table_deep_set_col_changed(t: EcsTableDeep, col_idx: i64, row_idx: i32, value: i64) -> EcsTableDeep {
+    if col_idx == 0 {
+        if row_idx == 0 { t.col0_changed0 = value; };
+        if row_idx == 1 { t.col0_changed1 = value; };
+        if row_idx == 2 { t.col0_changed2 = value; };
+        if row_idx == 3 { t.col0_changed3 = value; };
+        if row_idx == 4 { t.col0_changed4 = value; };
+        if row_idx == 5 { t.col0_changed5 = value; };
+        if row_idx == 6 { t.col0_changed6 = value; };
+        if row_idx == 7 { t.col0_changed7 = value; };
+    };
+    if col_idx == 1 {
+        if row_idx == 0 { t.col1_changed0 = value; };
+        if row_idx == 1 { t.col1_changed1 = value; };
+        if row_idx == 2 { t.col1_changed2 = value; };
+        if row_idx == 3 { t.col1_changed3 = value; };
+        if row_idx == 4 { t.col1_changed4 = value; };
+        if row_idx == 5 { t.col1_changed5 = value; };
+        if row_idx == 6 { t.col1_changed6 = value; };
+        if row_idx == 7 { t.col1_changed7 = value; };
+    };
+    if col_idx == 2 {
+        if row_idx == 0 { t.col2_changed0 = value; };
+        if row_idx == 1 { t.col2_changed1 = value; };
+        if row_idx == 2 { t.col2_changed2 = value; };
+        if row_idx == 3 { t.col2_changed3 = value; };
+        if row_idx == 4 { t.col2_changed4 = value; };
+        if row_idx == 5 { t.col2_changed5 = value; };
+        if row_idx == 6 { t.col2_changed6 = value; };
+        if row_idx == 7 { t.col2_changed7 = value; };
+    };
+    if col_idx == 3 {
+        if row_idx == 0 { t.col3_changed0 = value; };
+        if row_idx == 1 { t.col3_changed1 = value; };
+        if row_idx == 2 { t.col3_changed2 = value; };
+        if row_idx == 3 { t.col3_changed3 = value; };
+        if row_idx == 4 { t.col3_changed4 = value; };
+        if row_idx == 5 { t.col3_changed5 = value; };
+        if row_idx == 6 { t.col3_changed6 = value; };
+        if row_idx == 7 { t.col3_changed7 = value; };
+    };
+    return t;
+}
+
+fn _ecs_table_deep_get_col_data(t: EcsTableDeep, col_idx: i64, row_idx: i32) -> i64 {
+    if col_idx == 0 {
+        if row_idx == 0 { return t.col0_data0; };
+        if row_idx == 1 { return t.col0_data1; };
+        if row_idx == 2 { return t.col0_data2; };
+        if row_idx == 3 { return t.col0_data3; };
+        if row_idx == 4 { return t.col0_data4; };
+        if row_idx == 5 { return t.col0_data5; };
+        if row_idx == 6 { return t.col0_data6; };
+        if row_idx == 7 { return t.col0_data7; };
+    };
+    if col_idx == 1 {
+        if row_idx == 0 { return t.col1_data0; };
+        if row_idx == 1 { return t.col1_data1; };
+        if row_idx == 2 { return t.col1_data2; };
+        if row_idx == 3 { return t.col1_data3; };
+        if row_idx == 4 { return t.col1_data4; };
+        if row_idx == 5 { return t.col1_data5; };
+        if row_idx == 6 { return t.col1_data6; };
+        if row_idx == 7 { return t.col1_data7; };
+    };
+    if col_idx == 2 {
+        if row_idx == 0 { return t.col2_data0; };
+        if row_idx == 1 { return t.col2_data1; };
+        if row_idx == 2 { return t.col2_data2; };
+        if row_idx == 3 { return t.col2_data3; };
+        if row_idx == 4 { return t.col2_data4; };
+        if row_idx == 5 { return t.col2_data5; };
+        if row_idx == 6 { return t.col2_data6; };
+        if row_idx == 7 { return t.col2_data7; };
+    };
+    if col_idx == 3 {
+        if row_idx == 0 { return t.col3_data0; };
+        if row_idx == 1 { return t.col3_data1; };
+        if row_idx == 2 { return t.col3_data2; };
+        if row_idx == 3 { return t.col3_data3; };
+        if row_idx == 4 { return t.col3_data4; };
+        if row_idx == 5 { return t.col3_data5; };
+        if row_idx == 6 { return t.col3_data6; };
+        if row_idx == 7 { return t.col3_data7; };
+    };
+    return 0;
+}
+
+fn _ecs_table_deep_get_col_added(t: EcsTableDeep, col_idx: i64, row_idx: i32) -> i64 {
+    if col_idx == 0 {
+        if row_idx == 0 { return t.col0_added0; };
+        if row_idx == 1 { return t.col0_added1; };
+        if row_idx == 2 { return t.col0_added2; };
+        if row_idx == 3 { return t.col0_added3; };
+        if row_idx == 4 { return t.col0_added4; };
+        if row_idx == 5 { return t.col0_added5; };
+        if row_idx == 6 { return t.col0_added6; };
+        if row_idx == 7 { return t.col0_added7; };
+    };
+    if col_idx == 1 {
+        if row_idx == 0 { return t.col1_added0; };
+        if row_idx == 1 { return t.col1_added1; };
+        if row_idx == 2 { return t.col1_added2; };
+        if row_idx == 3 { return t.col1_added3; };
+        if row_idx == 4 { return t.col1_added4; };
+        if row_idx == 5 { return t.col1_added5; };
+        if row_idx == 6 { return t.col1_added6; };
+        if row_idx == 7 { return t.col1_added7; };
+    };
+    if col_idx == 2 {
+        if row_idx == 0 { return t.col2_added0; };
+        if row_idx == 1 { return t.col2_added1; };
+        if row_idx == 2 { return t.col2_added2; };
+        if row_idx == 3 { return t.col2_added3; };
+        if row_idx == 4 { return t.col2_added4; };
+        if row_idx == 5 { return t.col2_added5; };
+        if row_idx == 6 { return t.col2_added6; };
+        if row_idx == 7 { return t.col2_added7; };
+    };
+    if col_idx == 3 {
+        if row_idx == 0 { return t.col3_added0; };
+        if row_idx == 1 { return t.col3_added1; };
+        if row_idx == 2 { return t.col3_added2; };
+        if row_idx == 3 { return t.col3_added3; };
+        if row_idx == 4 { return t.col3_added4; };
+        if row_idx == 5 { return t.col3_added5; };
+        if row_idx == 6 { return t.col3_added6; };
+        if row_idx == 7 { return t.col3_added7; };
+    };
+    return 0;
+}
+
+fn _ecs_table_deep_get_col_changed(t: EcsTableDeep, col_idx: i64, row_idx: i32) -> i64 {
+    if col_idx == 0 {
+        if row_idx == 0 { return t.col0_changed0; };
+        if row_idx == 1 { return t.col0_changed1; };
+        if row_idx == 2 { return t.col0_changed2; };
+        if row_idx == 3 { return t.col0_changed3; };
+        if row_idx == 4 { return t.col0_changed4; };
+        if row_idx == 5 { return t.col0_changed5; };
+        if row_idx == 6 { return t.col0_changed6; };
+        if row_idx == 7 { return t.col0_changed7; };
+    };
+    if col_idx == 1 {
+        if row_idx == 0 { return t.col1_changed0; };
+        if row_idx == 1 { return t.col1_changed1; };
+        if row_idx == 2 { return t.col1_changed2; };
+        if row_idx == 3 { return t.col1_changed3; };
+        if row_idx == 4 { return t.col1_changed4; };
+        if row_idx == 5 { return t.col1_changed5; };
+        if row_idx == 6 { return t.col1_changed6; };
+        if row_idx == 7 { return t.col1_changed7; };
+    };
+    if col_idx == 2 {
+        if row_idx == 0 { return t.col2_changed0; };
+        if row_idx == 1 { return t.col2_changed1; };
+        if row_idx == 2 { return t.col2_changed2; };
+        if row_idx == 3 { return t.col2_changed3; };
+        if row_idx == 4 { return t.col2_changed4; };
+        if row_idx == 5 { return t.col2_changed5; };
+        if row_idx == 6 { return t.col2_changed6; };
+        if row_idx == 7 { return t.col2_changed7; };
+    };
+    if col_idx == 3 {
+        if row_idx == 0 { return t.col3_changed0; };
+        if row_idx == 1 { return t.col3_changed1; };
+        if row_idx == 2 { return t.col3_changed2; };
+        if row_idx == 3 { return t.col3_changed3; };
+        if row_idx == 4 { return t.col3_changed4; };
+        if row_idx == 5 { return t.col3_changed5; };
+        if row_idx == 6 { return t.col3_changed6; };
+        if row_idx == 7 { return t.col3_changed7; };
+    };
+    return 0;
+}
+
+// Set entity slot — field-assign helper for allocate / swap_remove.
+fn _ecs_table_deep_set_entity(t: EcsTableDeep, idx: i32, value: i64) -> EcsTableDeep {
+    if idx == 0 { t.entity0 = value; };
+    if idx == 1 { t.entity1 = value; };
+    if idx == 2 { t.entity2 = value; };
+    if idx == 3 { t.entity3 = value; };
+    if idx == 4 { t.entity4 = value; };
+    if idx == 5 { t.entity5 = value; };
+    if idx == 6 { t.entity6 = value; };
+    if idx == 7 { t.entity7 = value; };
+    return t;
+}
+
+fn _ecs_table_deep_get_entity(t: EcsTableDeep, idx: i32) -> i64 {
+    if idx == 0 { return t.entity0; };
+    if idx == 1 { return t.entity1; };
+    if idx == 2 { return t.entity2; };
+    if idx == 3 { return t.entity3; };
+    if idx == 4 { return t.entity4; };
+    if idx == 5 { return t.entity5; };
+    if idx == 6 { return t.entity6; };
+    return t.entity7;
+}
+
+// allocate: add an entity; initialise each existing column's next row (data 0, added=tick,
+// changed=tick). Cap-8 reject mirrors the entity_count < row_cap precondition (the shallow would
+// also panic at a Vec index OOB on `t.entities.push` overflow — we reject silently with ok=false
+// and a -1 row).
+struct EcsTableAllocateDeep { new_table: EcsTableDeep, row: i32, ok: bool }
+
+fn ecs_table_allocate_deep(t: EcsTableDeep, entity: i64, tick: i64) -> EcsTableAllocateDeep {
+    if t.entity_count >= ECS_TABLE_DEEP_ROW_CAP {
+        return EcsTableAllocateDeep { new_table: t, row: -1, ok: false };
+    };
+    let row = t.entity_count;
+    t = _ecs_table_deep_set_entity(t, row, entity);
+    // Initialise every in-use column at this row.
+    let col_idx: i64 = 0;
+    while col_idx < ECS_TABLE_DEEP_COL_CAP as i64 && col_idx < t.column_count as i64 {
+        t = _ecs_table_deep_set_col_data(t, col_idx, row, 0);
+        t = _ecs_table_deep_set_col_added(t, col_idx, row, tick);
+        t = _ecs_table_deep_set_col_changed(t, col_idx, row, tick);
+        col_idx = col_idx + 1;
+    }
+    t.entity_count = t.entity_count + 1;
+    return EcsTableAllocateDeep { new_table: t, row: row, ok: true };
+}
+
+fn ecs_table_allocate_deep_new_table(r: EcsTableAllocateDeep) -> EcsTableDeep { return r.new_table; }
+fn ecs_table_allocate_deep_row(r: EcsTableAllocateDeep) -> i32 { return r.row; }
+fn ecs_table_allocate_deep_ok(r: EcsTableAllocateDeep) -> bool { return r.ok; }
+
+// get: get component data at (component_id, row).
+struct EcsTableGetResultDeep { valid: bool, value: i64 }
+
+fn ecs_table_get_deep(t: EcsTableDeep, component_id: i32, row: i32) -> EcsTableGetResultDeep {
+    let col_idx = ecs_table_deep_get_column_index(t, component_id);
+    if col_idx < 0 { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    if row < 0 { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    if row >= t.entity_count { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    let v = _ecs_table_deep_get_col_data(t, col_idx, row);
+    return EcsTableGetResultDeep { valid: true, value: v };
+}
+
+fn ecs_table_get_deep_valid(r: EcsTableGetResultDeep) -> bool { return r.valid; }
+fn ecs_table_get_deep_value(r: EcsTableGetResultDeep) -> i64 { return r.value; }
+
+// set: set component data at (component_id, row, data, tick). Bumps changed_tick only (matches
+// the shallow — added_tick preserved on writes).
+struct EcsTableSetResultDeep { new_table: EcsTableDeep, ok: bool }
+
+fn ecs_table_set_deep(t: EcsTableDeep, component_id: i32, row: i32, data: i64, tick: i64) -> EcsTableSetResultDeep {
+    let col_idx = ecs_table_deep_get_column_index(t, component_id);
+    if col_idx < 0 { return EcsTableSetResultDeep { new_table: t, ok: false }; };
+    if row < 0 { return EcsTableSetResultDeep { new_table: t, ok: false }; };
+    if row >= t.entity_count { return EcsTableSetResultDeep { new_table: t, ok: false }; };
+    t = _ecs_table_deep_set_col_data(t, col_idx, row, data);
+    t = _ecs_table_deep_set_col_changed(t, col_idx, row, tick);
+    return EcsTableSetResultDeep { new_table: t, ok: true };
+}
+
+fn ecs_table_set_deep_new_table(r: EcsTableSetResultDeep) -> EcsTableDeep { return r.new_table; }
+fn ecs_table_set_deep_ok(r: EcsTableSetResultDeep) -> bool { return r.ok; }
+
+// get_added_tick / get_changed_tick.
+fn ecs_table_get_added_tick_deep(t: EcsTableDeep, component_id: i32, row: i32) -> EcsTableGetResultDeep {
+    let col_idx = ecs_table_deep_get_column_index(t, component_id);
+    if col_idx < 0 { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    if row < 0 { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    if row >= t.entity_count { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    let v = _ecs_table_deep_get_col_added(t, col_idx, row);
+    return EcsTableGetResultDeep { valid: true, value: v };
+}
+
+fn ecs_table_get_changed_tick_deep(t: EcsTableDeep, component_id: i32, row: i32) -> EcsTableGetResultDeep {
+    let col_idx = ecs_table_deep_get_column_index(t, component_id);
+    if col_idx < 0 { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    if row < 0 { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    if row >= t.entity_count { return EcsTableGetResultDeep { valid: false, value: 0 }; };
+    let v = _ecs_table_deep_get_col_changed(t, col_idx, row);
+    return EcsTableGetResultDeep { valid: true, value: v };
+}
+
+// get_drop_for: true iff the column exists (mirrors shallow has_column).
+fn ecs_table_get_drop_for_deep(t: EcsTableDeep, component_id: i32) -> bool {
+    return ecs_table_deep_has_column(t, component_id);
+}
+
+// get_entity_at_row: wrapper result.
+struct EcsTableEntityResultDeep { valid: bool, value: i64 }
+
+fn ecs_table_get_entity_at_row_deep(t: EcsTableDeep, row: i32) -> EcsTableEntityResultDeep {
+    if row < 0 { return EcsTableEntityResultDeep { valid: false, value: 0 }; };
+    if row >= t.entity_count { return EcsTableEntityResultDeep { valid: false, value: 0 }; };
+    let v = _ecs_table_deep_get_entity(t, row);
+    return EcsTableEntityResultDeep { valid: true, value: v };
+}
+
+fn ecs_table_get_entity_at_row_deep_valid(r: EcsTableEntityResultDeep) -> bool { return r.valid; }
+fn ecs_table_get_entity_at_row_deep_value(r: EcsTableEntityResultDeep) -> i64 { return r.value; }
+
+// swap_remove: remove the row by relocating the tail into it, then truncate the tail for every
+// in-use column and the entity list.
+struct EcsTableSwapRemoveDeep { new_table: EcsTableDeep, ok: bool }
+
+fn ecs_table_swap_remove_deep(t: EcsTableDeep, row: i32) -> EcsTableSwapRemoveDeep {
+    let n = t.entity_count;
+    if row < 0 { return EcsTableSwapRemoveDeep { new_table: t, ok: false }; };
+    if row >= n { return EcsTableSwapRemoveDeep { new_table: t, ok: false }; };
+    let last_idx = n - 1;
+    if row != last_idx {
+        // Relocate the entity id.
+        let src = _ecs_table_deep_get_entity(t, last_idx);
+        t = _ecs_table_deep_set_entity(t, row, src);
+        let col_idx: i64 = 0;
+        while col_idx < ECS_TABLE_DEEP_COL_CAP as i64 && col_idx < t.column_count as i64 {
+            let d = _ecs_table_deep_get_col_data(t, col_idx, last_idx);
+            let a = _ecs_table_deep_get_col_added(t, col_idx, last_idx);
+            let ch = _ecs_table_deep_get_col_changed(t, col_idx, last_idx);
+            t = _ecs_table_deep_set_col_data(t, col_idx, row, d);
+            t = _ecs_table_deep_set_col_added(t, col_idx, row, a);
+            t = _ecs_table_deep_set_col_changed(t, col_idx, row, ch);
+            col_idx = col_idx + 1;
+        }
+    };
+    // Zero the released tail slot for every column and entity slot.
+    t = _ecs_table_deep_set_entity(t, last_idx, 0);
+    let col_idx2: i64 = 0;
+    while col_idx2 < ECS_TABLE_DEEP_COL_CAP as i64 && col_idx2 < t.column_count as i64 {
+        t = _ecs_table_deep_set_col_data(t, col_idx2, last_idx, 0);
+        t = _ecs_table_deep_set_col_added(t, col_idx2, last_idx, 0);
+        t = _ecs_table_deep_set_col_changed(t, col_idx2, last_idx, 0);
+        col_idx2 = col_idx2 + 1;
+    }
+    t.entity_count = t.entity_count - 1;
+    return EcsTableSwapRemoveDeep { new_table: t, ok: true };
+}
+
+fn ecs_table_swap_remove_deep_new_table(r: EcsTableSwapRemoveDeep) -> EcsTableDeep { return r.new_table; }
+fn ecs_table_swap_remove_deep_ok(r: EcsTableSwapRemoveDeep) -> bool { return r.ok; }
+
+// === Tables collection ===
+struct EcsTablesDeep {
+    next_id: i32,
+    table0: EcsTableDeep, table1: EcsTableDeep, table2: EcsTableDeep, table3: EcsTableDeep,
+    table4: EcsTableDeep, table5: EcsTableDeep, table6: EcsTableDeep, table7: EcsTableDeep,
+    count: i32,
+}
+
+fn _ecs_tables_deep_empty() -> EcsTablesDeep {
+    let t0 = _ecs_table_deep_zeros();
+    let t1 = _ecs_table_deep_zeros();
+    let t2 = _ecs_table_deep_zeros();
+    let t3 = _ecs_table_deep_zeros();
+    let t4 = _ecs_table_deep_zeros();
+    let t5 = _ecs_table_deep_zeros();
+    let t6 = _ecs_table_deep_zeros();
+    let t7 = _ecs_table_deep_zeros();
+    return EcsTablesDeep {
+        next_id: 0,
+        table0: t0, table1: t1, table2: t2, table3: t3,
+        table4: t4, table5: t5, table6: t6, table7: t7,
+        count: 0,
+    };
+}
+
+fn ecs_tables_deep_new() -> EcsTablesDeep {
+    return _ecs_tables_deep_empty();
+}
+
+fn _ecs_tables_deep_get_at(ts: EcsTablesDeep, idx: i32) -> EcsTableDeep {
+    if idx == 0 { return ts.table0; };
+    if idx == 1 { return ts.table1; };
+    if idx == 2 { return ts.table2; };
+    if idx == 3 { return ts.table3; };
+    if idx == 4 { return ts.table4; };
+    if idx == 5 { return ts.table5; };
+    if idx == 6 { return ts.table6; };
+    return ts.table7;
+}
+
+// Set the table slot at idx — each branch consumes new_table and returns immediately so
+// the move-checker treats each subsequent reference as unreachable (cascade-of-return pattern).
+fn _ecs_tables_deep_set_table(ts: EcsTablesDeep, idx: i32, new_table: EcsTableDeep) -> EcsTablesDeep {
+    if idx == 0 { ts.table0 = new_table; return ts; };
+    if idx == 1 { ts.table1 = new_table; return ts; };
+    if idx == 2 { ts.table2 = new_table; return ts; };
+    if idx == 3 { ts.table3 = new_table; return ts; };
+    if idx == 4 { ts.table4 = new_table; return ts; };
+    if idx == 5 { ts.table5 = new_table; return ts; };
+    if idx == 6 { ts.table6 = new_table; return ts; };
+    ts.table7 = new_table;
+    return ts;
+}
+
+fn ecs_tables_deep_len(ts: EcsTablesDeep) -> i64 { return ts.count as i64; }
+fn ecs_tables_deep_is_empty(ts: EcsTablesDeep) -> bool { return ts.count == 0; }
+fn ecs_tables_deep_count(ts: EcsTablesDeep) -> i64 { return ts.count as i64; }
+
+struct EcsTablesGetResultDeep { valid: bool, table: EcsTableDeep }
+
+fn ecs_tables_deep_get(ts: EcsTablesDeep, id: i32) -> EcsTablesGetResultDeep {
+    let i: i32 = 0;
+    while i < ts.count {
+        let ti = _ecs_tables_deep_get_at(ts, i);
+        if ecs_table_deep_id(ti) == id {
+            return EcsTablesGetResultDeep { valid: true, table: ti };
+        };
+        i = i + 1;
+    }
+    return EcsTablesGetResultDeep { valid: false, table: ecs_table_deep_new(0, 0) };
+}
+
+fn ecs_tables_deep_get_valid(r: EcsTablesGetResultDeep) -> bool { return r.valid; }
+fn ecs_tables_deep_get_table(r: EcsTablesGetResultDeep) -> EcsTableDeep { return r.table; }
+
+struct EcsTablesCreateDeep { new_tables: EcsTablesDeep, id: i32, ok: bool }
+
+fn ecs_tables_deep_create(ts: EcsTablesDeep, capacity: i64) -> EcsTablesCreateDeep {
+    if ts.count >= ECS_TABLES_DEEP_CAP {
+        return EcsTablesCreateDeep { new_tables: ts, id: -1, ok: false };
+    };
+    let id = ts.next_id;
+    let new_table = ecs_table_deep_new(id, capacity);
+    ts = _ecs_tables_deep_set_table(ts, ts.count, new_table);
+    ts.count = ts.count + 1;
+    ts.next_id = ts.next_id + 1;
+    return EcsTablesCreateDeep { new_tables: ts, id: id, ok: true };
+}
+
+fn ecs_tables_deep_create_new_tables(r: EcsTablesCreateDeep) -> EcsTablesDeep { return r.new_tables; }
+fn ecs_tables_deep_create_id(r: EcsTablesCreateDeep) -> i32 { return r.id; }
+fn ecs_tables_deep_create_ok(r: EcsTablesCreateDeep) -> bool { return r.ok; }

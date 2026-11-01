@@ -1,0 +1,166 @@
+// Bevy ECS system::combinator + mod.rs system adapters — CombinatorSystem / PipeSystem /
+// IntoPipeSystem / IsPipeSystemMarker + system-assertion helpers.
+// Mirrors src/system/combinator.rs + src/system/mod.rs.
+
+// === CombinatorSystem<Func, A, B> ===
+// Func is the marker that customizes Combine semantics; A, B are systems.
+// We model a system as an opaque id pointing at a registered fn-tagged behaviour box.
+struct EcsCombinatorSystem {
+    marker_id: i32,
+    a_id: i64,
+    b_id: i64,
+    name_id: i64,
+    a_output: i64,
+    b_output: i64,
+    out: i64,
+}
+
+fn ecs_combinator_system_new(marker_id: i32, a_id: i64, b_id: i64, name_id: i64) -> EcsCombinatorSystem {
+    let s = EcsCombinatorSystem { marker_id: marker_id, a_id: a_id, b_id: b_id, name_id: name_id, a_output: 0, b_output: 0, out: 0 };
+    return s;
+}
+
+// run_a: stores system A's output (client provides)
+fn ecs_combinator_system_run_a(s: EcsCombinatorSystem, a_output: i64) -> EcsCombinatorSystem {
+    s.a_output = a_output;
+    return s;
+}
+
+// run_b: stores system B's output and applies combine as marker-defined transform.
+// marker 0 = pipe (out = b_output applied to a_output)
+// marker 1 = chain/and_then (out = b if a != 0 else 0)
+// marker 2 = map_combine (out = a_output + b_output)
+// marker 3 = xor (out = 1 if a != 0 != b != 0)
+fn ecs_combinator_system_run_b(s: EcsCombinatorSystem, b_output: i64) -> EcsCombinatorSystem {
+    s.b_output = b_output;
+    if s.marker_id == 0 {
+        s.out = b_output;
+        return s;
+    };
+    if s.marker_id == 1 {
+        if s.a_output != 0 {
+            s.out = b_output;
+            return s;
+        };
+        s.out = 0;
+        return s;
+    };
+    if s.marker_id == 2 {
+        s.out = s.a_output + b_output;
+        return s;
+    };
+    // marker 3: XOR
+    if s.a_output != 0 {
+        if b_output == 0 {
+            s.out = 1;
+            return s;
+        };
+        s.out = 0;
+        return s;
+    };
+    if b_output != 0 {
+        s.out = 1;
+        return s;
+    };
+    s.out = 0;
+    return s;
+}
+
+fn ecs_combinator_system_out(s: EcsCombinatorSystem) -> i64 {
+    return s.out;
+}
+
+fn ecs_combinator_system_a_id(s: EcsCombinatorSystem) -> i64 {
+    return s.a_id;
+}
+
+fn ecs_combinator_system_b_id(s: EcsCombinatorSystem) -> i64 {
+    return s.b_id;
+}
+
+fn ecs_combinator_system_name_id(s: EcsCombinatorSystem) -> i64 {
+    return s.name_id;
+}
+
+fn ecs_combinator_system_marker_id(s: EcsCombinatorSystem) -> i32 {
+    return s.marker_id;
+}
+
+// === PipeSystem<A, B> ===
+struct EcsPipeSystem {
+    a_id: i64,
+    b_id: i64,
+    name_id: i64,
+    pipe_value: i64,
+    b_assumed: i64,
+}
+
+fn ecs_pipe_system_new(a_id: i64, b_id: i64, name_id: i64) -> EcsPipeSystem {
+    let s = EcsPipeSystem { a_id: a_id, b_id: b_id, name_id: name_id, pipe_value: 0, b_assumed: 0 };
+    return s;
+}
+
+// A's output is the input to B; final out is B's result.
+fn ecs_pipe_system_run_a(s: EcsPipeSystem, a_output: i64) -> EcsPipeSystem {
+    s.pipe_value = a_output;
+    return s;
+}
+
+fn ecs_pipe_system_run_b(s: EcsPipeSystem, b_output: i64) -> EcsPipeSystem {
+    s.b_assumed = b_output;
+    return s;
+}
+
+fn ecs_pipe_system_out(s: EcsPipeSystem) -> i64 {
+    return s.b_assumed;
+}
+
+fn ecs_pipe_system_pipe_value(s: EcsPipeSystem) -> i64 {
+    return s.pipe_value;
+}
+
+fn ecs_pipe_system_a_id(s: EcsPipeSystem) -> i64 { return s.a_id; }
+fn ecs_pipe_system_b_id(s: EcsPipeSystem) -> i64 { return s.b_id; }
+fn ecs_pipe_system_name_id(s: EcsPipeSystem) -> i64 { return s.name_id; }
+
+// === IntoPipeSystem<A, B> ===
+struct EcsIntoPipeSystem {
+    a_id: i64,
+    b_id: i64,
+}
+
+fn ecs_into_pipe_system_new(a_id: i64, b_id: i64) -> EcsIntoPipeSystem {
+    let s = EcsIntoPipeSystem { a_id: a_id, b_id: b_id };
+    return s;
+}
+
+// Convert IntoPipeSystem into a PipeSystem by providing a name.
+fn ecs_into_pipe_system_into_pipe(s: EcsIntoPipeSystem, name_id: i64) -> EcsPipeSystem {
+    let p = ecs_pipe_system_new(s.a_id, s.b_id, name_id);
+    return p;
+}
+
+fn ecs_into_pipe_system_a_id(s: EcsIntoPipeSystem) -> i64 { return s.a_id; }
+fn ecs_into_pipe_system_b_id(s: EcsIntoPipeSystem) -> i64 { return s.b_id; }
+
+// === IsPipeSystemMarker ===
+struct EcsIsPipeSystemMarker {}
+
+fn ecs_is_pipe_system_marker_new() -> EcsIsPipeSystemMarker {
+    let m = EcsIsPipeSystemMarker {};
+    return m;
+}
+
+// === Assert helpers (src/system/mod.rs) ===
+// In SLA these assertions return the system id back, which is a compile-time/no-op pass.
+fn ecs_assert_is_system(system_id: i64) -> i64 {
+    return system_id;
+}
+
+fn ecs_assert_is_read_only_system(system_id: i64) -> i64 {
+    return system_id;
+}
+
+fn ecs_assert_system_does_not_conflict(system_id: i64) -> i64 {
+    return system_id;
+}

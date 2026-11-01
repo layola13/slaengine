@@ -1,0 +1,143 @@
+// Bevy ECS storage internals (src/storage/blob_array.rs, thin_array_ptr.rs, table/column.rs):
+// BlobArray, ThinArrayPtr, Column — low-level SoA storage primitives.
+
+// === BlobArray ===
+// A typed array of fixed-size blobs (component data). Mirrors BlobArray layout/is_zst/get_ptr.
+struct EcsBlobArray {
+    item_size: i64,    // bytes per item (layout size)
+    item_align: i64,
+    is_zst: bool,
+    data: Vec<i64>,    // simplified: store i64 slots
+}
+
+fn ecs_blob_array_new(item_size: i64, item_align: i64, is_zst: bool) -> EcsBlobArray {
+    return EcsBlobArray { item_size: item_size, item_align: item_align, is_zst: is_zst, data: Vec::new() };
+}
+
+fn ecs_blob_array_layout_size(b: EcsBlobArray) -> i64 { return b.item_size; }
+
+fn ecs_blob_array_layout_align(b: EcsBlobArray) -> i64 { return b.item_align; }
+
+fn ecs_blob_array_is_zst(b: EcsBlobArray) -> bool { return b.is_zst; }
+
+fn ecs_blob_array_len(b: EcsBlobArray) -> i64 { return len(b.data) as i64; }
+
+// get_ptr / get_ptr_mut: return the value at index
+fn ecs_blob_array_get(b: EcsBlobArray, idx: i64) -> i64 { return b.data[idx]; }
+
+fn ecs_blob_array_get_mut(b: EcsBlobArray, idx: i64) -> i64 { return b.data[idx]; }
+
+// push: append a value
+fn ecs_blob_array_push(b: EcsBlobArray, value: i64) -> EcsBlobArray {
+    b.data.push(value);
+    return b;
+}
+
+// swap_remove
+fn ecs_blob_array_swap_remove(b: EcsBlobArray, idx: i64) -> (EcsBlobArray, i64) {
+    let last = b.data[len(b.data) as i64 - 1];
+    let removed = b.data[idx];
+    b.data[idx] = last;
+    b.data.pop();
+    return (b, removed);
+}
+
+// get_drop: returns a drop fn id (0 = none, 1 = present). Mirrors Option<drop fn>.
+fn ecs_blob_array_get_drop(b: EcsBlobArray) -> i32 {
+    if b.is_zst { return 0; };
+    return 1;
+}
+
+// === ThinArrayPtr<T> ===
+// A pointer to a heap-allocated array with capacity. Mirrors ThinArrayPtr.
+struct EcsThinArrayPtr {
+    capacity: i64,
+    len: i64,
+    data: Vec<i64>,
+}
+
+fn ecs_thin_array_ptr_with_capacity(capacity: i64) -> EcsThinArrayPtr {
+    return EcsThinArrayPtr { capacity: capacity, len: 0, data: Vec::new() };
+}
+
+fn ecs_thin_array_ptr_alloc(t: EcsThinArrayPtr, capacity: i64) -> EcsThinArrayPtr {
+    t.capacity = capacity;
+    return t;
+}
+
+fn ecs_thin_array_ptr_capacity(t: EcsThinArrayPtr) -> i64 { return t.capacity; }
+
+fn ecs_thin_array_ptr_len(t: EcsThinArrayPtr) -> i64 { return t.len; }
+
+fn ecs_thin_array_ptr_push(t: EcsThinArrayPtr, value: i64) -> EcsThinArrayPtr {
+    t.data.push(value);
+    t.len = t.len + 1;
+    return t;
+}
+
+fn ecs_thin_array_ptr_get(t: EcsThinArrayPtr, idx: i64) -> i64 { return t.data[idx]; }
+
+fn ecs_thin_array_ptr_get_mut(t: EcsThinArrayPtr, idx: i64) -> i64 { return t.data[idx]; }
+
+fn ecs_thin_array_ptr_is_empty(t: EcsThinArrayPtr) -> bool { return t.len == 0; }
+
+// clear: reset len
+fn ecs_thin_array_ptr_clear(t: EcsThinArrayPtr) -> EcsThinArrayPtr {
+    t.len = 0;
+    return t;
+}
+
+// === Column (table column) ===
+// A column stores component data for one component across all entities in a table.
+// Mirrors Column::with_capacity / get_drop / get_ptr / swap / clear.
+struct EcsColumn {
+    component_id: i32,
+    capacity: i64,
+    data: Vec<i64>,
+}
+
+fn ecs_column_with_capacity(component_id: i32, capacity: i64) -> EcsColumn {
+    return EcsColumn { component_id: component_id, capacity: capacity, data: Vec::new() };
+}
+
+fn ecs_column_component_id(c: EcsColumn) -> i32 { return c.component_id; }
+
+fn ecs_column_len(c: EcsColumn) -> i64 { return len(c.data) as i64; }
+
+fn ecs_column_capacity(c: EcsColumn) -> i64 { return c.capacity; }
+
+fn ecs_column_get(c: EcsColumn, idx: i64) -> i64 { return c.data[idx]; }
+
+fn ecs_column_get_mut(c: EcsColumn, idx: i64) -> i64 { return c.data[idx]; }
+
+fn ecs_column_push(c: EcsColumn, value: i64) -> EcsColumn {
+    c.data.push(value);
+    return c;
+}
+
+fn ecs_column_swap(c: EcsColumn, a: i64, b: i64) -> EcsColumn {
+    let tmp = c.data[a];
+    c.data[a] = c.data[b];
+    c.data[b] = tmp;
+    return c;
+}
+
+fn ecs_column_swap_remove(c: EcsColumn, idx: i64) -> (EcsColumn, i64) {
+    let last_idx = len(c.data) as i64 - 1;
+    let removed = c.data[idx];
+    c.data[idx] = c.data[last_idx];
+    c.data.pop();
+    return (c, removed);
+}
+
+fn ecs_column_clear(c: EcsColumn) -> EcsColumn {
+    c.data = Vec::new();
+    return c;
+}
+
+fn ecs_column_get_drop(c: EcsColumn) -> i32 {
+    // columns for real components have a drop fn (id 1); ZSTs would be 0
+    return 1;
+}
+
+fn ecs_column_is_empty(c: EcsColumn) -> bool { return len(c.data) as i64 == 0; }

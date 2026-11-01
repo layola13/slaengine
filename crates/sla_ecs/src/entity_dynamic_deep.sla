@@ -1,0 +1,347 @@
+// Deepened Bevy ECS dynamic entity allocator with fixed-slot generations/occupied/free.
+// Stand-in for Entity identity control. Shallow lib/entity_dynamic.sla retained (Vec-backed).
+
+const ECS_DYN_CAP: i32 = 16;
+
+struct EcsDynEntityDeep { id: i32, gen: i32 }
+fn ecs_dyn_entity_new(id: i32, gen: i32) -> EcsDynEntityDeep { return EcsDynEntityDeep { id: id, gen: gen }; }
+fn ecs_dyn_entity_id(e: EcsDynEntityDeep) -> i32 { return e.id; }
+fn ecs_dyn_entity_gen(e: EcsDynEntityDeep) -> i32 { return e.gen; }
+fn ecs_dyn_entity_eq(a: EcsDynEntityDeep, b: EcsDynEntityDeep) -> bool {
+    if a.id != b.id { return false; };
+    if a.gen != b.gen { return false; };
+    return true;
+}
+
+struct EcsDynAllocatorDeep {
+    g0: i32, g1: i32, g2: i32, g3: i32, g4: i32, g5: i32, g6: i32, g7: i32,
+    g8: i32, g9: i32, g10: i32, g11: i32, g12: i32, g13: i32, g14: i32, g15: i32,
+    o0: i32, o1: i32, o2: i32, o3: i32, o4: i32, o5: i32, o6: i32, o7: i32,
+    o8: i32, o9: i32, o10: i32, o11: i32, o12: i32, o13: i32, o14: i32, o15: i32,
+    // free-stack (FIFO ordering): indices that have been freed and can be reused
+    f0: i32, f1: i32, f2: i32, f3: i32, f4: i32, f5: i32, f6: i32, f7: i32,
+    f8: i32, f9: i32, f10: i32, f11: i32, f12: i32, f13: i32, f14: i32, f15: i32,
+    free_len: i32,
+    alloc_count: i32,
+}
+
+fn ecs_dyn_alloc_new() -> EcsDynAllocatorDeep {
+    let a = EcsDynAllocatorDeep {
+        g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0,
+        g8: 0, g9: 0, g10: 0, g11: 0, g12: 0, g13: 0, g14: 0, g15: 0,
+        o0: 0, o1: 0, o2: 0, o3: 0, o4: 0, o5: 0, o6: 0, o7: 0,
+        o8: 0, o9: 0, o10: 0, o11: 0, o12: 0, o13: 0, o14: 0, o15: 0,
+        f0: -1, f1: -1, f2: -1, f3: -1, f4: -1, f5: -1, f6: -1, f7: -1,
+        f8: -1, f9: -1, f10: -1, f11: -1, f12: -1, f13: -1, f14: -1, f15: -1,
+        free_len: 0, alloc_count: 0,
+    };
+    return a;
+}
+
+fn ecs_dyn_gen_at(a: EcsDynAllocatorDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.g0; };
+    if idx == 1 { return a.g1; };
+    if idx == 2 { return a.g2; };
+    if idx == 3 { return a.g3; };
+    if idx == 4 { return a.g4; };
+    if idx == 5 { return a.g5; };
+    if idx == 6 { return a.g6; };
+    if idx == 7 { return a.g7; };
+    if idx == 8 { return a.g8; };
+    if idx == 9 { return a.g9; };
+    if idx == 10 { return a.g10; };
+    if idx == 11 { return a.g11; };
+    if idx == 12 { return a.g12; };
+    if idx == 13 { return a.g13; };
+    if idx == 14 { return a.g14; };
+    if idx == 15 { return a.g15; };
+    return -1;
+}
+
+fn ecs_dyn_occupied_at(a: EcsDynAllocatorDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.o0; };
+    if idx == 1 { return a.o1; };
+    if idx == 2 { return a.o2; };
+    if idx == 3 { return a.o3; };
+    if idx == 4 { return a.o4; };
+    if idx == 5 { return a.o5; };
+    if idx == 6 { return a.o6; };
+    if idx == 7 { return a.o7; };
+    if idx == 8 { return a.o8; };
+    if idx == 9 { return a.o9; };
+    if idx == 10 { return a.o10; };
+    if idx == 11 { return a.o11; };
+    if idx == 12 { return a.o12; };
+    if idx == 13 { return a.o13; };
+    if idx == 14 { return a.o14; };
+    if idx == 15 { return a.o15; };
+    return 0;
+}
+
+fn ecs_dyn_alloc_rebuild(
+    g0: i32, g1: i32, g2: i32, g3: i32, g4: i32, g5: i32, g6: i32, g7: i32,
+    g8: i32, g9: i32, g10: i32, g11: i32, g12: i32, g13: i32, g14: i32, g15: i32,
+    o0: i32, o1: i32, o2: i32, o3: i32, o4: i32, o5: i32, o6: i32, o7: i32,
+    o8: i32, o9: i32, o10: i32, o11: i32, o12: i32, o13: i32, o14: i32, o15: i32,
+    f0: i32, f1: i32, f2: i32, f3: i32, f4: i32, f5: i32, f6: i32, f7: i32,
+    f8: i32, f9: i32, f10: i32, f11: i32, f12: i32, f13: i32, f14: i32, f15: i32,
+    free_len: i32, alloc_count: i32
+) -> EcsDynAllocatorDeep {
+    return EcsDynAllocatorDeep {
+        g0: g0, g1: g1, g2: g2, g3: g3, g4: g4, g5: g5, g6: g6, g7: g7,
+        g8: g8, g9: g9, g10: g10, g11: g11, g12: g12, g13: g13, g14: g14, g15: g15,
+        o0: o0, o1: o1, o2: o2, o3: o3, o4: o4, o5: o5, o6: o6, o7: o7,
+        o8: o8, o9: o9, o10: o10, o11: o11, o12: o12, o13: o13, o14: o14, o15: o15,
+        f0: f0, f1: f1, f2: f2, f3: f3, f4: f4, f5: f5, f6: f6, f7: f7,
+        f8: f8, f9: f9, f10: f10, f11: f11, f12: f12, f13: f13, f14: f14, f15: f15,
+        free_len: free_len, alloc_count: alloc_count,
+    };
+}
+
+fn ecs_dyn_alloc_count(a: EcsDynAllocatorDeep) -> i32 { return a.alloc_count; }
+fn ecs_dyn_free_len(a: EcsDynAllocatorDeep) -> i32 { return a.free_len; }
+
+fn ecs_dyn_free_peek(a: EcsDynAllocatorDeep, stack_idx: i32) -> i32 {
+    if stack_idx == 0 { return a.f0; };
+    if stack_idx == 1 { return a.f1; };
+    if stack_idx == 2 { return a.f2; };
+    if stack_idx == 3 { return a.f3; };
+    if stack_idx == 4 { return a.f4; };
+    if stack_idx == 5 { return a.f5; };
+    if stack_idx == 6 { return a.f6; };
+    if stack_idx == 7 { return a.f7; };
+    if stack_idx == 8 { return a.f8; };
+    if stack_idx == 9 { return a.f9; };
+    if stack_idx == 10 { return a.f10; };
+    if stack_idx == 11 { return a.f11; };
+    if stack_idx == 12 { return a.f12; };
+    if stack_idx == 13 { return a.f13; };
+    if stack_idx == 14 { return a.f14; };
+    if stack_idx == 15 { return a.f15; };
+    return -1;
+}
+
+// set occupancy at idx to value
+fn ecs_dyn_set_occupied(a: EcsDynAllocatorDeep, idx: i32, value: i32) -> EcsDynAllocatorDeep {
+    let g0 = a.g0; let g1 = a.g1; let g2 = a.g2; let g3 = a.g3;
+    let g4 = a.g4; let g5 = a.g5; let g6 = a.g6; let g7 = a.g7;
+    let g8 = a.g8; let g9 = a.g9; let g10 = a.g10; let g11 = a.g11;
+    let g12 = a.g12; let g13 = a.g13; let g14 = a.g14; let g15 = a.g15;
+    let o0 = a.o0; let o1 = a.o1; let o2 = a.o2; let o3 = a.o3;
+    let o4 = a.o4; let o5 = a.o5; let o6 = a.o6; let o7 = a.o7;
+    let o8 = a.o8; let o9 = a.o9; let o10 = a.o10; let o11 = a.o11;
+    let o12 = a.o12; let o13 = a.o13; let o14 = a.o14; let o15 = a.o15;
+    if idx == 0 { o0 = value; };
+    if idx == 1 { o1 = value; };
+    if idx == 2 { o2 = value; };
+    if idx == 3 { o3 = value; };
+    if idx == 4 { o4 = value; };
+    if idx == 5 { o5 = value; };
+    if idx == 6 { o6 = value; };
+    if idx == 7 { o7 = value; };
+    if idx == 8 { o8 = value; };
+    if idx == 9 { o9 = value; };
+    if idx == 10 { o10 = value; };
+    if idx == 11 { o11 = value; };
+    if idx == 12 { o12 = value; };
+    if idx == 13 { o13 = value; };
+    if idx == 14 { o14 = value; };
+    if idx == 15 { o15 = value; };
+    return ecs_dyn_alloc_rebuild(
+        g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15,
+        o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14, o15,
+        a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, a.f6, a.f7,
+        a.f8, a.f9, a.f10, a.f11, a.f12, a.f13, a.f14, a.f15,
+        a.free_len, a.alloc_count
+    );
+}
+
+fn ecs_dyn_set_gen(a: EcsDynAllocatorDeep, idx: i32, value: i32) -> EcsDynAllocatorDeep {
+    let g0 = a.g0; let g1 = a.g1; let g2 = a.g2; let g3 = a.g3;
+    let g4 = a.g4; let g5 = a.g5; let g6 = a.g6; let g7 = a.g7;
+    let g8 = a.g8; let g9 = a.g9; let g10 = a.g10; let g11 = a.g11;
+    let g12 = a.g12; let g13 = a.g13; let g14 = a.g14; let g15 = a.g15;
+    if idx == 0 { g0 = value; };
+    if idx == 1 { g1 = value; };
+    if idx == 2 { g2 = value; };
+    if idx == 3 { g3 = value; };
+    if idx == 4 { g4 = value; };
+    if idx == 5 { g5 = value; };
+    if idx == 6 { g6 = value; };
+    if idx == 7 { g7 = value; };
+    if idx == 8 { g8 = value; };
+    if idx == 9 { g9 = value; };
+    if idx == 10 { g10 = value; };
+    if idx == 11 { g11 = value; };
+    if idx == 12 { g12 = value; };
+    if idx == 13 { g13 = value; };
+    if idx == 14 { g14 = value; };
+    if idx == 15 { g15 = value; };
+    return ecs_dyn_alloc_rebuild(
+        g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15,
+        a.o0, a.o1, a.o2, a.o3, a.o4, a.o5, a.o6, a.o7,
+        a.o8, a.o9, a.o10, a.o11, a.o12, a.o13, a.o14, a.o15,
+        a.f0, a.f1, a.f2, a.f3, a.f4, a.f5, a.f6, a.f7,
+        a.f8, a.f9, a.f10, a.f11, a.f12, a.f13, a.f14, a.f15,
+        a.free_len, a.alloc_count
+    );
+}
+
+fn ecs_dyn_push_free(a: EcsDynAllocatorDeep, idx: i32) -> EcsDynAllocatorDeep {
+    let ln = a.free_len;
+    if ln >= 16 { return a; };
+    let f0 = a.f0; let f1 = a.f1; let f2 = a.f2; let f3 = a.f3;
+    let f4 = a.f4; let f5 = a.f5; let f6 = a.f6; let f7 = a.f7;
+    let f8 = a.f8; let f9 = a.f9; let f10 = a.f10; let f11 = a.f11;
+    let f12 = a.f12; let f13 = a.f13; let f14 = a.f14; let f15 = a.f15;
+    if ln == 0 { f0 = idx; };
+    if ln == 1 { f1 = idx; };
+    if ln == 2 { f2 = idx; };
+    if ln == 3 { f3 = idx; };
+    if ln == 4 { f4 = idx; };
+    if ln == 5 { f5 = idx; };
+    if ln == 6 { f6 = idx; };
+    if ln == 7 { f7 = idx; };
+    if ln == 8 { f8 = idx; };
+    if ln == 9 { f9 = idx; };
+    if ln == 10 { f10 = idx; };
+    if ln == 11 { f11 = idx; };
+    if ln == 12 { f12 = idx; };
+    if ln == 13 { f13 = idx; };
+    if ln == 14 { f14 = idx; };
+    if ln == 15 { f15 = idx; };
+    return ecs_dyn_alloc_rebuild(
+        a.g0, a.g1, a.g2, a.g3, a.g4, a.g5, a.g6, a.g7, a.g8, a.g9, a.g10, a.g11, a.g12, a.g13, a.g14, a.g15,
+        a.o0, a.o1, a.o2, a.o3, a.o4, a.o5, a.o6, a.o7,
+        a.o8, a.o9, a.o10, a.o11, a.o12, a.o13, a.o14, a.o15,
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        f8, f9, f10, f11, f12, f13, f14, f15,
+        ln + 1, a.alloc_count
+    );
+}
+
+// pop free: removes the highest index (LIFO). Returns chosen id or -1 when empty.
+struct EcsDynPopFreeDeep { allocator: EcsDynAllocatorDeep, id: i32 }
+fn ecs_dyn_pop_free_alloc(p: EcsDynPopFreeDeep) -> EcsDynAllocatorDeep { return p.allocator; }
+fn ecs_dyn_pop_free_id(p: EcsDynPopFreeDeep) -> i32 { return p.id; }
+
+fn ecs_dyn_pop_free(a: EcsDynAllocatorDeep) -> EcsDynPopFreeDeep {
+    let ln = a.free_len;
+    if ln <= 0 { return EcsDynPopFreeDeep { allocator: a, id: -1 }; };
+    let slot = ln - 1;
+    let id = ecs_dyn_free_peek(a, slot);
+    // clear slot
+    let f0 = a.f0; let f1 = a.f1; let f2 = a.f2; let f3 = a.f3;
+    let f4 = a.f4; let f5 = a.f5; let f6 = a.f6; let f7 = a.f7;
+    let f8 = a.f8; let f9 = a.f9; let f10 = a.f10; let f11 = a.f11;
+    let f12 = a.f12; let f13 = a.f13; let f14 = a.f14; let f15 = a.f15;
+    if slot == 0 { f0 = -1; };
+    if slot == 1 { f1 = -1; };
+    if slot == 2 { f2 = -1; };
+    if slot == 3 { f3 = -1; };
+    if slot == 4 { f4 = -1; };
+    if slot == 5 { f5 = -1; };
+    if slot == 6 { f6 = -1; };
+    if slot == 7 { f7 = -1; };
+    if slot == 8 { f8 = -1; };
+    if slot == 9 { f9 = -1; };
+    if slot == 10 { f10 = -1; };
+    if slot == 11 { f11 = -1; };
+    if slot == 12 { f12 = -1; };
+    if slot == 13 { f13 = -1; };
+    if slot == 14 { f14 = -1; };
+    if slot == 15 { f15 = -1; };
+    let next = ecs_dyn_alloc_rebuild(
+        a.g0, a.g1, a.g2, a.g3, a.g4, a.g5, a.g6, a.g7, a.g8, a.g9, a.g10, a.g11, a.g12, a.g13, a.g14, a.g15,
+        a.o0, a.o1, a.o2, a.o3, a.o4, a.o5, a.o6, a.o7,
+        a.o8, a.o9, a.o10, a.o11, a.o12, a.o13, a.o14, a.o15,
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        f8, f9, f10, f11, f12, f13, f14, f15,
+        ln - 1, a.alloc_count
+    );
+    return EcsDynPopFreeDeep { allocator: next, id: id };
+}
+
+// first free id starting from 0 (used when free-stack is empty)
+fn ecs_dyn_first_free(a: EcsDynAllocatorDeep) -> i32 {
+    if ecs_dyn_occupied_at(a, 1) == 0 { return 1; };
+    if ecs_dyn_occupied_at(a, 2) == 0 { return 2; };
+    if ecs_dyn_occupied_at(a, 3) == 0 { return 3; };
+    if ecs_dyn_occupied_at(a, 4) == 0 { return 4; };
+    if ecs_dyn_occupied_at(a, 5) == 0 { return 5; };
+    if ecs_dyn_occupied_at(a, 6) == 0 { return 6; };
+    if ecs_dyn_occupied_at(a, 7) == 0 { return 7; };
+    if ecs_dyn_occupied_at(a, 8) == 0 { return 8; };
+    if ecs_dyn_occupied_at(a, 9) == 0 { return 9; };
+    if ecs_dyn_occupied_at(a, 10) == 0 { return 10; };
+    if ecs_dyn_occupied_at(a, 11) == 0 { return 11; };
+    if ecs_dyn_occupied_at(a, 12) == 0 { return 12; };
+    if ecs_dyn_occupied_at(a, 13) == 0 { return 13; };
+    if ecs_dyn_occupied_at(a, 14) == 0 { return 14; };
+    if ecs_dyn_occupied_at(a, 15) == 0 { return 15; };
+    return -1;
+}
+
+struct EcsDynAllocDeep { allocator: EcsDynAllocatorDeep, entity: EcsDynEntityDeep }
+fn ecs_dyn_alloc_result(next: EcsDynAllocDeep) -> EcsDynAllocatorDeep { return next.allocator; }
+fn ecs_dyn_alloc_result_entity(next: EcsDynAllocDeep) -> EcsDynEntityDeep { return next.entity; }
+
+fn ecs_dyn_alloc_entity(a: EcsDynAllocatorDeep) -> EcsDynAllocDeep {
+    let p = ecs_dyn_pop_free(a);
+    let id = ecs_dyn_pop_free_id(p);
+    let b = ecs_dyn_pop_free_alloc(p);
+    if id >= 0 {
+        let after = ecs_dyn_set_occupied(b, id, 1);
+        let gen = ecs_dyn_gen_at(after, id);
+        let next2 = ecs_dyn_alloc_rebuild(
+            after.g0, after.g1, after.g2, after.g3, after.g4, after.g5, after.g6, after.g7,
+            after.g8, after.g9, after.g10, after.g11, after.g12, after.g13, after.g14, after.g15,
+            after.o0, after.o1, after.o2, after.o3, after.o4, after.o5, after.o6, after.o7,
+            after.o8, after.o9, after.o10, after.o11, after.o12, after.o13, after.o14, after.o15,
+            after.f0, after.f1, after.f2, after.f3, after.f4, after.f5, after.f6, after.f7,
+            after.f8, after.f9, after.f10, after.f11, after.f12, after.f13, after.f14, after.f15,
+            after.free_len, after.alloc_count + 1
+        );
+        return EcsDynAllocDeep { allocator: next2, entity: ecs_dyn_entity_new(id, gen) };
+    };
+    let new_id = ecs_dyn_first_free(b);
+    if new_id < 0 {
+        return EcsDynAllocDeep { allocator: a, entity: ecs_dyn_entity_new(-1, 0) };
+    };
+    let after = ecs_dyn_set_occupied(b, new_id, 1);
+    let gen = ecs_dyn_gen_at(after, new_id);
+    let next2 = ecs_dyn_alloc_rebuild(
+        after.g0, after.g1, after.g2, after.g3, after.g4, after.g5, after.g6, after.g7,
+        after.g8, after.g9, after.g10, after.g11, after.g12, after.g13, after.g14, after.g15,
+        after.o0, after.o1, after.o2, after.o3, after.o4, after.o5, after.o6, after.o7,
+        after.o8, after.o9, after.o10, after.o11, after.o12, after.o13, after.o14, after.o15,
+        after.f0, after.f1, after.f2, after.f3, after.f4, after.f5, after.f6, after.f7,
+        after.f8, after.f9, after.f10, after.f11, after.f12, after.f13, after.f14, after.f15,
+        after.free_len, after.alloc_count + 1
+    );
+    return EcsDynAllocDeep { allocator: next2, entity: ecs_dyn_entity_new(new_id, gen) };
+}
+
+fn ecs_dyn_is_alive(a: EcsDynAllocatorDeep, entity: EcsDynEntityDeep) -> bool {
+    if entity.id <= 0 { return false; };
+    if entity.id >= ECS_DYN_CAP { return false; };
+    if ecs_dyn_occupied_at(a, entity.id) != 1 { return false; };
+    return ecs_dyn_gen_at(a, entity.id) == entity.gen;
+}
+
+fn ecs_dyn_free_entity(a: EcsDynAllocatorDeep, entity: EcsDynEntityDeep) -> EcsDynAllocatorDeep {
+    if ecs_dyn_is_alive(a, entity) != true { return a; };
+    let next_gen = ecs_dyn_gen_at(a, entity.id) + 1;
+    let after_gen = ecs_dyn_set_gen(a, entity.id, next_gen);
+    let after_occ = ecs_dyn_set_occupied(after_gen, entity.id, 0);
+    let pushed = ecs_dyn_push_free(after_occ, entity.id);
+    return ecs_dyn_alloc_rebuild(
+        pushed.g0, pushed.g1, pushed.g2, pushed.g3, pushed.g4, pushed.g5, pushed.g6, pushed.g7,
+        pushed.g8, pushed.g9, pushed.g10, pushed.g11, pushed.g12, pushed.g13, pushed.g14, pushed.g15,
+        pushed.o0, pushed.o1, pushed.o2, pushed.o3, pushed.o4, pushed.o5, pushed.o6, pushed.o7,
+        pushed.o8, pushed.o9, pushed.o10, pushed.o11, pushed.o12, pushed.o13, pushed.o14, pushed.o15,
+        pushed.f0, pushed.f1, pushed.f2, pushed.f3, pushed.f4, pushed.f5, pushed.f6, pushed.f7,
+        pushed.f8, pushed.f9, pushed.f10, pushed.f11, pushed.f12, pushed.f13, pushed.f14, pushed.f15,
+        pushed.free_len, pushed.alloc_count - 1
+    );
+}

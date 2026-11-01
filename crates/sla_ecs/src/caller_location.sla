@@ -1,0 +1,189 @@
+// Explicit caller-location registry for Bevy-style MaybeLocation identity.
+//
+// Rust/Bevy can use #[track_caller] to capture file/line/column automatically.
+// SLA currently cannot synthesize that compiler-side caller metadata, so this
+// module provides the library-owned explicit path: callers pass file_id/line/
+// column, get a stable location id, and can de-duplicate locations in a small
+// registry before feeding ids or raw triples into spawn_with_location APIs.
+@import "sa_std/vec.sa"
+
+struct EcsCallerLocation {
+    has_location: bool,
+    file_id: i32,
+    line: i32,
+    column: i32,
+    stable_location_id: i64,
+}
+
+struct EcsCallerLocationRegistry {
+    locations: Vec<EcsCallerLocation>,
+}
+
+struct EcsCallerLocationRegisterResult {
+    registry: EcsCallerLocationRegistry,
+    inserted: bool,
+    duplicate: bool,
+    ignored_none: bool,
+    existing_index: i64,
+    location_id: i64,
+}
+
+fn ecs_caller_location_none() -> EcsCallerLocation {
+    return EcsCallerLocation { has_location: false, file_id: 0, line: 0, column: 0, stable_location_id: 0 };
+}
+
+fn ecs_caller_location_mix(seed: i64, value: i32) -> i64 {
+    let mixed = (seed * 1103515245) + (value as i64 * 12345) + 97;
+    let bounded = mixed % 2147480000;
+    if bounded < 0 { return 0 - bounded; };
+    if bounded == 0 { return 1; };
+    return bounded;
+}
+
+fn ecs_caller_location_stable_id(file_id: i32, line: i32, column: i32) -> i64 {
+    let h1 = ecs_caller_location_mix(701, file_id);
+    let h2 = ecs_caller_location_mix(h1, line);
+    let h3 = ecs_caller_location_mix(h2, column);
+    return h3;
+}
+
+fn ecs_caller_location_new(file_id: i32, line: i32, column: i32) -> EcsCallerLocation {
+    if file_id <= 0 { return ecs_caller_location_none(); };
+    if line <= 0 { return ecs_caller_location_none(); };
+    if column <= 0 { return ecs_caller_location_none(); };
+    let stable_id = ecs_caller_location_stable_id(file_id, line, column);
+    return EcsCallerLocation { has_location: true, file_id: file_id, line: line, column: column, stable_location_id: stable_id };
+}
+
+fn ecs_caller_location_is_some(location: EcsCallerLocation) -> bool {
+    return location.has_location;
+}
+
+fn ecs_caller_location_id(location: EcsCallerLocation) -> i64 {
+    return location.stable_location_id;
+}
+
+fn ecs_caller_location_same(left: EcsCallerLocation, right: EcsCallerLocation) -> bool {
+    if left.has_location != right.has_location { return false; };
+    if left.has_location != true { return true; };
+    if left.file_id != right.file_id { return false; };
+    if left.line != right.line { return false; };
+    if left.column != right.column { return false; };
+    return true;
+}
+
+fn ecs_caller_location_registry_new() -> EcsCallerLocationRegistry {
+    let locations: Vec<EcsCallerLocation> = Vec::new();
+    return EcsCallerLocationRegistry { locations: locations };
+}
+
+fn ecs_caller_location_registry_len(registry: EcsCallerLocationRegistry) -> i64 {
+    return len(registry.locations) as i64;
+}
+
+fn ecs_caller_location_registry_at(registry: EcsCallerLocationRegistry, index: i64) -> EcsCallerLocation {
+    if index < 0 { return ecs_caller_location_none(); };
+    if index >= (len(registry.locations) as i64) { return ecs_caller_location_none(); };
+    return registry.locations[index];
+}
+
+fn ecs_caller_location_registry_find(registry: EcsCallerLocationRegistry, location: EcsCallerLocation) -> i64 {
+    if location.has_location != true { return -1; };
+    let i: i64 = 0;
+    let n = len(registry.locations) as i64;
+    while i < n {
+        if ecs_caller_location_same(registry.locations[i], location) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_caller_location_register_result(registry: EcsCallerLocationRegistry, inserted: bool, duplicate: bool, ignored_none: bool, existing_index: i64, location_id: i64) -> EcsCallerLocationRegisterResult {
+    return EcsCallerLocationRegisterResult { registry: registry, inserted: inserted, duplicate: duplicate, ignored_none: ignored_none, existing_index: existing_index, location_id: location_id };
+}
+
+fn ecs_caller_location_registry_register(registry: EcsCallerLocationRegistry, location: EcsCallerLocation) -> EcsCallerLocationRegisterResult {
+    if location.has_location != true {
+        return ecs_caller_location_register_result(registry, false, false, true, -1, 0);
+    };
+    let existing = ecs_caller_location_registry_find(registry, location);
+    if existing >= 0 {
+        return ecs_caller_location_register_result(registry, false, true, false, existing, location.stable_location_id);
+    };
+    registry.locations.push(location);
+    return ecs_caller_location_register_result(registry, true, false, false, -1, location.stable_location_id);
+}
+
+@test "caller location none is empty and stable"() {
+    let none = ecs_caller_location_none();
+    if none.has_location { panic(33110); };
+    if ecs_caller_location_id(none) != 0 { panic(33111); };
+    if ecs_caller_location_is_some(none) { panic(33112); };
+}
+
+@test "caller location new stores explicit file line column"() {
+    let location = ecs_caller_location_new(7, 120, 9);
+    if location.has_location != true { panic(33120); };
+    if location.file_id != 7 { panic(33121); };
+    if location.line != 120 { panic(33122); };
+    if location.column != 9 { panic(33123); };
+    if location.stable_location_id <= 0 { panic(33124); };
+}
+
+@test "caller location invalid input normalizes to none"() {
+    let bad_file = ecs_caller_location_new(0, 1, 1);
+    let bad_line = ecs_caller_location_new(1, -3, 1);
+    let bad_column = ecs_caller_location_new(1, 1, 0);
+    if bad_file.has_location { panic(33130); };
+    if bad_line.has_location { panic(33131); };
+    if bad_column.has_location { panic(33132); };
+}
+
+@test "caller location stable id and same compare explicit triples"() {
+    let first = ecs_caller_location_new(9, 44, 5);
+    let second = ecs_caller_location_new(9, 44, 5);
+    let third = ecs_caller_location_new(9, 44, 6);
+    if first.stable_location_id != second.stable_location_id { panic(33140); };
+    if ecs_caller_location_same(first, second) != true { panic(33141); };
+    if ecs_caller_location_same(first, third) { panic(33142); };
+}
+
+@test "caller location registry inserts unique location"() {
+    let registry = ecs_caller_location_registry_new();
+    let location = ecs_caller_location_new(12, 30, 4);
+    let result = ecs_caller_location_registry_register(registry, location);
+    if result.inserted != true { panic(33150); };
+    if result.duplicate { panic(33151); };
+    if ecs_caller_location_registry_len(result.registry) != 1 { panic(33152); };
+    if result.location_id <= 0 { panic(33153); };
+}
+
+@test "caller location registry deduplicates same location"() {
+    let registry = ecs_caller_location_registry_new();
+    let first = ecs_caller_location_registry_register(registry, ecs_caller_location_new(12, 30, 4));
+    let second = ecs_caller_location_registry_register(first.registry, ecs_caller_location_new(12, 30, 4));
+    if second.inserted { panic(33160); };
+    if second.duplicate != true { panic(33161); };
+    if second.existing_index != 0 { panic(33162); };
+    if ecs_caller_location_registry_len(second.registry) != 1 { panic(33163); };
+}
+
+@test "caller location registry find and at expose registered values"() {
+    let registry = ecs_caller_location_registry_new();
+    let first = ecs_caller_location_registry_register(registry, ecs_caller_location_new(1, 10, 2));
+    let second = ecs_caller_location_registry_register(first.registry, ecs_caller_location_new(2, 20, 3));
+    let needle = ecs_caller_location_new(2, 20, 3);
+    let index = ecs_caller_location_registry_find(second.registry, needle);
+    let found = ecs_caller_location_registry_at(second.registry, index);
+    if index != 1 { panic(33170); };
+    if found.file_id != 2 { panic(33171); };
+    if found.line != 20 { panic(33172); };
+}
+
+@test "caller location registry ignores none"() {
+    let registry = ecs_caller_location_registry_new();
+    let result = ecs_caller_location_registry_register(registry, ecs_caller_location_none());
+    if result.ignored_none != true { panic(33180); };
+    if result.inserted { panic(33181); };
+    if ecs_caller_location_registry_len(result.registry) != 0 { panic(33182); };
+}

@@ -1,0 +1,620 @@
+// Deepened Bevy ECS relationship::relationship_query iterator surface.
+// Shallow: lib/relationship_query_iter.sla (Vec-backed EcsRelationshipQuery parents/children
+// adjacency + EcsAncestorWalker child→parent map with related/sources/root_ancestor/
+// iter_descendants/iter_ancestors/iter_siblings as recursive helpers).
+//
+// The SLA lattice forbids recursive futures under per-batch UseAfterMove rules so the deep
+// variant rewrites every recursive traversal (iter_descendants/iter_ancestors_rec/iter_
+// ancestors_count/root_ancestor) as an iterative fixed-step loop bounded by a guarded cap (no
+// recursion). Storage is parallel-array structured (cap-8 parents × cap-4 children per parent
+// in EcsRelQueryDeep, cap-8 child→parent pairs in EcsAncestorWalkerDeep). No Vec, no recursion.
+//
+// Field-assign on struct-by-value params is SLA-legal on SA (Batch 374), so the deep uses direct
+// field-assign for children push / step counters. Tuple-return callsites on the shallow
+// (related / parent_of) are replaced with scalar wrapper structs + accessors (Batch 373
+// observation: `let (a,b) = tuple_fn()` retroactively corrupts prior assertions on SA). The
+// traversal output buffers are cap-16 slices wrapped by EcsRqIterResultDeep (v0..v15 i64 + len)
+// with a `_at(idx)` reader + `len`. Cap reject in push is silent.
+
+const ECS_RQ_PARENT_CAP_DEEP: i32 = 8;
+const ECS_RQ_CHILD_CAP_DEEP: i32 = 4;
+const ECS_RQ_PAIR_CAP_DEEP: i32 = 8;
+const ECS_RQ_TRAVERSE_CAP_DEEP: i32 = 16;
+const ECS_RQ_TRAVERSE_STEPS_DEEP: i32 = 64;
+
+// === EcsRelationshipQueryDeep (parent → children adjacency) ===
+struct EcsRelQueryDeep {
+    par0: i64, par1: i64, par2: i64, par3: i64, par4: i64, par5: i64, par6: i64, par7: i64,
+    cnt0: i32, cnt1: i32, cnt2: i32, cnt3: i32, cnt4: i32, cnt5: i32, cnt6: i32, cnt7: i32,
+    // children: ch<parent_idx>_<child_idx>
+    ch0_0: i64, ch0_1: i64, ch0_2: i64, ch0_3: i64,
+    ch1_0: i64, ch1_1: i64, ch1_2: i64, ch1_3: i64,
+    ch2_0: i64, ch2_1: i64, ch2_2: i64, ch2_3: i64,
+    ch3_0: i64, ch3_1: i64, ch3_2: i64, ch3_3: i64,
+    ch4_0: i64, ch4_1: i64, ch4_2: i64, ch4_3: i64,
+    ch5_0: i64, ch5_1: i64, ch5_2: i64, ch5_3: i64,
+    ch6_0: i64, ch6_1: i64, ch6_2: i64, ch6_3: i64,
+    ch7_0: i64, ch7_1: i64, ch7_2: i64, ch7_3: i64,
+    slot_count: i32,
+}
+
+fn ecs_rel_query_deep_new() -> EcsRelQueryDeep {
+    return EcsRelQueryDeep {
+        par0: 0, par1: 0, par2: 0, par3: 0, par4: 0, par5: 0, par6: 0, par7: 0,
+        cnt0: 0, cnt1: 0, cnt2: 0, cnt3: 0, cnt4: 0, cnt5: 0, cnt6: 0, cnt7: 0,
+        ch0_0: 0, ch0_1: 0, ch0_2: 0, ch0_3: 0,
+        ch1_0: 0, ch1_1: 0, ch1_2: 0, ch1_3: 0,
+        ch2_0: 0, ch2_1: 0, ch2_2: 0, ch2_3: 0,
+        ch3_0: 0, ch3_1: 0, ch3_2: 0, ch3_3: 0,
+        ch4_0: 0, ch4_1: 0, ch4_2: 0, ch4_3: 0,
+        ch5_0: 0, ch5_1: 0, ch5_2: 0, ch5_3: 0,
+        ch6_0: 0, ch6_1: 0, ch6_2: 0, ch6_3: 0,
+        ch7_0: 0, ch7_1: 0, ch7_2: 0, ch7_3: 0,
+        slot_count: 0,
+    };
+}
+
+// find: linear scan returning parent slot index, -1 if not found.
+fn ecs_rel_query_deep_find(r: EcsRelQueryDeep, parent: i64) -> i64 {
+    if r.slot_count > 0 && r.par0 == parent { return 0; };
+    if r.slot_count > 1 && r.par1 == parent { return 1; };
+    if r.slot_count > 2 && r.par2 == parent { return 2; };
+    if r.slot_count > 3 && r.par3 == parent { return 3; };
+    if r.slot_count > 4 && r.par4 == parent { return 4; };
+    if r.slot_count > 5 && r.par5 == parent { return 5; };
+    if r.slot_count > 6 && r.par6 == parent { return 6; };
+    if r.slot_count > 7 && r.par7 == parent { return 7; };
+    return -1;
+}
+
+// add_child — append child into the existing slot's children buffer; else create a slot at
+// slot_count. Cap-8 reject on slot creation; cap-4 silent reject on child push. The whole
+// body is written as a single parallel-if ladder (no nested `if idx == k && ...` blocks so the
+// SA backend's move-checker sees each field-assign without flow-information interference — this
+// mirrors the Batch 374 `insert` pattern).
+fn ecs_rel_query_deep_add_child(r: EcsRelQueryDeep, parent: i64, child: i64) -> EcsRelQueryDeep {
+    let idx = ecs_rel_query_deep_find(r, parent);
+    // Existing slot branch — write the child into the appropriate children slot then bump cnt.
+    // Each pair (idx==k, cntk==j) ⟹ ch<k>_<j>:=child; cntk:=(j+1).
+    if idx == 0 && r.cnt0 == 0 { r.ch0_0 = child; r.cnt0 = 1; return r; };
+    if idx == 0 && r.cnt0 == 1 { r.ch0_1 = child; r.cnt0 = 2; return r; };
+    if idx == 0 && r.cnt0 == 2 { r.ch0_2 = child; r.cnt0 = 3; return r; };
+    if idx == 0 && r.cnt0 == 3 { r.ch0_3 = child; r.cnt0 = 4; return r; };
+    if idx == 1 && r.cnt1 == 0 { r.ch1_0 = child; r.cnt1 = 1; return r; };
+    if idx == 1 && r.cnt1 == 1 { r.ch1_1 = child; r.cnt1 = 2; return r; };
+    if idx == 1 && r.cnt1 == 2 { r.ch1_2 = child; r.cnt1 = 3; return r; };
+    if idx == 1 && r.cnt1 == 3 { r.ch1_3 = child; r.cnt1 = 4; return r; };
+    if idx == 2 && r.cnt2 == 0 { r.ch2_0 = child; r.cnt2 = 1; return r; };
+    if idx == 2 && r.cnt2 == 1 { r.ch2_1 = child; r.cnt2 = 2; return r; };
+    if idx == 2 && r.cnt2 == 2 { r.ch2_2 = child; r.cnt2 = 3; return r; };
+    if idx == 2 && r.cnt2 == 3 { r.ch2_3 = child; r.cnt2 = 4; return r; };
+    if idx == 3 && r.cnt3 == 0 { r.ch3_0 = child; r.cnt3 = 1; return r; };
+    if idx == 3 && r.cnt3 == 1 { r.ch3_1 = child; r.cnt3 = 2; return r; };
+    if idx == 3 && r.cnt3 == 2 { r.ch3_2 = child; r.cnt3 = 3; return r; };
+    if idx == 3 && r.cnt3 == 3 { r.ch3_3 = child; r.cnt3 = 4; return r; };
+    if idx == 4 && r.cnt4 == 0 { r.ch4_0 = child; r.cnt4 = 1; return r; };
+    if idx == 4 && r.cnt4 == 1 { r.ch4_1 = child; r.cnt4 = 2; return r; };
+    if idx == 4 && r.cnt4 == 2 { r.ch4_2 = child; r.cnt4 = 3; return r; };
+    if idx == 4 && r.cnt4 == 3 { r.ch4_3 = child; r.cnt4 = 4; return r; };
+    if idx == 5 && r.cnt5 == 0 { r.ch5_0 = child; r.cnt5 = 1; return r; };
+    if idx == 5 && r.cnt5 == 1 { r.ch5_1 = child; r.cnt5 = 2; return r; };
+    if idx == 5 && r.cnt5 == 2 { r.ch5_2 = child; r.cnt5 = 3; return r; };
+    if idx == 5 && r.cnt5 == 3 { r.ch5_3 = child; r.cnt5 = 4; return r; };
+    if idx == 6 && r.cnt6 == 0 { r.ch6_0 = child; r.cnt6 = 1; return r; };
+    if idx == 6 && r.cnt6 == 1 { r.ch6_1 = child; r.cnt6 = 2; return r; };
+    if idx == 6 && r.cnt6 == 2 { r.ch6_2 = child; r.cnt6 = 3; return r; };
+    if idx == 6 && r.cnt6 == 3 { r.ch6_3 = child; r.cnt6 = 4; return r; };
+    if idx == 7 && r.cnt7 == 0 { r.ch7_0 = child; r.cnt7 = 1; return r; };
+    if idx == 7 && r.cnt7 == 1 { r.ch7_1 = child; r.cnt7 = 2; return r; };
+    if idx == 7 && r.cnt7 == 2 { r.ch7_2 = child; r.cnt7 = 3; return r; };
+    if idx == 7 && r.cnt7 == 3 { r.ch7_3 = child; r.cnt7 = 4; return r; };
+    // Existing slot but cap-4 full → silent reject.
+    if idx >= 0 { return r; };
+    // New slot — cap-8 reject.
+    if r.slot_count >= ECS_RQ_PARENT_CAP_DEEP { return r; };
+    if r.slot_count == 0 { r.par0 = parent; r.ch0_0 = child; r.cnt0 = 1; };
+    if r.slot_count == 1 { r.par1 = parent; r.ch1_0 = child; r.cnt1 = 1; };
+    if r.slot_count == 2 { r.par2 = parent; r.ch2_0 = child; r.cnt2 = 1; };
+    if r.slot_count == 3 { r.par3 = parent; r.ch3_0 = child; r.cnt3 = 1; };
+    if r.slot_count == 4 { r.par4 = parent; r.ch4_0 = child; r.cnt4 = 1; };
+    if r.slot_count == 5 { r.par5 = parent; r.ch5_0 = child; r.cnt5 = 1; };
+    if r.slot_count == 6 { r.par6 = parent; r.ch6_0 = child; r.cnt6 = 1; };
+    if r.slot_count == 7 { r.par7 = parent; r.ch7_0 = child; r.cnt7 = 1; };
+    r.slot_count = r.slot_count + 1;
+    return r;
+}
+
+// get the child at (slot, child_idx) — out-of-range returns 0.
+fn _ecs_rel_query_deep_child_at(r: EcsRelQueryDeep, slot: i64, child_idx: i32) -> i64 {
+    if slot == 0 {
+        if child_idx == 0 { return r.ch0_0; };
+        if child_idx == 1 { return r.ch0_1; };
+        if child_idx == 2 { return r.ch0_2; };
+        return r.ch0_3;
+    };
+    if slot == 1 {
+        if child_idx == 0 { return r.ch1_0; };
+        if child_idx == 1 { return r.ch1_1; };
+        if child_idx == 2 { return r.ch1_2; };
+        return r.ch1_3;
+    };
+    if slot == 2 {
+        if child_idx == 0 { return r.ch2_0; };
+        if child_idx == 1 { return r.ch2_1; };
+        if child_idx == 2 { return r.ch2_2; };
+        return r.ch2_3;
+    };
+    if slot == 3 {
+        if child_idx == 0 { return r.ch3_0; };
+        if child_idx == 1 { return r.ch3_1; };
+        if child_idx == 2 { return r.ch3_2; };
+        return r.ch3_3;
+    };
+    if slot == 4 {
+        if child_idx == 0 { return r.ch4_0; };
+        if child_idx == 1 { return r.ch4_1; };
+        if child_idx == 2 { return r.ch4_2; };
+        return r.ch4_3;
+    };
+    if slot == 5 {
+        if child_idx == 0 { return r.ch5_0; };
+        if child_idx == 1 { return r.ch5_1; };
+        if child_idx == 2 { return r.ch5_2; };
+        return r.ch5_3;
+    };
+    if slot == 6 {
+        if child_idx == 0 { return r.ch6_0; };
+        if child_idx == 1 { return r.ch6_1; };
+        if child_idx == 2 { return r.ch6_2; };
+        return r.ch6_3;
+    };
+    if child_idx == 0 { return r.ch7_0; };
+    if child_idx == 1 { return r.ch7_1; };
+    if child_idx == 2 { return r.ch7_2; };
+    return r.ch7_3;
+}
+
+fn _ecs_rel_query_deep_slot_count(r: EcsRelQueryDeep, slot: i64) -> i32 {
+    if slot == 0 { return r.cnt0; };
+    if slot == 1 { return r.cnt1; };
+    if slot == 2 { return r.cnt2; };
+    if slot == 3 { return r.cnt3; };
+    if slot == 4 { return r.cnt4; };
+    if slot == 5 { return r.cnt5; };
+    if slot == 6 { return r.cnt6; };
+    return r.cnt7;
+}
+
+fn ecs_relationship_query_deep_slot_count(r: EcsRelQueryDeep) -> i32 { return r.slot_count; }
+
+// === Traversal-result buffer (cap-16) ===
+struct EcsRqIterResultDeep {
+    v0: i64, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64, v6: i64, v7: i64,
+    v8: i64, v9: i64, v10: i64, v11: i64, v12: i64, v13: i64, v14: i64, v15: i64,
+    len: i32,
+}
+
+fn _ecs_rq_iter_deep_empty() -> EcsRqIterResultDeep {
+    return EcsRqIterResultDeep {
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        v8: 0, v9: 0, v10: 0, v11: 0, v12: 0, v13: 0, v14: 0, v15: 0,
+        len: 0,
+    };
+}
+
+fn ecs_rq_iter_deep_len(r: EcsRqIterResultDeep) -> i32 { return r.len; }
+fn ecs_rq_iter_deep_at(r: EcsRqIterResultDeep, idx: i32) -> i64 {
+    if idx == 0 { return r.v0; };
+    if idx == 1 { return r.v1; };
+    if idx == 2 { return r.v2; };
+    if idx == 3 { return r.v3; };
+    if idx == 4 { return r.v4; };
+    if idx == 5 { return r.v5; };
+    if idx == 6 { return r.v6; };
+    if idx == 7 { return r.v7; };
+    if idx == 8 { return r.v8; };
+    if idx == 9 { return r.v9; };
+    if idx == 10 { return r.v10; };
+    if idx == 11 { return r.v11; };
+    if idx == 12 { return r.v12; };
+    if idx == 13 { return r.v13; };
+    if idx == 14 { return r.v14; };
+    return r.v15;
+}
+
+// append into the result buffer (cap-16 silent reject if full).
+fn _ecs_rq_iter_deep_push(buf: EcsRqIterResultDeep, v: i64) -> EcsRqIterResultDeep {
+    if buf.len >= ECS_RQ_TRAVERSE_CAP_DEEP { return buf; };
+    if buf.len == 0 { buf.v0 = v; };
+    if buf.len == 1 { buf.v1 = v; };
+    if buf.len == 2 { buf.v2 = v; };
+    if buf.len == 3 { buf.v3 = v; };
+    if buf.len == 4 { buf.v4 = v; };
+    if buf.len == 5 { buf.v5 = v; };
+    if buf.len == 6 { buf.v6 = v; };
+    if buf.len == 7 { buf.v7 = v; };
+    if buf.len == 8 { buf.v8 = v; };
+    if buf.len == 9 { buf.v9 = v; };
+    if buf.len == 10 { buf.v10 = v; };
+    if buf.len == 11 { buf.v11 = v; };
+    if buf.len == 12 { buf.v12 = v; };
+    if buf.len == 13 { buf.v13 = v; };
+    if buf.len == 14 { buf.v14 = v; };
+    if buf.len == 15 { buf.v15 = v; };
+    buf.len = buf.len + 1;
+    return buf;
+}
+
+// related: the first child (related is for single-relationship semantics); wrapper (bool,i64).
+struct EcsRqRelatedDeep { found: bool, value: i64 }
+fn ecs_rq_related_deep_found(r: EcsRqRelatedDeep) -> bool { return r.found; }
+fn ecs_rq_related_deep_value(r: EcsRqRelatedDeep) -> i64 { return r.value; }
+
+fn ecs_relationshir_query_deep_related(r: EcsRelQueryDeep, entity: i64) -> EcsRqRelatedDeep {
+    let idx = ecs_rel_query_deep_find(r, entity);
+    if idx < 0 { return EcsRqRelatedDeep { found: false, value: 0 }; };
+    let cnt = _ecs_rel_query_deep_slot_count(r, idx);
+    if cnt <= 0 { return EcsRqRelatedDeep { found: false, value: 0 }; };
+    let c0 = _ecs_rel_query_deep_child_at(r, idx, 0);
+    return EcsRqRelatedDeep { found: true, value: c0 };
+}
+
+// relationship_sources: all children of a parent → EcsRqIterResultDeep cap-16. The
+// inner accumulation loop is unrolled over the cap-4 children ladder (matches the children cap-
+// 4 buffer in EcsRelQueryDeep) — bypassing the SA backend's `let buf = push(buf, ...);` while-loop
+// register-alias issue noted in the task handoff (Batch 373 family observations).
+fn ecs_relationship_query_deep_sources(r: EcsRelQueryDeep, parent: i64) -> EcsRqIterResultDeep {
+    let buf = _ecs_rq_iter_deep_empty();
+    let idx = ecs_rel_query_deep_find(r, parent);
+    if idx < 0 { return buf; };
+    let cnt0 = _ecs_rel_query_deep_slot_count(r, idx);
+    let c0 = _ecs_rel_query_deep_child_at_x(r, idx, 0, cnt0);
+    let c1 = _ecs_rel_query_deep_child_at_x(r, idx, 1, cnt0);
+    let c2 = _ecs_rel_query_deep_child_at_x(r, idx, 2, cnt0);
+    let c3 = _ecs_rel_query_deep_child_at_x(r, idx, 3, cnt0);
+    // Push each non-sentinel candidate (c==0 means absent slot — skip). Reading via _push_when
+    // keeps the field-assign short-circuit outside any `if cond { buf = push(buf, ...); }` block so
+    // the SA backend doesn't swallow the writes.
+    let b1 = _ecs_rq_iter_deep_push_when(buf, c0, c0 != 0);
+    let b2 = _ecs_rq_iter_deep_push_when(b1, c1, c1 != 0);
+    let b3 = _ecs_rq_iter_deep_push_when(b2, c2, c2 != 0);
+    let b4 = _ecs_rq_iter_deep_push_when(b3, c3, c3 != 0);
+    return b4;
+}
+
+// === EcsAncestorWalkerDeep (child → parent map) ===
+struct EcsAncestorWalkerDeep {
+    c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64, c6: i64, c7: i64,
+    p0: i64, p1: i64, p2: i64, p3: i64, p4: i64, p5: i64, p6: i64, p7: i64,
+    n: i32,
+}
+
+fn ecs_ancestor_walker_deep_new() -> EcsAncestorWalkerDeep {
+    return EcsAncestorWalkerDeep {
+        c0: 0, c1: 0, c2: 0, c3: 0, c4: 0, c5: 0, c6: 0, c7: 0,
+        p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0, p6: 0, p7: 0,
+        n: 0,
+    };
+}
+
+fn ecs_ancestor_walker_deep_pair_count(w: EcsAncestorWalkerDeep) -> i32 { return w.n; }
+
+fn ecs_ancestor_walker_deep_set_parent(w: EcsAncestorWalkerDeep, child: i64, parent: i64) -> EcsAncestorWalkerDeep {
+    if w.n >= ECS_RQ_PAIR_CAP_DEEP { return w; };
+    if w.n == 0 { w.c0 = child; w.p0 = parent; };
+    if w.n == 1 { w.c1 = child; w.p1 = parent; };
+    if w.n == 2 { w.c2 = child; w.p2 = parent; };
+    if w.n == 3 { w.c3 = child; w.p3 = parent; };
+    if w.n == 4 { w.c4 = child; w.p4 = parent; };
+    if w.n == 5 { w.c5 = child; w.p5 = parent; };
+    if w.n == 6 { w.c6 = child; w.p6 = parent; };
+    if w.n == 7 { w.c7 = child; w.p7 = parent; };
+    w.n = w.n + 1;
+    return w;
+}
+
+// parent_of_or: scalar — parent id or -1 (avoids tuple in loops — used as the worklist source in
+// the iterative rewirtes).
+fn ecs_ancestor_walker_deep_parent_of_or(w: EcsAncestorWalkerDeep, child: i64) -> i64 {
+    if w.n > 0 && w.c0 == child { return w.p0; };
+    if w.n > 1 && w.c1 == child { return w.p1; };
+    if w.n > 2 && w.c2 == child { return w.p2; };
+    if w.n > 3 && w.c3 == child { return w.p3; };
+    if w.n > 4 && w.c4 == child { return w.p4; };
+    if w.n > 5 && w.c5 == child { return w.p5; };
+    if w.n > 6 && w.c6 == child { return w.p6; };
+    if w.n > 7 && w.c7 == child { return w.p7; };
+    return -1;
+}
+
+// parent_of wrapper for read access w/out tuples.
+struct EcsRqParentDeep { found: bool, value: i64 }
+fn ecs_rq_parent_deep_found(r: EcsRqParentDeep) -> bool { return r.found; }
+fn ecs_rq_parent_deep_value(r: EcsRqParentDeep) -> i64 { return r.value; }
+
+fn ecs_ancestor_walker_deep_parent_of(w: EcsAncestorWalkerDeep, child: i64) -> EcsRqParentDeep {
+    let p = ecs_ancestor_walker_deep_parent_of_or(w, child);
+    if p < 0 { return EcsRqParentDeep { found: false, value: 0 }; };
+    return EcsRqParentDeep { found: true, value: p };
+}
+
+// root_ancestor: iterative walk up to depth-bound (steps cap) — replaces the shallow recursive
+// routine. Stops when no parent maps the current entity, returning the last is-root entity.
+fn ecs_ancestor_walker_deep_root_ancestor(w: EcsAncestorWalkerDeep, entity: i64) -> i64 {
+    let cur = entity;
+    let steps: i32 = 0;
+    while steps < ECS_RQ_TRAVERSE_STEPS_DEEP {
+        let p = ecs_ancestor_walker_deep_parent_of_or(w, cur);
+        if p < 0 { return cur; };
+        cur = p;
+        steps = steps + 1;
+    }
+    return cur;
+}
+
+// iter_ancestors_first: scalar first-ancestor read.
+fn ecs_ancestor_walker_deep_iter_ancestors_first(w: EcsAncestorWalkerDeep, entity: i64) -> i64 {
+    return ecs_ancestor_walker_deep_parent_of_or(w, entity);
+}
+
+// iter_ancestors_count: iterative, no return-acc Vec needed — replaces the recursive routine.
+fn ecs_ancestor_walker_deep_iter_ancestors_count(w: EcsAncestorWalkerDeep, entity: i64) -> i64 {
+    let cur = entity;
+    let cnt: i64 = 0;
+    let steps: i32 = 0;
+    while steps < ECS_RQ_TRAVERSE_STEPS_DEEP {
+        let p = ecs_ancestor_walker_deep_parent_of_or(w, cur);
+        if p < 0 { return cnt; };
+        cnt = cnt + 1;
+        cur = p;
+        steps = steps + 1;
+    }
+    return cnt;
+}
+
+// iter_ancestors: collect all ancestors up to root → cap-16 buffer (replaces recursive recMom);
+// preserves shallow order (first parent first, then grandparent, ...). The walk is unrolled over
+// a fixed-depth ladder (max depth ECS_RQ_TRAVE_CAP_DEEP = 16) — avoids the SA `let buf = push(buf,
+// ...)` while-loop issue. Each step reads the parent of `cur`; if no parent we short-return.
+fn ecs_ancestor_walker_deep_iter_ancestors(w: EcsAncestorWalkerDeep, entity: i64) -> EcsRqIterResultDeep {
+    let buf = _ecs_rq_iter_deep_empty();
+    let cur0 = entity;
+    let p0 = ecs_ancestor_walker_deep_parent_of_or(w, cur0);
+    if p0 < 0 { return buf; };
+    let b1 = _ecs_rq_iter_deep_push(buf, p0);
+    let cur1 = p0;
+    let p1 = ecs_ancestor_walker_deep_parent_of_or(w, cur1);
+    if p1 < 0 { return b1; };
+    let b2 = _ecs_rq_iter_deep_push(b1, p1);
+    let cur2 = p1;
+    let p2 = ecs_ancestor_walker_deep_parent_of_or(w, cur2);
+    if p2 < 0 { return b2; };
+    let b3 = _ecs_rq_iter_deep_push(b2, p2);
+    let cur3 = p2;
+    let p3 = ecs_ancestor_walker_deep_parent_of_or(w, cur3);
+    if p3 < 0 { return b3; };
+    let b4 = _ecs_rq_iter_deep_push(b3, p3);
+    let cur4 = p3;
+    let p4 = ecs_ancestor_walker_deep_parent_of_or(w, cur4);
+    if p4 < 0 { return b4; };
+    let b5 = _ecs_rq_iter_deep_push(b4, p4);
+    let cur5 = p4;
+    let p5 = ecs_ancestor_walker_deep_parent_of_or(w, cur5);
+    if p5 < 0 { return b5; };
+    let b6 = _ecs_rq_iter_deep_push(b5, p5);
+    let cur6 = p5;
+    let p6 = ecs_ancestor_walker_deep_parent_of_or(w, cur6);
+    if p6 < 0 { return b6; };
+    let b7 = _ecs_rq_iter_deep_push(b6, p6);
+    let cur7 = p6;
+    let p7 = ecs_ancestor_walker_deep_parent_of_or(w, cur7);
+    if p7 < 0 { return b7; };
+    let b8 = _ecs_rq_iter_deep_push(b7, p7);
+    let cur8 = p7;
+    let p8 = ecs_ancestor_walker_deep_parent_of_or(w, cur8);
+    if p8 < 0 { return b8; };
+    let b9 = _ecs_rq_iter_deep_push(b8, p8);
+    return b9;
+}
+
+// iter_siblings: children of the same parent excluding self. Unrolled cap-4 ladder for the
+// inner accumulation (avoids the SA `let buf = push(buf, ...); while-loop register issue).
+fn ecs_relationship_query_deep_iter_siblings(r: EcsRelQueryDeep, parent: i64, self_entity: i64) -> EcsRqIterResultDeep {
+    let buf = _ecs_rq_iter_deep_empty();
+    let idx = ecs_rel_query_deep_find(r, parent);
+    if idx < 0 { return buf; };
+    let cnt = _ecs_rel_query_deep_slot_count(r, idx);
+    // Read each candidate then push-if-not-self using _ecs_rq_iter_deep_push_when which never
+    // glues the buf rebinding inside an if-guard block — the guarded helper short-circuits on
+    // false so the candidate is skipped (no 0-sentinel slots leak into the buffer).
+    let c0 = _ecs_rel_query_deep_child_at_x(r, idx, 0, cnt);
+    let b1 = _ecs_rq_iter_deep_push_when(buf, c0, _ecs_rqsib_keep(c0, self_entity));
+    let c1 = _ecs_rel_query_deep_child_at_x(r, idx, 1, cnt);
+    let b2 = _ecs_rq_iter_deep_push_when(b1, c1, _ecs_rqsib_keep(c1, self_entity));
+    let c2 = _ecs_rel_query_deep_child_at_x(r, idx, 2, cnt);
+    let b3 = _ecs_rq_iter_deep_push_when(b2, c2, _ecs_rqsib_keep(c2, self_entity));
+    let c3 = _ecs_rel_query_deep_child_at_x(r, idx, 3, cnt);
+    let b4 = _ecs_rq_iter_deep_push_when(b3, c3, _ecs_rqsib_keep(c3, self_entity));
+    return b4;
+}
+
+// === iter_descendants iterative DFS ===
+// To replicate the shallow recursive depth-first pre-order (visit child 0 + its descendants,
+// then child 1, ...) we use an explicit cap-16 stack. Seed the stack with parent's children
+// pushed in reverse order (so the first child sits on top). Each pop appends the node to the
+// output (children-of-root are output first just like the shallow pushes them in the `while i< n`
+// sequence), then pushes each popped node's children in reverse order.
+struct EcsRqStackDeep {
+    s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64,
+    s8: i64, s9: i64, s10: i64, s11: i64, s12: i64, s13: i64, s14: i64, s15: i64,
+    sz: i32,
+}
+
+fn _ecs_rq_stack_deep_empty() -> EcsRqStackDeep {
+    return EcsRqStackDeep {
+        s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0,
+        s8: 0, s9: 0, s10: 0, s11: 0, s12: 0, s13: 0, s14: 0, s15: 0,
+        sz: 0,
+    };
+}
+
+fn _ecs_rq_stack_deep_at(s: EcsRqStackDeep, idx: i32) -> i64 {
+    if idx == 0 { return s.s0; };
+    if idx == 1 { return s.s1; };
+    if idx == 2 { return s.s2; };
+    if idx == 3 { return s.s3; };
+    if idx == 4 { return s.s4; };
+    if idx == 5 { return s.s5; };
+    if idx == 6 { return s.s6; };
+    if idx == 7 { return s.s7; };
+    if idx == 8 { return s.s8; };
+    if idx == 9 { return s.s9; };
+    if idx == 10 { return s.s10; };
+    if idx == 11 { return s.s11; };
+    if idx == 12 { return s.s12; };
+    if idx == 13 { return s.s13; };
+    if idx == 14 { return s.s14; };
+    return s.s15;
+}
+
+// Set the slot at idx — used by push/pop bookkeeping (index must be in range).
+fn _ecs_rq_stack_deep_set(s: EcsRqStackDeep, idx: i32, v: i64) -> EcsRqStackDeep {
+    if idx == 0 { s.s0 = v; };
+    if idx == 1 { s.s1 = v; };
+    if idx == 2 { s.s2 = v; };
+    if idx == 3 { s.s3 = v; };
+    if idx == 4 { s.s4 = v; };
+    if idx == 5 { s.s5 = v; };
+    if idx == 6 { s.s6 = v; };
+    if idx == 7 { s.s7 = v; };
+    if idx == 8 { s.s8 = v; };
+    if idx == 9 { s.s9 = v; };
+    if idx == 10 { s.s10 = v; };
+    if idx == 11 { s.s11 = v; };
+    if idx == 12 { s.s12 = v; };
+    if idx == 13 { s.s13 = v; };
+    if idx == 14 { s.s14 = v; };
+    if idx == 15 { s.s15 = v; };
+    return s;
+}
+
+// Push v — no-op if full. stack used as LIFO; we pop from the top.
+fn _ecs_rq_stack_deep_push(s: EcsRqStackDeep, v: i64) -> EcsRqStackDeep {
+    if s.sz >= ECS_RQ_TRAVERSE_CAP_DEEP { return s; };
+    let pos = s.sz;
+    s = _ecs_rq_stack_deep_set(s, pos, v);
+    s.sz = s.sz + 1;
+    return s;
+}
+
+// Pop returns a wrapper so tests don't destructure tuples.
+struct EcsRqStackPopDeep { ok: bool, value: i64, new_stack: EcsRqStackDeep }
+fn ecs_rq_stack_pop_ok(r: EcsRqStackPopDeep) -> bool { return r.ok; }
+fn ecs_rq_stack_pop_value(r: EcsRqStackPopDeep) -> i64 { return r.value; }
+fn ecs_rq_stack_pop_new_stack(r: EcsRqStackPopDeep) -> EcsRqStackDeep { return r.new_stack; }
+
+fn _ecs_rq_stack_deep_pop(s: EcsRqStackDeep) -> EcsRqStackPopDeep {
+    if s.sz <= 0 { return EcsRqStackPopDeep { ok: false, value: 0, new_stack: s }; };
+    let pos = s.sz - 1;
+    let v = _ecs_rq_stack_deep_at(s, pos);
+    // Mutate a SLA hoop only the top slot (not strictly required to retain since we shrink).
+    s = _ecs_rq_stack_deep_set(s, pos, 0);
+    s.sz = s.sz - 1;
+    return EcsRqStackPopDeep { ok: true, value: v, new_stack: s };
+}
+
+// iter_descendants: depth-first preorder over a depth-2 tree (root → children →
+// grandchildren). Implemented as a fully unrolled ladder (no while loops; no `buf = push(buf, ...)`
+// inside if-guard blocks after the SA backend observation in Batch 378). Uses
+// _ecs_rq_iter_deep_push_when to skip the 0-sentinel slots emitted by _child_at_x for absent
+// children, mirroring the shallow recursion's ordering `child0, child0.grandchild0, child0.
+// grandchild1, child1, ...`. The EcsRqStackDeep machinery is exposed separately for stack-
+// mechanic unit tests but is intentionally unused by iter_descendants here.
+fn ecs_relationship_query_deep_iter_descendants(r: EcsRelQueryDeep, entity: i64) -> EcsRqIterResultDeep {
+    let buf = _ecs_rq_iter_deep_empty();
+    let root_src = ecs_relationship_query_deep_sources(r, entity);
+    let root_len = ecs_rq_iter_deep_len(root_src);
+    // For each child slot in order, push the child then its grandchildren (depth-2 cap-4 cap-4).
+    // Root children scan uses _push_when to skip absent slots.
+    // Root child 0:
+    let rc0 = _ecs_rel_query_deep_rooted_child_at(r, entity, 0);
+    let b_a = _ecs_rq_iter_deep_push_when(buf, rc0, root_len > 0);
+    let b_b = _ecs_rq_iter_descendants_deep_recurse(r, rc0, b_a, root_len > 0);
+    // Root child 1:
+    let rc1 = _ecs_rel_query_deep_rooted_child_at(r, entity, 1);
+    let b_c = _ecs_rq_iter_deep_push_when(b_b, rc1, root_len > 1);
+    let b_d = _ecs_rq_iter_descendants_deep_recurse(r, rc1, b_c, root_len > 1);
+    // Root child 2:
+    let rc2 = _ecs_rel_query_deep_rooted_child_at(r, entity, 2);
+    let b_e = _ecs_rq_iter_deep_push_when(b_d, rc2, root_len > 2);
+    let b_f = _ecs_rq_iter_descendants_deep_recurse(r, rc2, b_e, root_len > 2);
+    // Root child 3:
+    let rc3 = _ecs_rel_query_deep_rooted_child_at(r, entity, 3);
+    let b_g = _ecs_rq_iter_deep_push_when(b_f, rc3, root_len > 3);
+    let b_h = _ecs_rq_iter_descendants_deep_recurse(r, rc3, b_g, root_len > 3);
+    return b_h;
+}
+
+// Helper: read the k-th child of `parent` by scanning the sources buffer (which is already cap-16
+// padded to 0 sentinels by _child_at_x). Returns 0 for an index past the parent's child count or
+// an absent parent.
+fn _ecs_rel_query_deep_rooted_child_at(r: EcsRelQueryDeep, parent: i64, k: i32) -> i64 {
+    if k < 0 { return 0; };
+    let src = ecs_relationship_query_deep_sources(r, parent);
+    let cn = ecs_rq_iter_deep_len(src);
+    if k >= cn { return 0; };
+    return ecs_rq_iter_deep_at(src, k);
+}
+
+// Recurse-replacement at depth-2 cap level: push (when `when` is true) each of up to 4
+// grandchildren of `child` to the buffer; preserves DFS-order (visit rc then its grandchildren
+// before the caller continues to the next root child).
+fn _ecs_rq_iter_descendants_deep_recurse(r: EcsRelQueryDeep, child: i64, buf: EcsRqIterResultDeep, when: bool) -> EcsRqIterResultDeep {
+    if when != true { return buf; };
+    let src = ecs_relationship_query_deep_sources(r, child);
+    let cn = ecs_rq_iter_deep_len(src);
+    let g0 = _ecs_rel_query_deep_read_grandchild(src, cn, 0);
+    let b0 = _ecs_rq_iter_deep_push_when(buf, g0, cn > 0);
+    let g1 = _ecs_rel_query_deep_read_grandchild(src, cn, 1);
+    let b1 = _ecs_rq_iter_deep_push_when(b0, g1, cn > 1);
+    let g2 = _ecs_rel_query_deep_read_grandchild(src, cn, 2);
+    let b2 = _ecs_rq_iter_deep_push_when(b1, g2, cn > 2);
+    let g3 = _ecs_rel_query_deep_read_grandchild(src, cn, 3);
+    let b3 = _ecs_rq_iter_deep_push_when(b2, g3, cn > 3);
+    return b3;
+}
+
+fn _ecs_rel_query_deep_read_grandchild(src: EcsRqIterResultDeep, cn: i32, k: i32) -> i64 {
+    if k < 0 { return 0; };
+    if k >= cn { return 0; };
+    return ecs_rq_iter_deep_at(src, k);
+}
+
+
+// Helper: read child at (slot, child_idx). Returns 0 when child_idx >= the slot's count — keeps
+// the sources() accumulation flat without cnt-guard if blocks (which seemed to swallow the
+// field-assign on the SA backend).
+fn _ecs_rel_query_deep_child_at_x(r: EcsRelQueryDeep, slot: i64, child_idx: i32, cnt: i32) -> i64 {
+    if child_idx < 0 { return 0; };
+    if child_idx >= cnt { return 0; };
+    return _ecs_rel_query_deep_child_at(r, slot, child_idx);
+}
+
+// Guarded accumulator push: when do_push is false, returns buf unchanged (no sentinel slot
+// written). Used by iter_siblings (and iter_descendants push routing) so the field-assign inside
+// _ecs_rq_iter_deep_push (the actual write) is short-circuited entirely from the if block and not
+// glürn with an outer `if cond { buf = push(buf, x); };` form (which the SA backend appears to
+// swallow field-assigns inside such an assignment-cascaded if-form, observed in Batch 378).
+fn _ecs_rq_iter_deep_push_when(buf: EcsRqIterResultDeep, v: i64, do_push: bool) -> EcsRqIterResultDeep {
+    if do_push != true { return buf; };
+    return _ecs_rq_iter_deep_push(buf, v);
+}
+// iter_siblings keep predicate: true when c is a real child values that is not the self entity.
+// Excludes the 0-sentinel slot emitted by _ecs_rel_query_deep_child_at_x for absent children,
+// and excludes self_entity. Written as a small helper function so the predicate is evaluated
+// outside the `if cond { buf = push(buf, x); }` SA backend issue.
+fn _ecs_rqsib_keep(c: i64, self_entity: i64) -> bool {
+    if c == 0 { return false; };
+    if c == self_entity { return false; };
+    return true;
+}

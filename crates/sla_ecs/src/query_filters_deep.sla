@@ -1,0 +1,227 @@
+// Deepened Bevy ECS query filters + fetch surface.
+// Mirrors src/query/filter.rs + fetch.rs core:
+//   With/Without/Or/Added/Changed/Spawned/Allow
+//   Has/AnyOf/Option fetch
+// Shallow lib/query_filters.sla retained.
+// Component presence modeled as fixed 4-id entity component list.
+
+struct EcsQfCompsDeep {
+    len: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32,
+}
+
+fn ecs_qf_comps_new() -> EcsQfCompsDeep {
+    return EcsQfCompsDeep { len: 0, c0: -1, c1: -1, c2: -1, c3: -1 };
+}
+fn ecs_qf_comps_push(c: EcsQfCompsDeep, id: i32) -> EcsQfCompsDeep {
+    if c.len >= 4 { return c; };
+    if c.len == 0 { return EcsQfCompsDeep { len: 1, c0: id, c1: c.c1, c2: c.c2, c3: c.c3 }; };
+    if c.len == 1 { return EcsQfCompsDeep { len: 2, c0: c.c0, c1: id, c2: c.c2, c3: c.c3 }; };
+    if c.len == 2 { return EcsQfCompsDeep { len: 3, c0: c.c0, c1: c.c1, c2: id, c3: c.c3 }; };
+    return EcsQfCompsDeep { len: 4, c0: c.c0, c1: c.c1, c2: c.c2, c3: id };
+}
+fn ecs_qf_comps_has(c: EcsQfCompsDeep, id: i32) -> bool {
+    if c.len >= 1 { if c.c0 == id { return true; }; };
+    if c.len >= 2 { if c.c1 == id { return true; }; };
+    if c.len >= 3 { if c.c2 == id { return true; }; };
+    if c.len >= 4 { if c.c3 == id { return true; }; };
+    return false;
+}
+
+// With
+fn ecs_qf_with_matches(cid: i32, comps: EcsQfCompsDeep) -> bool {
+    return ecs_qf_comps_has(comps, cid);
+}
+
+// Without
+fn ecs_qf_without_matches(cid: i32, comps: EcsQfCompsDeep) -> bool {
+    if ecs_qf_comps_has(comps, cid) { return false; };
+    return true;
+}
+
+// Or of two With-like terms
+fn ecs_qf_or_matches(a: i32, b: i32, comps: EcsQfCompsDeep) -> bool {
+    if ecs_qf_comps_has(comps, a) { return true; };
+    if ecs_qf_comps_has(comps, b) { return true; };
+    return false;
+}
+
+// Added: component present in added set
+fn ecs_qf_added_matches(cid: i32, added: EcsQfCompsDeep) -> bool {
+    return ecs_qf_comps_has(added, cid);
+}
+
+// Changed: component present in changed set
+fn ecs_qf_changed_matches(cid: i32, changed: EcsQfCompsDeep) -> bool {
+    return ecs_qf_comps_has(changed, cid);
+}
+
+// Spawned this tick
+fn ecs_qf_spawned_matches(spawned_this_tick: bool) -> bool {
+    return spawned_this_tick;
+}
+
+// Allow: bypass default disabling filter for component
+struct EcsQfAllowDeep {
+    component_id: i32,
+}
+fn ecs_qf_allow_new(cid: i32) -> EcsQfAllowDeep {
+    return EcsQfAllowDeep { component_id: cid };
+}
+fn ecs_qf_allow_id(a: EcsQfAllowDeep) -> i32 { return a.component_id; }
+fn ecs_qf_allow_mentions(a: EcsQfAllowDeep, cid: i32) -> bool {
+    if a.component_id == cid { return true; };
+    return false;
+}
+
+// Combined filter evaluation: with/without/or + change ticks + spawned
+struct EcsQfBundleDeep {
+    with0: i32, with_len: i32,
+    without0: i32, without_len: i32,
+    or_a: i32, or_b: i32, or_enabled: bool,
+    added0: i32, added_len: i32,
+    changed0: i32, changed_len: i32,
+    require_spawned: bool,
+}
+
+fn ecs_qf_bundle_new() -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: -1, with_len: 0,
+        without0: -1, without_len: 0,
+        or_a: -1, or_b: -1, or_enabled: false,
+        added0: -1, added_len: 0,
+        changed0: -1, changed_len: 0,
+        require_spawned: false,
+    };
+}
+fn ecs_qf_bundle_with(b: EcsQfBundleDeep, cid: i32) -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: cid, with_len: 1,
+        without0: b.without0, without_len: b.without_len,
+        or_a: b.or_a, or_b: b.or_b, or_enabled: b.or_enabled,
+        added0: b.added0, added_len: b.added_len,
+        changed0: b.changed0, changed_len: b.changed_len,
+        require_spawned: b.require_spawned,
+    };
+}
+fn ecs_qf_bundle_without(b: EcsQfBundleDeep, cid: i32) -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: b.with0, with_len: b.with_len,
+        without0: cid, without_len: 1,
+        or_a: b.or_a, or_b: b.or_b, or_enabled: b.or_enabled,
+        added0: b.added0, added_len: b.added_len,
+        changed0: b.changed0, changed_len: b.changed_len,
+        require_spawned: b.require_spawned,
+    };
+}
+fn ecs_qf_bundle_or(b: EcsQfBundleDeep, a: i32, c: i32) -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: b.with0, with_len: b.with_len,
+        without0: b.without0, without_len: b.without_len,
+        or_a: a, or_b: c, or_enabled: true,
+        added0: b.added0, added_len: b.added_len,
+        changed0: b.changed0, changed_len: b.changed_len,
+        require_spawned: b.require_spawned,
+    };
+}
+fn ecs_qf_bundle_added(b: EcsQfBundleDeep, cid: i32) -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: b.with0, with_len: b.with_len,
+        without0: b.without0, without_len: b.without_len,
+        or_a: b.or_a, or_b: b.or_b, or_enabled: b.or_enabled,
+        added0: cid, added_len: 1,
+        changed0: b.changed0, changed_len: b.changed_len,
+        require_spawned: b.require_spawned,
+    };
+}
+fn ecs_qf_bundle_changed(b: EcsQfBundleDeep, cid: i32) -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: b.with0, with_len: b.with_len,
+        without0: b.without0, without_len: b.without_len,
+        or_a: b.or_a, or_b: b.or_b, or_enabled: b.or_enabled,
+        added0: b.added0, added_len: b.added_len,
+        changed0: cid, changed_len: 1,
+        require_spawned: b.require_spawned,
+    };
+}
+fn ecs_qf_bundle_spawned(b: EcsQfBundleDeep) -> EcsQfBundleDeep {
+    return EcsQfBundleDeep {
+        with0: b.with0, with_len: b.with_len,
+        without0: b.without0, without_len: b.without_len,
+        or_a: b.or_a, or_b: b.or_b, or_enabled: b.or_enabled,
+        added0: b.added0, added_len: b.added_len,
+        changed0: b.changed0, changed_len: b.changed_len,
+        require_spawned: true,
+    };
+}
+
+fn ecs_qf_bundle_matches(
+    b: EcsQfBundleDeep,
+    comps: EcsQfCompsDeep,
+    added: EcsQfCompsDeep,
+    changed: EcsQfCompsDeep,
+    spawned_this_tick: bool,
+) -> bool {
+    if b.with_len >= 1 {
+        if ecs_qf_with_matches(b.with0, comps) != true { return false; };
+    };
+    if b.without_len >= 1 {
+        if ecs_qf_without_matches(b.without0, comps) != true { return false; };
+    };
+    if b.or_enabled {
+        if ecs_qf_or_matches(b.or_a, b.or_b, comps) != true { return false; };
+    };
+    if b.added_len >= 1 {
+        if ecs_qf_added_matches(b.added0, added) != true { return false; };
+    };
+    if b.changed_len >= 1 {
+        if ecs_qf_changed_matches(b.changed0, changed) != true { return false; };
+    };
+    if b.require_spawned {
+        if ecs_qf_spawned_matches(spawned_this_tick) != true { return false; };
+    };
+    return true;
+}
+
+// Fetch: Has / AnyOf / Option
+fn ecs_qf_has_fetch(comps: EcsQfCompsDeep, cid: i32) -> bool {
+    return ecs_qf_comps_has(comps, cid);
+}
+
+struct EcsQfAnyOfDeep {
+    has_a: bool,
+    has_b: bool,
+}
+fn ecs_qf_any_of_a(r: EcsQfAnyOfDeep) -> bool { return r.has_a; }
+fn ecs_qf_any_of_b(r: EcsQfAnyOfDeep) -> bool { return r.has_b; }
+fn ecs_qf_any_of_fetch(comps: EcsQfCompsDeep, a: i32, b: i32) -> EcsQfAnyOfDeep {
+    return EcsQfAnyOfDeep {
+        has_a: ecs_qf_comps_has(comps, a),
+        has_b: ecs_qf_comps_has(comps, b),
+    };
+}
+
+struct EcsQfOptionDeep {
+    is_some: bool,
+    value: i32,
+}
+fn ecs_qf_option_is_some(r: EcsQfOptionDeep) -> bool { return r.is_some; }
+fn ecs_qf_option_value(r: EcsQfOptionDeep) -> i32 { return r.value; }
+fn ecs_qf_option_fetch(comps: EcsQfCompsDeep, cid: i32) -> EcsQfOptionDeep {
+    if ecs_qf_comps_has(comps, cid) {
+        return EcsQfOptionDeep { is_some: true, value: cid };
+    };
+    return EcsQfOptionDeep { is_some: false, value: 0 };
+}
+
+// Archetype-level filter: required component present in table signature
+fn ecs_qf_archetype_matches(table: EcsQfCompsDeep, required: i32) -> bool {
+    return ecs_qf_comps_has(table, required);
+}
+
+// DefaultQueryFilters interaction: disabled unless Allow mentions component
+fn ecs_qf_disabled_by_default(disabling_cid: i32, has_disabling: bool, allow: EcsQfAllowDeep) -> bool {
+    if has_disabling != true { return false; };
+    if ecs_qf_allow_mentions(allow, disabling_cid) { return false; };
+    return true;
+}

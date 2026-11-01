@@ -1,0 +1,231 @@
+// Bevy task pool builder and global usage-pool facade.
+//
+// This module models the observable builder/global-pool API shape on top of
+// EcsParallelTaskPool. SLA has no global OnceLock primitive, so global pools are
+// represented as an explicit value that callers own and pass through.
+@import "parallel_runner.sla"
+
+struct EcsTaskPoolBuilder {
+    num_threads: i64,
+    has_num_threads: bool,
+    stack_size: i64,
+    has_stack_size: bool,
+    thread_name_id: i32,
+    has_thread_name: bool,
+    has_on_thread_spawn: bool,
+    has_on_thread_destroy: bool,
+}
+
+struct EcsTaskPoolTryGetResult {
+    found: bool,
+    pool: EcsParallelTaskPool,
+}
+
+struct EcsGlobalTaskPools {
+    compute_initialized: bool,
+    async_compute_initialized: bool,
+    io_initialized: bool,
+    compute: EcsParallelTaskPool,
+    async_compute: EcsParallelTaskPool,
+    io: EcsParallelTaskPool,
+    tick_count: i64,
+}
+
+fn ecs_task_pool_builder_new() -> EcsTaskPoolBuilder {
+    return EcsTaskPoolBuilder { num_threads: 0, has_num_threads: false, stack_size: 0, has_stack_size: false, thread_name_id: 0, has_thread_name: false, has_on_thread_spawn: false, has_on_thread_destroy: false };
+}
+
+fn ecs_task_pool_builder_num_threads(builder: EcsTaskPoolBuilder, num_threads: i64) -> EcsTaskPoolBuilder {
+    builder.num_threads = num_threads;
+    builder.has_num_threads = true;
+    return builder;
+}
+
+fn ecs_task_pool_builder_stack_size(builder: EcsTaskPoolBuilder, stack_size: i64) -> EcsTaskPoolBuilder {
+    builder.stack_size = stack_size;
+    builder.has_stack_size = true;
+    return builder;
+}
+
+fn ecs_task_pool_builder_thread_name_id(builder: EcsTaskPoolBuilder, thread_name_id: i32) -> EcsTaskPoolBuilder {
+    builder.thread_name_id = thread_name_id;
+    builder.has_thread_name = true;
+    return builder;
+}
+
+fn ecs_task_pool_builder_on_thread_spawn_flag(builder: EcsTaskPoolBuilder) -> EcsTaskPoolBuilder {
+    builder.has_on_thread_spawn = true;
+    return builder;
+}
+
+fn ecs_task_pool_builder_on_thread_destroy_flag(builder: EcsTaskPoolBuilder) -> EcsTaskPoolBuilder {
+    builder.has_on_thread_destroy = true;
+    return builder;
+}
+
+fn ecs_task_pool_available_parallelism() -> i64 {
+    return 1;
+}
+
+fn ecs_task_pool_builder_thread_count_or_available(builder: EcsTaskPoolBuilder) -> i64 {
+    if builder.has_num_threads { return builder.num_threads; };
+    return ecs_task_pool_available_parallelism();
+}
+
+fn ecs_task_pool_builder_build(builder: EcsTaskPoolBuilder) -> EcsParallelTaskPool {
+    return ecs_parallel_task_pool_new(ecs_task_pool_builder_thread_count_or_available(builder));
+}
+
+fn ecs_task_pool_builder_has_callbacks(builder: EcsTaskPoolBuilder) -> bool {
+    return builder.has_on_thread_spawn || builder.has_on_thread_destroy;
+}
+
+fn ecs_task_pool_try_get_result(found: bool, pool: EcsParallelTaskPool) -> EcsTaskPoolTryGetResult {
+    return EcsTaskPoolTryGetResult { found: found, pool: pool };
+}
+
+fn ecs_global_task_pools_new() -> EcsGlobalTaskPools {
+    let empty = ecs_parallel_task_pool_new(0);
+    return EcsGlobalTaskPools { compute_initialized: false, async_compute_initialized: false, io_initialized: false, compute: empty, async_compute: empty, io: empty, tick_count: 0 };
+}
+
+fn ecs_global_task_pools_initialized_count(pools: EcsGlobalTaskPools) -> i64 {
+    let count: i64 = 0;
+    if pools.compute_initialized { count = count + 1; };
+    if pools.async_compute_initialized { count = count + 1; };
+    if pools.io_initialized { count = count + 1; };
+    return count;
+}
+
+fn ecs_compute_task_pool_get_or_init(pools: EcsGlobalTaskPools, pool: EcsParallelTaskPool) -> EcsGlobalTaskPools {
+    if pools.compute_initialized != true {
+        pools.compute = pool;
+        pools.compute_initialized = true;
+    } else {
+        let _ = pool;
+    };
+    return pools;
+}
+
+fn ecs_compute_task_pool_try_get(pools: EcsGlobalTaskPools) -> EcsTaskPoolTryGetResult {
+    return ecs_task_pool_try_get_result(pools.compute_initialized, pools.compute);
+}
+
+fn ecs_compute_task_pool_get(pools: EcsGlobalTaskPools) -> EcsParallelTaskPool {
+    if pools.compute_initialized != true { panic(31200); };
+    return pools.compute;
+}
+
+fn ecs_async_compute_task_pool_get_or_init(pools: EcsGlobalTaskPools, pool: EcsParallelTaskPool) -> EcsGlobalTaskPools {
+    if pools.async_compute_initialized != true {
+        pools.async_compute = pool;
+        pools.async_compute_initialized = true;
+    } else {
+        let _ = pool;
+    };
+    return pools;
+}
+
+fn ecs_async_compute_task_pool_try_get(pools: EcsGlobalTaskPools) -> EcsTaskPoolTryGetResult {
+    return ecs_task_pool_try_get_result(pools.async_compute_initialized, pools.async_compute);
+}
+
+fn ecs_async_compute_task_pool_get(pools: EcsGlobalTaskPools) -> EcsParallelTaskPool {
+    if pools.async_compute_initialized != true { panic(31201); };
+    return pools.async_compute;
+}
+
+fn ecs_io_task_pool_get_or_init(pools: EcsGlobalTaskPools, pool: EcsParallelTaskPool) -> EcsGlobalTaskPools {
+    if pools.io_initialized != true {
+        pools.io = pool;
+        pools.io_initialized = true;
+    } else {
+        let _ = pool;
+    };
+    return pools;
+}
+
+fn ecs_io_task_pool_try_get(pools: EcsGlobalTaskPools) -> EcsTaskPoolTryGetResult {
+    return ecs_task_pool_try_get_result(pools.io_initialized, pools.io);
+}
+
+fn ecs_io_task_pool_get(pools: EcsGlobalTaskPools) -> EcsParallelTaskPool {
+    if pools.io_initialized != true { panic(31202); };
+    return pools.io;
+}
+
+fn ecs_tick_global_task_pools_on_main_thread(pools: EcsGlobalTaskPools) -> EcsGlobalTaskPools {
+    if pools.compute_initialized != true { panic(31203); };
+    if pools.async_compute_initialized != true { panic(31204); };
+    if pools.io_initialized != true { panic(31205); };
+    pools.tick_count = pools.tick_count + 1;
+    return pools;
+}
+
+@test "task pool builder defaults to available parallelism"() {
+    let builder = ecs_task_pool_builder_new();
+    let pool = ecs_task_pool_builder_build(builder);
+    if ecs_task_pool_available_parallelism() != 1 { panic(31210); };
+    if ecs_parallel_task_pool_worker_count(pool) != 1 { panic(31211); };
+    if ecs_parallel_task_pool_batch_width(pool) != 1 { panic(31212); };
+}
+
+@test "task pool builder stores thread stack name and callbacks"() {
+    let b0 = ecs_task_pool_builder_new();
+    let b1 = ecs_task_pool_builder_num_threads(b0, 4);
+    let b2 = ecs_task_pool_builder_stack_size(b1, 8192);
+    let b3 = ecs_task_pool_builder_thread_name_id(b2, 77);
+    let b4 = ecs_task_pool_builder_on_thread_spawn_flag(b3);
+    let b5 = ecs_task_pool_builder_on_thread_destroy_flag(b4);
+    let pool = ecs_task_pool_builder_build(b5);
+    if b5.has_num_threads != true { panic(31220); };
+    if b5.num_threads != 4 { panic(31221); };
+    if b5.has_stack_size != true { panic(31222); };
+    if b5.stack_size != 8192 { panic(31223); };
+    if b5.has_thread_name != true { panic(31224); };
+    if b5.thread_name_id != 77 { panic(31225); };
+    if ecs_task_pool_builder_has_callbacks(b5) != true { panic(31226); };
+    if ecs_parallel_task_pool_worker_count(pool) != 4 { panic(31227); };
+}
+
+@test "task pool builder build clamps negative thread counts"() {
+    let b0 = ecs_task_pool_builder_new();
+    let b1 = ecs_task_pool_builder_num_threads(b0, -5);
+    let pool = ecs_task_pool_builder_build(b1);
+    if ecs_parallel_task_pool_worker_count(pool) != 0 { panic(31230); };
+    if ecs_parallel_task_pool_batch_width(pool) != 0 { panic(31231); };
+}
+
+@test "global task pools try get and get or init"() {
+    let g0 = ecs_global_task_pools_new();
+    let missing = ecs_compute_task_pool_try_get(g0);
+    if missing.found { panic(31240); };
+    let g1 = ecs_compute_task_pool_get_or_init(g0, ecs_parallel_task_pool_new(2));
+    let found = ecs_compute_task_pool_try_get(g1);
+    if found.found != true { panic(31241); };
+    if ecs_parallel_task_pool_worker_count(found.pool) != 2 { panic(31242); };
+    let g2 = ecs_compute_task_pool_get_or_init(g1, ecs_parallel_task_pool_new(9));
+    let kept = ecs_compute_task_pool_get(g2);
+    if ecs_parallel_task_pool_worker_count(kept) != 2 { panic(31243); };
+}
+
+@test "global compute async and io pools are distinct"() {
+    let g0 = ecs_global_task_pools_new();
+    let g1 = ecs_compute_task_pool_get_or_init(g0, ecs_parallel_task_pool_new(2));
+    let g2 = ecs_async_compute_task_pool_get_or_init(g1, ecs_parallel_task_pool_new(3));
+    let g3 = ecs_io_task_pool_get_or_init(g2, ecs_parallel_task_pool_new(4));
+    if ecs_global_task_pools_initialized_count(g3) != 3 { panic(31250); };
+    if ecs_parallel_task_pool_worker_count(ecs_compute_task_pool_get(g3)) != 2 { panic(31251); };
+    if ecs_parallel_task_pool_worker_count(ecs_async_compute_task_pool_get(g3)) != 3 { panic(31252); };
+    if ecs_parallel_task_pool_worker_count(ecs_io_task_pool_get(g3)) != 4 { panic(31253); };
+}
+
+@test "tick global task pools requires initialized pools"() {
+    let g0 = ecs_global_task_pools_new();
+    let g1 = ecs_compute_task_pool_get_or_init(g0, ecs_parallel_task_pool_new(2));
+    let g2 = ecs_async_compute_task_pool_get_or_init(g1, ecs_parallel_task_pool_new(3));
+    let g3 = ecs_io_task_pool_get_or_init(g2, ecs_parallel_task_pool_new(4));
+    let g4 = ecs_tick_global_task_pools_on_main_thread(g3);
+    let g5 = ecs_tick_global_task_pools_on_main_thread(g4);
+    if g5.tick_count != 2 { panic(31260); };
+}

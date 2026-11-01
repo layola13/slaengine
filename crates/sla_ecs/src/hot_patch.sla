@@ -1,0 +1,108 @@
+// Bevy ECS HotPatched message + HotPatchChanges resource — mirrors src/lib.rs (hotpatching
+// feature gate) + src/schedule/executor/single_threaded.rs + src/system/system_registry.rs usage.
+//
+//   #[cfg(feature = "hotpatching")]
+//   #[derive(Message, Default)]
+//   pub struct HotPatched;
+//
+//   /// Resource which "changes" when a hotpatch happens. Exists solely for change-detection,
+//   /// which lets systems know whether a hotpatch happened even if they only run irregularily
+//   /// and would miss the event.
+//   #[cfg(feature = "hotpatching")]
+//   #[derive(resource::Resource, Default)]
+//   pub struct HotPatchChanges;
+//
+// Usage:
+//   - Executors read `HotPatchChanges.last_changed()` to record the tick of the most recent hotpatch
+//     (hotpatch_tick); each system's check_change_tick compares the system's last_run to the
+//     hotpatch_tick and the sytem is re-checked.
+//   - SystemRegistry, when re-running a stored system, does:
+//       if HotPatchChanges.is_none_or(|r| r.is_changed_after(system.get_last_run())) {
+//           system.refresh_hotpatch();
+//       }
+//   - A hotpatch run writes the new tick to HotPatchChanges.last_changed() so a subsequent
+//     consumer calling `DetectChanges::is_changed_after(system.get_last_run())` returns true
+//     iff the HotPatchChanges was changed *after* the system's last_run.
+
+// === EcsHotPatched (zero-sized Message marker) ===
+// We model it as a constant id; presence test is "is_registered".
+struct EcsHotPatched {
+    registered: bool,
+}
+
+fn ecs_hot_patched_new() -> EcsHotPatched {
+    return EcsHotPatched { registered: true };
+}
+
+// A "trigger" of the HotPatched message — by default, just a presence flag.
+fn ecs_hot_patched_is_registered(m: EcsHotPatched) -> bool {
+    return m.registered;
+}
+
+// === EcsHotPatchChanges — Resource carrying last_changed tick. ===
+// Default tick = 0 (Default). last_changed() getter. is_changed_after(system_last_run) returns
+// true iff last_changed > system_last_run (i.e. the Tick the resource was last changed is strictly
+// greater than the system's last-run Tick — wraps-free model for the test subset).
+struct EcsHotPatchChanges {
+    last_changed: i64,
+}
+
+fn ecs_hot_patch_changes_new() -> EcsHotPatchChanges {
+    return EcsHotPatchChanges { last_changed: 0 };
+}
+
+fn ecs_hot_patch_changes_last_changed(c: EcsHotPatchChanges) -> i64 {
+    return c.last_changed;
+}
+
+// Mark a hotpatch as having happened "at tick" — bumps last_changed.
+fn ecs_hot_patch_changes_apply(c: EcsHotPatchChanges, at_tick: i64) -> EcsHotPatchChanges {
+    return EcsHotPatchChanges { last_changed: at_tick };
+}
+
+// DetectChanges::is_changed_after — true iff last_changed > system_last_run.
+fn ecs_hot_patch_changes_is_changed_after(c: EcsHotPatchChanges, system_last_run: i64) -> bool {
+    return c.last_changed > system_last_run;
+}
+
+// Option<Res<HotPatchChanges>>::is_none_or(f): when None, return true (the
+// World does not carry the resource — per Bevy's "no resource => no prior hotpatch record =>
+// treat as needs refresh"). Modelled: has_resource=false -> true (refresh hotpatch).
+// has_resource=true -> apply the predicate.
+fn ecs_hot_patch_changes_is_none_or(has_resource: bool, last_changed: i64, system_last_run: i64) -> bool {
+    if !has_resource {
+        return true;
+    };
+    return last_changed > system_last_run;
+}
+
+// === Should the system's hotpatch be refreshed? ===
+// Mirrors SystemRegistry: refresh_hotpatch iff is_none_or(HotPatchChanges::is_changed_after(sys.last_run)).
+fn ecs_should_refresh_hotpatch(has_resource: bool, last_changed: i64, system_last_run: i64) -> bool {
+    return ecs_hot_patch_changes_is_none_or(has_resource, last_changed, system_last_run);
+}
+
+// === System hotpatch refresh — returns a new last_run / change-tick bookkeeping. ===
+// We model the refresh as resetting the system's last_run to the supplied tick (the refresh
+// effectively "re-evaluates the system from scratch" — mirrored by clearing any stale last_run).
+struct EcsSystemHotPatchState {
+    last_run: i64,
+    refreshed: bool,
+}
+
+fn ecs_shps_last_run(s: EcsSystemHotPatchState) -> i64 {
+    return s.last_run;
+}
+
+fn ecs_shps_refreshed(s: EcsSystemHotPatchState) -> bool {
+    return s.refreshed;
+}
+
+fn ecs_system_hotpatch_new(last_run: i64) -> EcsSystemHotPatchState {
+    return EcsSystemHotPatchState { last_run: last_run, refreshed: false };
+}
+
+// refresh_hotpatch(record_at_tick) — clears/sets last_run to record_at_tick and marks refreshed.
+fn ecs_system_hotpatch_refresh(s: EcsSystemHotPatchState, record_at_tick: i64) -> EcsSystemHotPatchState {
+    return EcsSystemHotPatchState { last_run: record_at_tick, refreshed: true };
+}

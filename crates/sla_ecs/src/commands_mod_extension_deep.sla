@@ -1,0 +1,377 @@
+// Deepened Bevy ECS system::commands mod extensions — Commands-side + EntityCommands-side
+// extension methods not covered elsewhere (shallow lib/commands_mod_extension.sla deep;
+// src/system/commands/mod.rs). The shallow models two lightweight state structs (counter-driven)
+// for `Commands`-side (boxed-system registration, cached run, event triggers, observer add,
+// write_message, run_schedule, get_spawned_entity, reborrow) and `EntityCommands`-side (entity
+// id, is_spawned, pending_commands/observes, cloned_to, last_event; entry/queue_handled/
+// queue_silenced/log_components/commands/commands_mut/observe/trigger + clone/move variants).
+//
+// The deep variant models the underlying deferred command queue with kind-discriminated
+// per-command metadata and a boxed-system registry that the shallow only touches via counters.
+// No generic types, no fn-ptr world application.
+
+const ECS_CMDEXT_CAP_DEEP: i32 = 8;
+
+// === Commands-side kinds (mirror shallow surface) ===
+const ECS_CMDEXT_KIND_TRIGGER: i32 = 1;
+const ECS_CMDEXT_KIND_TRIGGER_WITH: i32 = 2;
+const ECS_CMDEXT_KIND_ADD_OBSERVER: i32 = 3;
+const ECS_CMDEXT_KIND_WRITE_MESSAGE: i32 = 4;
+const ECS_CMDEXT_KIND_RUN_SCHEDULE: i32 = 5;
+// Entity-side kinds queued via EntityCommands:
+const ECS_CMDEXT_KIND_OBSERVE: i32 = 6;
+const ECS_CMDEXT_KIND_ENTRY: i32 = 7;
+const ECS_CMDEXT_KIND_LOG_COMPONENTS: i32 = 8;
+const ECS_CMDEXT_KIND_MOVE_COMPONENTS: i32 = 9;
+
+// === Commands-side deep state ===
+struct EcsCmdExtCommandsDeep {
+    // deferred command queue cap-8: kN kind + aN primary scalar + bN secondary scalar +
+    // cN component_id, per slot.
+    k0: i32, k1: i32, k2: i32, k3: i32, k4: i32, k5: i32, k6: i32, k7: i32,
+    a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32,
+    b0: i32, b1: i32, b2: i32, b3: i32, b4: i32, b5: i32, b6: i32, b7: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c4: i32, c5: i32, c6: i32, c7: i32,
+    cmd_count: i32,
+    // boxed-system registry cap-8 with i64 system ids.
+    sys0: i64, sys1: i64, sys2: i64, sys3: i64, sys4: i64, sys5: i64, sys6: i64, sys7: i64,
+    sys_count: i32,
+    // world binding marker (mirror shallow last_observed_entity when bound to existing entities)
+    bound_entities: i64,
+}
+
+fn ecs_cmd_ext_commands_deep_new() -> EcsCmdExtCommandsDeep {
+    let c = EcsCmdExtCommandsDeep {
+        k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0,
+        a0: 0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+        b0: 0, b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0, b7: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, c4: 0, c5: 0, c6: 0, c7: 0,
+        cmd_count: 0,
+        sys0: 0, sys1: 0, sys2: 0, sys3: 0, sys4: 0, sys5: 0, sys6: 0, sys7: 0,
+        sys_count: 0,
+        bound_entities: 0,
+    };
+    return c;
+}
+
+fn ecs_cmd_ext_commands_deep_len(c: EcsCmdExtCommandsDeep) -> i32 { return c.cmd_count; }
+fn ecs_cmd_ext_commands_deep_sys_count(c: EcsCmdExtCommandsDeep) -> i32 { return c.sys_count; }
+fn ecs_cmd_ext_commands_deep_bound_entities(c: EcsCmdExtCommandsDeep) -> i64 { return c.bound_entities; }
+
+fn ecs_cmd_ext_commands_deep_new_from_entities(world_marker: i64) -> EcsCmdExtCommandsDeep {
+    let c = ecs_cmd_ext_commands_deep_new();
+    c.bound_entities = world_marker;
+    return c;
+}
+
+// per-slot read accessors
+fn ecs_cmd_ext_kind_at(c: EcsCmdExtCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.k0; };
+    if idx == 1 { return c.k1; };
+    if idx == 2 { return c.k2; };
+    if idx == 3 { return c.k3; };
+    if idx == 4 { return c.k4; };
+    if idx == 5 { return c.k5; };
+    if idx == 6 { return c.k6; };
+    if idx == 7 { return c.k7; };
+    return 0;
+}
+
+fn ecs_cmd_ext_primary_at(c: EcsCmdExtCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.a0; };
+    if idx == 1 { return c.a1; };
+    if idx == 2 { return c.a2; };
+    if idx == 3 { return c.a3; };
+    if idx == 4 { return c.a4; };
+    if idx == 5 { return c.a5; };
+    if idx == 6 { return c.a6; };
+    if idx == 7 { return c.a7; };
+    return 0;
+}
+
+fn ecs_cmd_ext_secondary_at(c: EcsCmdExtCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.b0; };
+    if idx == 1 { return c.b1; };
+    if idx == 2 { return c.b2; };
+    if idx == 3 { return c.b3; };
+    if idx == 4 { return c.b4; };
+    if idx == 5 { return c.b5; };
+    if idx == 6 { return c.b6; };
+    if idx == 7 { return c.b7; };
+    return 0;
+}
+
+fn ecs_cmd_ext_component_at(c: EcsCmdExtCommandsDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.c0; };
+    if idx == 1 { return c.c1; };
+    if idx == 2 { return c.c2; };
+    if idx == 3 { return c.c3; };
+    if idx == 4 { return c.c4; };
+    if idx == 5 { return c.c5; };
+    if idx == 6 { return c.c6; };
+    if idx == 7 { return c.c7; };
+    return 0;
+}
+
+// sys id accessor for the boxed-system registry
+fn ecs_cmd_ext_sys_id_at(c: EcsCmdExtCommandsDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.sys0; };
+    if idx == 1 { return c.sys1; };
+    if idx == 2 { return c.sys2; };
+    if idx == 3 { return c.sys3; };
+    if idx == 4 { return c.sys4; };
+    if idx == 5 { return c.sys5; };
+    if idx == 6 { return c.sys6; };
+    if idx == 7 { return c.sys7; };
+    return 0;
+}
+
+// set command slot fields (k/a/b/c) — per-branch scalar assign.
+fn ecs_cmd_ext_set_slot(c: EcsCmdExtCommandsDeep, idx: i32, k: i32, a: i32, b: i32, cmp: i32) -> EcsCmdExtCommandsDeep {
+    if idx == 0 { c.k0 = k; c.a0 = a; c.b0 = b; c.c0 = cmp; };
+    if idx == 1 { c.k1 = k; c.a1 = a; c.b1 = b; c.c1 = cmp; };
+    if idx == 2 { c.k2 = k; c.a2 = a; c.b2 = b; c.c2 = cmp; };
+    if idx == 3 { c.k3 = k; c.a3 = a; c.b3 = b; c.c3 = cmp; };
+    if idx == 4 { c.k4 = k; c.a4 = a; c.b4 = b; c.c4 = cmp; };
+    if idx == 5 { c.k5 = k; c.a5 = a; c.b5 = b; c.c5 = cmp; };
+    if idx == 6 { c.k6 = k; c.a6 = a; c.b6 = b; c.c6 = cmp; };
+    if idx == 7 { c.k7 = k; c.a7 = a; c.b7 = b; c.c7 = cmp; };
+    return c;
+}
+
+fn ecs_cmd_ext_set_sys(c: EcsCmdExtCommandsDeep, idx: i32, id: i64) -> EcsCmdExtCommandsDeep {
+    if idx == 0 { c.sys0 = id; };
+    if idx == 1 { c.sys1 = id; };
+    if idx == 2 { c.sys2 = id; };
+    if idx == 3 { c.sys3 = id; };
+    if idx == 4 { c.sys4 = id; };
+    if idx == 5 { c.sys5 = id; };
+    if idx == 6 { c.sys6 = id; };
+    if idx == 7 { c.sys7 = id; };
+    return c;
+}
+
+fn ecs_cmd_ext_commands_deep_count_by_kind(c: EcsCmdExtCommandsDeep, kind: i32) -> i32 {
+    let i: i32 = 0;
+    let out: i32 = 0;
+    while i < c.cmd_count {
+        if ecs_cmd_ext_kind_at(c, i) == kind { out = out + 1; };
+        i = i + 1;
+    }
+    return out;
+}
+
+// register_boxed_system: reserves a system id (1-indexed) on the registry.
+fn ecs_cmd_ext_register_boxed_system(c: EcsCmdExtCommandsDeep) -> (EcsCmdExtCommandsDeep, i64) {
+    if c.sys_count >= ECS_CMDEXT_CAP_DEEP { return (c, -1); };
+    let slot: i32 = c.sys_count;
+    let id: i64 = (c.sys_count as i64) + 1;
+    c = ecs_cmd_ext_set_sys(c, slot, id);
+    c.sys_count = c.sys_count + 1;
+    return (c, id);
+}
+
+// unregister_system_cached: returns (state, found, removed_id); only the most-recently
+// registered (last_slot) is removable — mirrors shallow that only handles the last_system_id.
+fn ecs_cmd_ext_unregister_system_cached(c: EcsCmdExtCommandsDeep, id: i64) -> (EcsCmdExtCommandsDeep, bool, i64) {
+    if c.sys_count == 0 { return (c, false, id); };
+    let last_slot: i32 = c.sys_count - 1;
+    let last_id: i64 = ecs_cmd_ext_sys_id_at(c, last_slot);
+    if id == last_id {
+        c = ecs_cmd_ext_set_sys(c, last_slot, 0);
+        c.sys_count = c.sys_count - 1;
+        return (c, true, id);
+    };
+    return (c, false, id);
+}
+
+// run_system_cached: returns the cached id if id is in registry range, else -1.
+fn ecs_cmd_ext_run_system_cached(c: EcsCmdExtCommandsDeep, id: i64) -> (EcsCmdExtCommandsDeep, i64) {
+    if id > 0 && id <= (c.sys_count as i64) {
+        return (c, id);
+    };
+    return (c, -1);
+}
+
+// run_system_cached_with: returns (state, id, input) — input passed through.
+fn ecs_cmd_ext_run_system_cached_with(c: EcsCmdExtCommandsDeep, id: i64, input: i64) -> (EcsCmdExtCommandsDeep, i64, i64) {
+    let r = ecs_cmd_ext_run_system_cached(c, id);
+    return (r.0, r.1, input);
+}
+
+// enqueue helper for command kinds with primary scalar (event_id / observer_entity /
+// message_id / schedule_label / component_id) and optional component_id count.
+fn ecs_cmd_ext_enqueue(c: EcsCmdExtCommandsDeep, k: i32, a: i32, b: i32, cmp: i32) -> EcsCmdExtCommandsDeep {
+    if c.cmd_count >= ECS_CMDEXT_CAP_DEEP { return c; };
+    c = ecs_cmd_ext_set_slot(c, c.cmd_count, k, a, b, cmp);
+    c.cmd_count = c.cmd_count + 1;
+    return c;
+}
+
+// trigger(event_id)
+fn ecs_cmd_ext_trigger(c: EcsCmdExtCommandsDeep, event_id: i32) -> (EcsCmdExtCommandsDeep, i32) {
+    let next = ecs_cmd_ext_enqueue(c, ECS_CMDEXT_KIND_TRIGGER, event_id, 0, 0);
+    return (next, event_id);
+}
+
+// trigger_with(event_id, payload)
+fn ecs_cmd_ext_trigger_with(c: EcsCmdExtCommandsDeep, event_id: i32, payload: i64) -> (EcsCmdExtCommandsDeep, i32) {
+    let next = ecs_cmd_ext_enqueue(c, ECS_CMDEXT_KIND_TRIGGER_WITH, event_id, payload as i32, 0);
+    return (next, event_id);
+}
+
+// add_observer(observer_entity)
+fn ecs_cmd_ext_add_observer(c: EcsCmdExtCommandsDeep, observer_entity: i64) -> (EcsCmdExtCommandsDeep, bool) {
+    let next = ecs_cmd_ext_enqueue(c, ECS_CMDEXT_KIND_ADD_OBSERVER, observer_entity as i32, 0, 0);
+    return (next, true);
+}
+
+// write_message(message_id)
+fn ecs_cmd_ext_write_message(c: EcsCmdExtCommandsDeep, message_id: i32) -> (EcsCmdExtCommandsDeep, i32) {
+    let next = ecs_cmd_ext_enqueue(c, ECS_CMDEXT_KIND_WRITE_MESSAGE, message_id, 0, 0);
+    return (next, message_id);
+}
+
+// run_schedule(label)
+fn ecs_cmd_ext_run_schedule(c: EcsCmdExtCommandsDeep, label: i32) -> (EcsCmdExtCommandsDeep, bool) {
+    if label < 0 { return (c, false); };
+    let next = ecs_cmd_ext_enqueue(c, ECS_CMDEXT_KIND_RUN_SCHEDULE, label, 0, 0);
+    return (next, true);
+}
+
+// get_spawned_entity(requested): mirrors shallow — request<0 means spawn-request, else found.
+fn ecs_cmd_ext_get_spawned_entity(c: EcsCmdExtCommandsDeep, requested: i64) -> (EcsCmdExtCommandsDeep, i64, bool, bool) {
+    return (c, requested, requested < 0, requested >= 0);
+}
+
+// rebound_to / reborrow: clone-state (mirror shallow pass-through).
+fn ecs_cmd_ext_rebound_to(c: EcsCmdExtCommandsDeep) -> EcsCmdExtCommandsDeep { return c; }
+fn ecs_cmd_ext_reborrow(c: EcsCmdExtCommandsDeep) -> EcsCmdExtCommandsDeep { return c; }
+
+fn ecs_cmd_ext_commands_deep_clear(c: EcsCmdExtCommandsDeep) -> EcsCmdExtCommandsDeep {
+    return ecs_cmd_ext_commands_deep_new();
+}
+
+// === EntityCommands-side deep state ===
+struct EcsEntityCmdExtDeep {
+    entity: i64,
+    is_spawned: i32, // bool as i32 (0/1)
+    pending_commands: i64,
+    pending_observes: i64,
+    last_event: i64,
+    cloned_to: i64,
+    last_component: i32,
+}
+
+fn ecs_entity_cmd_ext_deep_new(entity: i64, is_spawned: bool) -> EcsEntityCmdExtDeep {
+    let spawned_i32: i32 = 0;
+    if is_spawned { spawned_i32 = 1; };
+    let s = EcsEntityCmdExtDeep {
+        entity: entity,
+        is_spawned: spawned_i32,
+        pending_commands: 0,
+        pending_observes: 0,
+        last_event: 0,
+        cloned_to: -1,
+        last_component: 0,
+    };
+    return s;
+}
+
+fn ecs_entity_cmd_ext_id(s: EcsEntityCmdExtDeep) -> i64 { return s.entity; }
+fn ecs_entity_cmd_ext_entity(s: EcsEntityCmdExtDeep) -> i64 { return s.entity; }
+fn ecs_entity_cmd_ext_is_spawned(s: EcsEntityCmdExtDeep) -> bool { return s.is_spawned == 1; }
+fn ecs_entity_cmd_ext_get_pending(s: EcsEntityCmdExtDeep) -> i64 { return s.pending_commands; }
+fn ecs_entity_cmd_ext_pending_observes(s: EcsEntityCmdExtDeep) -> i64 { return s.pending_observes; }
+fn ecs_entity_cmd_ext_cloned_to(s: EcsEntityCmdExtDeep) -> i64 { return s.cloned_to; }
+fn ecs_entity_cmd_ext_last_event(s: EcsEntityCmdExtDeep) -> i64 { return s.last_event; }
+fn ecs_entity_cmd_ext_last_component(s: EcsEntityCmdExtDeep) -> i32 { return s.last_component; }
+fn ecs_entity_cmd_ext_reborrow(s: EcsEntityCmdExtDeep) -> EcsEntityCmdExtDeep { return s; }
+
+fn ecs_entity_cmd_ext_entry(s: EcsEntityCmdExtDeep, component_id: i32) -> (EcsEntityCmdExtDeep, i32) {
+    s.pending_commands = s.pending_commands + 1;
+    s.last_component = component_id;
+    return (s, component_id);
+}
+
+fn ecs_entity_cmd_ext_queue_handled(s: EcsEntityCmdExtDeep, command_id: i32) -> (EcsEntityCmdExtDeep, bool) {
+    s.pending_commands = s.pending_commands + 1;
+    s.last_component = command_id;
+    return (s, true);
+}
+
+fn ecs_entity_cmd_ext_queue_silenced(s: EcsEntityCmdExtDeep, command_id: i32) -> (EcsEntityCmdExtDeep, bool) {
+    s.pending_commands = s.pending_commands + 1;
+    s.last_component = command_id;
+    return (s, false);
+}
+
+fn ecs_entity_cmd_ext_log_components(s: EcsEntityCmdExtDeep, components_count: i32) -> (EcsEntityCmdExtDeep, i64) {
+    s.pending_commands = s.pending_commands + 1;
+    return (s, components_count as i64);
+}
+
+fn ecs_entity_cmd_ext_commands(s: EcsEntityCmdExtDeep) -> EcsEntityCmdExtDeep {
+    s.pending_commands = s.pending_commands + 1;
+    return s;
+}
+
+fn ecs_entity_cmd_ext_commands_mut(s: EcsEntityCmdExtDeep) -> EcsEntityCmdExtDeep {
+    s.pending_commands = s.pending_commands + 1;
+    return s;
+}
+
+fn ecs_entity_cmd_ext_observe(s: EcsEntityCmdExtDeep, observer_entity: i64) -> (EcsEntityCmdExtDeep, bool) {
+    s.pending_observes = s.pending_observes + 1;
+    s.last_event = observer_entity;
+    return (s, true);
+}
+
+fn ecs_entity_cmd_ext_trigger(s: EcsEntityCmdExtDeep, event_id: i64) -> (EcsEntityCmdExtDeep, i64) {
+    s.last_event = event_id;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, event_id);
+}
+
+fn ecs_entity_cmd_ext_clone_with_opt_out(s: EcsEntityCmdExtDeep, target: i64, excluded_count: i32) -> (EcsEntityCmdExtDeep, i64) {
+    s.cloned_to = target;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, excluded_count as i64);
+}
+
+fn ecs_entity_cmd_ext_clone_with_opt_in(s: EcsEntityCmdExtDeep, target: i64, included_count: i32) -> (EcsEntityCmdExtDeep, i64) {
+    s.cloned_to = target;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, included_count as i64);
+}
+
+fn ecs_entity_cmd_ext_clone_and_spawn(s: EcsEntityCmdExtDeep, new_target: i64) -> (EcsEntityCmdExtDeep, i64, bool) {
+    s.cloned_to = new_target;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, new_target, true);
+}
+
+fn ecs_entity_cmd_ext_clone_and_spawn_with_opt_out(s: EcsEntityCmdExtDeep, new_target: i64, excluded_count: i32) -> (EcsEntityCmdExtDeep, i64) {
+    s.cloned_to = new_target;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, excluded_count as i64);
+}
+
+fn ecs_entity_cmd_ext_clone_and_spawn_with_opt_in(s: EcsEntityCmdExtDeep, new_target: i64, included_count: i32) -> (EcsEntityCmdExtDeep, i64) {
+    s.cloned_to = new_target;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, included_count as i64);
+}
+
+fn ecs_entity_cmd_ext_clone_components(s: EcsEntityCmdExtDeep, target: i64, component_count: i32) -> (EcsEntityCmdExtDeep, i64) {
+    s.cloned_to = target;
+    s.pending_commands = s.pending_commands + 1;
+    return (s, component_count as i64);
+}
+
+fn ecs_entity_cmd_ext_move_components(s: EcsEntityCmdExtDeep, target: i64, component_count: i32) -> (EcsEntityCmdExtDeep, i64, bool) {
+    s.cloned_to = target;
+    s.pending_commands = s.pending_commands + 1;
+    s.is_spawned = 0;
+    return (s, component_count as i64, true);
+}

@@ -1,0 +1,280 @@
+// Deepened Bevy ECS MessageReader + MessageWriter + PopulatedMessageReader.
+// Mirrors src/message/message_reader.rs + message_writer.rs over Messages dual-buffer:
+//   MessageWriter::{write, write_batch, write_default}
+//   MessageReader::{read, read_with_id, par_read, len, is_empty, clear}
+//   PopulatedMessageReader (Some when messages present)
+// Fixed capacity: 4 per sequence A/B. Shallow lib/message_reader_writer.sla retained.
+
+struct EcsMrwMessagesDeep {
+    message_count: i64,
+    a_start: i64,
+    a0: i64, a1: i64, a2: i64, a3: i64, a_len: i32,
+    b_start: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64, b_len: i32,
+}
+
+fn ecs_mrw_messages_new() -> EcsMrwMessagesDeep {
+    return EcsMrwMessagesDeep {
+        message_count: 0,
+        a_start: 0, a0: 0, a1: 0, a2: 0, a3: 0, a_len: 0,
+        b_start: 0, b0: 0, b1: 0, b2: 0, b3: 0, b_len: 0,
+    };
+}
+
+fn ecs_mrw_messages_message_count(m: EcsMrwMessagesDeep) -> i64 { return m.message_count; }
+fn ecs_mrw_messages_len(m: EcsMrwMessagesDeep) -> i64 {
+    return (m.a_len as i64) + (m.b_len as i64);
+}
+
+fn ecs_mrw_rebuild(
+    message_count: i64,
+    a_start: i64, a0: i64, a1: i64, a2: i64, a3: i64, a_len: i32,
+    b_start: i64, b0: i64, b1: i64, b2: i64, b3: i64, b_len: i32
+) -> EcsMrwMessagesDeep {
+    return EcsMrwMessagesDeep {
+        message_count: message_count,
+        a_start: a_start, a0: a0, a1: a1, a2: a2, a3: a3, a_len: a_len,
+        b_start: b_start, b0: b0, b1: b1, b2: b2, b3: b3, b_len: b_len,
+    };
+}
+
+struct EcsMrwWriteResult {
+    messages: EcsMrwMessagesDeep,
+    id: i64,
+}
+
+fn ecs_mrw_write_messages(r: EcsMrwWriteResult) -> EcsMrwMessagesDeep { return r.messages; }
+fn ecs_mrw_write_id(r: EcsMrwWriteResult) -> i64 { return r.id; }
+
+fn ecs_mrw_messages_write(m: EcsMrwMessagesDeep, value: i64) -> EcsMrwWriteResult {
+    let id = m.message_count;
+    let bl = m.b_len;
+    if bl >= 4 {
+        let m2 = ecs_mrw_rebuild(
+            m.message_count + 1,
+            m.a_start, m.a0, m.a1, m.a2, m.a3, m.a_len,
+            m.b_start, m.b0, m.b1, m.b2, m.b3, m.b_len
+        );
+        return EcsMrwWriteResult { messages: m2, id: id };
+    };
+    let b0 = m.b0; let b1 = m.b1; let b2 = m.b2; let b3 = m.b3;
+    if bl == 0 { b0 = value; };
+    if bl == 1 { b1 = value; };
+    if bl == 2 { b2 = value; };
+    if bl == 3 { b3 = value; };
+    let m2 = ecs_mrw_rebuild(
+        m.message_count + 1,
+        m.a_start, m.a0, m.a1, m.a2, m.a3, m.a_len,
+        m.b_start, b0, b1, b2, b3, bl + 1
+    );
+    return EcsMrwWriteResult { messages: m2, id: id };
+}
+
+fn ecs_mrw_messages_write_default(m: EcsMrwMessagesDeep) -> EcsMrwWriteResult {
+    return ecs_mrw_messages_write(m, 0);
+}
+
+struct EcsMrwBatchResult {
+    messages: EcsMrwMessagesDeep,
+    last_count: i64,
+    message_count: i64,
+}
+
+fn ecs_mrw_batch_messages(r: EcsMrwBatchResult) -> EcsMrwMessagesDeep { return r.messages; }
+fn ecs_mrw_batch_last(r: EcsMrwBatchResult) -> i64 { return r.last_count; }
+fn ecs_mrw_batch_count(r: EcsMrwBatchResult) -> i64 { return r.message_count - r.last_count; }
+
+fn ecs_mrw_messages_write_batch4(m: EcsMrwMessagesDeep, v0: i64, v1: i64, v2: i64, v3: i64, n: i32) -> EcsMrwBatchResult {
+    let last = m.message_count;
+    let cur = m;
+    if n <= 0 {
+        return EcsMrwBatchResult { messages: cur, last_count: last, message_count: cur.message_count };
+    };
+    let w0 = ecs_mrw_messages_write(cur, v0);
+    cur = ecs_mrw_write_messages(w0);
+    if n == 1 {
+        return EcsMrwBatchResult { messages: cur, last_count: last, message_count: cur.message_count };
+    };
+    let w1 = ecs_mrw_messages_write(cur, v1);
+    cur = ecs_mrw_write_messages(w1);
+    if n == 2 {
+        return EcsMrwBatchResult { messages: cur, last_count: last, message_count: cur.message_count };
+    };
+    let w2 = ecs_mrw_messages_write(cur, v2);
+    cur = ecs_mrw_write_messages(w2);
+    if n == 3 {
+        return EcsMrwBatchResult { messages: cur, last_count: last, message_count: cur.message_count };
+    };
+    let w3 = ecs_mrw_messages_write(cur, v3);
+    cur = ecs_mrw_write_messages(w3);
+    return EcsMrwBatchResult { messages: cur, last_count: last, message_count: cur.message_count };
+}
+
+fn ecs_mrw_messages_update(m: EcsMrwMessagesDeep) -> EcsMrwMessagesDeep {
+    return ecs_mrw_rebuild(
+        m.message_count,
+        m.b_start, m.b0, m.b1, m.b2, m.b3, m.b_len,
+        m.message_count, 0, 0, 0, 0, 0
+    );
+}
+
+// MessageWriter is just write path over Messages
+struct EcsMrwWriterDeep {
+    messages: EcsMrwMessagesDeep,
+}
+
+fn ecs_mrw_writer_new() -> EcsMrwWriterDeep {
+    return EcsMrwWriterDeep { messages: ecs_mrw_messages_new() };
+}
+fn ecs_mrw_writer_messages(w: EcsMrwWriterDeep) -> EcsMrwMessagesDeep { return w.messages; }
+fn ecs_mrw_writer_len(w: EcsMrwWriterDeep) -> i64 { return ecs_mrw_messages_len(w.messages); }
+
+fn ecs_mrw_writer_write(w: EcsMrwWriterDeep, value: i64) -> EcsMrwWriteResult {
+    return ecs_mrw_messages_write(w.messages, value);
+}
+
+fn ecs_mrw_writer_from_messages(m: EcsMrwMessagesDeep) -> EcsMrwWriterDeep {
+    return EcsMrwWriterDeep { messages: m };
+}
+
+// MessageReader cursor over Messages
+struct EcsMrwReaderDeep {
+    last_message_count: i64,
+}
+
+fn ecs_mrw_reader_new() -> EcsMrwReaderDeep {
+    return EcsMrwReaderDeep { last_message_count: 0 };
+}
+fn ecs_mrw_reader_last(r: EcsMrwReaderDeep) -> i64 { return r.last_message_count; }
+
+fn ecs_mrw_sat_sub(a: i64, b: i64) -> i64 {
+    if a < b { return 0; };
+    return a - b;
+}
+
+fn ecs_mrw_reader_len(r: EcsMrwReaderDeep, m: EcsMrwMessagesDeep) -> i64 {
+    if m.message_count <= r.last_message_count { return 0; };
+    let unread = m.message_count - r.last_message_count;
+    let stored = ecs_mrw_messages_len(m);
+    if unread < stored { return unread; };
+    return stored;
+}
+
+fn ecs_mrw_reader_is_empty(r: EcsMrwReaderDeep, m: EcsMrwMessagesDeep) -> bool {
+    if ecs_mrw_reader_len(r, m) == 0 { return true; };
+    return false;
+}
+
+fn ecs_mrw_reader_clear(r: EcsMrwReaderDeep, m: EcsMrwMessagesDeep) -> EcsMrwReaderDeep {
+    return EcsMrwReaderDeep { last_message_count: m.message_count };
+}
+
+fn ecs_mrw_a_get(m: EcsMrwMessagesDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.a0; };
+    if idx == 1 { return m.a1; };
+    if idx == 2 { return m.a2; };
+    if idx == 3 { return m.a3; };
+    return 0;
+}
+fn ecs_mrw_b_get(m: EcsMrwMessagesDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.b0; };
+    if idx == 1 { return m.b1; };
+    if idx == 2 { return m.b2; };
+    if idx == 3 { return m.b3; };
+    return 0;
+}
+
+struct EcsMrwReadResult {
+    reader: EcsMrwReaderDeep,
+    has: bool,
+    value: i64,
+    id: i64,
+}
+
+fn ecs_mrw_read_reader(r: EcsMrwReadResult) -> EcsMrwReaderDeep { return r.reader; }
+fn ecs_mrw_read_has(r: EcsMrwReadResult) -> bool { return r.has; }
+fn ecs_mrw_read_value(r: EcsMrwReadResult) -> i64 { return r.value; }
+fn ecs_mrw_read_id(r: EcsMrwReadResult) -> i64 { return r.id; }
+
+fn ecs_mrw_reader_read(r: EcsMrwReaderDeep, m: EcsMrwMessagesDeep) -> EcsMrwReadResult {
+    let last = r.last_message_count;
+    let oldest = m.a_start;
+    if last < oldest { last = oldest; };
+    if last >= m.message_count {
+        let r2 = EcsMrwReaderDeep { last_message_count: last };
+        return EcsMrwReadResult { reader: r2, has: false, value: 0, id: -1 };
+    };
+    let value: i64 = 0;
+    let found = false;
+    if last < m.b_start {
+        let ai = last - m.a_start;
+        if ai >= 0 {
+            if ai < (m.a_len as i64) {
+                value = ecs_mrw_a_get(m, ai as i32);
+                found = true;
+            };
+        };
+    };
+    if found != true {
+        let bi = last - m.b_start;
+        if bi >= 0 {
+            if bi < (m.b_len as i64) {
+                value = ecs_mrw_b_get(m, bi as i32);
+                found = true;
+            };
+        };
+    };
+    if found != true {
+        let r3 = EcsMrwReaderDeep { last_message_count: m.message_count };
+        return EcsMrwReadResult { reader: r3, has: false, value: 0, id: -1 };
+    };
+    let r4 = EcsMrwReaderDeep { last_message_count: last + 1 };
+    return EcsMrwReadResult { reader: r4, has: true, value: value, id: last };
+}
+
+fn ecs_mrw_reader_read_with_id(r: EcsMrwReaderDeep, m: EcsMrwMessagesDeep) -> EcsMrwReadResult {
+    return ecs_mrw_reader_read(r, m);
+}
+
+// par_read: unread count + batch size marker (no TaskPool)
+struct EcsMrwParDeep {
+    unread: i64,
+    batch_size: i64,
+}
+
+fn ecs_mrw_reader_par_read(r: EcsMrwReaderDeep, m: EcsMrwMessagesDeep) -> EcsMrwParDeep {
+    return EcsMrwParDeep { unread: ecs_mrw_reader_len(r, m), batch_size: 128 };
+}
+
+fn ecs_mrw_par_unread(p: EcsMrwParDeep) -> i64 { return p.unread; }
+fn ecs_mrw_par_batch_size(p: EcsMrwParDeep) -> i64 { return p.batch_size; }
+
+fn ecs_mrw_par_batching_strategy(p: EcsMrwParDeep, batch_size: i64) -> EcsMrwParDeep {
+    return EcsMrwParDeep { unread: p.unread, batch_size: batch_size };
+}
+
+fn ecs_mrw_par_batch_count(p: EcsMrwParDeep) -> i64 {
+    if p.unread <= 0 { return 0; };
+    if p.batch_size <= 0 { return p.unread; };
+    let n = p.unread / p.batch_size;
+    if p.unread % p.batch_size != 0 { return n + 1; };
+    return n;
+}
+
+// PopulatedMessageReader: Some when messages resource has any stored messages
+struct EcsMrwPopulatedDeep {
+    is_populated: bool,
+    reader: EcsMrwReaderDeep,
+}
+
+fn ecs_mrw_populated_from_messages(m: EcsMrwMessagesDeep) -> EcsMrwPopulatedDeep {
+    let populated = false;
+    if ecs_mrw_messages_len(m) > 0 { populated = true; };
+    return EcsMrwPopulatedDeep {
+        is_populated: populated,
+        reader: ecs_mrw_reader_new(),
+    };
+}
+
+fn ecs_mrw_populated_is_populated(p: EcsMrwPopulatedDeep) -> bool { return p.is_populated; }
+fn ecs_mrw_populated_reader(p: EcsMrwPopulatedDeep) -> EcsMrwReaderDeep { return p.reader; }

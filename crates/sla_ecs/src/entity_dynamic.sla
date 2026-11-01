@@ -1,0 +1,81 @@
+// Dynamic entity allocation backed by sa_std Vec.
+// This removes the old 16-slot cap and tracks live occupancy explicitly so a
+// fabricated entity with the next generation is not considered alive.
+@import "sa_std/vec.sa"
+@import "entity.sla"
+
+struct DynamicEntityAllocator {
+    free_ids: Vec<i32>,
+    generations: Vec<i32>,
+    occupied: Vec<bool>,
+}
+
+fn dyn_allocator_new() -> DynamicEntityAllocator {
+    let free_ids: Vec<i32> = Vec::new();
+    let generations: Vec<i32> = Vec::new();
+    let occupied: Vec<bool> = Vec::new();
+    generations.push(0);
+    occupied.push(false);
+    return DynamicEntityAllocator {
+        free_ids: free_ids,
+        generations: generations,
+        occupied: occupied,
+    };
+}
+
+fn dyn_alloc_entity(a: DynamicEntityAllocator) -> (DynamicEntityAllocator, Entity) {
+    let free_len = len(a.free_ids) as i64;
+    if free_len > 0 {
+        let slot = free_len - 1;
+        let id = a.free_ids.remove(slot);
+        a.occupied[id] = true;
+        return (a, entity_new(id, a.generations[id]));
+    };
+    let id = len(a.generations) as i32;
+    a.generations.push(0);
+    a.occupied.push(true);
+    return (a, entity_new(id, 0));
+}
+
+fn dyn_is_alive(a: DynamicEntityAllocator, entity: Entity) -> bool {
+    if entity.id <= 0 { return false; };
+    let idx = entity.id as i64;
+    if idx >= (len(a.generations) as i64) { return false; };
+    if a.occupied[idx] != true { return false; };
+    return a.generations[idx] == entity.gen;
+}
+
+fn dyn_free_entity(a: DynamicEntityAllocator, entity: Entity) -> DynamicEntityAllocator {
+    if dyn_is_alive(a, entity) != true { return a; };
+    let idx = entity.id as i64;
+    let next_gen = a.generations[idx] + 1;
+    a.generations[idx] = next_gen;
+    a.occupied[idx] = false;
+    a.free_ids.push(entity.id);
+    return a;
+}
+
+@test "dynamic allocator grows beyond fixed capacity"() {
+    let a = dyn_allocator_new();
+    let i: i32 = 0;
+    while i < 20 {
+        let (next_a, entity) = dyn_alloc_entity(a);
+        a = next_a;
+        if entity.id != i + 1 { panic(2150); };
+        if dyn_is_alive(a, entity) != true { panic(2151); };
+        i = i + 1;
+    }
+    if len(a.generations) != 21 { panic(2152); };
+}
+
+@test "dynamic allocator rejects fabricated next generation before reuse"() {
+    let a0 = dyn_allocator_new();
+    let (a1, e1) = dyn_alloc_entity(a0);
+    let a2 = dyn_free_entity(a1, e1);
+    let fake = entity_new(e1.id, e1.gen + 1);
+    if dyn_is_alive(a2, e1) != false { panic(2160); };
+    if dyn_is_alive(a2, fake) != false { panic(2161); };
+    let (a3, e2) = dyn_alloc_entity(a2);
+    if entity_eq(e2, fake) != true { panic(2162); };
+    if dyn_is_alive(a3, e2) != true { panic(2163); };
+}

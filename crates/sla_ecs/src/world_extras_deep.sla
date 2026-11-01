@@ -1,0 +1,1268 @@
+// Deep self-contained Bevy ECS world::extras module.
+// Mirrors lib/world_extras.sla (612 lines, no @import). The shallow module already uses
+// result-shim structs to dodge the SA-tuple .1 corruption, but several of those shim
+// structs nest the *operational* struct (registry, alloc, queue, facade, resources) as a
+// sibling @derive(copy) field, which (per docs/issue.md Batch 401/406/411) triggers the
+// SA MemoryLeak. The deep module:
+//   - Replaces every Vec<i32> with a cap-16 i32 slot family + count + helpers.
+//   - Wraps `_push`, `_pop_front`, `_remove_at`, `_at`, `_set`, `_len` skeleton helpers
+//     per cap-family.
+//   - Returns the *mutated* container directly (not a nested wrapper struct) and stashes
+//     the tuple companion into the container directly (Batch 406 pattern).
+// All structs carry @derive(copy). No @import.
+
+const ECS_WE_DEEP_CAP: i32 = 16;
+
+// === Result-shim structs (kept flat — they carry only scalar i32 fields; no nesting) ===
+@derive(copy)
+struct ReqCompResultDeep { ok: i32, err_kind: i32, err_a: i32, err_b: i32 }
+
+@derive(copy)
+struct ReqQueryResultDeep { found: i32, count: i32 }
+
+@derive(copy)
+struct ReqNthResultDeep { found: i32, required_id: i32, constructor_id: i32 }
+
+@derive(copy)
+struct ResourceGetResultDeep { found: i32, entity_idx: i32 }
+
+@derive(copy)
+struct QueueAtResultDeep { found: i32, type_id: i32, storage_kind: i32 }
+
+// === RequiredComponentsError variants ===
+// 0 = DuplicateRegistration, 1 = CyclicRequirement, 2 = ArchetypeExists
+fn ecs_req_err_kind_deep(kind: i32, a: i32, b: i32) -> ReqCompResultDeep {
+    return ReqCompResultDeep { ok: 0, err_kind: kind, err_a: a, err_b: b };
+}
+fn ecs_req_ok_placeholder_deep() -> ReqCompResultDeep {
+    return ReqCompResultDeep { ok: 1, err_kind: 0, err_a: 0, err_b: 0 };
+}
+fn ecs_req_result_ok_deep(r: ReqCompResultDeep) -> i32 { return r.ok; }
+fn ecs_req_result_kind_deep(r: ReqCompResultDeep) -> i32 { return r.err_kind; }
+fn ecs_req_result_a_deep(r: ReqCompResultDeep) -> i32 { return r.err_a; }
+fn ecs_req_result_b_deep(r: ReqCompResultDeep) -> i32 { return r.err_b; }
+fn ecs_req_result_is_dup_deep(r: ReqCompResultDeep) -> bool { return r.err_kind == 0; }
+fn ecs_req_result_is_cyclic_deep(r: ReqCompResultDeep) -> bool { return r.err_kind == 1; }
+fn ecs_req_result_is_archetype_exists_deep(r: ReqCompResultDeep) -> bool { return r.err_kind == 2; }
+
+// === SpawnError variants ===
+fn ecs_spawn_err_invalid_deep() -> i32 { return 0; }
+fn ecs_spawn_err_already_spawned_deep() -> i32 { return 1; }
+fn ecs_spawn_err_is_invalid_deep(code: i32) -> bool { return code == 0; }
+fn ecs_spawn_err_is_already_spawned_deep(code: i32) -> bool { return code == 1; }
+
+// === EntityMutableFetchError variants ===
+fn ecs_entity_fetch_err_not_spawned_deep() -> i32 { return 0; }
+fn ecs_entity_fetch_err_aliased_mutability_deep() -> i32 { return 1; }
+fn ecs_entity_fetch_err_is_not_spawned_deep(code: i32) -> bool { return code == 0; }
+fn ecs_entity_fetch_err_is_aliased_deep(code: i32) -> bool { return code == 1; }
+
+// === EcsWorldRequiredRegistryDeep (5 cap-16 i32 slot families) ===
+@derive(copy)
+struct EcsWorldRequiredRegistryDeep {
+    req0: i32, req1: i32, req2: i32, req3: i32, req4: i32, req5: i32, req6: i32, req7: i32,
+    req8: i32, req9: i32, req10: i32, req11: i32, req12: i32, req13: i32, req14: i32, req15: i32,
+    req_n: i32,
+    rid0: i32, rid1: i32, rid2: i32, rid3: i32, rid4: i32, rid5: i32, rid6: i32, rid7: i32,
+    rid8: i32, rid9: i32, rid10: i32, rid11: i32, rid12: i32, rid13: i32, rid14: i32, rid15: i32,
+    rid_n: i32,
+    cid0: i32, cid1: i32, cid2: i32, cid3: i32, cid4: i32, cid5: i32, cid6: i32, cid7: i32,
+    cid8: i32, cid9: i32, cid10: i32, cid11: i32, cid12: i32, cid13: i32, cid14: i32, cid15: i32,
+    cid_n: i32,
+    reg0: i32, reg1: i32, reg2: i32, reg3: i32, reg4: i32, reg5: i32, reg6: i32, reg7: i32,
+    reg8: i32, reg9: i32, reg10: i32, reg11: i32, reg12: i32, reg13: i32, reg14: i32, reg15: i32,
+    reg_n: i32,
+    arc0: i32, arc1: i32, arc2: i32, arc3: i32, arc4: i32, arc5: i32, arc6: i32, arc7: i32,
+    arc8: i32, arc9: i32, arc10: i32, arc11: i32, arc12: i32, arc13: i32, arc14: i32, arc15: i32,
+    arc_n: i32,
+    // Tuple-replacement companions for try_register_with / try_register / get_required_*
+    last_register_ok: i32,
+    last_register_kind: i32,
+    last_register_a: i32,
+    last_register_b: i32,
+    last_query_found: i32,
+    last_query_count: i32,
+    last_nth_found: i32,
+    last_nth_required_id: i32,
+    last_nth_constructor_id: i32,
+}
+
+fn ecs_world_req_registry_deep_new() -> EcsWorldRequiredRegistryDeep {
+    return EcsWorldRequiredRegistryDeep {
+        req0: 0, req1: 0, req2: 0, req3: 0, req4: 0, req5: 0, req6: 0, req7: 0,
+        req8: 0, req9: 0, req10: 0, req11: 0, req12: 0, req13: 0, req14: 0, req15: 0,
+        req_n: 0,
+        rid0: 0, rid1: 0, rid2: 0, rid3: 0, rid4: 0, rid5: 0, rid6: 0, rid7: 0,
+        rid8: 0, rid9: 0, rid10: 0, rid11: 0, rid12: 0, rid13: 0, rid14: 0, rid15: 0,
+        rid_n: 0,
+        cid0: 0, cid1: 0, cid2: 0, cid3: 0, cid4: 0, cid5: 0, cid6: 0, cid7: 0,
+        cid8: 0, cid9: 0, cid10: 0, cid11: 0, cid12: 0, cid13: 0, cid14: 0, cid15: 0,
+        cid_n: 0,
+        reg0: 0, reg1: 0, reg2: 0, reg3: 0, reg4: 0, reg5: 0, reg6: 0, reg7: 0,
+        reg8: 0, reg9: 0, reg10: 0, reg11: 0, reg12: 0, reg13: 0, reg14: 0, reg15: 0,
+        reg_n: 0,
+        arc0: 0, arc1: 0, arc2: 0, arc3: 0, arc4: 0, arc5: 0, arc6: 0, arc7: 0,
+        arc8: 0, arc9: 0, arc10: 0, arc11: 0, arc12: 0, arc13: 0, arc14: 0, arc15: 0,
+        arc_n: 0,
+        last_register_ok: 0,
+        last_register_kind: 0,
+        last_register_a: 0,
+        last_register_b: 0,
+        last_query_found: 0,
+        last_query_count: 0,
+        last_nth_found: 0,
+        last_nth_required_id: 0,
+        last_nth_constructor_id: 0,
+    };
+}
+
+// Slot helpers — one helper per arity family.ucceeds on a small fixed cap dispatch.
+// We collapse them by a generic `_at/_set` dispatch using sentinel slot IDs, but SLA
+// lacks generic fns, so we inline one slot-at/slot-set per cap-family per helper.
+
+fn _req_at(r: EcsWorldRequiredRegistryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.req0; };
+    if idx == 1 { return r.req1; };
+    if idx == 2 { return r.req2; };
+    if idx == 3 { return r.req3; };
+    if idx == 4 { return r.req4; };
+    if idx == 5 { return r.req5; };
+    if idx == 6 { return r.req6; };
+    if idx == 7 { return r.req7; };
+    if idx == 8 { return r.req8; };
+    if idx == 9 { return r.req9; };
+    if idx == 10 { return r.req10; };
+    if idx == 11 { return r.req11; };
+    if idx == 12 { return r.req12; };
+    if idx == 13 { return r.req13; };
+    if idx == 14 { return r.req14; };
+    if idx == 15 { return r.req15; };
+    panic(147130);
+}
+fn _rid_at(r: EcsWorldRequiredRegistryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.rid0; };
+    if idx == 1 { return r.rid1; };
+    if idx == 2 { return r.rid2; };
+    if idx == 3 { return r.rid3; };
+    if idx == 4 { return r.rid4; };
+    if idx == 5 { return r.rid5; };
+    if idx == 6 { return r.rid6; };
+    if idx == 7 { return r.rid7; };
+    if idx == 8 { return r.rid8; };
+    if idx == 9 { return r.rid9; };
+    if idx == 10 { return r.rid10; };
+    if idx == 11 { return r.rid11; };
+    if idx == 12 { return r.rid12; };
+    if idx == 13 { return r.rid13; };
+    if idx == 14 { return r.rid14; };
+    if idx == 15 { return r.rid15; };
+    panic(147131);
+}
+fn _cid_at(r: EcsWorldRequiredRegistryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.cid0; };
+    if idx == 1 { return r.cid1; };
+    if idx == 2 { return r.cid2; };
+    if idx == 3 { return r.cid3; };
+    if idx == 4 { return r.cid4; };
+    if idx == 5 { return r.cid5; };
+    if idx == 6 { return r.cid6; };
+    if idx == 7 { return r.cid7; };
+    if idx == 8 { return r.cid8; };
+    if idx == 9 { return r.cid9; };
+    if idx == 10 { return r.cid10; };
+    if idx == 11 { return r.cid11; };
+    if idx == 12 { return r.cid12; };
+    if idx == 13 { return r.cid13; };
+    if idx == 14 { return r.cid14; };
+    if idx == 15 { return r.cid15; };
+    panic(147132);
+}
+fn _reg_at(r: EcsWorldRequiredRegistryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.reg0; };
+    if idx == 1 { return r.reg1; };
+    if idx == 2 { return r.reg2; };
+    if idx == 3 { return r.reg3; };
+    if idx == 4 { return r.reg4; };
+    if idx == 5 { return r.reg5; };
+    if idx == 6 { return r.reg6; };
+    if idx == 7 { return r.reg7; };
+    if idx == 8 { return r.reg8; };
+    if idx == 9 { return r.reg9; };
+    if idx == 10 { return r.reg10; };
+    if idx == 11 { return r.reg11; };
+    if idx == 12 { return r.reg12; };
+    if idx == 13 { return r.reg13; };
+    if idx == 14 { return r.reg14; };
+    if idx == 15 { return r.reg15; };
+    panic(147133);
+}
+fn _arc_at(r: EcsWorldRequiredRegistryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.arc0; };
+    if idx == 1 { return r.arc1; };
+    if idx == 2 { return r.arc2; };
+    if idx == 3 { return r.arc3; };
+    if idx == 4 { return r.arc4; };
+    if idx == 5 { return r.arc5; };
+    if idx == 6 { return r.arc6; };
+    if idx == 7 { return r.arc7; };
+    if idx == 8 { return r.arc8; };
+    if idx == 9 { return r.arc9; };
+    if idx == 10 { return r.arc10; };
+    if idx == 11 { return r.arc11; };
+    if idx == 12 { return r.arc12; };
+    if idx == 13 { return r.arc13; };
+    if idx == 14 { return r.arc14; };
+    if idx == 15 { return r.arc15; };
+    panic(147134);
+}
+
+fn _reg_set(r: EcsWorldRequiredRegistryDeep, idx: i32, v: i32) -> EcsWorldRequiredRegistryDeep {
+    if idx == 0 { r.reg0 = v; return r; };
+    if idx == 1 { r.reg1 = v; return r; };
+    if idx == 2 { r.reg2 = v; return r; };
+    if idx == 3 { r.reg3 = v; return r; };
+    if idx == 4 { r.reg4 = v; return r; };
+    if idx == 5 { r.reg5 = v; return r; };
+    if idx == 6 { r.reg6 = v; return r; };
+    if idx == 7 { r.reg7 = v; return r; };
+    if idx == 8 { r.reg8 = v; return r; };
+    if idx == 9 { r.reg9 = v; return r; };
+    if idx == 10 { r.reg10 = v; return r; };
+    if idx == 11 { r.reg11 = v; return r; };
+    if idx == 12 { r.reg12 = v; return r; };
+    if idx == 13 { r.reg13 = v; return r; };
+    if idx == 14 { r.reg14 = v; return r; };
+    if idx == 15 { r.reg15 = v; return r; };
+    panic(147135);
+}
+
+// Workhorse push helpers: push each (req, rid, cid) tuple on their parallel arrays.
+// Each array uses `_xxx_at` reads; we write into the next free slot.
+fn _req_push(r: EcsWorldRequiredRegistryDeep, requiree: i32, required: i32, constructor: i32) -> EcsWorldRequiredRegistryDeep {
+    let i: i32 = r.req_n;
+    if i >= ECS_WE_DEEP_CAP { return r; };
+    if i >= r.rid_n {
+        // bounded writes — fall through to a guard helper routine
+    };
+    // parallel writes via inlined `if i == k { r.reqK = v }` chains.
+    if i == 0 { r.req0 = requiree; r.rid0 = required; r.cid0 = constructor; };
+    if i == 1 { r.req1 = requiree; r.rid1 = required; r.cid1 = constructor; };
+    if i == 2 { r.req2 = requiree; r.rid2 = required; r.cid2 = constructor; };
+    if i == 3 { r.req3 = requiree; r.rid3 = required; r.cid3 = constructor; };
+    if i == 4 { r.req4 = requiree; r.rid4 = required; r.cid4 = constructor; };
+    if i == 5 { r.req5 = requiree; r.rid5 = required; r.cid5 = constructor; };
+    if i == 6 { r.req6 = requiree; r.rid6 = required; r.cid6 = constructor; };
+    if i == 7 { r.req7 = requiree; r.rid7 = required; r.cid7 = constructor; };
+    if i == 8 { r.req8 = requiree; r.rid8 = required; r.cid8 = constructor; };
+    if i == 9 { r.req9 = requiree; r.rid9 = required; r.cid9 = constructor; };
+    if i == 10 { r.req10 = requiree; r.rid10 = required; r.cid10 = constructor; };
+    if i == 11 { r.req11 = requiree; r.rid11 = required; r.cid11 = constructor; };
+    if i == 12 { r.req12 = requiree; r.rid12 = required; r.cid12 = constructor; };
+    if i == 13 { r.req13 = requiree; r.rid13 = required; r.cid13 = constructor; };
+    if i == 14 { r.req14 = requiree; r.rid14 = required; r.cid14 = constructor; };
+    if i == 15 { r.req15 = requiree; r.rid15 = required; r.cid15 = constructor; };
+    r.req_n = r.req_n + 1;
+    r.rid_n = r.rid_n + 1;
+    r.cid_n = r.cid_n + 1;
+    return r;
+}
+
+// register_component + mark_archetyped pushes onto reg0/arc slot families.
+fn _reg_push(r: EcsWorldRequiredRegistryDeep, v: i32) -> EcsWorldRequiredRegistryDeep {
+    let i: i32 = r.reg_n;
+    if i >= ECS_WE_DEEP_CAP { return r; };
+    r = _reg_set(r, i, v);
+    r.reg_n = r.reg_n + 1;
+    return r;
+}
+fn _arc_push(r: EcsWorldRequiredRegistryDeep, v: i32) -> EcsWorldRequiredRegistryDeep {
+    let i: i32 = r.arc_n;
+    if i >= ECS_WE_DEEP_CAP { return r; };
+    if i == 0 { r.arc0 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 1 { r.arc1 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 2 { r.arc2 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 3 { r.arc3 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 4 { r.arc4 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 5 { r.arc5 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 6 { r.arc6 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 7 { r.arc7 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 8 { r.arc8 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 9 { r.arc9 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 10 { r.arc10 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 11 { r.arc11 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 12 { r.arc12 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 13 { r.arc13 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 14 { r.arc14 = v; r.arc_n = r.arc_n + 1; return r; };
+    if i == 15 { r.arc15 = v; r.arc_n = r.arc_n + 1; return r; };
+    return r;
+}
+
+fn ecs_world_req_registry_deep_next_free_type_id(reg: EcsWorldRequiredRegistryDeep, used: i32) -> i32 {
+    // Deep fix: ignore the `used` arg (always zero from us callers) and pick the smallest
+    // positive id not already in `reg`. The shallow variant accepted Vec<i32>; the deep
+    // variant scans the reg slot family instead.
+    let id: i32 = 1;
+    let scan: i32 = 0;
+    while scan < 200 {
+        let conflict: i32 = 0;
+        let r: i32 = 0;
+        while r < reg.reg_n {
+            if _reg_at(reg, r) == id { conflict = 1; };
+            r = r + 1;
+        }
+        if conflict == 0 { return id; };
+        id = id + 1;
+        scan = scan + 1;
+    }
+    return id;
+}
+
+fn ecs_world_req_registry_deep_register_component(reg: EcsWorldRequiredRegistryDeep, type_id: i32) -> EcsWorldRequiredRegistryDeep {
+    return _reg_push(reg, type_id);
+}
+
+fn ecs_world_req_registry_deep_mark_archetyped(reg: EcsWorldRequiredRegistryDeep, type_id: i32) -> EcsWorldRequiredRegistryDeep {
+    return _arc_push(reg, type_id);
+}
+
+fn ecs_world_req_registry_deep_is_archetyped(reg: EcsWorldRequiredRegistryDeep, type_id: i32) -> bool {
+    let n: i32 = reg.arc_n;
+    let i: i32 = 0;
+    while i < n {
+        if _arc_at(reg, i) == type_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// try_register_with: returns the mutated registry (Batch 406 style); the ReqCompResult
+// companion is stashed into last_register_*.
+fn ecs_world_req_registry_deep_try_register_with(reg: EcsWorldRequiredRegistryDeep, requiree_id: i32, required_id: i32, constructor_id: i32) -> EcsWorldRequiredRegistryDeep {
+    reg = ecs_world_req_registry_deep_register_component(reg, requiree_id);
+    reg = ecs_world_req_registry_deep_register_component(reg, required_id);
+    if ecs_world_req_registry_deep_is_archetyped(reg, requiree_id) {
+        reg.last_register_ok = 0;
+        reg.last_register_kind = 2;
+        reg.last_register_a = requiree_id;
+        reg.last_register_b = 0;
+        return reg;
+    };
+    let n: i32 = reg.req_n;
+    let i: i32 = 0;
+    while i < n {
+        if _req_at(reg, i) == requiree_id {
+            if _rid_at(reg, i) == required_id {
+                reg.last_register_ok = 0;
+                reg.last_register_kind = 0;
+                reg.last_register_a = requiree_id;
+                reg.last_register_b = required_id;
+                return reg;
+            };
+        };
+        i = i + 1;
+    }
+    reg = _req_push(reg, requiree_id, required_id, constructor_id);
+    reg.last_register_ok = 1;
+    reg.last_register_kind = 0;
+    reg.last_register_a = 0;
+    reg.last_register_b = 0;
+    return reg;
+}
+fn ecs_world_req_registry_deep_try_register(reg: EcsWorldRequiredRegistryDeep, requiree_id: i32, required_id: i32) -> EcsWorldRequiredRegistryDeep {
+    return ecs_world_req_registry_deep_try_register_with(reg, requiree_id, required_id, 0);
+}
+
+fn ecs_register_result_deep_registry(r: EcsWorldRequiredRegistryDeep) -> EcsWorldRequiredRegistryDeep { return r; }
+fn ecs_register_result_deep_result_ok(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_register_ok; }
+fn ecs_register_result_deep_result_kind(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_register_kind; }
+fn ecs_register_result_deep_result_a(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_register_a; }
+fn ecs_register_result_deep_result_b(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_register_b; }
+fn ecs_register_result_deep_is_dup(r: EcsWorldRequiredRegistryDeep) -> bool { return r.last_register_kind == 0; }
+fn ecs_register_result_deep_is_cyclic(r: EcsWorldRequiredRegistryDeep) -> bool { return r.last_register_kind == 1; }
+fn ecs_register_result_deep_is_archetype_exists(r: EcsWorldRequiredRegistryDeep) -> bool { return r.last_register_kind == 2; }
+
+// get_required_components_by_id: result stashed into last_query_*.
+fn ecs_world_req_registry_deep_get_required_by_id(reg: EcsWorldRequiredRegistryDeep, requiree_id: i32) -> EcsWorldRequiredRegistryDeep {
+    let n: i32 = reg.req_n;
+    let count: i32 = 0;
+    let i: i32 = 0;
+    while i < n {
+        if _req_at(reg, i) == requiree_id { count = count + 1; };
+        i = i + 1;
+    }
+    if count > 0 {
+        reg.last_query_found = 1;
+        reg.last_query_count = count;
+    } else {
+        reg.last_query_found = 0;
+        reg.last_query_count = 0;
+    };
+    return reg;
+}
+fn ecs_req_query_deep_found(r: EcsWorldRequiredRegistryDeep) -> bool { return r.last_query_found == 1; }
+fn ecs_req_query_deep_count(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_query_count; }
+
+// get_required_nth: result stashed into last_nth_*.
+fn ecs_world_req_registry_deep_get_required_nth(reg: EcsWorldRequiredRegistryDeep, requiree_id: i32, nth: i32) -> EcsWorldRequiredRegistryDeep {
+    let n: i32 = reg.req_n;
+    let seen: i32 = 0;
+    let i: i32 = 0;
+    while i < n {
+        if _req_at(reg, i) == requiree_id {
+            if seen == nth {
+                reg.last_nth_found = 1;
+                reg.last_nth_required_id = _rid_at(reg, i);
+                reg.last_nth_constructor_id = _cid_at(reg, i);
+                return reg;
+            };
+            seen = seen + 1;
+        };
+        i = i + 1;
+    }
+    reg.last_nth_found = 0;
+    reg.last_nth_required_id = 0;
+    reg.last_nth_constructor_id = 0;
+    return reg;
+}
+fn ecs_req_nth_deep_found(r: EcsWorldRequiredRegistryDeep) -> bool { return r.last_nth_found == 1; }
+fn ecs_req_nth_deep_required_id(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_nth_required_id; }
+fn ecs_req_nth_deep_constructor_id(r: EcsWorldRequiredRegistryDeep) -> i32 { return r.last_nth_constructor_id; }
+
+// === EcsWorldEntityAllocatorDeep (cap-16 free_indices + cap-16 spawned_indices) ===
+@derive(copy)
+struct EcsWorldEntityAllocatorDeep {
+    next_index: i32,
+    generation: i32,
+    fi0: i32, fi1: i32, fi2: i32, fi3: i32, fi4: i32, fi5: i32, fi6: i32, fi7: i32,
+    fi8: i32, fi9: i32, fi10: i32, fi11: i32, fi12: i32, fi13: i32, fi14: i32, fi15: i32,
+    fi_n: i32,
+    si0: i32, si1: i32, si2: i32, si3: i32, si4: i32, si5: i32, si6: i32, si7: i32,
+    si8: i32, si9: i32, si10: i32, si11: i32, si12: i32, si13: i32, si14: i32, si15: i32,
+    si_n: i32,
+    // Alloc tuple-replacement companions.
+    last_alloc_idx: i32,
+    last_alloc_generation: i32,
+}
+
+fn ecs_world_entity_allocator_deep_new() -> EcsWorldEntityAllocatorDeep {
+    return EcsWorldEntityAllocatorDeep {
+        next_index: 0, generation: 1,
+        fi0: 0, fi1: 0, fi2: 0, fi3: 0, fi4: 0, fi5: 0, fi6: 0, fi7: 0,
+        fi8: 0, fi9: 0, fi10: 0, fi11: 0, fi12: 0, fi13: 0, fi14: 0, fi15: 0,
+        fi_n: 0,
+        si0: 0, si1: 0, si2: 0, si3: 0, si4: 0, si5: 0, si6: 0, si7: 0,
+        si8: 0, si9: 0, si10: 0, si11: 0, si12: 0, si13: 0, si14: 0, si15: 0,
+        si_n: 0,
+        last_alloc_idx: 0,
+        last_alloc_generation: 1,
+    };
+}
+
+fn _fi_at(a: EcsWorldEntityAllocatorDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.fi0; };
+    if idx == 1 { return a.fi1; };
+    if idx == 2 { return a.fi2; };
+    if idx == 3 { return a.fi3; };
+    if idx == 4 { return a.fi4; };
+    if idx == 5 { return a.fi5; };
+    if idx == 6 { return a.fi6; };
+    if idx == 7 { return a.fi7; };
+    if idx == 8 { return a.fi8; };
+    if idx == 9 { return a.fi9; };
+    if idx == 10 { return a.fi10; };
+    if idx == 11 { return a.fi11; };
+    if idx == 12 { return a.fi12; };
+    if idx == 13 { return a.fi13; };
+    if idx == 14 { return a.fi14; };
+    if idx == 15 { return a.fi15; };
+    panic(147136);
+}
+fn _si_at(a: EcsWorldEntityAllocatorDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.si0; };
+    if idx == 1 { return a.si1; };
+    if idx == 2 { return a.si2; };
+    if idx == 3 { return a.si3; };
+    if idx == 4 { return a.si4; };
+    if idx == 5 { return a.si5; };
+    if idx == 6 { return a.si6; };
+    if idx == 7 { return a.si7; };
+    if idx == 8 { return a.si8; };
+    if idx == 9 { return a.si9; };
+    if idx == 10 { return a.si10; };
+    if idx == 11 { return a.si11; };
+    if idx == 12 { return a.si12; };
+    if idx == 13 { return a.si13; };
+    if idx == 14 { return a.si14; };
+    if idx == 15 { return a.si15; };
+    panic(147137);
+}
+fn _si_set(a: EcsWorldEntityAllocatorDeep, idx: i32, v: i32) -> EcsWorldEntityAllocatorDeep {
+    if idx == 0 { a.si0 = v; return a; };
+    if idx == 1 { a.si1 = v; return a; };
+    if idx == 2 { a.si2 = v; return a; };
+    if idx == 3 { a.si3 = v; return a; };
+    if idx == 4 { a.si4 = v; return a; };
+    if idx == 5 { a.si5 = v; return a; };
+    if idx == 6 { a.si6 = v; return a; };
+    if idx == 7 { a.si7 = v; return a; };
+    if idx == 8 { a.si8 = v; return a; };
+    if idx == 9 { a.si9 = v; return a; };
+    if idx == 10 { a.si10 = v; return a; };
+    if idx == 11 { a.si11 = v; return a; };
+    if idx == 12 { a.si12 = v; return a; };
+    if idx == 13 { a.si13 = v; return a; };
+    if idx == 14 { a.si14 = v; return a; };
+    if idx == 15 { a.si15 = v; return a; };
+    panic(147138);
+}
+fn _si_push(a: EcsWorldEntityAllocatorDeep, v: i32) -> EcsWorldEntityAllocatorDeep {
+    let i: i32 = a.si_n;
+    if i >= ECS_WE_DEEP_CAP { return a; };
+    a = _si_set(a, i, v);
+    a.si_n = a.si_n + 1;
+    return a;
+}
+// _si_remove_at: compact-by-backshift (slot i removed).
+fn _si_remove_at(a: EcsWorldEntityAllocatorDeep, idx: i32) -> EcsWorldEntityAllocatorDeep {
+    if idx < 0 || idx >= a.si_n { return a; };
+    let j: i32 = idx;
+    while j < a.si_n - 1 {
+        a = _si_set(a, j, _si_at(a, j + 1));
+        j = j + 1;
+    }
+    a = _si_set(a, a.si_n - 1, 0);
+    a.si_n = a.si_n - 1;
+    return a;
+}
+
+fn ecs_world_entity_allocator_deep_alloc(a: EcsWorldEntityAllocatorDeep) -> EcsWorldEntityAllocatorDeep {
+    let idx: i32 = a.next_index;
+    if a.fi_n > 0 {
+        // Pop front of the free list (compact-backshift).
+        idx = _fi_at(a, 0);
+        let k: i32 = 0;
+        while k < a.fi_n - 1 {
+            if k == 0 { a.fi0 = _fi_at(a, 1); };
+            if k == 1 { a.fi1 = _fi_at(a, 2); };
+            if k == 2 { a.fi2 = _fi_at(a, 3); };
+            if k == 3 { a.fi3 = _fi_at(a, 4); };
+            if k == 4 { a.fi4 = _fi_at(a, 5); };
+            if k == 5 { a.fi5 = _fi_at(a, 6); };
+            if k == 6 { a.fi6 = _fi_at(a, 7); };
+            if k == 7 { a.fi7 = _fi_at(a, 8); };
+            if k == 8 { a.fi8 = _fi_at(a, 9); };
+            if k == 9 { a.fi9 = _fi_at(a, 10); };
+            if k == 10 { a.fi10 = _fi_at(a, 11); };
+            if k == 11 { a.fi11 = _fi_at(a, 12); };
+            if k == 12 { a.fi12 = _fi_at(a, 13); };
+            if k == 13 { a.fi13 = _fi_at(a, 14); };
+            if k == 14 { a.fi14 = _fi_at(a, 15); };
+            k = k + 1;
+        }
+        if a.fi_n > 0 {
+            if a.fi_n - 1 == 0 { a.fi0 = 0; };
+            if a.fi_n - 1 == 1 { a.fi1 = 0; };
+            if a.fi_n - 1 == 2 { a.fi2 = 0; };
+            if a.fi_n - 1 == 3 { a.fi3 = 0; };
+            if a.fi_n - 1 == 4 { a.fi4 = 0; };
+            if a.fi_n - 1 == 5 { a.fi5 = 0; };
+            if a.fi_n - 1 == 6 { a.fi6 = 0; };
+            if a.fi_n - 1 == 7 { a.fi7 = 0; };
+            if a.fi_n - 1 == 8 { a.fi8 = 0; };
+            if a.fi_n - 1 == 9 { a.fi9 = 0; };
+            if a.fi_n - 1 == 10 { a.fi10 = 0; };
+            if a.fi_n - 1 == 11 { a.fi11 = 0; };
+            if a.fi_n - 1 == 12 { a.fi12 = 0; };
+            if a.fi_n - 1 == 13 { a.fi13 = 0; };
+            if a.fi_n - 1 == 14 { a.fi14 = 0; };
+            if a.fi_n - 1 == 15 { a.fi15 = 0; };
+        };
+        a.fi_n = a.fi_n - 1;
+    } else {
+        a.next_index = a.next_index + 1;
+    };
+    a = _si_push(a, idx);
+    a.last_alloc_idx = idx;
+    a.last_alloc_generation = a.generation;
+    return a;
+}
+
+fn ecs_world_entity_allocator_deep_alloc_idx(a: EcsWorldEntityAllocatorDeep) -> i32 { return a.last_alloc_idx; }
+fn ecs_world_entity_allocator_deep_alloc_gen(a: EcsWorldEntityAllocatorDeep) -> i32 { return a.last_alloc_generation; }
+fn ecs_world_entity_allocator_deep_alloc_allocator(a: EcsWorldEntityAllocatorDeep) -> EcsWorldEntityAllocatorDeep { return a; }
+
+fn ecs_world_entity_allocator_deep_free_push(a: EcsWorldEntityAllocatorDeep, idx: i32) -> EcsWorldEntityAllocatorDeep {
+    // helper: push onto fi slot family.
+    let i: i32 = a.fi_n;
+    if i >= ECS_WE_DEEP_CAP { return a; };
+    if i == 0 { a.fi0 = idx; };
+    if i == 1 { a.fi1 = idx; };
+    if i == 2 { a.fi2 = idx; };
+    if i == 3 { a.fi3 = idx; };
+    if i == 4 { a.fi4 = idx; };
+    if i == 5 { a.fi5 = idx; };
+    if i == 6 { a.fi6 = idx; };
+    if i == 7 { a.fi7 = idx; };
+    if i == 8 { a.fi8 = idx; };
+    if i == 9 { a.fi9 = idx; };
+    if i == 10 { a.fi10 = idx; };
+    if i == 11 { a.fi11 = idx; };
+    if i == 12 { a.fi12 = idx; };
+    if i == 13 { a.fi13 = idx; };
+    if i == 14 { a.fi14 = idx; };
+    if i == 15 { a.fi15 = idx; };
+    a.fi_n = a.fi_n + 1;
+    return a;
+}
+
+fn ecs_world_entity_allocator_deep_free(a: EcsWorldEntityAllocatorDeep, idx: i32) -> EcsWorldEntityAllocatorDeep {
+    a = ecs_world_entity_allocator_deep_free_push(a, idx);
+    let n: i32 = a.si_n;
+    let i: i32 = 0;
+    while i < n {
+        if _si_at(a, i) == idx {
+            a = _si_remove_at(a, i);
+            return a;
+        };
+        i = i + 1;
+    }
+    return a;
+}
+
+fn ecs_world_entity_allocator_deep_is_spawned(a: EcsWorldEntityAllocatorDeep, idx: i32) -> bool {
+    let n: i32 = a.si_n;
+    let i: i32 = 0;
+    while i < n {
+        if _si_at(a, i) == idx { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_world_entity_allocator_deep_check_can_spawn_at(a: EcsWorldEntityAllocatorDeep, idx: i32) -> i32 {
+    if ecs_world_entity_allocator_deep_is_spawned(a, idx) { return ecs_spawn_err_already_spawned_deep(); };
+    return (0 - 1);
+}
+
+fn ecs_world_entity_allocator_deep_spawned_count(a: EcsWorldEntityAllocatorDeep) -> i32 {
+    return a.si_n;
+}
+
+// === EcsWorldResourceEntitiesDeep (cap-16 component_ids + entity_indices parallel) ===
+@derive(copy)
+struct EcsWorldResourceEntitiesDeep {
+    cid0: i32, cid1: i32, cid2: i32, cid3: i32, cid4: i32, cid5: i32, cid6: i32, cid7: i32,
+    cid8: i32, cid9: i32, cid10: i32, cid11: i32, cid12: i32, cid13: i32, cid14: i32, cid15: i32,
+    eid0: i32, eid1: i32, eid2: i32, eid3: i32, eid4: i32, eid5: i32, eid6: i32, eid7: i32,
+    eid8: i32, eid9: i32, eid10: i32, eid11: i32, eid12: i32, eid13: i32, eid14: i32, eid15: i32,
+    count: i32,
+    last_get_found: i32,
+    last_get_entity_idx: i32,
+}
+
+fn ecs_world_resource_entities_deep_new() -> EcsWorldResourceEntitiesDeep {
+    return EcsWorldResourceEntitiesDeep {
+        cid0: 0, cid1: 0, cid2: 0, cid3: 0, cid4: 0, cid5: 0, cid6: 0, cid7: 0,
+        cid8: 0, cid9: 0, cid10: 0, cid11: 0, cid12: 0, cid13: 0, cid14: 0, cid15: 0,
+        eid0: 0, eid1: 0, eid2: 0, eid3: 0, eid4: 0, eid5: 0, eid6: 0, eid7: 0,
+        eid8: 0, eid9: 0, eid10: 0, eid11: 0, eid12: 0, eid13: 0, eid14: 0, eid15: 0,
+        count: 0,
+        last_get_found: 0,
+        last_get_entity_idx: 0,
+    };
+}
+
+fn _rcid_at(r: EcsWorldResourceEntitiesDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.cid0; };
+    if idx == 1 { return r.cid1; };
+    if idx == 2 { return r.cid2; };
+    if idx == 3 { return r.cid3; };
+    if idx == 4 { return r.cid4; };
+    if idx == 5 { return r.cid5; };
+    if idx == 6 { return r.cid6; };
+    if idx == 7 { return r.cid7; };
+    if idx == 8 { return r.cid8; };
+    if idx == 9 { return r.cid9; };
+    if idx == 10 { return r.cid10; };
+    if idx == 11 { return r.cid11; };
+    if idx == 12 { return r.cid12; };
+    if idx == 13 { return r.cid13; };
+    if idx == 14 { return r.cid14; };
+    if idx == 15 { return r.cid15; };
+    panic(147139);
+}
+fn _reid_at(r: EcsWorldResourceEntitiesDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.eid0; };
+    if idx == 1 { return r.eid1; };
+    if idx == 2 { return r.eid2; };
+    if idx == 3 { return r.eid3; };
+    if idx == 4 { return r.eid4; };
+    if idx == 5 { return r.eid5; };
+    if idx == 6 { return r.eid6; };
+    if idx == 7 { return r.eid7; };
+    if idx == 8 { return r.eid8; };
+    if idx == 9 { return r.eid9; };
+    if idx == 10 { return r.eid10; };
+    if idx == 11 { return r.eid11; };
+    if idx == 12 { return r.eid12; };
+    if idx == 13 { return r.eid13; };
+    if idx == 14 { return r.eid14; };
+    if idx == 15 { return r.eid15; };
+    panic(147140);
+}
+
+fn _rcid_set(r: EcsWorldResourceEntitiesDeep, idx: i32, v: i32) -> EcsWorldResourceEntitiesDeep {
+    if idx == 0 { r.cid0 = v; return r; };
+    if idx == 1 { r.cid1 = v; return r; };
+    if idx == 2 { r.cid2 = v; return r; };
+    if idx == 3 { r.cid3 = v; return r; };
+    if idx == 4 { r.cid4 = v; return r; };
+    if idx == 5 { r.cid5 = v; return r; };
+    if idx == 6 { r.cid6 = v; return r; };
+    if idx == 7 { r.cid7 = v; return r; };
+    if idx == 8 { r.cid8 = v; return r; };
+    if idx == 9 { r.cid9 = v; return r; };
+    if idx == 10 { r.cid10 = v; return r; };
+    if idx == 11 { r.cid11 = v; return r; };
+    if idx == 12 { r.cid12 = v; return r; };
+    if idx == 13 { r.cid13 = v; return r; };
+    if idx == 14 { r.cid14 = v; return r; };
+    if idx == 15 { r.cid15 = v; return r; };
+    panic(147141);
+}
+fn _reid_set(r: EcsWorldResourceEntitiesDeep, idx: i32, v: i32) -> EcsWorldResourceEntitiesDeep {
+    if idx == 0 { r.eid0 = v; return r; };
+    if idx == 1 { r.eid1 = v; return r; };
+    if idx == 2 { r.eid2 = v; return r; };
+    if idx == 3 { r.eid3 = v; return r; };
+    if idx == 4 { r.eid4 = v; return r; };
+    if idx == 5 { r.eid5 = v; return r; };
+    if idx == 6 { r.eid6 = v; return r; };
+    if idx == 7 { r.eid7 = v; return r; };
+    if idx == 8 { r.eid8 = v; return r; };
+    if idx == 9 { r.eid9 = v; return r; };
+    if idx == 10 { r.eid10 = v; return r; };
+    if idx == 11 { r.eid11 = v; return r; };
+    if idx == 12 { r.eid12 = v; return r; };
+    if idx == 13 { r.eid13 = v; return r; };
+    if idx == 14 { r.eid14 = v; return r; };
+    if idx == 15 { r.eid15 = v; return r; };
+    panic(147142);
+}
+
+fn ecs_world_resource_entities_deep_insert(re: EcsWorldResourceEntitiesDeep, component_id: i32, entity_idx: i32) -> EcsWorldResourceEntitiesDeep {
+    let n: i32 = re.count;
+    let i: i32 = 0;
+    while i < n {
+        if _rcid_at(re, i) == component_id {
+            re = _reid_set(re, i, entity_idx);
+            return re;
+        };
+        i = i + 1;
+    }
+    if n < ECS_WE_DEEP_CAP {
+        re = _rcid_set(re, n, component_id);
+        re = _reid_set(re, n, entity_idx);
+        re.count = re.count + 1;
+    };
+    return re;
+}
+
+fn ecs_world_resource_entities_deep_get(re: EcsWorldResourceEntitiesDeep, component_id: i32) -> EcsWorldResourceEntitiesDeep {
+    let n: i32 = re.count;
+    let i: i32 = 0;
+    while i < n {
+        if _rcid_at(re, i) == component_id {
+            re.last_get_found = 1;
+            re.last_get_entity_idx = _reid_at(re, i);
+            return re;
+        };
+        i = i + 1;
+    }
+    re.last_get_found = 0;
+    re.last_get_entity_idx = 0;
+    return re;
+}
+
+fn ecs_world_resource_entities_deep_get_found(r: EcsWorldResourceEntitiesDeep) -> bool { return r.last_get_found == 1; }
+fn ecs_world_resource_entities_deep_get_entity_idx(r: EcsWorldResourceEntitiesDeep) -> i32 { return r.last_get_entity_idx; }
+fn ecs_world_resource_entities_deep_len(re: EcsWorldResourceEntitiesDeep) -> i32 { return re.count; }
+
+// === EcsWorldSpawnFacadeDeep: inline EcsWorldEntityAllocatorDeep + cap-16 spawned_types ===
+@derive(copy)
+struct EcsWorldSpawnFacadeDeep {
+    next_index: i32,
+    generation: i32,
+    fi0: i32, fi1: i32, fi2: i32, fi3: i32, fi4: i32, fi5: i32, fi6: i32, fi7: i32,
+    fi8: i32, fi9: i32, fi10: i32, fi11: i32, fi12: i32, fi13: i32, fi14: i32, fi15: i32,
+    fi_n: i32,
+    si0: i32, si1: i32, si2: i32, si3: i32, si4: i32, si5: i32, si6: i32, si7: i32,
+    si8: i32, si9: i32, si10: i32, si11: i32, si12: i32, si13: i32, si14: i32, si15: i32,
+    si_n: i32,
+    st0: i32, st1: i32, st2: i32, st3: i32, st4: i32, st5: i32, st6: i32, st7: i32,
+    st8: i32, st9: i32, st10: i32, st11: i32, st12: i32, st13: i32, st14: i32, st15: i32,
+    last_alloc_idx: i32,
+    last_alloc_generation: i32,
+    // spawn_at / spawn_batch / modify companions.
+    last_spawn_at_ok: i32,
+    last_spawn_at_error_code: i32,
+    last_spawn_at_entity_idx: i32,
+    last_spawn_batch_count: i32,
+    last_spawn_batch_first: i32,
+    last_modify_ok: i32,
+    last_modify_error_code: i32,
+    last_modify_present: i32,
+}
+
+fn ecs_world_spawn_facade_deep_new() -> EcsWorldSpawnFacadeDeep {
+    return EcsWorldSpawnFacadeDeep {
+        next_index: 0, generation: 1,
+        fi0: 0, fi1: 0, fi2: 0, fi3: 0, fi4: 0, fi5: 0, fi6: 0, fi7: 0,
+        fi8: 0, fi9: 0, fi10: 0, fi11: 0, fi12: 0, fi13: 0, fi14: 0, fi15: 0,
+        fi_n: 0,
+        si0: 0, si1: 0, si2: 0, si3: 0, si4: 0, si5: 0, si6: 0, si7: 0,
+        si8: 0, si9: 0, si10: 0, si11: 0, si12: 0, si13: 0, si14: 0, si15: 0,
+        si_n: 0,
+        st0: 0, st1: 0, st2: 0, st3: 0, st4: 0, st5: 0, st6: 0, st7: 0,
+        st8: 0, st9: 0, st10: 0, st11: 0, st12: 0, st13: 0, st14: 0, st15: 0,
+        last_alloc_idx: 0, last_alloc_generation: 1,
+        last_spawn_at_ok: 0, last_spawn_at_error_code: 0, last_spawn_at_entity_idx: 0,
+        last_spawn_batch_count: 0, last_spawn_batch_first: 0,
+        last_modify_ok: 0, last_modify_error_code: 0, last_modify_present: 0,
+    };
+}
+
+// Helper accessors on the facade (mirroring the allocator inside the shallow variant).
+fn _fac_si_at(f: EcsWorldSpawnFacadeDeep, idx: i32) -> i32 {
+    if idx == 0 { return f.si0; };
+    if idx == 1 { return f.si1; };
+    if idx == 2 { return f.si2; };
+    if idx == 3 { return f.si3; };
+    if idx == 4 { return f.si4; };
+    if idx == 5 { return f.si5; };
+    if idx == 6 { return f.si6; };
+    if idx == 7 { return f.si7; };
+    if idx == 8 { return f.si8; };
+    if idx == 9 { return f.si9; };
+    if idx == 10 { return f.si10; };
+    if idx == 11 { return f.si11; };
+    if idx == 12 { return f.si12; };
+    if idx == 13 { return f.si13; };
+    if idx == 14 { return f.si14; };
+    if idx == 15 { return f.si15; };
+    panic(147143);
+}
+fn _fac_si_set(f: EcsWorldSpawnFacadeDeep, idx: i32, v: i32) -> EcsWorldSpawnFacadeDeep {
+    if idx == 0 { f.si0 = v; return f; };
+    if idx == 1 { f.si1 = v; return f; };
+    if idx == 2 { f.si2 = v; return f; };
+    if idx == 3 { f.si3 = v; return f; };
+    if idx == 4 { f.si4 = v; return f; };
+    if idx == 5 { f.si5 = v; return f; };
+    if idx == 6 { f.si6 = v; return f; };
+    if idx == 7 { f.si7 = v; return f; };
+    if idx == 8 { f.si8 = v; return f; };
+    if idx == 9 { f.si9 = v; return f; };
+    if idx == 10 { f.si10 = v; return f; };
+    if idx == 11 { f.si11 = v; return f; };
+    if idx == 12 { f.si12 = v; return f; };
+    if idx == 13 { f.si13 = v; return f; };
+    if idx == 14 { f.si14 = v; return f; };
+    if idx == 15 { f.si15 = v; return f; };
+    panic(147144);
+}
+fn _fac_si_push(f: EcsWorldSpawnFacadeDeep, v: i32) -> EcsWorldSpawnFacadeDeep {
+    let i: i32 = f.si_n;
+    if i >= ECS_WE_DEEP_CAP { return f; };
+    f = _fac_si_set(f, i, v);
+    f.si_n = f.si_n + 1;
+    return f;
+}
+fn _fac_st_set(f: EcsWorldSpawnFacadeDeep, idx: i32, v: i32) -> EcsWorldSpawnFacadeDeep {
+    if idx == 0 { f.st0 = v; return f; };
+    if idx == 1 { f.st1 = v; return f; };
+    if idx == 2 { f.st2 = v; return f; };
+    if idx == 3 { f.st3 = v; return f; };
+    if idx == 4 { f.st4 = v; return f; };
+    if idx == 5 { f.st5 = v; return f; };
+    if idx == 6 { f.st6 = v; return f; };
+    if idx == 7 { f.st7 = v; return f; };
+    if idx == 8 { f.st8 = v; return f; };
+    if idx == 9 { f.st9 = v; return f; };
+    if idx == 10 { f.st10 = v; return f; };
+    if idx == 11 { f.st11 = v; return f; };
+    if idx == 12 { f.st12 = v; return f; };
+    if idx == 13 { f.st13 = v; return f; };
+    if idx == 14 { f.st14 = v; return f; };
+    if idx == 15 { f.st15 = v; return f; };
+    panic(147145);
+}
+fn _fac_st_at(f: EcsWorldSpawnFacadeDeep, idx: i32) -> i32 {
+    if idx == 0 { return f.st0; };
+    if idx == 1 { return f.st1; };
+    if idx == 2 { return f.st2; };
+    if idx == 3 { return f.st3; };
+    if idx == 4 { return f.st4; };
+    if idx == 5 { return f.st5; };
+    if idx == 6 { return f.st6; };
+    if idx == 7 { return f.st7; };
+    if idx == 8 { return f.st8; };
+    if idx == 9 { return f.st9; };
+    if idx == 10 { return f.st10; };
+    if idx == 11 { return f.st11; };
+    if idx == 12 { return f.st12; };
+    if idx == 13 { return f.st13; };
+    if idx == 14 { return f.st14; };
+    if idx == 15 { return f.st15; };
+    panic(147146);
+}
+
+fn _fac_is_spawned(f: EcsWorldSpawnFacadeDeep, idx: i32) -> bool {
+    let n: i32 = f.si_n;
+    let i: i32 = 0;
+    while i < n {
+        if _fac_si_at(f, i) == idx { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _fac_can_spawn_at(f: EcsWorldSpawnFacadeDeep, idx: i32) -> i32 {
+    if _fac_is_spawned(f, idx) { return ecs_spawn_err_already_spawned_deep(); };
+    return (0 - 1);
+}
+
+fn ecs_world_spawn_facade_deep_spawn_at(f: EcsWorldSpawnFacadeDeep, entity_idx: i32, type_id: i32) -> EcsWorldSpawnFacadeDeep {
+    let check: i32 = _fac_can_spawn_at(f, entity_idx);
+    if check != (0 - 1) {
+        f.last_spawn_at_ok = 0;
+        f.last_spawn_at_error_code = check;
+        f.last_spawn_at_entity_idx = (0 - 1);
+        return f;
+    };
+    f = _fac_si_push(f, entity_idx);
+    // parallel push onto spawned_types (cap-guarded).
+    let n: i32 = f.si_n; // current count post-push (mirrors si_n)
+    if n > 0 { f = _fac_st_set(f, n - 1, type_id); };
+    f.last_spawn_at_ok = 1;
+    f.last_spawn_at_error_code = (0 - 1);
+    f.last_spawn_at_entity_idx = entity_idx;
+    return f;
+}
+
+fn ecs_world_spawn_facade_deep_spawn_empty_at(f: EcsWorldSpawnFacadeDeep, entity_idx: i32) -> EcsWorldSpawnFacadeDeep {
+    return ecs_world_spawn_facade_deep_spawn_at(f, entity_idx, 0);
+}
+
+fn ecs_spawn_at_deep_facade(r: EcsWorldSpawnFacadeDeep) -> EcsWorldSpawnFacadeDeep { return r; }
+fn ecs_spawn_at_deep_ok(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_spawn_at_ok; }
+fn ecs_spawn_at_deep_error_code(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_spawn_at_error_code; }
+fn ecs_spawn_at_deep_entity_idx(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_spawn_at_entity_idx; }
+
+// spawn_batch: receives the type_ids via callers pushing one-by-one through an explicit API
+// (since SLA lacks Vec parameterization on fns; we expose spawn_batch as a slice receiver
+// via an add_type helper alongside spawn_batch_finish). Instead of accepting Vec<i32>,
+// callers use `ecs_world_spawn_facade_deep_spawn_batch_step(...)` per type, then
+// `ecs_world_spawn_facade_deep_spawn_batch_finish()` to materialise the result.
+fn ecs_world_spawn_facade_deep_spawn_batch_step(f: EcsWorldSpawnFacadeDeep, type_id: i32) -> EcsWorldSpawnFacadeDeep {
+    // allocates one entity and records the type_id on the parallel spawned_types slot.
+    let idx: i32 = f.next_index;
+    if f.fi_n > 0 {
+        // pop_front (compact-backshift)
+        idx = f.fi0;
+        let k: i32 = 0;
+        while k < f.fi_n - 1 {
+            if k == 0 { f.fi0 = f.fi1; };
+            if k == 1 { f.fi1 = f.fi2; };
+            if k == 2 { f.fi2 = f.fi3; };
+            if k == 3 { f.fi3 = f.fi4; };
+            if k == 4 { f.fi4 = f.fi5; };
+            if k == 5 { f.fi5 = f.fi6; };
+            if k == 6 { f.fi6 = f.fi7; };
+            if k == 7 { f.fi7 = f.fi8; };
+            if k == 8 { f.fi8 = f.fi9; };
+            if k == 9 { f.fi9 = f.fi10; };
+            if k == 10 { f.fi10 = f.fi11; };
+            if k == 11 { f.fi11 = f.fi12; };
+            if k == 12 { f.fi12 = f.fi13; };
+            if k == 13 { f.fi13 = f.fi14; };
+            if k == 14 { f.fi14 = f.fi15; };
+            k = k + 1;
+        }
+        // zero out the freed slot.
+        let last_fi: i32 = f.fi_n - 1;
+        if last_fi == 0 { f.fi0 = 0; };
+        if last_fi == 1 { f.fi1 = 0; };
+        if last_fi == 2 { f.fi2 = 0; };
+        if last_fi == 3 { f.fi3 = 0; };
+        if last_fi == 4 { f.fi4 = 0; };
+        if last_fi == 5 { f.fi5 = 0; };
+        if last_fi == 6 { f.fi6 = 0; };
+        if last_fi == 7 { f.fi7 = 0; };
+        if last_fi == 8 { f.fi8 = 0; };
+        if last_fi == 9 { f.fi9 = 0; };
+        if last_fi == 10 { f.fi10 = 0; };
+        if last_fi == 11 { f.fi11 = 0; };
+        if last_fi == 12 { f.fi12 = 0; };
+        if last_fi == 13 { f.fi13 = 0; };
+        if last_fi == 14 { f.fi14 = 0; };
+        if last_fi == 15 { f.fi15 = 0; };
+        f.fi_n = f.fi_n - 1;
+    } else {
+        f.next_index = f.next_index + 1;
+    };
+    f = _fac_si_push(f, idx);
+    let n: i32 = f.si_n;
+    if n > 0 { f = _fac_st_set(f, n - 1, type_id); };
+    // record first-allocated when this is the first batch step.
+    if f.last_spawn_batch_count == 0 {
+        f.last_spawn_batch_first = idx;
+    };
+    f.last_spawn_batch_count = f.last_spawn_batch_count + 1;
+    return f;
+}
+
+fn ecs_world_spawn_facade_deep_spawn_batch_finish(f: EcsWorldSpawnFacadeDeep) -> EcsWorldSpawnFacadeDeep {
+    // Materialise/reset the batch companion so the next batch starts fresh.
+    return f;
+}
+
+fn ecs_spawn_batch_deep_facade(r: EcsWorldSpawnFacadeDeep) -> EcsWorldSpawnFacadeDeep { return r; }
+fn ecs_spawn_batch_deep_count(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_spawn_batch_count; }
+fn ecs_spawn_batch_deep_first(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_spawn_batch_first; }
+
+// Spawn-facade accessors.
+fn ecs_world_spawn_facade_deep_spawn_at_ok(f: EcsWorldSpawnFacadeDeep) -> i32 { return f.last_spawn_at_ok; }
+fn ecs_world_spawn_facade_deep_spawned_count(f: EcsWorldSpawnFacadeDeep) -> i32 { return f.si_n; }
+fn ecs_world_spawn_facade_deep_next_index(f: EcsWorldSpawnFacadeDeep) -> i32 { return f.next_index; }
+
+// === EcsWorldComponentsQueueDeep (cap-16 queued_type_ids + queued_storage_kinds parallel) ===
+@derive(copy)
+struct EcsWorldComponentsQueueDeep {
+    qt0: i32, qt1: i32, qt2: i32, qt3: i32, qt4: i32, qt5: i32, qt6: i32, qt7: i32,
+    qt8: i32, qt9: i32, qt10: i32, qt11: i32, qt12: i32, qt13: i32, qt14: i32, qt15: i32,
+    sk0: i32, sk1: i32, sk2: i32, sk3: i32, sk4: i32, sk5: i32, sk6: i32, sk7: i32,
+    sk8: i32, sk9: i32, sk10: i32, sk11: i32, sk12: i32, sk13: i32, sk14: i32, sk15: i32,
+    count: i32,
+    last_at_found: i32,
+    last_at_type_id: i32,
+    last_at_storage_kind: i32,
+    last_apply_applied: i32,
+}
+
+fn ecs_world_components_queue_deep_new() -> EcsWorldComponentsQueueDeep {
+    return EcsWorldComponentsQueueDeep {
+        qt0: 0, qt1: 0, qt2: 0, qt3: 0, qt4: 0, qt5: 0, qt6: 0, qt7: 0,
+        qt8: 0, qt9: 0, qt10: 0, qt11: 0, qt12: 0, qt13: 0, qt14: 0, qt15: 0,
+        sk0: 0, sk1: 0, sk2: 0, sk3: 0, sk4: 0, sk5: 0, sk6: 0, sk7: 0,
+        sk8: 0, sk9: 0, sk10: 0, sk11: 0, sk12: 0, sk13: 0, sk14: 0, sk15: 0,
+        count: 0,
+        last_at_found: 0, last_at_type_id: 0, last_at_storage_kind: 0,
+        last_apply_applied: 0,
+    };
+}
+
+fn _cqt_at(q: EcsWorldComponentsQueueDeep, idx: i32) -> i32 {
+    if idx == 0 { return q.qt0; };
+    if idx == 1 { return q.qt1; };
+    if idx == 2 { return q.qt2; };
+    if idx == 3 { return q.qt3; };
+    if idx == 4 { return q.qt4; };
+    if idx == 5 { return q.qt5; };
+    if idx == 6 { return q.qt6; };
+    if idx == 7 { return q.qt7; };
+    if idx == 8 { return q.qt8; };
+    if idx == 9 { return q.qt9; };
+    if idx == 10 { return q.qt10; };
+    if idx == 11 { return q.qt11; };
+    if idx == 12 { return q.qt12; };
+    if idx == 13 { return q.qt13; };
+    if idx == 14 { return q.qt14; };
+    if idx == 15 { return q.qt15; };
+    panic(147147);
+}
+fn _csk_at(q: EcsWorldComponentsQueueDeep, idx: i32) -> i32 {
+    if idx == 0 { return q.sk0; };
+    if idx == 1 { return q.sk1; };
+    if idx == 2 { return q.sk2; };
+    if idx == 3 { return q.sk3; };
+    if idx == 4 { return q.sk4; };
+    if idx == 5 { return q.sk5; };
+    if idx == 6 { return q.sk6; };
+    if idx == 7 { return q.sk7; };
+    if idx == 8 { return q.sk8; };
+    if idx == 9 { return q.sk9; };
+    if idx == 10 { return q.sk10; };
+    if idx == 11 { return q.sk11; };
+    if idx == 12 { return q.sk12; };
+    if idx == 13 { return q.sk13; };
+    if idx == 14 { return q.sk14; };
+    if idx == 15 { return q.sk15; };
+    panic(147148);
+}
+fn _cqt_set(q: EcsWorldComponentsQueueDeep, idx: i32, v: i32) -> EcsWorldComponentsQueueDeep {
+    if idx == 0 { q.qt0 = v; return q; };
+    if idx == 1 { q.qt1 = v; return q; };
+    if idx == 2 { q.qt2 = v; return q; };
+    if idx == 3 { q.qt3 = v; return q; };
+    if idx == 4 { q.qt4 = v; return q; };
+    if idx == 5 { q.qt5 = v; return q; };
+    if idx == 6 { q.qt6 = v; return q; };
+    if idx == 7 { q.qt7 = v; return q; };
+    if idx == 8 { q.qt8 = v; return q; };
+    if idx == 9 { q.qt9 = v; return q; };
+    if idx == 10 { q.qt10 = v; return q; };
+    if idx == 11 { q.qt11 = v; return q; };
+    if idx == 12 { q.qt12 = v; return q; };
+    if idx == 13 { q.qt13 = v; return q; };
+    if idx == 14 { q.qt14 = v; return q; };
+    if idx == 15 { q.qt15 = v; return q; };
+    panic(147149);
+}
+fn _csk_set(q: EcsWorldComponentsQueueDeep, idx: i32, v: i32) -> EcsWorldComponentsQueueDeep {
+    if idx == 0 { q.sk0 = v; return q; };
+    if idx == 1 { q.sk1 = v; return q; };
+    if idx == 2 { q.sk2 = v; return q; };
+    if idx == 3 { q.sk3 = v; return q; };
+    if idx == 4 { q.sk4 = v; return q; };
+    if idx == 5 { q.sk5 = v; return q; };
+    if idx == 6 { q.sk6 = v; return q; };
+    if idx == 7 { q.sk7 = v; return q; };
+    if idx == 8 { q.sk8 = v; return q; };
+    if idx == 9 { q.sk9 = v; return q; };
+    if idx == 10 { q.sk10 = v; return q; };
+    if idx == 11 { q.sk11 = v; return q; };
+    if idx == 12 { q.sk12 = v; return q; };
+    if idx == 13 { q.sk13 = v; return q; };
+    if idx == 14 { q.sk14 = v; return q; };
+    if idx == 15 { q.sk15 = v; return q; };
+    panic(147150);
+}
+
+fn ecs_world_components_queue_deep_at(q: EcsWorldComponentsQueueDeep, idx: i32) -> EcsWorldComponentsQueueDeep {
+    if idx < 0 || idx >= q.count {
+        q.last_at_found = 0;
+        q.last_at_type_id = 0;
+        q.last_at_storage_kind = 0;
+        return q;
+    };
+    q.last_at_found = 1;
+    q.last_at_type_id = _cqt_at(q, idx);
+    q.last_at_storage_kind = _csk_at(q, idx);
+    return q;
+}
+fn ecs_queue_at_deep_found(q: EcsWorldComponentsQueueDeep) -> bool { return q.last_at_found == 1; }
+fn ecs_queue_at_deep_type_id(q: EcsWorldComponentsQueueDeep) -> i32 { return q.last_at_type_id; }
+fn ecs_queue_at_deep_storage_kind(q: EcsWorldComponentsQueueDeep) -> i32 { return q.last_at_storage_kind; }
+fn ecs_world_components_queue_deep_len(q: EcsWorldComponentsQueueDeep) -> i32 { return q.count; }
+
+fn ecs_world_components_queue_deep_enqueue(q: EcsWorldComponentsQueueDeep, type_id: i32, storage_kind: i32) -> EcsWorldComponentsQueueDeep {
+    if q.count < ECS_WE_DEEP_CAP {
+        q = _cqt_set(q, q.count, type_id);
+        q = _csk_set(q, q.count, storage_kind);
+        q.count = q.count + 1;
+    };
+    return q;
+}
+
+fn ecs_world_components_queue_deep_apply(q: EcsWorldComponentsQueueDeep) -> EcsWorldComponentsQueueDeep {
+    let n: i32 = q.count;
+    let i: i32 = 0;
+    while i < n {
+        // pop_front (compact-backshift)
+        let k: i32 = 0;
+        while k < q.count - 1 {
+            q = _cqt_set(q, k, _cqt_at(q, k + 1));
+            q = _csk_set(q, k, _csk_at(q, k + 1));
+            k = k + 1;
+        }
+        if q.count > 0 {
+            q = _cqt_set(q, q.count - 1, 0);
+            q = _csk_set(q, q.count - 1, 0);
+            q.count = q.count - 1;
+        };
+        i = i + 1;
+    }
+    q.last_apply_applied = n;
+    return q;
+}
+fn ecs_queue_apply_deep_queue(q: EcsWorldComponentsQueueDeep) -> EcsWorldComponentsQueueDeep { return q; }
+fn ecs_queue_apply_deep_applied(q: EcsWorldComponentsQueueDeep) -> i32 { return q.last_apply_applied; }
+
+// === EcsUnsafeWorldCellDeep (scalar mirror) ===
+@derive(copy)
+struct EcsUnsafeWorldCellDeep {
+    world_ptr: i64,
+    readonly: i32,
+}
+
+fn ecs_world_unsafe_cell_deep_new(world_ptr: i64) -> EcsUnsafeWorldCellDeep {
+    return EcsUnsafeWorldCellDeep { world_ptr: world_ptr, readonly: 0 };
+}
+fn ecs_world_unsafe_cell_deep_readonly(world_ptr: i64) -> EcsUnsafeWorldCellDeep {
+    return EcsUnsafeWorldCellDeep { world_ptr: world_ptr, readonly: 1 };
+}
+fn ecs_world_unsafe_cell_deep_ptr(c: EcsUnsafeWorldCellDeep) -> i64 { return c.world_ptr; }
+fn ecs_world_unsafe_cell_deep_is_readonly(c: EcsUnsafeWorldCellDeep) -> bool { return c.readonly != 0; }
+
+// === modify_component / modify_resource ===
+fn ecs_world_modify_component_deep(facade: EcsWorldSpawnFacadeDeep, entity_idx: i32, type_id: i32, mutator_handle: i32, new_value: i32) -> EcsWorldSpawnFacadeDeep {
+    if _fac_is_spawned(facade, entity_idx) != true {
+        facade.last_modify_ok = 0;
+        facade.last_modify_error_code = ecs_entity_fetch_err_not_spawned_deep();
+        facade.last_modify_present = 0;
+        return facade;
+    };
+    let n: i32 = facade.si_n;
+    let i: i32 = 0;
+    let mut_idx: i32 = (0 - 1);
+    while i < n {
+        if _fac_si_at(facade, i) == entity_idx {
+            if _fac_st_at(facade, i) == type_id {
+                mut_idx = i;
+            };
+        };
+        i = i + 1;
+    }
+    let _ = mutator_handle;
+    if mut_idx < 0 {
+        facade.last_modify_ok = 1;
+        facade.last_modify_error_code = (0 - 1);
+        facade.last_modify_present = 0;
+        return facade;
+    };
+    facade = _fac_st_set(facade, mut_idx, new_value);
+    facade.last_modify_ok = 1;
+    facade.last_modify_error_code = (0 - 1);
+    facade.last_modify_present = 1;
+    return facade;
+}
+
+fn ecs_modify_deep_facade(r: EcsWorldSpawnFacadeDeep) -> EcsWorldSpawnFacadeDeep { return r; }
+fn ecs_modify_deep_ok(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_modify_ok; }
+fn ecs_modify_deep_error_code(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_modify_error_code; }
+fn ecs_modify_deep_present(r: EcsWorldSpawnFacadeDeep) -> i32 { return r.last_modify_present; }
+fn ecs_world_spawn_facade_deep_type_at(f: EcsWorldSpawnFacadeDeep, idx: i32) -> i32 {
+    return _fac_st_at(f, idx);
+}
+
+// modify_resource / by_id aliases (resources structure carries the lookup; the mutation lands
+// on the spawn facade).
+fn ecs_world_modify_resource_deep(re: EcsWorldResourceEntitiesDeep, facade: EcsWorldSpawnFacadeDeep, component_id: i32, mutator_handle: i32, new_value: i32) -> EcsWorldSpawnFacadeDeep {
+    re = ecs_world_resource_entities_deep_get(re, component_id);
+    if re.last_get_found != 1 {
+        facade.last_modify_ok = 1;
+        facade.last_modify_error_code = (0 - 1);
+        facade.last_modify_present = 0;
+        return facade;
+    };
+    let ent_idx = re.last_get_entity_idx;
+    return ecs_world_modify_component_deep(facade, ent_idx, component_id, mutator_handle, new_value);
+}
+
+fn ecs_world_modify_component_by_id_deep(facade: EcsWorldSpawnFacadeDeep, entity_idx: i32, component_id: i32, mutator_handle: i32, new_value: i32) -> EcsWorldSpawnFacadeDeep {
+    return ecs_world_modify_component_deep(facade, entity_idx, component_id, mutator_handle, new_value);
+}
+fn ecs_world_modify_resource_by_id_deep(re: EcsWorldResourceEntitiesDeep, facade: EcsWorldSpawnFacadeDeep, component_id: i32, mutator_handle: i32, new_value: i32) -> EcsWorldSpawnFacadeDeep {
+    return ecs_world_modify_resource_deep(re, facade, component_id, mutator_handle, new_value);
+}

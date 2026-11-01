@@ -1,0 +1,175 @@
+// Bevy ECS archetype (src/archetype.rs):
+// Edges — caches archetype transitions for bundle insert/remove/take operations.
+// ArchetypeAfterBundleInsert, ComponentStatus, ArchetypeEntity, ArchetypeRow, ArchetypeId.
+
+// === ArchetypeId / ArchetypeRow ===
+struct EcsArchetypeId { id: i32 }
+fn ecs_archetype_id_new(id: i32) -> EcsArchetypeId { return EcsArchetypeId { id: id }; }
+fn ecs_archetype_id_value(a: EcsArchetypeId) -> i32 { return a.id; }
+fn ecs_archetype_id_index(a: EcsArchetypeId) -> i32 { return a.id; }
+fn ecs_archetype_id_eq(a: EcsArchetypeId, b: EcsArchetypeId) -> bool { return a.id == b.id; }
+
+struct EcsArchetypeRow { row: i32 }
+fn ecs_archetype_row_new(row: i32) -> EcsArchetypeRow { return EcsArchetypeRow { row: row }; }
+fn ecs_archetype_row_value(r: EcsArchetypeRow) -> i32 { return r.row; }
+
+// === ComponentStatus ===
+const ECS_COMPONENT_STATUS_NOT_PRESENT: i32 = 0;
+const ECS_COMPONENT_STATUS_ADDED: i32 = 1;
+const ECS_COMPONENT_STATUS_EXISTED: i32 = 2;
+
+fn ecs_component_status_not_present() -> i32 { return ECS_COMPONENT_STATUS_NOT_PRESENT; }
+fn ecs_component_status_added() -> i32 { return ECS_COMPONENT_STATUS_ADDED; }
+fn ecs_component_status_existed() -> i32 { return ECS_COMPONENT_STATUS_EXISTED; }
+
+// === ArchetypeAfterBundleInsert ===
+struct EcsArchetypeAfterBundleInsert {
+    archetype_id: i32,
+    added_len: i32,
+    // which components were added vs existed
+    inserted: Vec<i32>,
+}
+
+fn ecs_archetype_after_bundle_insert_new(archetype_id: i32, added: Vec<i32>, existing: Vec<i32>) -> EcsArchetypeAfterBundleInsert {
+    let inserted = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(added) as i64;
+    while i < n {
+        inserted.push(added[i]);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let m: i64 = len(existing) as i64;
+    while j < m {
+        inserted.push(existing[j]);
+        j = j + 1;
+    }
+    return EcsArchetypeAfterBundleInsert {
+        archetype_id: archetype_id,
+        added_len: len(added) as i32,
+        inserted: inserted
+    };
+}
+
+fn ecs_archetype_after_insert_id(a: EcsArchetypeAfterBundleInsert) -> i32 { return a.archetype_id; }
+fn ecs_archetype_after_insert_added_len(a: EcsArchetypeAfterBundleInsert) -> i32 { return a.added_len; }
+fn ecs_archetype_after_insert_total_len(a: EcsArchetypeAfterBundleInsert) -> i64 { return len(a.inserted) as i64; }
+
+// === Edges ===
+struct EcsArchetypeEdges {
+    // insert: bundle_id -> archetype_id
+    insert_bundle_ids: Vec<i32>,
+    insert_bundle_targets: Vec<i32>,
+    // remove: bundle_id -> Option<archetype_id> (stored as -1 for None)
+    remove_bundle_ids: Vec<i32>,
+    remove_bundle_targets: Vec<i32>,
+    // take: bundle_id -> Option<archetype_id> (stored as -1 for None)
+    take_bundle_ids: Vec<i32>,
+    take_bundle_targets: Vec<i32>,
+}
+
+fn ecs_archetype_edges_new() -> EcsArchetypeEdges {
+    return EcsArchetypeEdges {
+        insert_bundle_ids: Vec::new(), insert_bundle_targets: Vec::new(),
+        remove_bundle_ids: Vec::new(), remove_bundle_targets: Vec::new(),
+        take_bundle_ids: Vec::new(), take_bundle_targets: Vec::new()
+    };
+}
+
+// get_archetype_after_bundle_insert: returns (found, archetype_id)
+fn ecs_archetype_edges_get_insert(e: EcsArchetypeEdges, bundle_id: i32) -> (bool, i32) {
+    let i: i64 = 0;
+    let n: i64 = len(e.insert_bundle_ids) as i64;
+    while i < n {
+        if e.insert_bundle_ids[i] == bundle_id { return (true, e.insert_bundle_targets[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+// cache_archetype_after_bundle_insert
+fn ecs_archetype_edges_cache_insert(e: EcsArchetypeEdges, bundle_id: i32, archetype_id: i32) -> EcsArchetypeEdges {
+    // Check if already cached
+    let existing = ecs_archetype_edges_get_insert(e, bundle_id);
+    if existing.0 { return e; };
+    e.insert_bundle_ids.push(bundle_id);
+    e.insert_bundle_targets.push(archetype_id);
+    return e;
+}
+
+// get_archetype_after_bundle_remove: returns (found, has_result, archetype_id)
+// found=false: not cached; found=true, has_result=false: cannot remove; found=true, has_result=true: archetype_id
+fn ecs_archetype_edges_get_remove(e: EcsArchetypeEdges, bundle_id: i32) -> (bool, bool, i32) {
+    let i: i64 = 0;
+    let n: i64 = len(e.remove_bundle_ids) as i64;
+    while i < n {
+        if e.remove_bundle_ids[i] == bundle_id {
+            let target = e.remove_bundle_targets[i];
+            if target < 0 { return (true, false, 0); };
+            return (true, true, target);
+        };
+        i = i + 1;
+    }
+    return (false, false, 0);
+}
+
+// cache_archetype_after_bundle_remove
+fn ecs_archetype_edges_cache_remove(e: EcsArchetypeEdges, bundle_id: i32, archetype_id: i32) -> EcsArchetypeEdges {
+    e.remove_bundle_ids.push(bundle_id);
+    e.remove_bundle_targets.push(archetype_id);
+    return e;
+}
+
+// cache_archetype_after_bundle_remove_none (cannot remove)
+fn ecs_archetype_edges_cache_remove_none(e: EcsArchetypeEdges, bundle_id: i32) -> EcsArchetypeEdges {
+    e.remove_bundle_ids.push(bundle_id);
+    e.remove_bundle_targets.push(-1);
+    return e;
+}
+
+// get_archetype_after_bundle_take
+fn ecs_archetype_edges_get_take(e: EcsArchetypeEdges, bundle_id: i32) -> (bool, bool, i32) {
+    let i: i64 = 0;
+    let n: i64 = len(e.take_bundle_ids) as i64;
+    while i < n {
+        if e.take_bundle_ids[i] == bundle_id {
+            let target = e.take_bundle_targets[i];
+            if target < 0 { return (true, false, 0); };
+            return (true, true, target);
+        };
+        i = i + 1;
+    }
+    return (false, false, 0);
+}
+
+// cache_archetype_after_bundle_take
+fn ecs_archetype_edges_cache_take(e: EcsArchetypeEdges, bundle_id: i32, archetype_id: i32) -> EcsArchetypeEdges {
+    e.take_bundle_ids.push(bundle_id);
+    e.take_bundle_targets.push(archetype_id);
+    return e;
+}
+
+// cache_archetype_after_bundle_take_none
+fn ecs_archetype_edges_cache_take_none(e: EcsArchetypeEdges, bundle_id: i32) -> EcsArchetypeEdges {
+    e.take_bundle_ids.push(bundle_id);
+    e.take_bundle_targets.push(-1);
+    return e;
+}
+
+// stats
+fn ecs_archetype_edges_insert_count(e: EcsArchetypeEdges) -> i64 { return len(e.insert_bundle_ids) as i64; }
+fn ecs_archetype_edges_remove_count(e: EcsArchetypeEdges) -> i64 { return len(e.remove_bundle_ids) as i64; }
+fn ecs_archetype_edges_take_count(e: EcsArchetypeEdges) -> i64 { return len(e.take_bundle_ids) as i64; }
+
+// === ArchetypeEntity ===
+struct EcsArchetypeEntity {
+    entity: i64,
+    table_row: i32,
+}
+
+fn ecs_archetype_entity_new(entity: i64, table_row: i32) -> EcsArchetypeEntity {
+    return EcsArchetypeEntity { entity: entity, table_row: table_row };
+}
+
+fn ecs_archetype_entity_id(e: EcsArchetypeEntity) -> i64 { return e.entity; }
+fn ecs_archetype_entity_table_row(e: EcsArchetypeEntity) -> i32 { return e.table_row; }

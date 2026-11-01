@@ -1,0 +1,630 @@
+// Deepened Bevy ECS world::deferred_world surface.
+// Mirrors src/world/deferred_world.rs: DeferredWorld disallows structural ECS
+// changes; entity fetch errors; modify_component discard->mutate->insert hook
+// path without archetype move; trigger_on_* hooks; trigger_raw observer
+// dispatch; write_message + MessageId; reborrow; change_tick.
+// Shallow deferred_world.sla + deferred_world_extras.sla retained.
+
+// === EntityMutableFetchError ===
+const ECS_DW_FETCH_OK: i32 = 0;
+const ECS_DW_FETCH_NOT_SPAWNED: i32 = 1;
+const ECS_DW_FETCH_ALIASED_MUT: i32 = 2;
+
+// === RelationshipHookMode ===
+const ECS_DW_HOOK_RUN: i32 = 0;
+const ECS_DW_HOOK_SKIP: i32 = 1;
+
+// === Hook kinds recorded in log ===
+const ECS_DW_HOOK_DISCARD: i32 = 1;
+const ECS_DW_HOOK_INSERT: i32 = 2;
+const ECS_DW_HOOK_REMOVE: i32 = 3;
+const ECS_DW_HOOK_DESPAWN: i32 = 4;
+const ECS_DW_HOOK_OBSERVER: i32 = 5;
+
+// === Message write result ===
+const ECS_DW_MSG_NONE: i64 = 0; // MessageId starts at 1; 0 models Option::None (no negative top-level const)
+const ECS_DW_ERR_STRUCTURAL: i32 = 10;
+
+// Fixed-capacity log of (hook_kind, entity, component_id)
+// Fixed entity slots for component presence/values
+
+struct EcsDeferredWorldDeep {
+    world_id: i64,
+    change_tick: i64,
+    // entity occupancy: 8 slots
+    e0: bool, e1: bool, e2: bool, e3: bool,
+    e4: bool, e5: bool, e6: bool, e7: bool,
+    // component presence bitmasks per entity (bits 0..7 = component_id)
+    c0: i64, c1: i64, c2: i64, c3: i64,
+    c4: i64, c5: i64, c6: i64, c7: i64,
+    // one primary value per entity (component 0 value for modify path)
+    v0: i64, v1: i64, v2: i64, v3: i64,
+    v4: i64, v5: i64, v6: i64, v7: i64,
+    // registered component ids present in world (bitmask)
+    registered_components: i64,
+    // archetype flags
+    has_discard_hook: bool,
+    has_insert_hook: bool,
+    has_remove_hook: bool,
+    has_despawn_hook: bool,
+    has_discard_observer: bool,
+    has_insert_observer: bool,
+    // message channel present
+    has_messages: bool,
+    next_message_id: i64,
+    // message log fixed 8
+    m0: i64, m1: i64, m2: i64, m3: i64,
+    m4: i64, m5: i64, m6: i64, m7: i64,
+    msg_len: i32,
+    // hook log fixed 16: kind/entity/component triples packed as kind*1000000+entity*1000+cid
+    h0: i64, h1: i64, h2: i64, h3: i64,
+    h4: i64, h5: i64, h6: i64, h7: i64,
+    h8: i64, h9: i64, h10: i64, h11: i64,
+    h12: i64, h13: i64, h14: i64, h15: i64,
+    hook_len: i32,
+    // observer trigger count / last event key
+    trigger_count: i64,
+    last_event_key: i64,
+    // structural change ban: true while deferred
+    structural_ban: bool,
+    last_error: i32,
+    // active exclusive borrow entity (-1 none) for aliased mutability
+    borrowed_entity: i64,
+}
+
+fn ecs_dw_deep_new(world_id: i64, change_tick: i64) -> EcsDeferredWorldDeep {
+    return EcsDeferredWorldDeep {
+        world_id: world_id,
+        change_tick: change_tick,
+        e0: false, e1: false, e2: false, e3: false,
+        e4: false, e5: false, e6: false, e7: false,
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        c4: 0, c5: 0, c6: 0, c7: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0,
+        v4: 0, v5: 0, v6: 0, v7: 0,
+        registered_components: 0,
+        has_discard_hook: false,
+        has_insert_hook: false,
+        has_remove_hook: false,
+        has_despawn_hook: false,
+        has_discard_observer: false,
+        has_insert_observer: false,
+        has_messages: true,
+        next_message_id: 1,
+        m0: 0, m1: 0, m2: 0, m3: 0,
+        m4: 0, m5: 0, m6: 0, m7: 0,
+        msg_len: 0,
+        h0: 0, h1: 0, h2: 0, h3: 0,
+        h4: 0, h5: 0, h6: 0, h7: 0,
+        h8: 0, h9: 0, h10: 0, h11: 0,
+        h12: 0, h13: 0, h14: 0, h15: 0,
+        hook_len: 0,
+        trigger_count: 0,
+        last_event_key: 0,
+        structural_ban: true,
+        last_error: ECS_DW_FETCH_OK,
+        borrowed_entity: -1,
+    };
+}
+
+fn ecs_dw_deep_world_id(d: EcsDeferredWorldDeep) -> i64 { return d.world_id; }
+fn ecs_dw_deep_change_tick(d: EcsDeferredWorldDeep) -> i64 { return d.change_tick; }
+fn ecs_dw_deep_last_error(d: EcsDeferredWorldDeep) -> i32 { return d.last_error; }
+fn ecs_dw_deep_structural_ban(d: EcsDeferredWorldDeep) -> bool { return d.structural_ban; }
+fn ecs_dw_deep_msg_len(d: EcsDeferredWorldDeep) -> i32 { return d.msg_len; }
+fn ecs_dw_deep_hook_len(d: EcsDeferredWorldDeep) -> i32 { return d.hook_len; }
+fn ecs_dw_deep_trigger_count(d: EcsDeferredWorldDeep) -> i64 { return d.trigger_count; }
+fn ecs_dw_deep_last_event_key(d: EcsDeferredWorldDeep) -> i64 { return d.last_event_key; }
+
+// reborrow: new view, same world_id/tick
+fn ecs_dw_deep_reborrow(d: EcsDeferredWorldDeep) -> EcsDeferredWorldDeep {
+    // reborrow keeps state; clears exclusive borrow marker
+    d.borrowed_entity = -1;
+    d.last_error = ECS_DW_FETCH_OK;
+    return d;
+}
+
+fn ecs_dw_deep_as_unsafe_world_cell(d: EcsDeferredWorldDeep) -> i64 {
+    return d.world_id;
+}
+
+// register component id (bit)
+fn ecs_dw_deep_register_component(d: EcsDeferredWorldDeep, component_id: i64) -> EcsDeferredWorldDeep {
+    if component_id >= 0 && component_id < 63 {
+        let bit: i64 = 1;
+        let i: i64 = 0;
+        while i < component_id {
+            bit = bit * 2;
+            i = i + 1;
+        }
+        d.registered_components = d.registered_components | bit;
+    };
+    return d;
+}
+
+fn ecs_dw_deep_component_registered(d: EcsDeferredWorldDeep, component_id: i64) -> bool {
+    if component_id < 0 || component_id >= 63 { return false; };
+    let bit: i64 = 1;
+    let i: i64 = 0;
+    while i < component_id {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return (d.registered_components & bit) != 0;
+}
+
+// archetype flags
+fn ecs_dw_deep_set_has_discard_hook(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_discard_hook = v;
+    return d;
+}
+fn ecs_dw_deep_set_has_insert_hook(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_insert_hook = v;
+    return d;
+}
+fn ecs_dw_deep_set_has_remove_hook(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_remove_hook = v;
+    return d;
+}
+fn ecs_dw_deep_set_has_despawn_hook(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_despawn_hook = v;
+    return d;
+}
+fn ecs_dw_deep_set_has_discard_observer(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_discard_observer = v;
+    return d;
+}
+fn ecs_dw_deep_set_has_insert_observer(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_insert_observer = v;
+    return d;
+}
+fn ecs_dw_deep_set_has_messages(d: EcsDeferredWorldDeep, v: bool) -> EcsDeferredWorldDeep {
+    d.has_messages = v;
+    return d;
+}
+
+// --- entity occupancy helpers ---
+fn ecs_dw_deep_entity_occupied(d: EcsDeferredWorldDeep, entity: i64) -> bool {
+    if entity == 0 { return d.e0; };
+    if entity == 1 { return d.e1; };
+    if entity == 2 { return d.e2; };
+    if entity == 3 { return d.e3; };
+    if entity == 4 { return d.e4; };
+    if entity == 5 { return d.e5; };
+    if entity == 6 { return d.e6; };
+    if entity == 7 { return d.e7; };
+    return false;
+}
+
+fn ecs_dw_deep_set_entity_occupied(d: EcsDeferredWorldDeep, entity: i64, v: bool) -> EcsDeferredWorldDeep {
+    if entity == 0 { d.e0 = v; return d; };
+    if entity == 1 { d.e1 = v; return d; };
+    if entity == 2 { d.e2 = v; return d; };
+    if entity == 3 { d.e3 = v; return d; };
+    if entity == 4 { d.e4 = v; return d; };
+    if entity == 5 { d.e5 = v; return d; };
+    if entity == 6 { d.e6 = v; return d; };
+    if entity == 7 { d.e7 = v; return d; };
+    return d;
+}
+
+fn ecs_dw_deep_get_comp_mask(d: EcsDeferredWorldDeep, entity: i64) -> i64 {
+    if entity == 0 { return d.c0; };
+    if entity == 1 { return d.c1; };
+    if entity == 2 { return d.c2; };
+    if entity == 3 { return d.c3; };
+    if entity == 4 { return d.c4; };
+    if entity == 5 { return d.c5; };
+    if entity == 6 { return d.c6; };
+    if entity == 7 { return d.c7; };
+    return 0;
+}
+
+fn ecs_dw_deep_set_comp_mask(d: EcsDeferredWorldDeep, entity: i64, mask: i64) -> EcsDeferredWorldDeep {
+    if entity == 0 { d.c0 = mask; return d; };
+    if entity == 1 { d.c1 = mask; return d; };
+    if entity == 2 { d.c2 = mask; return d; };
+    if entity == 3 { d.c3 = mask; return d; };
+    if entity == 4 { d.c4 = mask; return d; };
+    if entity == 5 { d.c5 = mask; return d; };
+    if entity == 6 { d.c6 = mask; return d; };
+    if entity == 7 { d.c7 = mask; return d; };
+    return d;
+}
+
+fn ecs_dw_deep_get_value(d: EcsDeferredWorldDeep, entity: i64) -> i64 {
+    if entity == 0 { return d.v0; };
+    if entity == 1 { return d.v1; };
+    if entity == 2 { return d.v2; };
+    if entity == 3 { return d.v3; };
+    if entity == 4 { return d.v4; };
+    if entity == 5 { return d.v5; };
+    if entity == 6 { return d.v6; };
+    if entity == 7 { return d.v7; };
+    return 0;
+}
+
+fn ecs_dw_deep_set_value(d: EcsDeferredWorldDeep, entity: i64, v: i64) -> EcsDeferredWorldDeep {
+    if entity == 0 { d.v0 = v; return d; };
+    if entity == 1 { d.v1 = v; return d; };
+    if entity == 2 { d.v2 = v; return d; };
+    if entity == 3 { d.v3 = v; return d; };
+    if entity == 4 { d.v4 = v; return d; };
+    if entity == 5 { d.v5 = v; return d; };
+    if entity == 6 { d.v6 = v; return d; };
+    if entity == 7 { d.v7 = v; return d; };
+    return d;
+}
+
+fn ecs_dw_deep_comp_bit(component_id: i64) -> i64 {
+    if component_id < 0 || component_id >= 63 { return 0; };
+    let bit: i64 = 1;
+    let i: i64 = 0;
+    while i < component_id {
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return bit;
+}
+
+fn ecs_dw_deep_entity_has_component(d: EcsDeferredWorldDeep, entity: i64, component_id: i64) -> bool {
+    if ecs_dw_deep_entity_occupied(d, entity) != true { return false; };
+    let mask = ecs_dw_deep_get_comp_mask(d, entity);
+    let bit = ecs_dw_deep_comp_bit(component_id);
+    return (mask & bit) != 0;
+}
+
+// setup helper: place entity with component_id and value (not a structural spawn via DeferredWorld;
+// models pre-existing world state)
+fn ecs_dw_deep_seed_entity(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64,
+    value: i64
+) -> EcsDeferredWorldDeep {
+    d = ecs_dw_deep_set_entity_occupied(d, entity, true);
+    let bit = ecs_dw_deep_comp_bit(component_id);
+    let mask = ecs_dw_deep_get_comp_mask(d, entity);
+    mask = mask | bit;
+    d = ecs_dw_deep_set_comp_mask(d, entity, mask);
+    d = ecs_dw_deep_set_value(d, entity, value);
+    d = ecs_dw_deep_register_component(d, component_id);
+    return d;
+}
+
+// --- hook log ---
+fn ecs_dw_deep_pack_hook(kind: i32, entity: i64, component_id: i64) -> i64 {
+    return (kind as i64) * 1000000 + entity * 1000 + component_id;
+}
+
+fn ecs_dw_deep_hook_kind(packed: i64) -> i32 {
+    return (packed / 1000000) as i32;
+}
+fn ecs_dw_deep_hook_entity(packed: i64) -> i64 {
+    return (packed / 1000) % 1000;
+}
+fn ecs_dw_deep_hook_component(packed: i64) -> i64 {
+    return packed % 1000;
+}
+
+fn ecs_dw_deep_push_hook(d: EcsDeferredWorldDeep, kind: i32, entity: i64, component_id: i64) -> EcsDeferredWorldDeep {
+    if d.hook_len >= 16 { return d; };
+    let packed = ecs_dw_deep_pack_hook(kind, entity, component_id);
+    let i = d.hook_len;
+    if i == 0 { d.h0 = packed; };
+    if i == 1 { d.h1 = packed; };
+    if i == 2 { d.h2 = packed; };
+    if i == 3 { d.h3 = packed; };
+    if i == 4 { d.h4 = packed; };
+    if i == 5 { d.h5 = packed; };
+    if i == 6 { d.h6 = packed; };
+    if i == 7 { d.h7 = packed; };
+    if i == 8 { d.h8 = packed; };
+    if i == 9 { d.h9 = packed; };
+    if i == 10 { d.h10 = packed; };
+    if i == 11 { d.h11 = packed; };
+    if i == 12 { d.h12 = packed; };
+    if i == 13 { d.h13 = packed; };
+    if i == 14 { d.h14 = packed; };
+    if i == 15 { d.h15 = packed; };
+    d.hook_len = d.hook_len + 1;
+    return d;
+}
+
+fn ecs_dw_deep_hook_at(d: EcsDeferredWorldDeep, i: i32) -> i64 {
+    if i == 0 { return d.h0; };
+    if i == 1 { return d.h1; };
+    if i == 2 { return d.h2; };
+    if i == 3 { return d.h3; };
+    if i == 4 { return d.h4; };
+    if i == 5 { return d.h5; };
+    if i == 6 { return d.h6; };
+    if i == 7 { return d.h7; };
+    if i == 8 { return d.h8; };
+    if i == 9 { return d.h9; };
+    if i == 10 { return d.h10; };
+    if i == 11 { return d.h11; };
+    if i == 12 { return d.h12; };
+    if i == 13 { return d.h13; };
+    if i == 14 { return d.h14; };
+    if i == 15 { return d.h15; };
+    return 0;
+}
+
+// --- get_entity_mut ---
+// returns updated world; last_error set; on ok borrows entity
+fn ecs_dw_deep_get_entity_mut(d: EcsDeferredWorldDeep, entity: i64) -> EcsDeferredWorldDeep {
+    if ecs_dw_deep_entity_occupied(d, entity) != true {
+        d.last_error = ECS_DW_FETCH_NOT_SPAWNED;
+        return d;
+    };
+    if d.borrowed_entity == entity {
+        d.last_error = ECS_DW_FETCH_ALIASED_MUT;
+        return d;
+    };
+    d.borrowed_entity = entity;
+    d.last_error = ECS_DW_FETCH_OK;
+    return d;
+}
+
+// release exclusive borrow
+fn ecs_dw_deep_release_borrow(d: EcsDeferredWorldDeep) -> EcsDeferredWorldDeep {
+    d.borrowed_entity = -1;
+    return d;
+}
+
+// get_mut: component must be present; returns (ok, value) via last_error + value read
+fn ecs_dw_deep_get_mut(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64
+) -> (EcsDeferredWorldDeep, bool, i64) {
+    d = ecs_dw_deep_get_entity_mut(d, entity);
+    if d.last_error != ECS_DW_FETCH_OK {
+        return (d, false, 0);
+    };
+    if ecs_dw_deep_entity_has_component(d, entity, component_id) != true {
+        d = ecs_dw_deep_release_borrow(d);
+        return (d, false, 0);
+    };
+    let v = ecs_dw_deep_get_value(d, entity);
+    return (d, true, v);
+}
+
+// entity_mut: panics in Bevy on missing; we set last_error and return
+fn ecs_dw_deep_entity_mut(d: EcsDeferredWorldDeep, entity: i64) -> EcsDeferredWorldDeep {
+    return ecs_dw_deep_get_entity_mut(d, entity);
+}
+
+// --- trigger_on_discard / insert / remove / despawn ---
+fn ecs_dw_deep_trigger_on_discard(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64,
+    relationship_hook_mode: i32
+) -> EcsDeferredWorldDeep {
+    if d.has_discard_hook {
+        if relationship_hook_mode != ECS_DW_HOOK_SKIP {
+            d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_DISCARD, entity, component_id);
+        };
+    };
+    if d.has_discard_observer {
+        d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_OBSERVER, entity, component_id);
+        d.trigger_count = d.trigger_count + 1;
+        d.last_event_key = 100; // DISCARD sentinel
+    };
+    return d;
+}
+
+fn ecs_dw_deep_trigger_on_insert(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64,
+    relationship_hook_mode: i32
+) -> EcsDeferredWorldDeep {
+    if d.has_insert_hook {
+        if relationship_hook_mode != ECS_DW_HOOK_SKIP {
+            d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_INSERT, entity, component_id);
+        };
+    };
+    if d.has_insert_observer {
+        d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_OBSERVER, entity, component_id);
+        d.trigger_count = d.trigger_count + 1;
+        d.last_event_key = 101; // INSERT sentinel
+    };
+    return d;
+}
+
+fn ecs_dw_deep_trigger_on_remove(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64
+) -> EcsDeferredWorldDeep {
+    if d.has_remove_hook {
+        d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_REMOVE, entity, component_id);
+    };
+    return d;
+}
+
+fn ecs_dw_deep_trigger_on_despawn(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64
+) -> EcsDeferredWorldDeep {
+    if d.has_despawn_hook {
+        d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_DESPAWN, entity, component_id);
+    };
+    return d;
+}
+
+// modify_component: discard hooks -> mutate value via f(delta) -> insert hooks
+// returns (world, ok, had_component, result_value)
+// f modeled as: new_value = old_value + delta
+fn ecs_dw_deep_modify_component(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64,
+    delta: i64,
+    relationship_hook_mode: i32
+) -> (EcsDeferredWorldDeep, bool, bool, i64) {
+    // unregistered component => Ok(None)
+    if ecs_dw_deep_component_registered(d, component_id) != true {
+        d.last_error = ECS_DW_FETCH_OK;
+        return (d, true, false, 0);
+    };
+    d = ecs_dw_deep_get_entity_mut(d, entity);
+    if d.last_error != ECS_DW_FETCH_OK {
+        return (d, false, false, 0);
+    };
+    if ecs_dw_deep_entity_has_component(d, entity, component_id) != true {
+        d = ecs_dw_deep_release_borrow(d);
+        d.last_error = ECS_DW_FETCH_OK;
+        return (d, true, false, 0);
+    };
+    // release then re-fetch pattern (Bevy re-gets after discard)
+    d = ecs_dw_deep_release_borrow(d);
+    d = ecs_dw_deep_trigger_on_discard(d, entity, component_id, relationship_hook_mode);
+    // mutate
+    let old = ecs_dw_deep_get_value(d, entity);
+    let new_val = old + delta;
+    d = ecs_dw_deep_set_value(d, entity, new_val);
+    // insert hooks (simulate re-add without archetype move)
+    d = ecs_dw_deep_trigger_on_insert(d, entity, component_id, relationship_hook_mode);
+    d.last_error = ECS_DW_FETCH_OK;
+    return (d, true, true, new_val);
+}
+
+// trigger_raw: observer dispatch for event_key
+fn ecs_dw_deep_trigger_raw(
+    d: EcsDeferredWorldDeep,
+    event_key: i64,
+    entity: i64
+) -> EcsDeferredWorldDeep {
+    d.trigger_count = d.trigger_count + 1;
+    d.last_event_key = event_key;
+    d = ecs_dw_deep_push_hook(d, ECS_DW_HOOK_OBSERVER, entity, event_key % 1000);
+    return d;
+}
+
+// trigger: queues via commands path — modeled as trigger_raw with event payload id
+fn ecs_dw_deep_trigger(d: EcsDeferredWorldDeep, event_id: i64) -> EcsDeferredWorldDeep {
+    return ecs_dw_deep_trigger_raw(d, event_id, 0);
+}
+
+// --- messages ---
+fn ecs_dw_deep_push_message(d: EcsDeferredWorldDeep, message: i64) -> EcsDeferredWorldDeep {
+    if d.msg_len >= 8 { return d; };
+    let i = d.msg_len;
+    if i == 0 { d.m0 = message; };
+    if i == 1 { d.m1 = message; };
+    if i == 2 { d.m2 = message; };
+    if i == 3 { d.m3 = message; };
+    if i == 4 { d.m4 = message; };
+    if i == 5 { d.m5 = message; };
+    if i == 6 { d.m6 = message; };
+    if i == 7 { d.m7 = message; };
+    d.msg_len = d.msg_len + 1;
+    return d;
+}
+
+fn ecs_dw_deep_message_at(d: EcsDeferredWorldDeep, i: i32) -> i64 {
+    if i == 0 { return d.m0; };
+    if i == 1 { return d.m1; };
+    if i == 2 { return d.m2; };
+    if i == 3 { return d.m3; };
+    if i == 4 { return d.m4; };
+    if i == 5 { return d.m5; };
+    if i == 6 { return d.m6; };
+    if i == 7 { return d.m7; };
+    return 0;
+}
+
+// write_message -> Option<MessageId>; None if no message resource
+fn ecs_dw_deep_write_message(d: EcsDeferredWorldDeep, message: i64) -> (EcsDeferredWorldDeep, i64) {
+    if d.has_messages != true {
+        return (d, ECS_DW_MSG_NONE);
+    };
+    let id = d.next_message_id;
+    d.next_message_id = d.next_message_id + 1;
+    d = ecs_dw_deep_push_message(d, message);
+    return (d, id);
+}
+
+fn ecs_dw_deep_write_message_default(d: EcsDeferredWorldDeep) -> (EcsDeferredWorldDeep, i64) {
+    return ecs_dw_deep_write_message(d, 0);
+}
+
+// write_message_batch: writes n messages starting at base_value
+fn ecs_dw_deep_write_message_batch(
+    d: EcsDeferredWorldDeep,
+    base_value: i64,
+    count: i32
+) -> (EcsDeferredWorldDeep, i64) {
+    if d.has_messages != true {
+        return (d, ECS_DW_MSG_NONE);
+    };
+    if count <= 0 {
+        return (d, ECS_DW_MSG_NONE);
+    };
+    let first_id = d.next_message_id;
+    let i: i32 = 0;
+    while i < count {
+        let pair = ecs_dw_deep_write_message(d, base_value + (i as i64));
+        d = pair.0;
+        i = i + 1;
+    }
+    return (d, first_id);
+}
+
+// resource_mut markers (non-structural)
+fn ecs_dw_deep_resource_mut(d: EcsDeferredWorldDeep) -> EcsDeferredWorldDeep {
+    d.last_error = ECS_DW_FETCH_OK;
+    return d;
+}
+
+fn ecs_dw_deep_get_resource_mut(d: EcsDeferredWorldDeep, present: bool) -> (EcsDeferredWorldDeep, bool) {
+    if present != true {
+        return (d, false);
+    };
+    return (d, true);
+}
+
+fn ecs_dw_deep_get_mut_by_id(
+    d: EcsDeferredWorldDeep,
+    entity: i64,
+    component_id: i64
+) -> (EcsDeferredWorldDeep, bool, i64) {
+    return ecs_dw_deep_get_mut(d, entity, component_id);
+}
+
+// structural ban: deferred world cannot spawn/register (modeled as no-op + error flag)
+fn ecs_dw_deep_try_spawn_banned(d: EcsDeferredWorldDeep) -> EcsDeferredWorldDeep {
+    if d.structural_ban {
+        d.last_error = ECS_DW_ERR_STRUCTURAL;
+        return d;
+    };
+    return d;
+}
+
+// entities_and_commands: returns entity count of occupied slots + world
+fn ecs_dw_deep_entity_count(d: EcsDeferredWorldDeep) -> i32 {
+    let n: i32 = 0;
+    if d.e0 { n = n + 1; };
+    if d.e1 { n = n + 1; };
+    if d.e2 { n = n + 1; };
+    if d.e3 { n = n + 1; };
+    if d.e4 { n = n + 1; };
+    if d.e5 { n = n + 1; };
+    if d.e6 { n = n + 1; };
+    if d.e7 { n = n + 1; };
+    return n;
+}
+
+fn ecs_dw_deep_entities_and_commands(d: EcsDeferredWorldDeep) -> (i32, EcsDeferredWorldDeep) {
+    return (ecs_dw_deep_entity_count(d), d);
+}
+
+// From World: construct deferred view
+fn ecs_dw_deep_from_world(world_id: i64, change_tick: i64) -> EcsDeferredWorldDeep {
+    return ecs_dw_deep_new(world_id, change_tick);
+}

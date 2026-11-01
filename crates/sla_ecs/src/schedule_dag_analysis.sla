@@ -1,0 +1,382 @@
+// Bevy ECS schedule::graph::dag — DagAnalysis + DagGroups + errors.
+// Mirrors src/schedule/graph/dag.rs.
+
+struct EcsDagAnalysis {
+    reachable_pairs: Vec<(i32, i32)>,
+    disconnected_pairs: Vec<(i32, i32)>,
+    transitive_edges: Vec<(i32, i32)>,
+    reduction_edges: Vec<(i32, i32)>,
+    closure_edges: Vec<(i32, i32)>,
+    reachable_set: Vec<i64>,
+    node_count: i32,
+}
+
+fn ecs_dag_analysis_new(node_count: i32) -> EcsDagAnalysis {
+    let d = EcsDagAnalysis { reachable_pairs: Vec::new(), disconnected_pairs: Vec::new(), transitive_edges: Vec::new(), reduction_edges: Vec::new(), closure_edges: Vec::new(), reachable_set: Vec::new(), node_count: node_count };
+    return d;
+}
+
+fn ecs_dag_index(a: i32, b: i32, n: i32) -> i64 {
+    return (a as i64) * (n as i64) + (b as i64);
+}
+
+fn ecs_dag_reachable_contains(set: Vec<i64>, a: i32, b: i32, n: i32) -> bool {
+    let idx = ecs_dag_index(a, b, n);
+    let i = 0;
+    while i < len(set) {
+        if set[i] == idx { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_dag_reachable_insert(set: Vec<i64>, a: i32, b: i32, n: i32) -> Vec<i64> {
+    if ecs_dag_reachable_contains(set, a, b, n) {
+        return set;
+    } else {
+        set.push(ecs_dag_index(a, b, n));
+        return set;
+    };
+}
+
+fn ecs_dag_vec_contains_i32(v: Vec<i32>, x: i32) -> bool {
+    let i = 0;
+    while i < len(v) {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_dag_analysis_reachable_count(a: EcsDagAnalysis) -> i64 { return len(a.reachable_set) as i64; }
+fn ecs_dag_analysis_connected_count(a: EcsDagAnalysis) -> i64 { return len(a.reachable_pairs) as i64; }
+fn ecs_dag_analysis_disconnected_count(a: EcsDagAnalysis) -> i64 { return len(a.disconnected_pairs) as i64; }
+fn ecs_dag_analysis_transitive_edges_count(a: EcsDagAnalysis) -> i64 { return len(a.transitive_edges) as i64; }
+fn ecs_dag_analysis_reduction_edges_count(a: EcsDagAnalysis) -> i64 { return len(a.reduction_edges) as i64; }
+fn ecs_dag_analysis_closure_edges_count(a: EcsDagAnalysis) -> i64 { return len(a.closure_edges) as i64; }
+fn ecs_dag_analysis_node_count(a: EcsDagAnalysis) -> i32 { return a.node_count; }
+
+fn ecs_dag_analysis_is_reachable(a: EcsDagAnalysis, x: i32, y: i32) -> bool {
+    return ecs_dag_reachable_contains(a.reachable_set, x, y, a.node_count);
+}
+
+fn ecs_dag_propagate_closure(anal: EcsDagAnalysis, adj: Vec<Vec<i32>>, n: i32, a: i32, b: i32, visited: Vec<i32>) -> EcsDagAnalysis {
+    let succ_b = adj[b];
+    let i = 0;
+    while i < len(succ_b) {
+        let c = succ_b[i];
+        if ecs_dag_vec_contains_i32(visited, c) {
+            i = i + 1;
+        } else {
+            anal.closure_edges.push((a, c));
+            anal.reachable_set = ecs_dag_reachable_insert(anal.reachable_set, a, c, n);
+            visited.push(c);
+            anal = ecs_dag_propagate_closure(anal, adj, n, a, c, visited);
+            visited.pop();
+            i = i + 1;
+        };
+    }
+    return anal;
+}
+
+fn ecs_dag_analysis_build_for(anal: EcsDagAnalysis, adj: Vec<Vec<i32>>, n: i32, a: i32) -> EcsDagAnalysis {
+    if a < 0 {
+        return anal;
+    } else {
+        let succ = adj[a];
+        let i = 0;
+        while i < len(succ) {
+            let b = succ[i];
+            let visited = Vec::new();
+            visited.push(b);
+            anal.reduction_edges.push((a, b));
+            anal.closure_edges.push((a, b));
+            anal.reachable_set = ecs_dag_reachable_insert(anal.reachable_set, a, b, n);
+            anal = ecs_dag_propagate_closure(anal, adj, n, a, b, visited);
+            i = i + 1;
+        }
+        return ecs_dag_analysis_build_for(anal, adj, n, a - 1);
+    };
+}
+
+fn ecs_dag_analysis_build(n: i32, adj: Vec<Vec<i32>>) -> EcsDagAnalysis {
+    let anal = ecs_dag_analysis_new(n);
+    if n > 0 {
+        return ecs_dag_analysis_build_for(anal, adj, n, n - 1);
+    } else {
+        return anal;
+    };
+}
+
+fn ecs_dag_analysis_partition(anal: EcsDagAnalysis, topsort: Vec<i32>, n: i32) -> EcsDagAnalysis {
+    let i = 0;
+    while i < n {
+        let j = i + 1;
+        while j < n {
+            let na = topsort[i];
+            let nb = topsort[j];
+            if ecs_dag_reachable_contains(anal.reachable_set, i, j, n) {
+                anal.reachable_pairs.push((na, nb));
+            } else {
+                anal.disconnected_pairs.push((na, nb));
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return anal;
+}
+
+fn ecs_dag_analysis_compute(n: i32, adj: Vec<Vec<i32>>, topsort: Vec<i32>) -> EcsDagAnalysis {
+    let anal = ecs_dag_analysis_build(n, adj);
+    return ecs_dag_analysis_partition(anal, topsort, n);
+}
+
+fn ecs_dag_check_for_redundant_edges(anal: EcsDagAnalysis) -> (bool, i64) {
+    if len(anal.transitive_edges) == 0 {
+        return (false, 0);
+    } else {
+        return (true, len(anal.transitive_edges) as i64);
+    };
+}
+
+fn ecs_dag_analysis_add_transitive_edge(anal: EcsDagAnalysis, a: i32, b: i32) -> EcsDagAnalysis {
+    anal.transitive_edges.push((a, b));
+    return anal;
+}
+
+fn ecs_dag_pair_in_set(pairs: Vec<(i32, i32)>, a: i32, b: i32) -> bool {
+    let i = 0;
+    while i < len(pairs) {
+        let p = pairs[i];
+        if p.0 == a {
+            if p.1 == b { return true; };
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_dag_check_for_cross_dependencies(self_: EcsDagAnalysis, other: EcsDagAnalysis) -> (bool, i32, i32) {
+    let i = 0;
+    while i < len(self_.reachable_pairs) {
+        let p = self_.reachable_pairs[i];
+        if ecs_dag_pair_in_set(other.reachable_pairs, p.0, p.1) { return (true, p.0, p.1); };
+        if ecs_dag_pair_in_set(other.reachable_pairs, p.1, p.0) { return (true, p.0, p.1); };
+        i = i + 1;
+    }
+    return (false, 0, 0);
+}
+
+struct EcsDagGroups {
+    keys: Vec<i32>,
+    groups: Vec<Vec<i32>>,
+}
+
+fn ecs_dag_groups_new() -> EcsDagGroups {
+    let g = EcsDagGroups { keys: Vec::new(), groups: Vec::new() };
+    return g;
+}
+
+fn ecs_dag_groups_len(g: EcsDagGroups) -> i64 { return len(g.keys) as i64; }
+fn ecs_dag_groups_is_empty(g: EcsDagGroups) -> bool { return len(g.keys) == 0; }
+
+fn ecs_dag_groups_key_index(g: EcsDagGroups, key: i32) -> i32 {
+    let i = 0;
+    while i < len(g.keys) {
+        if g.keys[i] == key { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_dag_groups_contains(g: EcsDagGroups, key: i32) -> bool {
+    return ecs_dag_groups_key_index(g, key) != -1;
+}
+
+fn ecs_dag_groups_count_for(g: EcsDagGroups, key: i32) -> i64 {
+    let idx = ecs_dag_groups_key_index(g, key);
+    if idx < 0 {
+        return 0;
+    } else {
+        return len(g.groups[idx]) as i64;
+    };
+}
+
+fn ecs_dag_groups_get(g: EcsDagGroups, key: i32) -> Vec<i32> {
+    let idx = ecs_dag_groups_key_index(g, key);
+    if idx < 0 {
+        return Vec::new();
+    } else {
+        return g.groups[idx];
+    };
+}
+
+fn ecs_dag_groups_insert(g: EcsDagGroups, key: i32, values: Vec<i32>) -> EcsDagGroups {
+    let existing = ecs_dag_groups_key_index(g, key);
+    if existing < 0 {
+        g.keys.push(key);
+        g.groups.push(values);
+        return g;
+    };
+    g.groups[existing] = values;
+    return g;
+}
+
+fn ecs_dag_arr_push_unique(arr: Vec<i32>, x: i32) -> Vec<i32> {
+    if ecs_dag_vec_contains_i32(arr, x) {
+        return arr;
+    } else {
+        arr.push(x);
+        return arr;
+    };
+}
+
+fn ecs_dag_groups_build(toposort: Vec<i32>, adj: Vec<Vec<i32>>, is_key_fn: Vec<i32>) -> EcsDagGroups {
+    let g = ecs_dag_groups_new();
+    let i = len(toposort) - 1;
+    while i >= 0 {
+        let id = toposort[i];
+        if is_key_fn[id] > 0 {
+            let key = id;
+            let succ = adj[id];
+            let children = Vec::new();
+            let j = 0;
+            while j < len(succ) {
+                let neighbor = succ[j];
+                if is_key_fn[neighbor] > 0 {
+                    let child_children = ecs_dag_groups_get(g, neighbor);
+                    let k = 0;
+                    while k < len(child_children) {
+                        children = ecs_dag_arr_push_unique(children, child_children[k]);
+                        k = k + 1;
+                    }
+                } else {
+                    children = ecs_dag_arr_push_unique(children, neighbor);
+                };
+                j = j + 1;
+            }
+            g = ecs_dag_groups_insert(g, key, children);
+        };
+        i = i - 1;
+    }
+    return g;
+}
+
+fn ecs_dag_groups_flatten(g: EcsDagGroups, adj: Vec<Vec<i32>>) -> Vec<Vec<i32>> {
+    let out = Vec::new();
+    let n = len(adj) as i32;
+    let i = 0;
+    while i < n {
+        let succ = adj[i];
+        let new_edges = Vec::new();
+        let j = 0;
+        while j < len(succ) {
+            let neighbor = succ[j];
+            let idx = ecs_dag_groups_key_index(g, neighbor);
+            if idx < 0 {
+                new_edges.push(neighbor);
+            } else {
+                let vals = g.groups[idx];
+                let k = 0;
+                while k < len(vals) {
+                    new_edges.push(vals[k]);
+                    k = k + 1;
+                }
+            };
+            j = j + 1;
+        }
+        out.push(new_edges);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_dag_groups_flatten_undirected(g: EcsDagGroups, edges: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(edges) {
+        let p = edges[i];
+        let la = ecs_dag_groups_key_index(g, p.0);
+        let lb = ecs_dag_groups_key_index(g, p.1);
+        if la < 0 {
+            if lb < 0 {
+                out.push((p.0, p.1));
+            } else {
+                let vals = g.groups[lb];
+                let k = 0;
+                while k < len(vals) {
+                    out.push((p.0, vals[k]));
+                    k = k + 1;
+                }
+            };
+        } else {
+            let avals = g.groups[la];
+            if lb < 0 {
+                let k = 0;
+                while k < len(avals) {
+                    out.push((avals[k], p.1));
+                    k = k + 1;
+                }
+            } else {
+                let bvals = g.groups[lb];
+                let k = 0;
+                while k < len(avals) {
+                    let m = 0;
+                    while m < len(bvals) {
+                        out.push((avals[k], bvals[m]));
+                        m = m + 1;
+                    }
+                    k = k + 1;
+                }
+            };
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+struct EcsDagRedundancyError { count: i64 }
+struct EcsDagCrossDependencyError { a: i32, b: i32 }
+struct EcsDagOverlappingGroupError { key_a: i32, key_b: i32 }
+
+fn ecs_dag_redundancy_error_new(count: i64) -> EcsDagRedundancyError {
+    return EcsDagRedundancyError { count: count };
+}
+fn ecs_dag_redundancy_error_count(e: EcsDagRedundancyError) -> i64 { return e.count; }
+
+fn ecs_dag_cross_dep_error_new(a: i32, b: i32) -> EcsDagCrossDependencyError {
+    return EcsDagCrossDependencyError { a: a, b: b };
+}
+fn ecs_dag_cross_dep_error_a(e: EcsDagCrossDependencyError) -> i32 { return e.a; }
+fn ecs_dag_cross_dep_error_b(e: EcsDagCrossDependencyError) -> i32 { return e.b; }
+
+fn ecs_dag_overlapping_group_error_new(ka: i32, kb: i32) -> EcsDagOverlappingGroupError {
+    return EcsDagOverlappingGroupError { key_a: ka, key_b: kb };
+}
+fn ecs_dag_overlapping_group_error_a(e: EcsDagOverlappingGroupError) -> i32 { return e.key_a; }
+fn ecs_dag_overlapping_group_error_b(e: EcsDagOverlappingGroupError) -> i32 { return e.key_b; }
+
+fn ecs_dag_check_for_overlapping_groups(self_: EcsDagAnalysis, groups: EcsDagGroups) -> (bool, i32, i32) {
+    let i = 0;
+    while i < len(groups.keys) {
+        let ga = groups.groups[i];
+        let j = i + 1;
+        while j < len(groups.keys) {
+            let gb = groups.groups[j];
+            let ki = 0;
+            while ki < len(ga) {
+                let va = ga[ki];
+                let kj = 0;
+                while kj < len(gb) {
+                    if gb[kj] == va { return (true, groups.keys[i], groups.keys[j]); };
+                    kj = kj + 1;
+                }
+                ki = ki + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return (false, 0, 0);
+}

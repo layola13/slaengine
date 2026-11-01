@@ -1,0 +1,715 @@
+// Deepened Bevy ECS bundle insert + spawner surface.
+// Mirrors src/bundle/insert.rs + spawner.rs:
+//   BundleInserter { archetype_move_type, InsertMode Keep/Replace, change_tick }
+//   before_insert Discard on Replace existing; after_insert Add/Insert on new
+//   ComponentStatus Added vs Existing for write_components
+//   BundleSpawner spawn/spawn_at all-Added, reserve, flush_commands
+// Shallow lib/bundle_spawner.sla retained.
+
+// === InsertMode ===
+const ECS_BI_KEEP: i32 = 0;
+const ECS_BI_REPLACE: i32 = 1;
+
+fn ecs_bi_keep() -> i32 { return ECS_BI_KEEP; }
+fn ecs_bi_replace() -> i32 { return ECS_BI_REPLACE; }
+
+// === ArchetypeMoveType ===
+const ECS_BI_MOVE_SAME: i32 = 0;
+const ECS_BI_MOVE_SAME_TABLE: i32 = 1;
+const ECS_BI_MOVE_NEW_TABLE: i32 = 2;
+
+fn ecs_bi_move_same() -> i32 { return ECS_BI_MOVE_SAME; }
+fn ecs_bi_move_same_table() -> i32 { return ECS_BI_MOVE_SAME_TABLE; }
+fn ecs_bi_move_new_table() -> i32 { return ECS_BI_MOVE_NEW_TABLE; }
+
+// === ComponentStatus ===
+const ECS_BI_STATUS_ADDED: i32 = 0;
+const ECS_BI_STATUS_EXISTING: i32 = 1;
+
+fn ecs_bi_status_added() -> i32 { return ECS_BI_STATUS_ADDED; }
+fn ecs_bi_status_existing() -> i32 { return ECS_BI_STATUS_EXISTING; }
+
+// === Storage ===
+const ECS_BI_TABLE: i32 = 0;
+const ECS_BI_SPARSE: i32 = 1;
+
+// === Component id list (capacity 4) ===
+struct EcsBiListDeep {
+    v0: i32, v1: i32, v2: i32, v3: i32, len: i32,
+}
+
+fn ecs_bi_list_new() -> EcsBiListDeep {
+    return EcsBiListDeep { v0: 0, v1: 0, v2: 0, v3: 0, len: 0 };
+}
+
+fn ecs_bi_list_len(l: EcsBiListDeep) -> i32 { return l.len; }
+
+fn ecs_bi_list_at(l: EcsBiListDeep, idx: i32) -> i32 {
+    if idx == 0 { return l.v0; };
+    if idx == 1 { return l.v1; };
+    if idx == 2 { return l.v2; };
+    if idx == 3 { return l.v3; };
+    return 0;
+}
+
+fn ecs_bi_list_push(l: EcsBiListDeep, v: i32) -> EcsBiListDeep {
+    let n = l.len;
+    if n == 0 { return EcsBiListDeep { v0: v, v1: l.v1, v2: l.v2, v3: l.v3, len: 1 }; };
+    if n == 1 { return EcsBiListDeep { v0: l.v0, v1: v, v2: l.v2, v3: l.v3, len: 2 }; };
+    if n == 2 { return EcsBiListDeep { v0: l.v0, v1: l.v1, v2: v, v3: l.v3, len: 3 }; };
+    if n == 3 { return EcsBiListDeep { v0: l.v0, v1: l.v1, v2: l.v2, v3: v, len: 4 }; };
+    return l;
+}
+
+fn ecs_bi_list_contains(l: EcsBiListDeep, v: i32) -> bool {
+    if l.len >= 1 && l.v0 == v { return true; };
+    if l.len >= 2 && l.v1 == v { return true; };
+    if l.len >= 3 && l.v2 == v { return true; };
+    if l.len >= 4 && l.v3 == v { return true; };
+    return false;
+}
+
+// === Bundle explicit components ===
+struct EcsBiBundleDeep {
+    id: i32,
+    c0: i32, s0: i32, val0: i64,
+    c1: i32, s1: i32, val1: i64,
+    c2: i32, s2: i32, val2: i64,
+    c3: i32, s3: i32, val3: i64,
+    len: i32,
+}
+
+fn ecs_bi_bundle_new(id: i32) -> EcsBiBundleDeep {
+    return EcsBiBundleDeep {
+        id: id,
+        c0: 0, s0: 0, val0: 0, c1: 0, s1: 0, val1: 0,
+        c2: 0, s2: 0, val2: 0, c3: 0, s3: 0, val3: 0, len: 0,
+    };
+}
+
+fn ecs_bi_bundle_push(b: EcsBiBundleDeep, c: i32, storage: i32, val: i64) -> EcsBiBundleDeep {
+    let n = b.len;
+    if n == 0 {
+        return EcsBiBundleDeep {
+            id: b.id, c0: c, s0: storage, val0: val, c1: b.c1, s1: b.s1, val1: b.val1,
+            c2: b.c2, s2: b.s2, val2: b.val2, c3: b.c3, s3: b.s3, val3: b.val3, len: 1,
+        };
+    };
+    if n == 1 {
+        return EcsBiBundleDeep {
+            id: b.id, c0: b.c0, s0: b.s0, val0: b.val0, c1: c, s1: storage, val1: val,
+            c2: b.c2, s2: b.s2, val2: b.val2, c3: b.c3, s3: b.s3, val3: b.val3, len: 2,
+        };
+    };
+    if n == 2 {
+        return EcsBiBundleDeep {
+            id: b.id, c0: b.c0, s0: b.s0, val0: b.val0, c1: b.c1, s1: b.s1, val1: b.val1,
+            c2: c, s2: storage, val2: val, c3: b.c3, s3: b.s3, val3: b.val3, len: 3,
+        };
+    };
+    if n == 3 {
+        return EcsBiBundleDeep {
+            id: b.id, c0: b.c0, s0: b.s0, val0: b.val0, c1: b.c1, s1: b.s1, val1: b.val1,
+            c2: b.c2, s2: b.s2, val2: b.val2, c3: c, s3: storage, val3: val, len: 4,
+        };
+    };
+    return b;
+}
+
+// === Archetype ===
+struct EcsBiArchetypeDeep {
+    id: i32,
+    table_id: i32,
+    comps: EcsBiListDeep,
+    // insert edge cache
+    edge_bundle: i32,
+    edge_arch: i32,
+    edge_valid: bool,
+    has_add_observer: bool,
+    has_insert_observer: bool,
+    has_discard_observer: bool,
+}
+
+fn ecs_bi_arch_new(id: i32, table_id: i32) -> EcsBiArchetypeDeep {
+    return EcsBiArchetypeDeep {
+        id: id, table_id: table_id, comps: ecs_bi_list_new(),
+        edge_bundle: -1, edge_arch: -1, edge_valid: false,
+        has_add_observer: false, has_insert_observer: false, has_discard_observer: false,
+    };
+}
+
+fn ecs_bi_arch_add(a: EcsBiArchetypeDeep, c: i32) -> EcsBiArchetypeDeep {
+    let comps = ecs_bi_list_push(a.comps, c);
+    return EcsBiArchetypeDeep {
+        id: a.id, table_id: a.table_id, comps: comps,
+        edge_bundle: a.edge_bundle, edge_arch: a.edge_arch, edge_valid: a.edge_valid,
+        has_add_observer: a.has_add_observer, has_insert_observer: a.has_insert_observer, has_discard_observer: a.has_discard_observer,
+    };
+}
+
+fn ecs_bi_arch_with_observers(a: EcsBiArchetypeDeep, add: bool, insert: bool, discard: bool) -> EcsBiArchetypeDeep {
+    return EcsBiArchetypeDeep {
+        id: a.id, table_id: a.table_id, comps: a.comps,
+        edge_bundle: a.edge_bundle, edge_arch: a.edge_arch, edge_valid: a.edge_valid,
+        has_add_observer: add, has_insert_observer: insert, has_discard_observer: discard,
+    };
+}
+
+fn ecs_bi_arch_contains(a: EcsBiArchetypeDeep, c: i32) -> bool {
+    return ecs_bi_list_contains(a.comps, c);
+}
+
+// === Entity storage values for components ===
+struct EcsBiEntityDeep {
+    entity: i64,
+    arch_id: i32,
+    // values for component ids 1..4 simplified map by cid
+    has1: bool, v1: i64, tick1: i32,
+    has2: bool, v2: i64, tick2: i32,
+    has3: bool, v3: i64, tick3: i32,
+    has4: bool, v4: i64, tick4: i32,
+    alive: bool,
+}
+
+fn ecs_bi_entity_new(entity: i64, arch_id: i32) -> EcsBiEntityDeep {
+    return EcsBiEntityDeep {
+        entity: entity, arch_id: arch_id,
+        has1: false, v1: 0, tick1: 0,
+        has2: false, v2: 0, tick2: 0,
+        has3: false, v3: 0, tick3: 0,
+        has4: false, v4: 0, tick4: 0,
+        alive: true,
+    };
+}
+
+fn ecs_bi_entity_has(e: EcsBiEntityDeep, c: i32) -> bool {
+    if c == 1 { return e.has1; };
+    if c == 2 { return e.has2; };
+    if c == 3 { return e.has3; };
+    if c == 4 { return e.has4; };
+    return false;
+}
+
+fn ecs_bi_entity_value(e: EcsBiEntityDeep, c: i32) -> i64 {
+    if c == 1 { return e.v1; };
+    if c == 2 { return e.v2; };
+    if c == 3 { return e.v3; };
+    if c == 4 { return e.v4; };
+    return 0;
+}
+
+fn ecs_bi_entity_tick(e: EcsBiEntityDeep, c: i32) -> i32 {
+    if c == 1 { return e.tick1; };
+    if c == 2 { return e.tick2; };
+    if c == 3 { return e.tick3; };
+    if c == 4 { return e.tick4; };
+    return 0;
+}
+
+fn ecs_bi_entity_set(e: EcsBiEntityDeep, c: i32, val: i64, tick: i32) -> EcsBiEntityDeep {
+    if c == 1 {
+        return EcsBiEntityDeep {
+            entity: e.entity, arch_id: e.arch_id,
+            has1: true, v1: val, tick1: tick,
+            has2: e.has2, v2: e.v2, tick2: e.tick2,
+            has3: e.has3, v3: e.v3, tick3: e.tick3,
+            has4: e.has4, v4: e.v4, tick4: e.tick4,
+            alive: e.alive,
+        };
+    };
+    if c == 2 {
+        return EcsBiEntityDeep {
+            entity: e.entity, arch_id: e.arch_id,
+            has1: e.has1, v1: e.v1, tick1: e.tick1,
+            has2: true, v2: val, tick2: tick,
+            has3: e.has3, v3: e.v3, tick3: e.tick3,
+            has4: e.has4, v4: e.v4, tick4: e.tick4,
+            alive: e.alive,
+        };
+    };
+    if c == 3 {
+        return EcsBiEntityDeep {
+            entity: e.entity, arch_id: e.arch_id,
+            has1: e.has1, v1: e.v1, tick1: e.tick1,
+            has2: e.has2, v2: e.v2, tick2: e.tick2,
+            has3: true, v3: val, tick3: tick,
+            has4: e.has4, v4: e.v4, tick4: e.tick4,
+            alive: e.alive,
+        };
+    };
+    if c == 4 {
+        return EcsBiEntityDeep {
+            entity: e.entity, arch_id: e.arch_id,
+            has1: e.has1, v1: e.v1, tick1: e.tick1,
+            has2: e.has2, v2: e.v2, tick2: e.tick2,
+            has3: e.has3, v3: e.v3, tick3: e.tick3,
+            has4: true, v4: val, tick4: tick,
+            alive: e.alive,
+        };
+    };
+    return e;
+}
+
+// === World ===
+struct EcsBiWorldDeep {
+    a0: EcsBiArchetypeDeep, a0_has: bool,
+    a1: EcsBiArchetypeDeep, a1_has: bool,
+    a2: EcsBiArchetypeDeep, a2_has: bool,
+    a3: EcsBiArchetypeDeep, a3_has: bool,
+    next_arch: i32,
+    next_table: i32,
+    next_entity: i64,
+    entity: EcsBiEntityDeep,
+    has_entity: bool,
+    // lifecycle counts
+    discard_count: i32,
+    add_count: i32,
+    insert_count: i32,
+    on_add_hooks: i32,
+    on_insert_hooks: i32,
+    on_discard_hooks: i32,
+    archetype_created: i32,
+    reserved: i64,
+    flush_count: i32,
+    change_tick: i32,
+}
+
+fn ecs_bi_world_new(change_tick: i32) -> EcsBiWorldDeep {
+    return EcsBiWorldDeep {
+        a0: ecs_bi_arch_new(0, 0), a0_has: false,
+        a1: ecs_bi_arch_new(0, 0), a1_has: false,
+        a2: ecs_bi_arch_new(0, 0), a2_has: false,
+        a3: ecs_bi_arch_new(0, 0), a3_has: false,
+        next_arch: 1, next_table: 1, next_entity: 1,
+        entity: ecs_bi_entity_new(0, 0), has_entity: false,
+        discard_count: 0, add_count: 0, insert_count: 0,
+        on_add_hooks: 0, on_insert_hooks: 0, on_discard_hooks: 0,
+        archetype_created: 0, reserved: 0, flush_count: 0, change_tick: change_tick,
+    };
+}
+
+fn ecs_bi_world_set_arch(w: EcsBiWorldDeep, a: EcsBiArchetypeDeep) -> EcsBiWorldDeep {
+    if w.a0_has != true || w.a0.id == a.id {
+        return EcsBiWorldDeep {
+            a0: a, a0_has: true, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+            next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+            entity: w.entity, has_entity: w.has_entity,
+            discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+            on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+            archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+        };
+    };
+    if w.a1_has != true || w.a1.id == a.id {
+        return EcsBiWorldDeep {
+            a0: w.a0, a0_has: w.a0_has, a1: a, a1_has: true, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+            next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+            entity: w.entity, has_entity: w.has_entity,
+            discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+            on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+            archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+        };
+    };
+    if w.a2_has != true || w.a2.id == a.id {
+        return EcsBiWorldDeep {
+            a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: a, a2_has: true, a3: w.a3, a3_has: w.a3_has,
+            next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+            entity: w.entity, has_entity: w.has_entity,
+            discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+            on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+            archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+        };
+    };
+    return EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: a, a3_has: true,
+        next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+        entity: w.entity, has_entity: w.has_entity,
+        discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+        on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+}
+
+fn ecs_bi_world_get_arch(w: EcsBiWorldDeep, id: i32) -> (bool, EcsBiArchetypeDeep) {
+    if w.a0_has && w.a0.id == id { return (true, w.a0); };
+    if w.a1_has && w.a1.id == id { return (true, w.a1); };
+    if w.a2_has && w.a2.id == id { return (true, w.a2); };
+    if w.a3_has && w.a3.id == id { return (true, w.a3); };
+    return (false, ecs_bi_arch_new(0, 0));
+}
+
+fn ecs_bi_world_place_entity(w: EcsBiWorldDeep, e: EcsBiEntityDeep) -> EcsBiWorldDeep {
+    return EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+        entity: e, has_entity: true,
+        discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+        on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+}
+
+fn ecs_bi_world_spawn_base(w: EcsBiWorldDeep, arch: EcsBiArchetypeDeep) -> EcsBiWorldDeep {
+    w = ecs_bi_world_set_arch(w, arch);
+    let next_a = w.next_arch;
+    if arch.id >= next_a { next_a = arch.id + 1; };
+    let next_t = w.next_table;
+    if arch.table_id >= next_t { next_t = arch.table_id + 1; };
+    let e = ecs_bi_entity_new(w.next_entity, arch.id);
+    // seed components present on archetype with zero values
+    if ecs_bi_arch_contains(arch, 1) { e = ecs_bi_entity_set(e, 1, 0, w.change_tick); };
+    if ecs_bi_arch_contains(arch, 2) { e = ecs_bi_entity_set(e, 2, 0, w.change_tick); };
+    if ecs_bi_arch_contains(arch, 3) { e = ecs_bi_entity_set(e, 3, 0, w.change_tick); };
+    if ecs_bi_arch_contains(arch, 4) { e = ecs_bi_entity_set(e, 4, 0, w.change_tick); };
+    return EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: next_a, next_table: next_t, next_entity: w.next_entity + 1,
+        entity: e, has_entity: true,
+        discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+        on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+}
+
+fn ecs_bi_world_entity(w: EcsBiWorldDeep) -> EcsBiEntityDeep { return w.entity; }
+fn ecs_bi_world_discard_count(w: EcsBiWorldDeep) -> i32 { return w.discard_count; }
+fn ecs_bi_world_add_count(w: EcsBiWorldDeep) -> i32 { return w.add_count; }
+fn ecs_bi_world_insert_count(w: EcsBiWorldDeep) -> i32 { return w.insert_count; }
+fn ecs_bi_world_on_add_hooks(w: EcsBiWorldDeep) -> i32 { return w.on_add_hooks; }
+fn ecs_bi_world_on_insert_hooks(w: EcsBiWorldDeep) -> i32 { return w.on_insert_hooks; }
+fn ecs_bi_world_on_discard_hooks(w: EcsBiWorldDeep) -> i32 { return w.on_discard_hooks; }
+fn ecs_bi_world_archetype_created(w: EcsBiWorldDeep) -> i32 { return w.archetype_created; }
+fn ecs_bi_world_reserved(w: EcsBiWorldDeep) -> i64 { return w.reserved; }
+fn ecs_bi_world_flush_count(w: EcsBiWorldDeep) -> i32 { return w.flush_count; }
+fn ecs_bi_world_change_tick(w: EcsBiWorldDeep) -> i32 { return w.change_tick; }
+
+// compute existing/added lists for bundle vs archetype
+fn ecs_bi_classify(arch: EcsBiArchetypeDeep, bundle: EcsBiBundleDeep) -> (EcsBiListDeep, EcsBiListDeep) {
+    // (existing, added)
+    let existing = ecs_bi_list_new();
+    let added = ecs_bi_list_new();
+    if bundle.len >= 1 {
+        if ecs_bi_arch_contains(arch, bundle.c0) {
+            existing = ecs_bi_list_push(existing, bundle.c0);
+        } else {
+            added = ecs_bi_list_push(added, bundle.c0);
+        };
+    };
+    if bundle.len >= 2 {
+        if ecs_bi_arch_contains(arch, bundle.c1) {
+            existing = ecs_bi_list_push(existing, bundle.c1);
+        } else {
+            added = ecs_bi_list_push(added, bundle.c1);
+        };
+    };
+    if bundle.len >= 3 {
+        if ecs_bi_arch_contains(arch, bundle.c2) {
+            existing = ecs_bi_list_push(existing, bundle.c2);
+        } else {
+            added = ecs_bi_list_push(added, bundle.c2);
+        };
+    };
+    if bundle.len >= 4 {
+        if ecs_bi_arch_contains(arch, bundle.c3) {
+            existing = ecs_bi_list_push(existing, bundle.c3);
+        } else {
+            added = ecs_bi_list_push(added, bundle.c3);
+        };
+    };
+    return (existing, added);
+}
+
+// insert_bundle_into_archetype
+fn ecs_bi_insert_into_archetype(w: EcsBiWorldDeep, arch_id: i32, bundle: EcsBiBundleDeep) -> (EcsBiWorldDeep, i32, i32, bool) {
+    // returns world, new_arch_id, move_type, is_new_created
+    let got = ecs_bi_world_get_arch(w, arch_id);
+    if got.0 != true { return (w, arch_id, ECS_BI_MOVE_SAME, false); };
+    let arch = got.1;
+    if arch.edge_valid && arch.edge_bundle == bundle.id {
+        let newg = ecs_bi_world_get_arch(w, arch.edge_arch);
+        let move_t = ECS_BI_MOVE_SAME;
+        if arch.edge_arch != arch.id {
+            if newg.1.table_id == arch.table_id {
+                move_t = ECS_BI_MOVE_SAME_TABLE;
+            } else {
+                move_t = ECS_BI_MOVE_NEW_TABLE;
+            };
+        };
+        return (w, arch.edge_arch, move_t, false);
+    };
+    let cls = ecs_bi_classify(arch, bundle);
+    let added = cls.1;
+    if ecs_bi_list_len(added) == 0 {
+        // same archetype
+        let arch2 = EcsBiArchetypeDeep {
+            id: arch.id, table_id: arch.table_id, comps: arch.comps,
+            edge_bundle: bundle.id, edge_arch: arch.id, edge_valid: true,
+            has_add_observer: arch.has_add_observer, has_insert_observer: arch.has_insert_observer, has_discard_observer: arch.has_discard_observer,
+        };
+        w = ecs_bi_world_set_arch(w, arch2);
+        return (w, arch.id, ECS_BI_MOVE_SAME, false);
+    };
+    // build new archetype components
+    let comps = arch.comps;
+    if ecs_bi_list_len(added) >= 1 { comps = ecs_bi_list_push(comps, ecs_bi_list_at(added, 0)); };
+    if ecs_bi_list_len(added) >= 2 { comps = ecs_bi_list_push(comps, ecs_bi_list_at(added, 1)); };
+    if ecs_bi_list_len(added) >= 3 { comps = ecs_bi_list_push(comps, ecs_bi_list_at(added, 2)); };
+    if ecs_bi_list_len(added) >= 4 { comps = ecs_bi_list_push(comps, ecs_bi_list_at(added, 3)); };
+    // table move if any added component is table storage
+    let table_move = false;
+    if bundle.len >= 1 && ecs_bi_list_contains(added, bundle.c0) && bundle.s0 == ECS_BI_TABLE { table_move = true; };
+    if bundle.len >= 2 && ecs_bi_list_contains(added, bundle.c1) && bundle.s1 == ECS_BI_TABLE { table_move = true; };
+    if bundle.len >= 3 && ecs_bi_list_contains(added, bundle.c2) && bundle.s2 == ECS_BI_TABLE { table_move = true; };
+    if bundle.len >= 4 && ecs_bi_list_contains(added, bundle.c3) && bundle.s3 == ECS_BI_TABLE { table_move = true; };
+    let new_table = arch.table_id;
+    let next_table = w.next_table;
+    if table_move {
+        new_table = w.next_table;
+        next_table = w.next_table + 1;
+    };
+    let new_id = w.next_arch;
+    let new_arch = EcsBiArchetypeDeep {
+        id: new_id, table_id: new_table, comps: comps,
+        edge_bundle: -1, edge_arch: -1, edge_valid: false,
+        has_add_observer: arch.has_add_observer, has_insert_observer: arch.has_insert_observer, has_discard_observer: arch.has_discard_observer,
+    };
+    let old2 = EcsBiArchetypeDeep {
+        id: arch.id, table_id: arch.table_id, comps: arch.comps,
+        edge_bundle: bundle.id, edge_arch: new_id, edge_valid: true,
+        has_add_observer: arch.has_add_observer, has_insert_observer: arch.has_insert_observer, has_discard_observer: arch.has_discard_observer,
+    };
+    w = EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch + 1, next_table: next_table, next_entity: w.next_entity,
+        entity: w.entity, has_entity: w.has_entity,
+        discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+        on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created + 1, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+    w = ecs_bi_world_set_arch(w, old2);
+    w = ecs_bi_world_set_arch(w, new_arch);
+    let move_t = ECS_BI_MOVE_SAME_TABLE;
+    if table_move { move_t = ECS_BI_MOVE_NEW_TABLE; };
+    return (w, new_id, move_t, true);
+}
+
+// === BundleInserter ===
+struct EcsBiInserterDeep {
+    arch_id: i32,
+    new_arch_id: i32,
+    move_type: i32,
+    bundle: EcsBiBundleDeep,
+    change_tick: i32,
+    valid: bool,
+}
+
+fn ecs_bi_inserter_new(w: EcsBiWorldDeep, arch_id: i32, bundle: EcsBiBundleDeep) -> (EcsBiWorldDeep, EcsBiInserterDeep) {
+    let r = ecs_bi_insert_into_archetype(w, arch_id, bundle);
+    w = r.0;
+    return (w, EcsBiInserterDeep {
+        arch_id: arch_id, new_arch_id: r.1, move_type: r.2, bundle: bundle, change_tick: w.change_tick, valid: true,
+    });
+}
+
+fn ecs_bi_inserter_move_type(i: EcsBiInserterDeep) -> i32 { return i.move_type; }
+fn ecs_bi_inserter_new_arch(i: EcsBiInserterDeep) -> i32 { return i.new_arch_id; }
+
+// insert with InsertMode
+fn ecs_bi_inserter_insert(w: EcsBiWorldDeep, ins: EcsBiInserterDeep, mode: i32) -> EcsBiWorldDeep {
+    if ins.valid != true { return w; };
+    if w.has_entity != true { return w; };
+    let oldg = ecs_bi_world_get_arch(w, ins.arch_id);
+    let newg = ecs_bi_world_get_arch(w, ins.new_arch_id);
+    let cls = ecs_bi_classify(oldg.1, ins.bundle);
+    let existing = cls.0;
+    let added = cls.1;
+    // before_insert: Discard on Replace for existing
+    let discard = w.discard_count;
+    let discard_hooks = w.on_discard_hooks;
+    if mode == ECS_BI_REPLACE && ecs_bi_list_len(existing) > 0 {
+        discard_hooks = discard_hooks + ecs_bi_list_len(existing);
+        if oldg.1.has_discard_observer {
+            discard = discard + 1;
+        };
+    };
+    // write components
+    let e = w.entity;
+    let tick = ins.change_tick;
+    // Keep mode: only write added; Replace: write all
+    if mode == ECS_BI_REPLACE || ecs_bi_list_contains(added, 1) || (ecs_bi_entity_has(e, 1) != true && ins.bundle.len >= 1 && ins.bundle.c0 == 1) {
+        // handled below per bundle slots
+    };
+    if ins.bundle.len >= 1 {
+        let c = ins.bundle.c0;
+        let is_existing = ecs_bi_list_contains(existing, c);
+        if mode == ECS_BI_REPLACE || is_existing != true {
+            e = ecs_bi_entity_set(e, c, ins.bundle.val0, tick);
+        };
+    };
+    if ins.bundle.len >= 2 {
+        let c = ins.bundle.c1;
+        let is_existing = ecs_bi_list_contains(existing, c);
+        if mode == ECS_BI_REPLACE || is_existing != true {
+            e = ecs_bi_entity_set(e, c, ins.bundle.val1, tick);
+        };
+    };
+    if ins.bundle.len >= 3 {
+        let c = ins.bundle.c2;
+        let is_existing = ecs_bi_list_contains(existing, c);
+        if mode == ECS_BI_REPLACE || is_existing != true {
+            e = ecs_bi_entity_set(e, c, ins.bundle.val2, tick);
+        };
+    };
+    if ins.bundle.len >= 4 {
+        let c = ins.bundle.c3;
+        let is_existing = ecs_bi_list_contains(existing, c);
+        if mode == ECS_BI_REPLACE || is_existing != true {
+            e = ecs_bi_entity_set(e, c, ins.bundle.val3, tick);
+        };
+    };
+    e = EcsBiEntityDeep {
+        entity: e.entity, arch_id: ins.new_arch_id,
+        has1: e.has1, v1: e.v1, tick1: e.tick1,
+        has2: e.has2, v2: e.v2, tick2: e.tick2,
+        has3: e.has3, v3: e.v3, tick3: e.tick3,
+        has4: e.has4, v4: e.v4, tick4: e.tick4,
+        alive: e.alive,
+    };
+    // after_insert: Add/Insert for added components
+    let add_hooks = w.on_add_hooks + ecs_bi_list_len(added);
+    let insert_hooks = w.on_insert_hooks + ecs_bi_list_len(added);
+    // Insert also fires for replaced existing in Replace mode? Bevy fires insert for contributed; model added + (replace existing)
+    if mode == ECS_BI_REPLACE {
+        insert_hooks = insert_hooks + ecs_bi_list_len(existing);
+    };
+    let add_obs = w.add_count;
+    let insert_obs = w.insert_count;
+    if ecs_bi_list_len(added) > 0 && newg.1.has_add_observer { add_obs = add_obs + 1; };
+    if (ecs_bi_list_len(added) > 0 || (mode == ECS_BI_REPLACE && ecs_bi_list_len(existing) > 0)) && newg.1.has_insert_observer {
+        insert_obs = insert_obs + 1;
+    };
+    return EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+        entity: e, has_entity: true,
+        discard_count: discard, add_count: add_obs, insert_count: insert_obs,
+        on_add_hooks: add_hooks, on_insert_hooks: insert_hooks, on_discard_hooks: discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+}
+
+// === BundleSpawner ===
+struct EcsBiSpawnerDeep {
+    arch_id: i32,
+    bundle: EcsBiBundleDeep,
+    change_tick: i32,
+    reserved: i64,
+}
+
+fn ecs_bi_spawner_new(w: EcsBiWorldDeep, bundle: EcsBiBundleDeep) -> (EcsBiWorldDeep, EcsBiSpawnerDeep) {
+    // empty archetype 0 then insert bundle
+    let empty = ecs_bi_arch_new(0, 0);
+    // ensure empty arch exists
+    if w.a0_has != true || w.a0.id != 0 {
+        // if no arch 0, place empty as a0 only when free
+        empty = ecs_bi_arch_new(w.next_arch, w.next_table);
+    };
+    // simpler: create target archetype from empty + bundle components
+    let comps = ecs_bi_list_new();
+    if bundle.len >= 1 { comps = ecs_bi_list_push(comps, bundle.c0); };
+    if bundle.len >= 2 { comps = ecs_bi_list_push(comps, bundle.c1); };
+    if bundle.len >= 3 { comps = ecs_bi_list_push(comps, bundle.c2); };
+    if bundle.len >= 4 { comps = ecs_bi_list_push(comps, bundle.c3); };
+    let arch = EcsBiArchetypeDeep {
+        id: w.next_arch, table_id: w.next_table, comps: comps,
+        edge_bundle: -1, edge_arch: -1, edge_valid: false,
+        has_add_observer: true, has_insert_observer: true, has_discard_observer: false,
+    };
+    w = EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch + 1, next_table: w.next_table + 1, next_entity: w.next_entity,
+        entity: w.entity, has_entity: w.has_entity,
+        discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+        on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created + 1, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+    w = ecs_bi_world_set_arch(w, arch);
+    return (w, EcsBiSpawnerDeep {
+        arch_id: arch.id, bundle: bundle, change_tick: w.change_tick, reserved: 0,
+    });
+}
+
+fn ecs_bi_spawner_reserve(s: EcsBiSpawnerDeep, n: i64) -> EcsBiSpawnerDeep {
+    return EcsBiSpawnerDeep {
+        arch_id: s.arch_id, bundle: s.bundle, change_tick: s.change_tick, reserved: s.reserved + n,
+    };
+}
+
+fn ecs_bi_spawner_reserved(s: EcsBiSpawnerDeep) -> i64 { return s.reserved; }
+fn ecs_bi_spawner_arch(s: EcsBiSpawnerDeep) -> i32 { return s.arch_id; }
+
+fn ecs_bi_spawner_spawn(w: EcsBiWorldDeep, s: EcsBiSpawnerDeep) -> (EcsBiWorldDeep, i64) {
+    let entity_id = w.next_entity;
+    let e = ecs_bi_entity_new(entity_id, s.arch_id);
+    let tick = s.change_tick;
+    if s.bundle.len >= 1 { e = ecs_bi_entity_set(e, s.bundle.c0, s.bundle.val0, tick); };
+    if s.bundle.len >= 2 { e = ecs_bi_entity_set(e, s.bundle.c1, s.bundle.val1, tick); };
+    if s.bundle.len >= 3 { e = ecs_bi_entity_set(e, s.bundle.c2, s.bundle.val2, tick); };
+    if s.bundle.len >= 4 { e = ecs_bi_entity_set(e, s.bundle.c3, s.bundle.val3, tick); };
+    let n = s.bundle.len;
+    let archg = ecs_bi_world_get_arch(w, s.arch_id);
+    let add_obs = w.add_count;
+    let insert_obs = w.insert_count;
+    if archg.1.has_add_observer { add_obs = add_obs + 1; };
+    if archg.1.has_insert_observer { insert_obs = insert_obs + 1; };
+    let w2 = EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch, next_table: w.next_table, next_entity: entity_id + 1,
+        entity: e, has_entity: true,
+        discard_count: w.discard_count, add_count: add_obs, insert_count: insert_obs,
+        on_add_hooks: w.on_add_hooks + n, on_insert_hooks: w.on_insert_hooks + n, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved + s.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+    return (w2, entity_id);
+}
+
+fn ecs_bi_spawner_spawn_at(w: EcsBiWorldDeep, s: EcsBiSpawnerDeep, entity_id: i64) -> EcsBiWorldDeep {
+    let e = ecs_bi_entity_new(entity_id, s.arch_id);
+    let tick = s.change_tick;
+    if s.bundle.len >= 1 { e = ecs_bi_entity_set(e, s.bundle.c0, s.bundle.val0, tick); };
+    if s.bundle.len >= 2 { e = ecs_bi_entity_set(e, s.bundle.c1, s.bundle.val1, tick); };
+    if s.bundle.len >= 3 { e = ecs_bi_entity_set(e, s.bundle.c2, s.bundle.val2, tick); };
+    if s.bundle.len >= 4 { e = ecs_bi_entity_set(e, s.bundle.c3, s.bundle.val3, tick); };
+    let n = s.bundle.len;
+    let archg = ecs_bi_world_get_arch(w, s.arch_id);
+    let add_obs = w.add_count;
+    let insert_obs = w.insert_count;
+    if archg.1.has_add_observer { add_obs = add_obs + 1; };
+    if archg.1.has_insert_observer { insert_obs = insert_obs + 1; };
+    let next_e = w.next_entity;
+    if entity_id >= next_e { next_e = entity_id + 1; };
+    return EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch, next_table: w.next_table, next_entity: next_e,
+        entity: e, has_entity: true,
+        discard_count: w.discard_count, add_count: add_obs, insert_count: insert_obs,
+        on_add_hooks: w.on_add_hooks + n, on_insert_hooks: w.on_insert_hooks + n, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count, change_tick: w.change_tick,
+    };
+}
+
+fn ecs_bi_spawner_flush(w: EcsBiWorldDeep) -> EcsBiWorldDeep {
+    return EcsBiWorldDeep {
+        a0: w.a0, a0_has: w.a0_has, a1: w.a1, a1_has: w.a1_has, a2: w.a2, a2_has: w.a2_has, a3: w.a3, a3_has: w.a3_has,
+        next_arch: w.next_arch, next_table: w.next_table, next_entity: w.next_entity,
+        entity: w.entity, has_entity: w.has_entity,
+        discard_count: w.discard_count, add_count: w.add_count, insert_count: w.insert_count,
+        on_add_hooks: w.on_add_hooks, on_insert_hooks: w.on_insert_hooks, on_discard_hooks: w.on_discard_hooks,
+        archetype_created: w.archetype_created, reserved: w.reserved, flush_count: w.flush_count + 1, change_tick: w.change_tick,
+    };
+}
+
+// status helper for tests
+fn ecs_bi_component_status(arch: EcsBiArchetypeDeep, c: i32) -> i32 {
+    if ecs_bi_arch_contains(arch, c) { return ECS_BI_STATUS_EXISTING; };
+    return ECS_BI_STATUS_ADDED;
+}

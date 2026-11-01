@@ -1,0 +1,841 @@
+// Deepened Bevy ECS EntityIndexMap iterator/boxed-slice wrappers — extras-deep variant.
+// Shallow: lib/entity_index_map_iter_extras.sla (Vec-backed slice/iter wrappers for
+// IterMut, IntoIter, Drain::as_slice, boxed Slice conversion/clone/default, Slice equality/
+// order/hash/index).
+//
+// The deep variant mirrors the shallow surface with a fixed-cap-16 flat parallel-array
+// storage (k0..k15 i64 keys + v0..v15 i32 values + a per-struct count, front, back, boxed flag
+// as appropriate) — no Vec, no recursion. The IterMut / IntoIter / Drain structs each hold their
+// own cap-16 buffer copy (parallel-array view) and front/back pointers. Slice conversion etc.
+// emit fresh structs via the slot-view rebuild pattern (capture scalars once, construct a fresh
+// struct literal per branch — no field-assign after move). Result/IterNext types mirror the shallow
+// — and to dodge the SA/backend tuple-return register-alias corruption (Batch 373 observation
+// that let (a,b) = tuple_fn() retroactively flips prior assertions), the deep variant uses
+// small wrapper structs for the multi-slot results returned from drain_clamped / iter_mut_set_next.
+//
+// Intentional leave-outs: no Vec backing (the deep never uses Vec); no recursion; only the
+// extras surface, not the base EntityIndexMap (that's `entity_index_map_extras.sla` separately).
+
+const ECS_EIM2_DEEP_CAP: i32 = 16;
+
+struct EcsEim2DeepMap {
+    k0: i64, k1: i64, k2: i64, k3: i64, k4: i64, k5: i64, k6: i64, k7: i64,
+    k8: i64, k9: i64, k10: i64, k11: i64, k12: i64, k13: i64, k14: i64, k15: i64,
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32,
+    len: i32,
+}
+
+struct EcsEim2DeepSlice {
+    k0: i64, k1: i64, k2: i64, k3: i64, k4: i64, k5: i64, k6: i64, k7: i64,
+    k8: i64, k9: i64, k10: i64, k11: i64, k12: i64, k13: i64, k14: i64, k15: i64,
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32,
+    len: i32, boxed: i32,
+}
+
+struct EcsEim2DeepIterMut {
+    k0: i64, k1: i64, k2: i64, k3: i64, k4: i64, k5: i64, k6: i64, k7: i64,
+    k8: i64, k9: i64, k10: i64, k11: i64, k12: i64, k13: i64, k14: i64, k15: i64,
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32,
+    len: i32, front: i32, back: i32,
+}
+
+struct EcsEim2DeepIntoIter {
+    k0: i64, k1: i64, k2: i64, k3: i64, k4: i64, k5: i64, k6: i64, k7: i64,
+    k8: i64, k9: i64, k10: i64, k11: i64, k12: i64, k13: i64, k14: i64, k15: i64,
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32,
+    len: i32, front: i32, back: i32,
+}
+
+struct EcsEim2DeepDrain {
+    k0: i64, k1: i64, k2: i64, k3: i64, k4: i64, k5: i64, k6: i64, k7: i64,
+    k8: i64, k9: i64, k10: i64, k11: i64, k12: i64, k13: i64, k14: i64, k15: i64,
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32,
+    len: i32, front: i32, back: i32,
+}
+
+// === Result wrappers (multi-slot returns) — struct-based to avoid tuple-return callsites ====
+struct EcsEim2DeepPairResult { has: i32, key: i64, value: i32 }
+struct EcsEim2DeepIterNext { iter_front: i32, iter_back: i32, has: i32, key: i64, value: i32 }
+struct EcsEim2DeepIterMutSetResult { has: i32, key: i64, old_value: i32, new_value: i32,
+    r_k0: i64, r_k1: i64, r_k2: i64, r_k3: i64, r_k4: i64, r_k5: i64, r_k6: i64, r_k7: i64,
+    r_k8: i64, r_k9: i64, r_k10: i64, r_k11: i64, r_k12: i64, r_k13: i64, r_k14: i64, r_k15: i64,
+    r_v0: i32, r_v1: i32, r_v2: i32, r_v3: i32, r_v4: i32, r_v5: i32, r_v6: i32, r_v7: i32,
+    r_v8: i32, r_v9: i32, r_v10: i32, r_v11: i32, r_v12: i32, r_v13: i32, r_v14: i32, r_v15: i32,
+    r_len: i32, r_front: i32, r_back: i32 }
+struct EcsEim2DeepRangeResult { has: i32 } // (Slice payload emitted alongside via separate accessors.)
+struct EcsEim2DeepDrainResult { has: i32 } // (Map + drain buffer emitted via separate accessors.)
+
+// === EcsEim2DeepMap constructors and accessors ===
+fn ecs_eim2_deep_new() -> EcsEim2DeepMap {
+    return EcsEim2DeepMap {
+        k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0,
+        k8: 0, k9: 0, k10: 0, k11: 0, k12: 0, k13: 0, k14: 0, k15: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        v8: 0, v9: 0, v10: 0, v11: 0, v12: 0, v13: 0, v14: 0, v15: 0,
+        len: 0,
+    };
+}
+
+fn ecs_eim2_deep_map_key_at(m: EcsEim2DeepMap, idx: i32) -> i64 {
+    if idx == 0 { return m.k0; };
+    if idx == 1 { return m.k1; };
+    if idx == 2 { return m.k2; };
+    if idx == 3 { return m.k3; };
+    if idx == 4 { return m.k4; };
+    if idx == 5 { return m.k5; };
+    if idx == 6 { return m.k6; };
+    if idx == 7 { return m.k7; };
+    if idx == 8 { return m.k8; };
+    if idx == 9 { return m.k9; };
+    if idx == 10 { return m.k10; };
+    if idx == 11 { return m.k11; };
+    if idx == 12 { return m.k12; };
+    if idx == 13 { return m.k13; };
+    if idx == 14 { return m.k14; };
+    if idx == 15 { return m.k15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_map_val_at(m: EcsEim2DeepMap, idx: i32) -> i32 {
+    if idx == 0 { return m.v0; };
+    if idx == 1 { return m.v1; };
+    if idx == 2 { return m.v2; };
+    if idx == 3 { return m.v3; };
+    if idx == 4 { return m.v4; };
+    if idx == 5 { return m.v5; };
+    if idx == 6 { return m.v6; };
+    if idx == 7 { return m.v7; };
+    if idx == 8 { return m.v8; };
+    if idx == 9 { return m.v9; };
+    if idx == 10 { return m.v10; };
+    if idx == 11 { return m.v11; };
+    if idx == 12 { return m.v12; };
+    if idx == 13 { return m.v13; };
+    if idx == 14 { return m.v14; };
+    if idx == 15 { return m.v15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_map_len(m: EcsEim2DeepMap) -> i32 { return m.len; }
+
+// ecs_eim2_deep_insert: replace existing key's value else append (cap-16 reject). Uses slot-view
+// rebuild — reads scalars once, rebuilds struct literal per assign branch.
+fn ecs_eim2_deep_insert(m: EcsEim2DeepMap, key: i64, value: i32) -> EcsEim2DeepMap {
+    // Replace existing key's value else append. Field-assign on a struct-by-value param is
+    // SLA-legal (verified on SA — see Batch 374). Cap-16 reject on append.
+    let i: i32 = 0;
+    while i < m.len {
+        if ecs_eim2_deep_map_key_at(m, i) == key {
+            if i == 0 { m.v0 = value; };
+            if i == 1 { m.v1 = value; };
+            if i == 2 { m.v2 = value; };
+            if i == 3 { m.v3 = value; };
+            if i == 4 { m.v4 = value; };
+            if i == 5 { m.v5 = value; };
+            if i == 6 { m.v6 = value; };
+            if i == 7 { m.v7 = value; };
+            if i == 8 { m.v8 = value; };
+            if i == 9 { m.v9 = value; };
+            if i == 10 { m.v10 = value; };
+            if i == 11 { m.v11 = value; };
+            if i == 12 { m.v12 = value; };
+            if i == 13 { m.v13 = value; };
+            if i == 14 { m.v14 = value; };
+            if i == 15 { m.v15 = value; };
+            return m;
+        };
+        i = i + 1;
+    }
+    // Append if not present and cap not exceeded.
+    if m.len >= ECS_EIM2_DEEP_CAP { return m; };
+    if m.len == 0 { m.k0 = key; m.v0 = value; };
+    if m.len == 1 { m.k1 = key; m.v1 = value; };
+    if m.len == 2 { m.k2 = key; m.v2 = value; };
+    if m.len == 3 { m.k3 = key; m.v3 = value; };
+    if m.len == 4 { m.k4 = key; m.v4 = value; };
+    if m.len == 5 { m.k5 = key; m.v5 = value; };
+    if m.len == 6 { m.k6 = key; m.v6 = value; };
+    if m.len == 7 { m.k7 = key; m.v7 = value; };
+    if m.len == 8 { m.k8 = key; m.v8 = value; };
+    if m.len == 9 { m.k9 = key; m.v9 = value; };
+    if m.len == 10 { m.k10 = key; m.v10 = value; };
+    if m.len == 11 { m.k11 = key; m.v11 = value; };
+    if m.len == 12 { m.k12 = key; m.v12 = value; };
+    if m.len == 13 { m.k13 = key; m.v13 = value; };
+    if m.len == 14 { m.k14 = key; m.v14 = value; };
+    if m.len == 15 { m.k15 = key; m.v15 = value; };
+    m.len = m.len + 1;
+    return m;
+}
+
+// === Slice (boxed-flag struct) builders ===
+fn ecs_eim2_deep_empty_slice() -> EcsEim2DeepSlice {
+    return EcsEim2DeepSlice {
+        k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0,
+        k8: 0, k9: 0, k10: 0, k11: 0, k12: 0, k13: 0, k14: 0, k15: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        v8: 0, v9: 0, v10: 0, v11: 0, v12: 0, v13: 0, v14: 0, v15: 0,
+        len: 0, boxed: 0,
+    };
+}
+
+fn ecs_eim2_deep_boxed_default() -> EcsEim2DeepSlice {
+    let s = ecs_eim2_deep_empty_slice();
+    s.boxed = 1;
+    return s;
+}
+
+// copy slice builders — builds an EcsEim2DeepSlice from a map view of cap-n entries.
+fn ecs_eim2_deep_build_slice_from_map(m: EcsEim2DeepMap, boxed_flag: i32) -> EcsEim2DeepSlice {
+    let s = EcsEim2DeepSlice {
+        k0: m.k0, k1: m.k1, k2: m.k2, k3: m.k3, k4: m.k4, k5: m.k5, k6: m.k6, k7: m.k7,
+        k8: m.k8, k9: m.k9, k10: m.k10, k11: m.k11, k12: m.k12, k13: m.k13, k14: m.k14, k15: m.k15,
+        v0: m.v0, v1: m.v1, v2: m.v2, v3: m.v3, v4: m.v4, v5: m.v5, v6: m.v6, v7: m.v7,
+        v8: m.v8, v9: m.v9, v10: m.v10, v11: m.v11, v12: m.v12, v13: m.v13, v14: m.v14, v15: m.v15,
+        len: m.len, boxed: boxed_flag,
+    };
+    return s;
+}
+
+fn ecs_eim2_deep_as_slice(m: EcsEim2DeepMap) -> EcsEim2DeepSlice {
+    return ecs_eim2_deep_build_slice_from_map(m, 0);
+}
+
+fn ecs_eim2_deep_into_boxed_slice(m: EcsEim2DeepMap) -> EcsEim2DeepSlice {
+    return ecs_eim2_deep_build_slice_from_map(m, 1);
+}
+
+fn ecs_eim2_deep_boxed_clone(s: EcsEim2DeepSlice) -> EcsEim2DeepSlice {
+    let out = EcsEim2DeepSlice {
+        k0: s.k0, k1: s.k1, k2: s.k2, k3: s.k3, k4: s.k4, k5: s.k5, k6: s.k6, k7: s.k7,
+        k8: s.k8, k9: s.k9, k10: s.k10, k11: s.k11, k12: s.k12, k13: s.k13, k14: s.k14, k15: s.k15,
+        v0: s.v0, v1: s.v1, v2: s.v2, v3: s.v3, v4: s.v4, v5: s.v5, v6: s.v6, v7: s.v7,
+        v8: s.v8, v9: s.v9, v10: s.v10, v11: s.v11, v12: s.v12, v13: s.v13, v14: s.v14, v15: s.v15,
+        len: s.len, boxed: 1,
+    };
+    return out;
+}
+
+fn ecs_eim2_deep_boxed_into_inner(s: EcsEim2DeepSlice) -> EcsEim2DeepSlice {
+    let out = EcsEim2DeepSlice {
+        k0: s.k0, k1: s.k1, k2: s.k2, k3: s.k3, k4: s.k4, k5: s.k5, k6: s.k6, k7: s.k7,
+        k8: s.k8, k9: s.k9, k10: s.k10, k11: s.k11, k12: s.k12, k13: s.k13, k14: s.k14, k15: s.k15,
+        v0: s.v0, v1: s.v1, v2: s.v2, v3: s.v3, v4: s.v4, v5: s.v5, v6: s.v6, v7: s.v7,
+        v8: s.v8, v9: s.v9, v10: s.v10, v11: s.v11, v12: s.v12, v13: s.v13, v14: s.v14, v15: s.v15,
+        len: s.len, boxed: 0,
+    };
+    return out;
+}
+
+fn ecs_eim2_deep_slice_len(s: EcsEim2DeepSlice) -> i32 { return s.len; }
+fn ecs_eim2_deep_slice_boxed(s: EcsEim2DeepSlice) -> i32 { return s.boxed; }
+
+fn ecs_eim2_deep_slice_key_at(s: EcsEim2DeepSlice, idx: i32) -> i64 {
+    if idx == 0 { return s.k0; };
+    if idx == 1 { return s.k1; };
+    if idx == 2 { return s.k2; };
+    if idx == 3 { return s.k3; };
+    if idx == 4 { return s.k4; };
+    if idx == 5 { return s.k5; };
+    if idx == 6 { return s.k6; };
+    if idx == 7 { return s.k7; };
+    if idx == 8 { return s.k8; };
+    if idx == 9 { return s.k9; };
+    if idx == 10 { return s.k10; };
+    if idx == 11 { return s.k11; };
+    if idx == 12 { return s.k12; };
+    if idx == 13 { return s.k13; };
+    if idx == 14 { return s.k14; };
+    if idx == 15 { return s.k15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_slice_val_at(s: EcsEim2DeepSlice, idx: i32) -> i32 {
+    if idx == 0 { return s.v0; };
+    if idx == 1 { return s.v1; };
+    if idx == 2 { return s.v2; };
+    if idx == 3 { return s.v3; };
+    if idx == 4 { return s.v4; };
+    if idx == 5 { return s.v5; };
+    if idx == 6 { return s.v6; };
+    if idx == 7 { return s.v7; };
+    if idx == 8 { return s.v8; };
+    if idx == 9 { return s.v9; };
+    if idx == 10 { return s.v10; };
+    if idx == 11 { return s.v11; };
+    if idx == 12 { return s.v12; };
+    if idx == 13 { return s.v13; };
+    if idx == 14 { return s.v14; };
+    if idx == 15 { return s.v15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_slice_at(s: EcsEim2DeepSlice, index: i32) -> EcsEim2DeepPairResult {
+    if index < 0 { return EcsEim2DeepPairResult { has: 0, key: -1, value: 0 }; };
+    if index >= s.len { return EcsEim2DeepPairResult { has: 0, key: -1, value: 0 }; };
+    return EcsEim2DeepPairResult {
+        has: 1, key: ecs_eim2_deep_slice_key_at(s, index), value: ecs_eim2_deep_slice_val_at(s, index),
+    };
+}
+
+// range helpers — walk [start,end), push each (k,v) from the source slice into a fresh slice.
+// Uses field-assign per index. Cap-16 destination reject silently truncates.
+fn ecs_eim2_deep_set_slice_slot(out: EcsEim2DeepSlice, idx: i32, k: i64, v: i32) -> EcsEim2DeepSlice {
+    if idx == 0 { out.k0 = k; out.v0 = v; };
+    if idx == 1 { out.k1 = k; out.v1 = v; };
+    if idx == 2 { out.k2 = k; out.v2 = v; };
+    if idx == 3 { out.k3 = k; out.v3 = v; };
+    if idx == 4 { out.k4 = k; out.v4 = v; };
+    if idx == 5 { out.k5 = k; out.v5 = v; };
+    if idx == 6 { out.k6 = k; out.v6 = v; };
+    if idx == 7 { out.k7 = k; out.v7 = v; };
+    if idx == 8 { out.k8 = k; out.v8 = v; };
+    if idx == 9 { out.k9 = k; out.v9 = v; };
+    if idx == 10 { out.k10 = k; out.v10 = v; };
+    if idx == 11 { out.k11 = k; out.v11 = v; };
+    if idx == 12 { out.k12 = k; out.v12 = v; };
+    if idx == 13 { out.k13 = k; out.v13 = v; };
+    if idx == 14 { out.k14 = k; out.v14 = v; };
+    if idx == 15 { out.k15 = k; out.v15 = v; };
+    return out;
+}
+
+fn ecs_eim2_deep_slice_range(s: EcsEim2DeepSlice, start: i32, end: i32) -> EcsEim2DeepRangeResult {
+    if start < 0 { return EcsEim2DeepRangeResult { has: 0 }; };
+    if end < start { return EcsEim2DeepRangeResult { has: 0 }; };
+    if end > s.len { return EcsEim2DeepRangeResult { has: 0 }; };
+    let out = ecs_eim2_deep_empty_slice();
+    out.boxed = s.boxed;
+    let oi: i32 = 0;
+    let si: i32 = start;
+    while si < end {
+        if oi >= ECS_EIM2_DEEP_CAP { si = end; } else {
+            let k = ecs_eim2_deep_slice_key_at(s, si);
+            let v = ecs_eim2_deep_slice_val_at(s, si);
+            out = ecs_eim2_deep_set_slice_slot(out, oi, k, v);
+            oi = oi + 1;
+            si = si + 1;
+        };
+    }
+    out.len = oi;
+    return EcsEim2DeepRangeResult { has: 1 };
+}
+
+// Slice payload accessor — re-reads s, range [start,end) into a fresh slice and returns it
+// (avoids result-tuple payload; tests call this after the has-check).
+fn ecs_eim2_deep_slice_range_slice(s: EcsEim2DeepSlice, start: i32, end: i32) -> EcsEim2DeepSlice {
+    let out = ecs_eim2_deep_empty_slice();
+    out.boxed = s.boxed;
+    let oi: i32 = 0;
+    let si: i32 = start;
+    while si < end {
+        if oi >= ECS_EIM2_DEEP_CAP { si = end; } else {
+            let k = ecs_eim2_deep_slice_key_at(s, si);
+            let v = ecs_eim2_deep_slice_val_at(s, si);
+            out = ecs_eim2_deep_set_slice_slot(out, oi, k, v);
+            oi = oi + 1;
+            si = si + 1;
+        };
+    }
+    out.len = oi;
+    return out;
+}
+
+fn ecs_eim2_deep_slice_range_from(s: EcsEim2DeepSlice, start: i32) -> EcsEim2DeepRangeResult {
+    return ecs_eim2_deep_slice_range(s, start, s.len);
+}
+
+fn ecs_eim2_deep_slice_range_to(s: EcsEim2DeepSlice, end: i32) -> EcsEim2DeepRangeResult {
+    return ecs_eim2_deep_slice_range(s, 0, end);
+}
+
+fn ecs_eim2_deep_slice_range_inclusive(s: EcsEim2DeepSlice, start: i32, end_inclusive: i32) -> EcsEim2DeepRangeResult {
+    return ecs_eim2_deep_slice_range(s, start, end_inclusive + 1);
+}
+
+fn ecs_eim2_deep_slice_range_from_slice(s: EcsEim2DeepSlice, start: i32) -> EcsEim2DeepSlice {
+    return ecs_eim2_deep_slice_range_slice(s, start, s.len);
+}
+
+fn ecs_eim2_deep_slice_range_to_slice(s: EcsEim2DeepSlice, end: i32) -> EcsEim2DeepSlice {
+    return ecs_eim2_deep_slice_range_slice(s, 0, end);
+}
+
+fn ecs_eim2_deep_slice_range_inclusive_slice(s: EcsEim2DeepSlice, start: i32, end_inclusive: i32) -> EcsEim2DeepSlice {
+    return ecs_eim2_deep_slice_range_slice(s, start, end_inclusive + 1);
+}
+
+// === Slice equality / order / hash ===
+fn ecs_eim2_deep_slice_eq(a: EcsEim2DeepSlice, b: EcsEim2DeepSlice) -> bool {
+    if a.len != b.len { return false; };
+    let i: i32 = 0;
+    while i < a.len {
+        if ecs_eim2_deep_slice_key_at(a, i) != ecs_eim2_deep_slice_key_at(b, i) { return false; };
+        if ecs_eim2_deep_slice_val_at(a, i) != ecs_eim2_deep_slice_val_at(b, i) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ecs_eim2_deep_slice_cmp(a: EcsEim2DeepSlice, b: EcsEim2DeepSlice) -> i32 {
+    let min_len = a.len;
+    if b.len < min_len { min_len = b.len; };
+    let i: i32 = 0;
+    while i < min_len {
+        let ak = ecs_eim2_deep_slice_key_at(a, i);
+        let bk = ecs_eim2_deep_slice_key_at(b, i);
+        if ak < bk { return -1; };
+        if ak > bk { return 1; };
+        let av = ecs_eim2_deep_slice_val_at(a, i);
+        let bv = ecs_eim2_deep_slice_val_at(b, i);
+        if av < bv { return -1; };
+        if av > bv { return 1; };
+        i = i + 1;
+    }
+    if a.len < b.len { return -1; };
+    if a.len > b.len { return 1; };
+    return 0;
+}
+
+fn ecs_eim2_deep_slice_hash(s: EcsEim2DeepSlice) -> i64 {
+    let h: i64 = 17;
+    let i: i32 = 0;
+    while i < s.len {
+        h = h * 31 + ecs_eim2_deep_slice_key_at(s, i);
+        h = h * 31 + ecs_eim2_deep_slice_val_at(s, i) as i64;
+        i = i + 1;
+    }
+    return h;
+}
+
+// === IterMut ===
+// underlying buffer is the same flat parallel array — front and back (start, end) window over it.
+fn ecs_eim2_deep_iter_mut(m: EcsEim2DeepMap) -> EcsEim2DeepIterMut {
+    let it = EcsEim2DeepIterMut {
+        k0: m.k0, k1: m.k1, k2: m.k2, k3: m.k3, k4: m.k4, k5: m.k5, k6: m.k6, k7: m.k7,
+        k8: m.k8, k9: m.k9, k10: m.k10, k11: m.k11, k12: m.k12, k13: m.k13, k14: m.k14, k15: m.k15,
+        v0: m.v0, v1: m.v1, v2: m.v2, v3: m.v3, v4: m.v4, v5: m.v5, v6: m.v6, v7: m.v7,
+        v8: m.v8, v9: m.v9, v10: m.v10, v11: m.v11, v12: m.v12, v13: m.v13, v14: m.v14, v15: m.v15,
+        len: m.len, front: 0, back: m.len,
+    };
+    return it;
+}
+
+fn ecs_eim2_deep_iter_mut_len(it: EcsEim2DeepIterMut) -> i32 { return it.len; }
+fn ecs_eim2_deep_iter_mut_front(it: EcsEim2DeepIterMut) -> i32 { return it.front; }
+fn ecs_eim2_deep_iter_mut_back(it: EcsEim2DeepIterMut) -> i32 { return it.back; }
+
+fn ecs_eim2_deep_iter_mut_key_at(it: EcsEim2DeepIterMut, idx: i32) -> i64 {
+    if idx == 0 { return it.k0; };
+    if idx == 1 { return it.k1; };
+    if idx == 2 { return it.k2; };
+    if idx == 3 { return it.k3; };
+    if idx == 4 { return it.k4; };
+    if idx == 5 { return it.k5; };
+    if idx == 6 { return it.k6; };
+    if idx == 7 { return it.k7; };
+    if idx == 8 { return it.k8; };
+    if idx == 9 { return it.k9; };
+    if idx == 10 { return it.k10; };
+    if idx == 11 { return it.k11; };
+    if idx == 12 { return it.k12; };
+    if idx == 13 { return it.k13; };
+    if idx == 14 { return it.k14; };
+    if idx == 15 { return it.k15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_iter_mut_val_at(it: EcsEim2DeepIterMut, idx: i32) -> i32 {
+    if idx == 0 { return it.v0; };
+    if idx == 1 { return it.v1; };
+    if idx == 2 { return it.v2; };
+    if idx == 3 { return it.v3; };
+    if idx == 4 { return it.v4; };
+    if idx == 5 { return it.v5; };
+    if idx == 6 { return it.v6; };
+    if idx == 7 { return it.v7; };
+    if idx == 8 { return it.v8; };
+    if idx == 9 { return it.v9; };
+    if idx == 10 { return it.v10; };
+    if idx == 11 { return it.v11; };
+    if idx == 12 { return it.v12; };
+    if idx == 13 { return it.v13; };
+    if idx == 14 { return it.v14; };
+    if idx == 15 { return it.v15; };
+    return 0;
+}
+
+// iter_mut_set_next: advance front pointer and overwrite the v-slot at front-1 with new_value,
+// returning the updated iter buffer flattened in the result (r_*) plus scalars.
+// We use field-reassign on the param struct first (returns m), then flatten via a fresh
+// EcsEim2DeepIterMutSetResult literal.
+fn ecs_eim2_deep_iter_mut_set_next(it: EcsEim2DeepIterMut, new_value: i32) -> EcsEim2DeepIterMutSetResult {
+    if it.front >= it.back {
+        return EcsEim2DeepIterMutSetResult {
+            has: 0, key: -1, old_value: 0, new_value: 0,
+            r_k0: it.k0, r_k1: it.k1, r_k2: it.k2, r_k3: it.k3, r_k4: it.k4, r_k5: it.k5, r_k6: it.k6, r_k7: it.k7,
+            r_k8: it.k8, r_k9: it.k9, r_k10: it.k10, r_k11: it.k11, r_k12: it.k12, r_k13: it.k13, r_k14: it.k14, r_k15: it.k15,
+            r_v0: it.v0, r_v1: it.v1, r_v2: it.v2, r_v3: it.v3, r_v4: it.v4, r_v5: it.v5, r_v6: it.v6, r_v7: it.v7,
+            r_v8: it.v8, r_v9: it.v9, r_v10: it.v10, r_v11: it.v11, r_v12: it.v12, r_v13: it.v13, r_v14: it.v14, r_v15: it.v15,
+            r_len: it.len, r_front: it.front, r_back: it.back,
+        };
+    };
+    // capture key + old_value at it.front (before write).
+    let key = ecs_eim2_deep_iter_mut_key_at(it, it.front);
+    let old_value = ecs_eim2_deep_iter_mut_val_at(it, it.front);
+    // overwrite the value at it.front.
+    if it.front == 0 { it.v0 = new_value; };
+    if it.front == 1 { it.v1 = new_value; };
+    if it.front == 2 { it.v2 = new_value; };
+    if it.front == 3 { it.v3 = new_value; };
+    if it.front == 4 { it.v4 = new_value; };
+    if it.front == 5 { it.v5 = new_value; };
+    if it.front == 6 { it.v6 = new_value; };
+    if it.front == 7 { it.v7 = new_value; };
+    if it.front == 8 { it.v8 = new_value; };
+    if it.front == 9 { it.v9 = new_value; };
+    if it.front == 10 { it.v10 = new_value; };
+    if it.front == 11 { it.v11 = new_value; };
+    if it.front == 12 { it.v12 = new_value; };
+    if it.front == 13 { it.v13 = new_value; };
+    if it.front == 14 { it.v14 = new_value; };
+    if it.front == 15 { it.v15 = new_value; };
+    it.front = it.front + 1;
+    return EcsEim2DeepIterMutSetResult {
+        has: 1, key: key, old_value: old_value, new_value: new_value,
+        r_k0: it.k0, r_k1: it.k1, r_k2: it.k2, r_k3: it.k3, r_k4: it.k4, r_k5: it.k5, r_k6: it.k6, r_k7: it.k7,
+        r_k8: it.k8, r_k9: it.k9, r_k10: it.k10, r_k11: it.k11, r_k12: it.k12, r_k13: it.k13, r_k14: it.k14, r_k15: it.k15,
+        r_v0: it.v0, r_v1: it.v1, r_v2: it.v2, r_v3: it.v3, r_v4: it.v4, r_v5: it.v5, r_v6: it.v6, r_v7: it.v7,
+        r_v8: it.v8, r_v9: it.v9, r_v10: it.v10, r_v11: it.v11, r_v12: it.v12, r_v13: it.v13, r_v14: it.v14, r_v15: it.v15,
+        r_len: it.len, r_front: it.front, r_back: it.back,
+    };
+}
+
+// Rebuild the IterMut from a result (so the test can call set_next again).
+fn ecs_eim2_deep_iter_mut_from_result(r: EcsEim2DeepIterMutSetResult) -> EcsEim2DeepIterMut {
+    return EcsEim2DeepIterMut {
+        k0: r.r_k0, k1: r.r_k1, k2: r.r_k2, k3: r.r_k3, k4: r.r_k4, k5: r.r_k5, k6: r.r_k6, k7: r.r_k7,
+        k8: r.r_k8, k9: r.r_k9, k10: r.r_k10, k11: r.r_k11, k12: r.r_k12, k13: r.r_k13, k14: r.r_k14, k15: r.r_k15,
+        v0: r.r_v0, v1: r.r_v1, v2: r.r_v2, v3: r.r_v3, v4: r.r_v4, v5: r.r_v5, v6: r.r_v6, v7: r.r_v7,
+        v8: r.r_v8, v9: r.r_v9, v10: r.r_v10, v11: r.r_v11, v12: r.r_v12, v13: r.r_v13, v14: r.r_v14, v15: r.r_v15,
+        len: r.r_len, front: r.r_front, back: r.r_back,
+    };
+}
+
+fn ecs_eim2_deep_iter_mut_as_slice(it: EcsEim2DeepIterMut) -> EcsEim2DeepSlice {
+    let out = ecs_eim2_deep_empty_slice();
+    let oi: i32 = 0;
+    let si: i32 = it.front;
+    while si < it.back {
+        if oi >= ECS_EIM2_DEEP_CAP { si = it.back; } else {
+            let k = ecs_eim2_deep_iter_mut_key_at(it, si);
+            let v = ecs_eim2_deep_iter_mut_val_at(it, si);
+            out = ecs_eim2_deep_set_slice_slot(out, oi, k, v);
+            oi = oi + 1;
+            si = si + 1;
+        };
+    }
+    out.len = oi;
+    return out;
+}
+
+// === IntoIter ===
+fn ecs_eim2_deep_into_iter(m: EcsEim2DeepMap) -> EcsEim2DeepIntoIter {
+    let it = EcsEim2DeepIntoIter {
+        k0: m.k0, k1: m.k1, k2: m.k2, k3: m.k3, k4: m.k4, k5: m.k5, k6: m.k6, k7: m.k7,
+        k8: m.k8, k9: m.k9, k10: m.k10, k11: m.k11, k12: m.k12, k13: m.k13, k14: m.k14, k15: m.k15,
+        v0: m.v0, v1: m.v1, v2: m.v2, v3: m.v3, v4: m.v4, v5: m.v5, v6: m.v6, v7: m.v7,
+        v8: m.v8, v9: m.v9, v10: m.v10, v11: m.v11, v12: m.v12, v13: m.v13, v14: m.v14, v15: m.v15,
+        len: m.len, front: 0, back: m.len,
+    };
+    return it;
+}
+
+fn ecs_eim2_deep_into_iter_front(it: EcsEim2DeepIntoIter) -> i32 { return it.front; }
+fn ecs_eim2_deep_into_iter_back(it: EcsEim2DeepIntoIter) -> i32 { return it.back; }
+fn ecs_eim2_deep_into_iter_len(it: EcsEim2DeepIntoIter) -> i32 { return it.len; }
+
+fn ecs_eim2_deep_into_iter_key_at(it: EcsEim2DeepIntoIter, idx: i32) -> i64 {
+    if idx == 0 { return it.k0; };
+    if idx == 1 { return it.k1; };
+    if idx == 2 { return it.k2; };
+    if idx == 3 { return it.k3; };
+    if idx == 4 { return it.k4; };
+    if idx == 5 { return it.k5; };
+    if idx == 6 { return it.k6; };
+    if idx == 7 { return it.k7; };
+    if idx == 8 { return it.k8; };
+    if idx == 9 { return it.k9; };
+    if idx == 10 { return it.k10; };
+    if idx == 11 { return it.k11; };
+    if idx == 12 { return it.k12; };
+    if idx == 13 { return it.k13; };
+    if idx == 14 { return it.k14; };
+    if idx == 15 { return it.k15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_into_iter_val_at(it: EcsEim2DeepIntoIter, idx: i32) -> i32 {
+    if idx == 0 { return it.v0; };
+    if idx == 1 { return it.v1; };
+    if idx == 2 { return it.v2; };
+    if idx == 3 { return it.v3; };
+    if idx == 4 { return it.v4; };
+    if idx == 5 { return it.v5; };
+    if idx == 6 { return it.v6; };
+    if idx == 7 { return it.v7; };
+    if idx == 8 { return it.v8; };
+    if idx == 9 { return it.v9; };
+    if idx == 10 { return it.v10; };
+    if idx == 11 { return it.v11; };
+    if idx == 12 { return it.v12; };
+    if idx == 13 { return it.v13; };
+    if idx == 14 { return it.v14; };
+    if idx == 15 { return it.v15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_into_iter_from_scalars(front: i32, back: i32) -> EcsEim2DeepIterNext {
+    return EcsEim2DeepIterNext { iter_front: front, iter_back: back, has: 0, key: 0, value: 0 };
+}
+
+fn ecs_eim2_deep_into_iter_next(it: EcsEim2DeepIntoIter) -> EcsEim2DeepIterNext {
+    if it.front >= it.back {
+        return ecs_eim2_deep_into_iter_from_scalars(it.front, it.back);
+    };
+    let key = ecs_eim2_deep_into_iter_key_at(it, it.front);
+    let value = ecs_eim2_deep_into_iter_val_at(it, it.front);
+    let next_front = it.front + 1;
+    return EcsEim2DeepIterNext { iter_front: next_front, iter_back: it.back, has: 1, key: key, value: value };
+    // Note: this returns only the advanced pointer + the visited pair, not the buffer (which is
+    // unchanged). Tests typically re-call into_iter_next with the same buffer but advance the
+    // front via iter_front passthrough. Since IntoIter recv tests use the unchanged buffer (the
+    // deep variant never mutates the underlying map), callsites pass the same iter back and read
+    // iter_front to track progress. For multi-pass test loops we expose a helper that re-sets the
+    // window; see ecs_eim2_deep_into_iter_set_window.
+}
+
+// Set front/back on a fresh-returned iter so multi-step tests can re-call next without carrying the buffer twice.
+// Field-assign on struct-by-value param.
+fn ecs_eim2_deep_into_iter_set_window(it: EcsEim2DeepIntoIter, new_front: i32, new_back: i32) -> EcsEim2DeepIntoIter {
+    it.front = new_front;
+    it.back = new_back;
+    return it;
+}
+
+fn ecs_eim2_deep_into_iter_next_back(it: EcsEim2DeepIntoIter) -> EcsEim2DeepIterNext {
+    if it.front >= it.back {
+        return ecs_eim2_deep_into_iter_from_scalars(it.front, it.back);
+    };
+    let new_back = it.back - 1;
+    let key = ecs_eim2_deep_into_iter_key_at(it, new_back);
+    let value = ecs_eim2_deep_into_iter_val_at(it, new_back);
+    return EcsEim2DeepIterNext { iter_front: it.front, iter_back: new_back, has: 1, key: key, value: value };
+}
+
+fn ecs_eim2_deep_into_iter_as_slice(it: EcsEim2DeepIntoIter) -> EcsEim2DeepSlice {
+    let out = ecs_eim2_deep_empty_slice();
+    let oi: i32 = 0;
+    let si: i32 = it.front;
+    while si < it.back {
+        if oi >= ECS_EIM2_DEEP_CAP { si = it.back; } else {
+            let k = ecs_eim2_deep_into_iter_key_at(it, si);
+            let v = ecs_eim2_deep_into_iter_val_at(it, si);
+            out = ecs_eim2_deep_set_slice_slot(out, oi, k, v);
+            oi = oi + 1;
+            si = si + 1;
+        };
+    }
+    out.len = oi;
+    return out;
+}
+
+// === Drain ===
+// drain_clamped: split map entries at indices [start, end) — kept vs drained lists. Each is a
+// cap-16 buffer of (k,v) pairs. We return the kept-buffer assembled map separately from the
+// drain-struct and the has-flag (EcsEim2DeepDrainResult just carries has).
+fn ecs_eim2_deep_drain_clamped_map(m: EcsEim2DeepMap, start: i32, end: i32) -> EcsEim2DeepMap {
+    let kept = ecs_eim2_deep_new();
+    let i: i32 = 0;
+    while i < m.len {
+        let keep = 0;
+        if i < start { keep = 1; };
+        if i >= end { keep = 1; };
+        if keep == 1 {
+            let k = ecs_eim2_deep_map_key_at(m, i);
+            let v = ecs_eim2_deep_map_val_at(m, i);
+            kept = ecs_eim2_deep_insert(kept, k, v);
+        };
+        i = i + 1;
+    }
+    return kept;
+}
+
+fn ecs_eim2_deep_set_drain_slot(d: EcsEim2DeepDrain, idx: i32, k: i64, v: i32) -> EcsEim2DeepDrain {
+    if idx == 0 { d.k0 = k; d.v0 = v; };
+    if idx == 1 { d.k1 = k; d.v1 = v; };
+    if idx == 2 { d.k2 = k; d.v2 = v; };
+    if idx == 3 { d.k3 = k; d.v3 = v; };
+    if idx == 4 { d.k4 = k; d.v4 = v; };
+    if idx == 5 { d.k5 = k; d.v5 = v; };
+    if idx == 6 { d.k6 = k; d.v6 = v; };
+    if idx == 7 { d.k7 = k; d.v7 = v; };
+    if idx == 8 { d.k8 = k; d.v8 = v; };
+    if idx == 9 { d.k9 = k; d.v9 = v; };
+    if idx == 10 { d.k10 = k; d.v10 = v; };
+    if idx == 11 { d.k11 = k; d.v11 = v; };
+    if idx == 12 { d.k12 = k; d.v12 = v; };
+    if idx == 13 { d.k13 = k; d.v13 = v; };
+    if idx == 14 { d.k14 = k; d.v14 = v; };
+    if idx == 15 { d.k15 = k; d.v15 = v; };
+    return d;
+}
+
+fn ecs_eim2_deep_drain_clamped_drain(m: EcsEim2DeepMap, start: i32, end: i32) -> EcsEim2DeepDrain {
+    let drain = EcsEim2DeepDrain {
+        k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0,
+        k8: 0, k9: 0, k10: 0, k11: 0, k12: 0, k13: 0, k14: 0, k15: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        v8: 0, v9: 0, v10: 0, v11: 0, v12: 0, v13: 0, v14: 0, v15: 0,
+        len: 0, front: 0, back: 0,
+    };
+    let oi: i32 = 0;
+    let i: i32 = start;
+    while i < end {
+        if oi >= ECS_EIM2_DEEP_CAP {
+            i = end;
+        } else {
+            let k = ecs_eim2_deep_map_key_at(m, i);
+            let v = ecs_eim2_deep_map_val_at(m, i);
+            drain = ecs_eim2_deep_set_drain_slot(drain, oi, k, v);
+            oi = oi + 1;
+        };
+        i = i + 1;
+    }
+    drain.len = oi;
+    drain.front = 0;
+    drain.back = oi;
+    return drain;
+}
+
+fn ecs_eim2_deep_drain_key_at(d: EcsEim2DeepDrain, idx: i32) -> i64 {
+    if idx == 0 { return d.k0; };
+    if idx == 1 { return d.k1; };
+    if idx == 2 { return d.k2; };
+    if idx == 3 { return d.k3; };
+    if idx == 4 { return d.k4; };
+    if idx == 5 { return d.k5; };
+    if idx == 6 { return d.k6; };
+    if idx == 7 { return d.k7; };
+    if idx == 8 { return d.k8; };
+    if idx == 9 { return d.k9; };
+    if idx == 10 { return d.k10; };
+    if idx == 11 { return d.k11; };
+    if idx == 12 { return d.k12; };
+    if idx == 13 { return d.k13; };
+    if idx == 14 { return d.k14; };
+    if idx == 15 { return d.k15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_drain_val_at(d: EcsEim2DeepDrain, idx: i32) -> i32 {
+    if idx == 0 { return d.v0; };
+    if idx == 1 { return d.v1; };
+    if idx == 2 { return d.v2; };
+    if idx == 3 { return d.v3; };
+    if idx == 4 { return d.v4; };
+    if idx == 5 { return d.v5; };
+    if idx == 6 { return d.v6; };
+    if idx == 7 { return d.v7; };
+    if idx == 8 { return d.v8; };
+    if idx == 9 { return d.v9; };
+    if idx == 10 { return d.v10; };
+    if idx == 11 { return d.v11; };
+    if idx == 12 { return d.v12; };
+    if idx == 13 { return d.v13; };
+    if idx == 14 { return d.v14; };
+    if idx == 15 { return d.v15; };
+    return 0;
+}
+
+fn ecs_eim2_deep_drain_len(d: EcsEim2DeepDrain) -> i32 { return d.len; }
+fn ecs_eim2_deep_drain_front(d: EcsEim2DeepDrain) -> i32 { return d.front; }
+fn ecs_eim2_deep_drain_back(d: EcsEim2DeepDrain) -> i32 { return d.back; }
+
+fn ecs_eim2_deep_drain_as_slice(d: EcsEim2DeepDrain) -> EcsEim2DeepSlice {
+    let out = ecs_eim2_deep_empty_slice();
+    let oi: i32 = 0;
+    let si: i32 = d.front;
+    while si < d.back {
+        if oi >= ECS_EIM2_DEEP_CAP { si = d.back; } else {
+            let k = ecs_eim2_deep_drain_key_at(d, si);
+            let v = ecs_eim2_deep_drain_val_at(d, si);
+            out = ecs_eim2_deep_set_slice_slot(out, oi, k, v);
+            oi = oi + 1;
+            si = si + 1;
+        };
+    }
+    out.len = oi;
+    return out;
+}
+
+// Top-level drain facade: clamps ranges out of [0, n) and emits kept-map + drain-struct via
+// separate has-result + accessor pair.
+fn ecs_eim2_deep_drain(has_result: EcsEim2DeepDrainResult) -> i32 { return has_result.has; }
+
+fn ecs_eim2_deep_drain_range_ok(m: EcsEim2DeepMap, start: i32, end: i32) -> i32 {
+    let n = m.len;
+    if start <= 0 {
+        if end >= n { return 1; };
+        if end <= 0 { return 1; }; // empty drain range still ok
+        return 1;
+    };
+    if start >= n { return 1; };
+    if end <= start { return 1; };
+    if end > n { return 0; };
+    return 1;
+}
+
+// Drain keeps components at indices outside [start, end). Static: we just route to the clamped
+// core. The result carries `has` but the test interrogates the kept map + drain via separate
+// accessors. Actually the deep variant never range-rejects — the shallow's drain always clamps;
+// we just dispatch to the clamped core. So `has`=1 unconditionally.
+fn ecs_eim2_deep_drain_result(m: EcsEim2DeepMap, start: i32, end: i32) -> EcsEim2DeepDrainResult {
+    return EcsEim2DeepDrainResult { has: 1 };
+}
+
+fn ecs_eim2_deep_drain_kept_map(m: EcsEim2DeepMap, start: i32, end: i32) -> EcsEim2DeepMap {
+    let n = m.len;
+    let s: i32 = start;
+    let e: i32 = end;
+    if start < 0 { s = 0; };
+    if start > n { s = n; };
+    if end <= start { e = s; };
+    if end > n { e = n; };
+    return ecs_eim2_deep_drain_clamped_map(m, s, e);
+}
+
+fn ecs_eim2_deep_drain_drained(m: EcsEim2DeepMap, start: i32, end: i32) -> EcsEim2DeepDrain {
+    let n = m.len;
+    let s: i32 = start;
+    let e: i32 = end;
+    if start < 0 { s = 0; };
+    if start > n { s = n; };
+    if end <= start { e = s; };
+    if end > n { e = n; };
+    return ecs_eim2_deep_drain_clamped_drain(m, s, e);
+}
+
+// IterMut window mutator — used by tests to re-view the buffer window after set_next exhausted
+// one end (e.g. set_window(0, len) for as_slice of the full post-write buffer). Field-assign on
+// struct-by-value.
+fn ecs_eim2_deep_iter_mut_set_window(it: EcsEim2DeepIterMut, new_front: i32, new_back: i32) -> EcsEim2DeepIterMut {
+    it.front = new_front;
+    it.back = new_back;
+    return it;
+}

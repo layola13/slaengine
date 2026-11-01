@@ -1,0 +1,644 @@
+// Archetype table-row value world.
+// Unlike world_archetype_value.sla, component values live inside the owning
+// archetype table and are aligned by the entity's table row.
+@import "world_registry.sla"
+@import "resource.sla"
+@import "messages.sla"
+@import "query_dynamic.sla"
+
+struct TableValueColumn<T> {
+    component_id: i32,
+    values: Vec<T>,
+}
+
+struct TableValueArchetype<T> {
+    id: i32,
+    component_ids: Vec<i32>,
+    entity_ids: Vec<i32>,
+    columns: Vec<TableValueColumn<T>>,
+}
+
+struct TableValueLocation {
+    entity_id: i32,
+    archetype_id: i32,
+    row: i64,
+}
+
+struct TableValueWorld<T, R, M> {
+    registry: RegistryWorld,
+    archetypes: Vec<TableValueArchetype<T>>,
+    locations: Vec<TableValueLocation>,
+    resource: ResourceSlot<R>,
+    messages: Messages<M>,
+    resource_added_tick: i32,
+    resource_changed_tick: i32,
+}
+
+struct TableValueMut<T> {
+    entity: Entity,
+    component_id: i32,
+    archetype_id: i32,
+    row: i64,
+    value: T,
+}
+
+struct TableValuePair<T> {
+    entity: Entity,
+    first: T,
+    second: T,
+}
+
+struct TableValuePairMut<T> {
+    first: TableValueMut<T>,
+    second_component_id: i32,
+    second: T,
+}
+
+fn table_value_column_new<T>(component_id: i32) -> TableValueColumn<T> {
+    let values: Vec<T> = Vec::new();
+    return TableValueColumn<T> { component_id: component_id, values: values };
+}
+
+fn table_value_column_copy_last_to<T>(column: TableValueColumn<T>, row: i64, last: i64) -> TableValueColumn<T> {
+    column.values[row] = column.values[last];
+    return column;
+}
+
+fn table_value_column_remove_last<T>(column: TableValueColumn<T>, last: i64) -> TableValueColumn<T> {
+    let removed_value = column.values.remove(last);
+    return column;
+}
+
+fn table_value_archetype_new<T>(id: i32, component_ids: Vec<i32>) -> TableValueArchetype<T> {
+    let entity_ids: Vec<i32> = Vec::new();
+    let columns: Vec<TableValueColumn<T>> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(component_ids) as i64;
+    while i < cnt {
+        columns.push(table_value_column_new<T>(component_ids[i]));
+        i = i + 1;
+    }
+    return TableValueArchetype<T> { id: id, component_ids: component_ids, entity_ids: entity_ids, columns: columns };
+}
+
+fn table_value_location_empty(entity_id: i32) -> TableValueLocation {
+    return TableValueLocation { entity_id: entity_id, archetype_id: -1, row: -1 };
+}
+
+fn table_value_signature_empty() -> Vec<i32> {
+    let ids: Vec<i32> = Vec::new();
+    return ids;
+}
+
+fn table_value_world_new<T, R, M>(default_r: R, default_m: M) -> TableValueWorld<T, R, M> {
+    let archetypes: Vec<TableValueArchetype<T>> = Vec::new();
+    let locations: Vec<TableValueLocation> = Vec::new();
+    let world = TableValueWorld<T, R, M> {
+        registry: registry_world_new(),
+        archetypes: archetypes,
+        locations: locations,
+        resource: resource_slot_new<R>(default_r),
+        messages: messages_new<M>(default_m),
+        resource_added_tick: 0,
+        resource_changed_tick: 0,
+    };
+    world.archetypes.push(table_value_archetype_new<T>(0, table_value_signature_empty()));
+    return world;
+}
+
+fn table_value_world_register_table<T, R, M>(world: TableValueWorld<T, R, M>) -> (TableValueWorld<T, R, M>, ComponentInfo) {
+    let (registry, info) = registry_world_register_table(world.registry);
+    world.registry = registry;
+    return (world, info);
+}
+
+fn table_value_world_register_sparse_set<T, R, M>(world: TableValueWorld<T, R, M>) -> (TableValueWorld<T, R, M>, ComponentInfo) {
+    let (registry, info) = registry_world_register_sparse_set(world.registry);
+    world.registry = registry;
+    return (world, info);
+}
+
+fn table_value_world_increment_tick<T, R, M>(world: TableValueWorld<T, R, M>) -> TableValueWorld<T, R, M> {
+    world.registry = registry_world_increment_tick(world.registry);
+    return world;
+}
+
+fn table_value_world_ensure_location<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> TableValueWorld<T, R, M> {
+    while (len(world.locations) as i32) < entity.id + 1 {
+        let next_id = len(world.locations) as i32;
+        world.locations.push(table_value_location_empty(next_id));
+    }
+    return world;
+}
+
+fn table_value_signature_equals(left: Vec<i32>, right: Vec<i32>) -> bool {
+    let left_len = len(left) as i64;
+    let right_len = len(right) as i64;
+    if left_len != right_len { return false; };
+    let i: i64 = 0;
+    while i < left_len {
+        if left[i] != right[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn table_value_signature_has(signature: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(signature) as i64;
+    while i < cnt {
+        if signature[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn table_value_world_find_archetype<T, R, M>(world: TableValueWorld<T, R, M>, component_ids: Vec<i32>) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.archetypes) as i64;
+    while i < cnt {
+        if table_value_signature_equals(world.archetypes[i].component_ids, component_ids) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn table_value_world_get_or_create_archetype<T, R, M>(world: TableValueWorld<T, R, M>, component_ids: Vec<i32>) -> (TableValueWorld<T, R, M>, i64) {
+    let existing = table_value_world_find_archetype<T, R, M>(world, component_ids);
+    if existing >= 0 { return (world, existing); };
+    let id = len(world.archetypes) as i32;
+    world.archetypes.push(table_value_archetype_new<T>(id, component_ids));
+    return (world, id as i64);
+}
+
+fn table_value_world_column_slot<T, R, M>(world: TableValueWorld<T, R, M>, archetype_slot: i64, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.archetypes[archetype_slot].columns) as i64;
+    while i < cnt {
+        if world.archetypes[archetype_slot].columns[i].component_id == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn table_value_world_signature_for_entity<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> Vec<i32> {
+    let ids: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(world.registry.columns) as i64;
+    while i < cnt {
+        let component_id = world.registry.columns[i].info.id;
+        if registry_world_has_component(world.registry, entity, component_id) { ids.push(component_id); };
+        i = i + 1;
+    }
+    return ids;
+}
+
+fn table_value_world_is_alive<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> bool {
+    return registry_world_is_alive(world.registry, entity);
+}
+
+fn table_value_world_has<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32) -> bool {
+    return registry_world_has_component(world.registry, entity, component_id);
+}
+
+fn table_value_world_entity_archetype_id<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> i32 {
+    if entity.id >= (len(world.locations) as i32) { return -1; };
+    return world.locations[entity.id].archetype_id;
+}
+
+fn table_value_world_entity_row<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> i64 {
+    if entity.id >= (len(world.locations) as i32) { return -1; };
+    return world.locations[entity.id].row;
+}
+
+fn table_value_world_archetype_entity_count<T, R, M>(world: TableValueWorld<T, R, M>, archetype_id: i32) -> i64 {
+    if archetype_id < 0 { return 0; };
+    return len(world.archetypes[archetype_id].entity_ids) as i64;
+}
+
+fn table_value_world_get_unchecked<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32) -> T {
+    let location = world.locations[entity.id];
+    let archetype_slot = location.archetype_id as i64;
+    let column_slot = table_value_world_column_slot<T, R, M>(world, archetype_slot, component_id);
+    if column_slot < 0 { panic(11001); };
+    return world.archetypes[archetype_slot].columns[column_slot].values[location.row];
+}
+
+fn table_value_world_get<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32) -> T {
+    if table_value_world_has<T, R, M>(world, entity, component_id) != true { panic(11002); };
+    return table_value_world_get_unchecked<T, R, M>(world, entity, component_id);
+}
+
+fn table_value_world_collect_values<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_ids: Vec<i32>, extra_component_id: i32, extra_value: T) -> Vec<T> {
+    let values: Vec<T> = Vec::new();
+    let extra_index: i64 = -1;
+    let find: i64 = 0;
+    let cnt = len(component_ids) as i64;
+    while find < cnt {
+        if component_ids[find] == extra_component_id { extra_index = find + 0; };
+        find = find + 1;
+    }
+    if extra_index < 0 { panic(11004); };
+    let i: i64 = 0;
+    while i < extra_index {
+        values.push(table_value_world_get_unchecked<T, R, M>(world, entity, component_ids[i]));
+        i = i + 1;
+    }
+    values.push(extra_value);
+    let j = extra_index + 1;
+    while j < cnt {
+        values.push(table_value_world_get_unchecked<T, R, M>(world, entity, component_ids[j]));
+        j = j + 1;
+    }
+    return values;
+}
+
+fn table_value_world_collect_existing_values<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_ids: Vec<i32>) -> Vec<T> {
+    let values: Vec<T> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(component_ids) as i64;
+    while i < cnt {
+        values.push(table_value_world_get_unchecked<T, R, M>(world, entity, component_ids[i]));
+        i = i + 1;
+    }
+    return values;
+}
+
+fn table_value_world_detach<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> TableValueWorld<T, R, M> {
+    if entity.id >= (len(world.locations) as i32) { return world; };
+    let location = world.locations[entity.id];
+    if location.archetype_id < 0 { return world; };
+    let archetype_slot = location.archetype_id as i64;
+    let last = (len(world.archetypes[archetype_slot].entity_ids) as i64) - 1;
+    if location.row != last {
+        let moved_entity_id = world.archetypes[archetype_slot].entity_ids[last];
+        world.archetypes[archetype_slot].entity_ids[location.row] = moved_entity_id;
+        world.locations[moved_entity_id].row = location.row;
+        let c: i64 = 0;
+        let column_count = len(world.archetypes[archetype_slot].columns) as i64;
+        while c < column_count {
+            world.archetypes[archetype_slot].columns[c] = table_value_column_copy_last_to<T>(world.archetypes[archetype_slot].columns[c], location.row, last);
+            c = c + 1;
+        }
+    };
+    let removed_entity = world.archetypes[archetype_slot].entity_ids.remove(last);
+    let r: i64 = 0;
+    let remove_column_count = len(world.archetypes[archetype_slot].columns) as i64;
+    while r < remove_column_count {
+        world.archetypes[archetype_slot].columns[r] = table_value_column_remove_last<T>(world.archetypes[archetype_slot].columns[r], last);
+        r = r + 1;
+    }
+    world.locations[entity.id].archetype_id = -1;
+    world.locations[entity.id].row = -1;
+    return world;
+}
+
+fn table_value_world_attach_with_values<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_ids: Vec<i32>, values: Vec<T>) -> TableValueWorld<T, R, M> {
+    world = table_value_world_ensure_location<T, R, M>(world, entity);
+    let (next_world, archetype_slot) = table_value_world_get_or_create_archetype<T, R, M>(world, component_ids);
+    world = next_world;
+    let row = len(world.archetypes[archetype_slot].entity_ids) as i64;
+    world.archetypes[archetype_slot].entity_ids.push(entity.id);
+    let i: i64 = 0;
+    let cnt = len(world.archetypes[archetype_slot].columns) as i64;
+    while i < cnt {
+        world.archetypes[archetype_slot].columns[i].values.push(values[i]);
+        i = i + 1;
+    }
+    world.locations[entity.id].entity_id = entity.id;
+    world.locations[entity.id].archetype_id = world.archetypes[archetype_slot].id;
+    world.locations[entity.id].row = row;
+    return world;
+}
+
+fn table_value_world_attach_empty<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> TableValueWorld<T, R, M> {
+    let values: Vec<T> = Vec::new();
+    return table_value_world_attach_with_values<T, R, M>(world, entity, table_value_signature_empty(), values);
+}
+
+fn table_value_world_spawn<T, R, M>(world: TableValueWorld<T, R, M>) -> (TableValueWorld<T, R, M>, Entity) {
+    let (registry, entity) = registry_world_spawn(world.registry);
+    world.registry = registry;
+    world = table_value_world_attach_empty<T, R, M>(world, entity);
+    return (world, entity);
+}
+
+fn table_value_world_replace_existing<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32, value: T) -> TableValueWorld<T, R, M> {
+    let location = world.locations[entity.id];
+    let archetype_slot = location.archetype_id as i64;
+    let column_slot = table_value_world_column_slot<T, R, M>(world, archetype_slot, component_id);
+    if column_slot < 0 { panic(11003); };
+    world.archetypes[archetype_slot].columns[column_slot].values[location.row] = value;
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    return world;
+}
+
+fn table_value_world_insert_new<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32, value: T) -> TableValueWorld<T, R, M> {
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    let signature = table_value_world_signature_for_entity<T, R, M>(world, entity);
+    let values = table_value_world_collect_values<T, R, M>(world, entity, signature, component_id, value);
+    world = table_value_world_detach<T, R, M>(world, entity);
+    return table_value_world_attach_with_values<T, R, M>(world, entity, signature, values);
+}
+
+fn table_value_world_insert<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32, value: T) -> TableValueWorld<T, R, M> {
+    if table_value_world_has<T, R, M>(world, entity, component_id) {
+        return table_value_world_replace_existing<T, R, M>(world, entity, component_id, value);
+    };
+    return table_value_world_insert_new<T, R, M>(world, entity, component_id, value);
+}
+
+fn table_value_world_remove<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32) -> TableValueWorld<T, R, M> {
+    if table_value_world_has<T, R, M>(world, entity, component_id) != true { return world; };
+    world.registry = registry_world_remove_component(world.registry, entity, component_id);
+    let signature = table_value_world_signature_for_entity<T, R, M>(world, entity);
+    let values = table_value_world_collect_existing_values<T, R, M>(world, entity, signature);
+    world = table_value_world_detach<T, R, M>(world, entity);
+    return table_value_world_attach_with_values<T, R, M>(world, entity, signature, values);
+}
+
+fn table_value_world_despawn<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity) -> TableValueWorld<T, R, M> {
+    if table_value_world_is_alive<T, R, M>(world, entity) != true { return world; };
+    world = table_value_world_detach<T, R, M>(world, entity);
+    world.registry = registry_world_despawn(world.registry, entity);
+    return world;
+}
+
+fn table_value_world_added_since<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32, tick: i32) -> bool {
+    return registry_world_component_added_since(world.registry, entity, component_id, tick);
+}
+
+fn table_value_world_changed_since<T, R, M>(world: TableValueWorld<T, R, M>, entity: Entity, component_id: i32, tick: i32) -> bool {
+    return registry_world_component_changed_since(world.registry, entity, component_id, tick);
+}
+
+fn table_value_world_query<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let a: i64 = 0;
+    let archetype_count = len(world.archetypes) as i64;
+    while a < archetype_count {
+        if table_value_signature_has(world.archetypes[a].component_ids, component_id) {
+            let column_slot = table_value_world_column_slot<T, R, M>(world, a, component_id);
+            let row: i64 = 0;
+            let row_count = len(world.archetypes[a].entity_ids) as i64;
+            while row < row_count {
+                let eid = world.archetypes[a].entity_ids[row];
+                let entity = entity_new(eid, world.registry.entities.generations[eid]);
+                if table_value_world_is_alive<T, R, M>(world, entity) {
+                    query.items.push(EntityItem<T> { entity: entity, value: world.archetypes[a].columns[column_slot].values[row] });
+                };
+                row = row + 1;
+            }
+        };
+        a = a + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_without<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, without_component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let base = table_value_world_query<T, R, M>(world, component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let item = base.items[i];
+        if table_value_world_has<T, R, M>(world, item.entity, without_component_id) != true { query.items.push(item); };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_with<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, with_component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let base = table_value_world_query<T, R, M>(world, component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let item = base.items[i];
+        if table_value_world_has<T, R, M>(world, item.entity, with_component_id) { query.items.push(item); };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_added<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let base = table_value_world_query<T, R, M>(world, component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let item = base.items[i];
+        if table_value_world_added_since<T, R, M>(world, item.entity, component_id, tick) { query.items.push(item); };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_changed<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let base = table_value_world_query<T, R, M>(world, component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let item = base.items[i];
+        if table_value_world_changed_since<T, R, M>(world, item.entity, component_id, tick) { query.items.push(item); };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_pair<T, R, M>(world: TableValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32) -> Query<TableValuePair<T>> {
+    let query = query_new<TableValuePair<T>>();
+    let base = table_value_world_query<T, R, M>(world, first_component_id);
+    let i: i64 = 0;
+    let cnt = len(base.items) as i64;
+    while i < cnt {
+        let item = base.items[i];
+        if table_value_world_has<T, R, M>(world, item.entity, second_component_id) {
+            query.items.push(TableValuePair<T> { entity: item.entity, first: item.value, second: table_value_world_get<T, R, M>(world, item.entity, second_component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_mut<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32) -> Query<TableValueMut<T>> {
+    let query = query_new<TableValueMut<T>>();
+    let a: i64 = 0;
+    let archetype_count = len(world.archetypes) as i64;
+    while a < archetype_count {
+        if table_value_signature_has(world.archetypes[a].component_ids, component_id) {
+            let column_slot = table_value_world_column_slot<T, R, M>(world, a, component_id);
+            let row: i64 = 0;
+            let row_count = len(world.archetypes[a].entity_ids) as i64;
+            while row < row_count {
+                let eid = world.archetypes[a].entity_ids[row];
+                let entity = entity_new(eid, world.registry.entities.generations[eid]);
+                query.items.push(TableValueMut<T> { entity: entity, component_id: component_id, archetype_id: world.archetypes[a].id, row: row, value: world.archetypes[a].columns[column_slot].values[row] });
+                row = row + 1;
+            }
+        };
+        a = a + 1;
+    }
+    return query;
+}
+
+fn table_value_world_query_pair_mut_first<T, R, M>(world: TableValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32) -> Query<TableValuePairMut<T>> {
+    let query = query_new<TableValuePairMut<T>>();
+    let first_items = table_value_world_query_mut<T, R, M>(world, first_component_id);
+    let i: i64 = 0;
+    let cnt = len(first_items.items) as i64;
+    while i < cnt {
+        let item = first_items.items[i];
+        if table_value_world_has<T, R, M>(world, item.entity, second_component_id) {
+            query.items.push(TableValuePairMut<T> { first: item, second_component_id: second_component_id, second: table_value_world_get<T, R, M>(world, item.entity, second_component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_value_world_write<T, R, M>(world: TableValueWorld<T, R, M>, item: TableValueMut<T>, value: T) -> TableValueWorld<T, R, M> {
+    if table_value_world_is_alive<T, R, M>(world, item.entity) != true { return world; };
+    let current_archetype = table_value_world_entity_archetype_id<T, R, M>(world, item.entity);
+    let current_row = table_value_world_entity_row<T, R, M>(world, item.entity);
+    if current_archetype != item.archetype_id { return world; };
+    if current_row != item.row { return world; };
+    let archetype_slot = item.archetype_id as i64;
+    let column_slot = table_value_world_column_slot<T, R, M>(world, archetype_slot, item.component_id);
+    if column_slot < 0 { return world; };
+    world.archetypes[archetype_slot].columns[column_slot].values[item.row] = value;
+    world.registry = registry_world_insert_component(world.registry, item.entity, item.component_id);
+    return world;
+}
+
+fn table_value_world_pair_write_first<T, R, M>(world: TableValueWorld<T, R, M>, item: TableValuePairMut<T>, value: T) -> TableValueWorld<T, R, M> {
+    return table_value_world_write<T, R, M>(world, item.first, value);
+}
+
+fn table_value_world_insert_resource<T, R, M>(world: TableValueWorld<T, R, M>, value: R) -> TableValueWorld<T, R, M> {
+    if resource_has<R>(world.resource) != true { world.resource_added_tick = world.registry.change_tick; };
+    world.resource = resource_insert<R>(world.resource, value);
+    world.resource_changed_tick = world.registry.change_tick;
+    return world;
+}
+
+fn table_value_world_get_resource<T, R, M>(world: TableValueWorld<T, R, M>) -> R { return resource_get<R>(world.resource); }
+
+fn table_value_world_has_resource<T, R, M>(world: TableValueWorld<T, R, M>) -> bool { return resource_has<R>(world.resource); }
+
+fn table_value_world_res<T, R, M>(world: TableValueWorld<T, R, M>) -> Res<R> {
+    return Res<R> { value: table_value_world_get_resource<T, R, M>(world), added_tick: world.resource_added_tick, changed_tick: world.resource_changed_tick };
+}
+
+fn table_value_world_res_mut<T, R, M>(world: TableValueWorld<T, R, M>) -> ResMut<R> {
+    return ResMut<R> { value: table_value_world_get_resource<T, R, M>(world), added_tick: world.resource_added_tick, changed_tick: world.resource_changed_tick };
+}
+
+fn table_value_world_resource_added_since<T, R, M>(world: TableValueWorld<T, R, M>, tick: i32) -> bool {
+    if table_value_world_has_resource<T, R, M>(world) != true { return false; };
+    return world.resource_added_tick > tick;
+}
+
+fn table_value_world_resource_changed_since<T, R, M>(world: TableValueWorld<T, R, M>, tick: i32) -> bool {
+    if table_value_world_has_resource<T, R, M>(world) != true { return false; };
+    return world.resource_changed_tick > tick;
+}
+
+fn table_value_world_res_mut_write<T, R, M>(world: TableValueWorld<T, R, M>, res: ResMut<R>, value: R) -> TableValueWorld<T, R, M> {
+    if table_value_world_has_resource<T, R, M>(world) != true { return world; };
+    world.resource = resource_insert<R>(world.resource, value);
+    world.resource_changed_tick = world.registry.change_tick;
+    return world;
+}
+
+fn table_value_world_remove_resource<T, R, M>(world: TableValueWorld<T, R, M>) -> TableValueWorld<T, R, M> {
+    world.resource = resource_remove<R>(world.resource);
+    world.resource_added_tick = 0;
+    world.resource_changed_tick = 0;
+    return world;
+}
+
+fn table_value_world_write_message<T, R, M>(world: TableValueWorld<T, R, M>, value: M) -> TableValueWorld<T, R, M> { world.messages = messages_write<M>(world.messages, value); return world; }
+fn table_value_world_read_message<T, R, M>(world: TableValueWorld<T, R, M>, reader: MessageReader, default_value: M) -> MessageRead<M> { return messages_read_next<M>(world.messages, reader, default_value); }
+
+struct TableValueData { amount: i32 }
+struct TableValueTime { tick: i32 }
+struct TableValueEvent { amount: i32 }
+
+fn table_value_time_default() -> TableValueTime { return TableValueTime { tick: 0 }; }
+fn table_value_event_default() -> TableValueEvent { return TableValueEvent { amount: 0 }; }
+fn table_value_test_world_new() -> TableValueWorld<TableValueData, TableValueTime, TableValueEvent> { return table_value_world_new<TableValueData, TableValueTime, TableValueEvent>(table_value_time_default(), table_value_event_default()); }
+
+@test "table value world stores component values by archetype row"() {
+    let w0 = table_value_test_world_new();
+    let (w1, health) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w0);
+    let (w2, mana) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w1);
+    let (w3, selected) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w2);
+    let (w4, e1) = table_value_world_spawn<TableValueData, TableValueTime, TableValueEvent>(w3);
+    let (w5, e2) = table_value_world_spawn<TableValueData, TableValueTime, TableValueEvent>(w4);
+    let w6 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w5, e1, health.id, TableValueData { amount: 10 });
+    let w7 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w6, e1, mana.id, TableValueData { amount: 4 });
+    let w8 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w7, e2, health.id, TableValueData { amount: 8 });
+    let w9 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w8, e2, mana.id, TableValueData { amount: 2 });
+    let shared = table_value_world_entity_archetype_id<TableValueData, TableValueTime, TableValueEvent>(w9, e1);
+    if shared != table_value_world_entity_archetype_id<TableValueData, TableValueTime, TableValueEvent>(w9, e2) { panic(11010); };
+    if table_value_world_archetype_entity_count<TableValueData, TableValueTime, TableValueEvent>(w9, shared) != 2 { panic(11011); };
+    let row_e2_before = table_value_world_entity_row<TableValueData, TableValueTime, TableValueEvent>(w9, e2);
+    if row_e2_before != 1 { panic(11012); };
+    let w10 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w9, e1, selected.id, TableValueData { amount: 1 });
+    if table_value_world_entity_archetype_id<TableValueData, TableValueTime, TableValueEvent>(w10, e1) == table_value_world_entity_archetype_id<TableValueData, TableValueTime, TableValueEvent>(w10, e2) { panic(11013); };
+    if table_value_world_entity_row<TableValueData, TableValueTime, TableValueEvent>(w10, e2) != 0 { panic(11014); };
+    if table_value_world_get<TableValueData, TableValueTime, TableValueEvent>(w10, e2, health.id).amount != 8 { panic(11015); };
+    if table_value_world_get<TableValueData, TableValueTime, TableValueEvent>(w10, e2, mana.id).amount != 2 { panic(11016); };
+}
+
+@test "table value world writeback preserves archetype row"() {
+    let w0 = table_value_test_world_new();
+    let (w1, health) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w0);
+    let (w2, mana) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w1);
+    let (w3, entity) = table_value_world_spawn<TableValueData, TableValueTime, TableValueEvent>(w2);
+    let w4 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w3, entity, health.id, TableValueData { amount: 5 });
+    let w5 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w4, entity, mana.id, TableValueData { amount: 3 });
+    let before = w5.registry.change_tick;
+    let group_before = table_value_world_entity_archetype_id<TableValueData, TableValueTime, TableValueEvent>(w5, entity);
+    let row_before = table_value_world_entity_row<TableValueData, TableValueTime, TableValueEvent>(w5, entity);
+    let w6 = table_value_world_increment_tick<TableValueData, TableValueTime, TableValueEvent>(w5);
+    let q = table_value_world_query_pair_mut_first<TableValueData, TableValueTime, TableValueEvent>(w6, health.id, mana.id);
+    let item = q.items[0];
+    let w7 = table_value_world_pair_write_first<TableValueData, TableValueTime, TableValueEvent>(w6, item, TableValueData { amount: item.first.value.amount + item.second.amount });
+    if table_value_world_entity_archetype_id<TableValueData, TableValueTime, TableValueEvent>(w7, entity) != group_before { panic(11020); };
+    if table_value_world_entity_row<TableValueData, TableValueTime, TableValueEvent>(w7, entity) != row_before { panic(11021); };
+    if table_value_world_get<TableValueData, TableValueTime, TableValueEvent>(w7, entity, health.id).amount != 8 { panic(11022); };
+    if table_value_world_changed_since<TableValueData, TableValueTime, TableValueEvent>(w7, entity, health.id, before) != true { panic(11023); };
+    let changed = table_value_world_query_changed<TableValueData, TableValueTime, TableValueEvent>(w7, health.id, before);
+    if len(changed.items) != 1 { panic(11024); };
+}
+
+@test "table value world remove despawn resources and messages"() {
+    let w0 = table_value_test_world_new();
+    let (w1, health) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w0);
+    let (w2, mana) = table_value_world_register_table<TableValueData, TableValueTime, TableValueEvent>(w1);
+    let (w3, e1) = table_value_world_spawn<TableValueData, TableValueTime, TableValueEvent>(w2);
+    let (w4, e2) = table_value_world_spawn<TableValueData, TableValueTime, TableValueEvent>(w3);
+    let w5 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w4, e1, health.id, TableValueData { amount: 5 });
+    let w6 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w5, e1, mana.id, TableValueData { amount: 3 });
+    let w7 = table_value_world_insert<TableValueData, TableValueTime, TableValueEvent>(w6, e2, health.id, TableValueData { amount: 7 });
+    let has_mana = table_value_world_query_with<TableValueData, TableValueTime, TableValueEvent>(w7, health.id, mana.id);
+    if len(has_mana.items) != 1 { panic(11036); };
+    if has_mana.items[0].entity.id != e1.id { panic(11037); };
+    let w8 = table_value_world_remove<TableValueData, TableValueTime, TableValueEvent>(w7, e1, mana.id);
+    if table_value_world_has<TableValueData, TableValueTime, TableValueEvent>(w8, e1, mana.id) != false { panic(11030); };
+    let health_only = table_value_world_query_without<TableValueData, TableValueTime, TableValueEvent>(w8, health.id, mana.id);
+    if len(health_only.items) != 2 { panic(11031); };
+    let w9 = table_value_world_insert_resource<TableValueData, TableValueTime, TableValueEvent>(w8, TableValueTime { tick: 6 });
+    let w10 = table_value_world_write_message<TableValueData, TableValueTime, TableValueEvent>(w9, TableValueEvent { amount: 9 });
+    let w11 = table_value_world_despawn<TableValueData, TableValueTime, TableValueEvent>(w10, e2);
+    let q = table_value_world_query<TableValueData, TableValueTime, TableValueEvent>(w11, health.id);
+    let time = table_value_world_get_resource<TableValueData, TableValueTime, TableValueEvent>(w11);
+    let event = table_value_world_read_message<TableValueData, TableValueTime, TableValueEvent>(w11, message_reader_new(), table_value_event_default());
+    if len(q.items) != 1 { panic(11032); };
+    if table_value_world_is_alive<TableValueData, TableValueTime, TableValueEvent>(w11, e2) != false { panic(11033); };
+    if time.tick != 6 { panic(11034); };
+    if event.value.amount != 9 { panic(11035); };
+}

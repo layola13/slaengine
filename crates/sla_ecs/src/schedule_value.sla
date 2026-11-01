@@ -1,0 +1,406 @@
+// Bevy ECS schedule::schedule::Schedule (src/schedule/schedule.rs lines 387-715).
+// This models the single-Schedule value struct and its lifecycle API.
+// The executable layer references by ID, keeping the model pure-value.
+
+const ECS_SCHEDULE_EXECUTOR_MULTI: i32 = 0;
+const ECS_SCHEDULE_EXECUTOR_SINGLE: i32 = 1;
+
+// Mirror of SystemSchedule executable: system IDs + condition counts + run bookkeeping
+struct EcsScheduleExecutable {
+    system_ids: Vec<i64>,
+    system_condition_counts: Vec<i64>,
+    system_last_run: Vec<i64>,
+    system_change_tick: Vec<i64>,
+    set_ids: Vec<i64>,
+    set_condition_counts: Vec<i64>,
+    // total systems actually scheduled after build
+    built_system_count: i64,
+    // total sets scheduled after build
+    built_set_count: i64,
+}
+
+struct EcsSchedule {
+    label: i64,
+    // graph changed flag (schedule rebuild trigger)
+    graph_changed: bool,
+    // executable build state
+    executable: EcsScheduleExecutable,
+    // executor kind: multi-threaded or single-threaded
+    executor_kind: i32,
+    // apply_final_deferred setting
+    apply_final_deferred: bool,
+    // true after initialize() has been called
+    executor_initialized: bool,
+    // build settings index reference
+    build_settings_ambiguity: i32,
+    build_settings_hierarchy: i32,
+    build_settings_auto_insert: bool,
+}
+
+// new(label): construct an empty Schedule
+fn ecs_schedule_new(label: i64) -> EcsSchedule {
+    return EcsSchedule {
+        label: label,
+        graph_changed: true,
+        executable: EcsScheduleExecutable {
+            system_ids: Vec::new(),
+            system_condition_counts: Vec::new(),
+            system_last_run: Vec::new(),
+            system_change_tick: Vec::new(),
+            set_ids: Vec::new(),
+            set_condition_counts: Vec::new(),
+            built_system_count: 0,
+            built_set_count: 0,
+        },
+        executor_kind: ECS_SCHEDULE_EXECUTOR_MULTI,
+        apply_final_deferred: true,
+        executor_initialized: false,
+        build_settings_ambiguity: 0,
+        build_settings_hierarchy: 0,
+        build_settings_auto_insert: true,
+    };
+}
+
+// default(): schedule with default label 0
+fn ecs_schedule_default() -> EcsSchedule {
+    return ecs_schedule_new(0);
+}
+
+// is_changed(): whether schedule graph changed since last build
+fn ecs_schedule_is_changed(s: EcsSchedule) -> bool {
+    return s.graph_changed;
+}
+
+// label(): the schedule's label
+fn ecs_schedule_label(s: EcsSchedule) -> i64 {
+    return s.label;
+}
+
+// mark graph as changed (e.g. on add_systems)
+fn ecs_schedule_mark_changed(s: EcsSchedule) -> EcsSchedule {
+    s.graph_changed = true;
+    s.executor_initialized = false;
+    return s;
+}
+
+// set_executor: set the executor kind (multi-threaded or single-threaded)
+fn ecs_schedule_set_executor(s: EcsSchedule, executor_kind: i32) -> EcsSchedule {
+    s.executor_kind = executor_kind;
+    s.executor_initialized = false;
+    return s;
+}
+
+// set_apply_final_deferred: configure deferred apply at schedule end
+fn ecs_schedule_set_apply_final_deferred(s: EcsSchedule, apply_final_deferred: bool) -> EcsSchedule {
+    s.apply_final_deferred = apply_final_deferred;
+    return s;
+}
+
+// add_system: record a new system with its condition count, mark graph changed
+fn ecs_schedule_add_system(s: EcsSchedule, system_id: i64, condition_count: i64) -> EcsSchedule {
+    s.executable.system_ids.push(system_id);
+    s.executable.system_condition_counts.push(condition_count);
+    s.executable.system_last_run.push(0);
+    s.executable.system_change_tick.push(0);
+    return ecs_schedule_mark_changed(s);
+}
+
+// add_set: record a new set with its condition count
+fn ecs_schedule_add_set(s: EcsSchedule, set_id: i64, condition_count: i64) -> EcsSchedule {
+    s.executable.set_ids.push(set_id);
+    s.executable.set_condition_counts.push(condition_count);
+    return ecs_schedule_mark_changed(s);
+}
+
+// set_build_settings: configure ambiguity/hierarchy/auto-insert levels
+fn ecs_schedule_set_build_settings(s: EcsSchedule, ambiguity_level: i32, hierarchy_level: i32, auto_insert: bool) -> EcsSchedule {
+    s.build_settings_ambiguity = ambiguity_level;
+    s.build_settings_hierarchy = hierarchy_level;
+    s.build_settings_auto_insert = auto_insert;
+    return s;
+}
+
+// get_build_settings_ambiguity
+fn ecs_schedule_get_build_settings_ambiguity(s: EcsSchedule) -> i32 {
+    return s.build_settings_ambiguity;
+}
+
+// get_build_settings_hierarchy
+fn ecs_schedule_get_build_settings_hierarchy(s: EcsSchedule) -> i32 {
+    return s.build_settings_hierarchy;
+}
+
+// get_build_settings_auto_insert
+fn ecs_schedule_get_build_settings_auto_insert(s: EcsSchedule) -> bool {
+    return s.build_settings_auto_insert;
+}
+
+// initialize(): rebuild executable from graph; sets executor_initialized=true.
+// In this model we "freeze" the built counts and clear graph_changed.
+fn ecs_schedule_initialize(s: EcsSchedule) -> (EcsSchedule, bool) {
+    s.executable.built_system_count = len(s.executable.system_ids) as i64;
+    s.executable.built_set_count = len(s.executable.set_ids) as i64;
+    s.graph_changed = false;
+    s.executor_initialized = true;
+    return (s, true);
+}
+
+// run(): checks change ticks, initializes if needed, then returns the run order
+// (model: returns the built_system_count so callers can verify)
+fn ecs_schedule_run(s: EcsSchedule) -> (EcsSchedule, i64) {
+    // check_change_ticks - increment all ticks
+    let r0 = ecs_schedule_check_change_ticks(s, 1);
+    let s2 = r0.0;
+    // initialize
+    let ri = ecs_schedule_initialize(s2);
+    return (ri.0, ri.0.executable.built_system_count);
+}
+
+struct EcsCheckChangeTicksResult {
+    checked_systems: i64,
+    present_tick: i64,
+}
+
+// check_change_ticks: clamp each system's last_check_tick to present - max_age
+// Bevy: for each non-ApplyDeferred system, condition: check_change_tick(present, max_age)
+// Model: set change_tick = present for all built systems + conditions
+fn ecs_schedule_check_change_ticks(s: EcsSchedule, present_tick: i64) -> (EcsSchedule, EcsCheckChangeTicksResult) {
+    let idx: i64 = 0;
+    let n: i64 = len(s.executable.system_change_tick) as i64;
+    while idx < n {
+        s.executable.system_change_tick[idx] = present_tick;
+        idx = idx + 1;
+    }
+    return (s, EcsCheckChangeTicksResult { checked_systems: n, present_tick: present_tick });
+}
+
+// apply_deferred: directly flush all accumulated deferred system buffers
+// Bevy: for SystemWithAccess { system, .. } in executable.systems: system.apply_deferred(world)
+// Model: returns the count of systems for which apply_deferred was invoked
+fn ecs_schedule_apply_deferred(s: EcsSchedule) -> (EcsSchedule, i64) {
+    let count: i64 = len(s.executable.system_ids) as i64;
+    return (s, count);
+}
+
+// systems(): returns (initialized, system_ids) — always fail ScheduleNotInitialized if executor not initialized
+fn ecs_schedule_systems(s: EcsSchedule) -> (bool, Vec<i64>) {
+    if s.executor_initialized != true {
+        return (false, Vec::new());
+    };
+    return (true, s.executable.system_ids);
+}
+
+// systems_len(): returns (initialized, count) — fail if not initialized
+fn ecs_schedule_systems_len(s: EcsSchedule) -> (bool, i64) {
+    if s.executor_initialized != true {
+        return (false, 0);
+    };
+    return (true, len(s.executable.system_ids) as i64);
+}
+
+// graph accessor: returns (built, system_count_in_graph)
+fn ecs_schedule_graph_system_count(s: EcsSchedule) -> i64 {
+    return len(s.executable.system_ids) as i64;
+}
+
+fn ecs_schedule_graph_set_count(s: EcsSchedule) -> i64 {
+    return len(s.executable.set_ids) as i64;
+}
+
+// systems_in_set: returns count of systems tied to a given set id
+fn ecs_schedule_systems_in_set(s: EcsSchedule, set_id: i64) -> i64 {
+    // model: count by set_id; in this struct we track set_ids directly
+    let idx: i64 = 0;
+    let n: i64 = len(s.executable.set_ids) as i64;
+    let c: i64 = 0;
+    while idx < n {
+        if s.executable.set_ids[idx] == set_id {
+            c = c + 1;
+        };
+        idx = idx + 1;
+    }
+    return c;
+}
+
+// remove_systems_in_set: removes all systems with matching set id; marks graph changed
+fn ecs_schedule_remove_systems_in_set(s: EcsSchedule, set_id: i64) -> EcsSchedule {
+    let new_set_ids: Vec<i64> = Vec::new();
+    let idx: i64 = 0;
+    let n: i64 = len(s.executable.set_ids) as i64;
+    while idx < n {
+        if s.executable.set_ids[idx] != set_id {
+            new_set_ids.push(s.executable.set_ids[idx]);
+        };
+        idx = idx + 1;
+    }
+    s.executable.set_ids = new_set_ids;
+    return ecs_schedule_mark_changed(s);
+}
+
+// executor_initialized: whether executor has been initialized
+fn ecs_schedule_executor_initialized(s: EcsSchedule) -> bool {
+    return s.executor_initialized;
+}
+
+// apply_final_deferred: accessor
+fn ecs_schedule_apply_final_deferred(s: EcsSchedule) -> bool {
+    return s.apply_final_deferred;
+}
+
+// executor_kind: accessor
+fn ecs_schedule_executor_kind(s: EcsSchedule) -> i32 {
+    return s.executor_kind;
+}
+
+// ---------------------------------------------------------------------------
+// Batch 172 — ScheduleCleanupPolicy + remove_systems_in_set_with_policy.
+// Mirrors src/schedule/schedule.rs (enum ScheduleCleanupPolicy lines 1460-1490,
+// remove_systems_in_set lines 1005-1070, add_edges_for_transitive_dependencies
+// lines 983-1004, remove_systems_by_keys/remove_set_by_key lines 1060-1074).
+// ---------------------------------------------------------------------------
+
+// ScheduleCleanupPolicy enum constants
+const ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS: i32 = 0;
+const ECS_CLEANUP_REMOVE_SYSTEMS_ONLY: i32 = 1;
+const ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS_ALLOW_BREAKAGES: i32 = 2;
+const ECS_CLEANUP_REMOVE_SYSTEMS_ONLY_ALLOW_BREAKAGES: i32 = 3;
+
+fn ecs_cleanup_policy_default() -> i32 {
+    return ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS;
+}
+
+fn ecs_cleanup_policy_is_remove_set_and_systems(p: i32) -> bool {
+    return p == ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS;
+}
+
+fn ecs_cleanup_policy_is_remove_systems_only(p: i32) -> bool {
+    return p == ECS_CLEANUP_REMOVE_SYSTEMS_ONLY;
+}
+
+fn ecs_cleanup_policy_is_remove_set_and_systems_allow_breakages(p: i32) -> bool {
+    return p == ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS_ALLOW_BREAKAGES;
+}
+
+fn ecs_cleanup_policy_is_remove_systems_only_allow_breakages(p: i32) -> bool {
+    return p == ECS_CLEANUP_REMOVE_SYSTEMS_ONLY_ALLOW_BREAKAGES;
+}
+
+// result struct for policy-aware removal
+struct EcsScheduleCleanupResult {
+    removed_count: i32,
+    transitive_edges_added: i32,
+    set_removed: bool,
+    ok: bool,
+}
+
+// remove_systems_in_set_with_policy: Bevy's full policy-aware removal.
+// – RemoveSetAndSystems: remove systems + set, add transitive edges (preserve order)
+// – RemoveSystemsOnly: remove systems only, add transitive edges
+// – RemoveSetAndSystemsAllowBreakages: remove systems + set, no transitive edges
+// – RemoveSystemsOnlyAllowBreakages: remove systems only, no transitive edges
+fn ecs_schedule_remove_systems_in_set_with_policy(s: EcsSchedule, set_id: i64, policy: i32) -> (EcsSchedule, EcsScheduleCleanupResult) {
+    // find systems in set (indices matching set_id)
+    let keys: Vec<i64> = Vec::new();
+    let idx: i64 = 0;
+    let n: i64 = len(s.executable.set_ids) as i64;
+    while idx < n {
+        if s.executable.set_ids[idx] == set_id {
+            keys.push(idx);
+        };
+        idx = idx + 1;
+    }
+
+    let removed_count: i32 = len(keys) as i32;
+    let kn: i32 = len(keys) as i32;
+
+    // remove systems from system_ids and parallel arrays
+    let new_system_ids: Vec<i64> = Vec::new();
+    let new_cond_counts: Vec<i64> = Vec::new();
+    let new_last_run: Vec<i64> = Vec::new();
+    let new_change_tick: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let sn: i64 = len(s.executable.system_ids) as i64;
+    while i < sn {
+        let in_removed_set: bool = false;
+        let kj: i32 = 0;
+        while kj < kn {
+            if keys[kj] == i {
+                in_removed_set = true;
+            };
+            kj = kj + 1;
+        }
+        if in_removed_set != true {
+            new_system_ids.push(s.executable.system_ids[i]);
+            new_cond_counts.push(s.executable.system_condition_counts[i]);
+            new_last_run.push(s.executable.system_last_run[i]);
+            new_change_tick.push(s.executable.system_change_tick[i]);
+        };
+        i = i + 1;
+    }
+    s.executable.system_ids = new_system_ids;
+    s.executable.system_condition_counts = new_cond_counts;
+    s.executable.system_last_run = new_last_run;
+    s.executable.system_change_tick = new_change_tick;
+
+    // filter set_ids: RemoveSetAndSystems* variants drop the set itself
+    let drop_set: bool = policy == ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS || policy == ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS_ALLOW_BREAKAGES;
+    let new_set_ids: Vec<i64> = Vec::new();
+    let si: i64 = 0;
+    let stn: i64 = len(s.executable.set_ids) as i64;
+    while si < stn {
+        if (drop_set == true) && (s.executable.set_ids[si] == set_id) {
+            // skip
+        } else {
+            new_set_ids.push(s.executable.set_ids[si]);
+        };
+        si = si + 1;
+    }
+    s.executable.set_ids = new_set_ids;
+
+    // transitive edges added (bridging in->out neighbors of removed systems)
+    let transitive_edges_added: i32 = 0;
+    let need_bridge: bool = policy == ECS_CLEANUP_REMOVE_SET_AND_SYSTEMS || policy == ECS_CLEANUP_REMOVE_SYSTEMS_ONLY;
+    if need_bridge == true {
+        // without explicit dependency_edges stored in this value model, bridge count is 0;
+        // the field exists and is reported for parity — full edge-bridging lives in the
+        // higher-level ScheduleGraph model where dependency/adjacency arrays are tracked.
+    };
+
+    s = ecs_schedule_mark_changed(s);
+
+    return (s, EcsScheduleCleanupResult {
+        removed_count: removed_count,
+        transitive_edges_added: transitive_edges_added,
+        set_removed: drop_set,
+        ok: true,
+    });
+}
+
+fn ecs_schedule_systems_in_set_count(s: EcsSchedule, set_id: i64) -> i32 {
+    let idx: i64 = 0;
+    let n: i64 = len(s.executable.set_ids) as i64;
+    let c: i32 = 0;
+    while idx < n {
+        if s.executable.set_ids[idx] == set_id {
+            c = c + 1;
+        };
+        idx = idx + 1;
+    }
+    return c;
+}
+
+fn ecs_schedule_cleanup_result_removed_count(r: EcsScheduleCleanupResult) -> i32 {
+    return r.removed_count;
+}
+
+fn ecs_schedule_cleanup_result_transitive_edges_added(r: EcsScheduleCleanupResult) -> i32 {
+    return r.transitive_edges_added;
+}
+
+fn ecs_schedule_cleanup_result_set_removed(r: EcsScheduleCleanupResult) -> bool {
+    return r.set_removed;
+}
+
+fn ecs_schedule_cleanup_result_ok(r: EcsScheduleCleanupResult) -> bool {
+    return r.ok;
+}

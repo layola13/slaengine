@@ -1,0 +1,308 @@
+// Bevy ECS EntityIndexMap ordered slice/range/iterator extras.
+// Mirrors src/entity/index_map.rs surface not covered by lib/entity_collections.sla:
+// as_slice/as_mut_slice/get_range/drain, Slice split/range/key/value helpers,
+// Iter/IntoIter/Drain/Keys/IntoKeys ordered double-ended iterator semantics.
+
+struct EcsEntityIndexMapPair {
+    key: i64,
+    value: i32,
+}
+
+struct EcsEntityIndexMapExtras {
+    entries: Vec<EcsEntityIndexMapPair>,
+}
+
+struct EcsEntityIndexMapSlice {
+    entries: Vec<EcsEntityIndexMapPair>,
+}
+
+struct EcsEimSliceResult {
+    has: i32,
+    slice: EcsEntityIndexMapSlice,
+}
+
+struct EcsEimPairResult {
+    has: i32,
+    key: i64,
+    value: i32,
+}
+
+struct EcsEimSlicePairResult {
+    slice: EcsEntityIndexMapSlice,
+    pair: EcsEimPairResult,
+}
+
+struct EcsEimSplitResult {
+    left: EcsEntityIndexMapSlice,
+    right: EcsEntityIndexMapSlice,
+}
+
+struct EcsEimSplitPairResult {
+    has: i32,
+    key: i64,
+    value: i32,
+    rest: EcsEntityIndexMapSlice,
+}
+
+struct EcsEimDrainResult {
+    map: EcsEntityIndexMapExtras,
+    drained: EcsEntityIndexMapIter,
+}
+
+struct EcsEntityIndexMapIter {
+    entries: Vec<EcsEntityIndexMapPair>,
+    front: i64,
+    back: i64,
+}
+
+struct EcsEntityIndexMapKeys {
+    keys: Vec<i64>,
+    front: i64,
+    back: i64,
+    trusted_unique: i32,
+}
+
+struct EcsEimIterNext {
+    iter: EcsEntityIndexMapIter,
+    has: i32,
+    key: i64,
+    value: i32,
+}
+
+struct EcsEimKeyNext {
+    iter: EcsEntityIndexMapKeys,
+    has: i32,
+    key: i64,
+}
+
+fn ecs_eim_pair(key: i64, value: i32) -> EcsEntityIndexMapPair {
+    return EcsEntityIndexMapPair { key: key, value: value };
+}
+
+fn ecs_eim_new() -> EcsEntityIndexMapExtras {
+    return EcsEntityIndexMapExtras { entries: Vec::new() };
+}
+
+fn ecs_eim_len(map: EcsEntityIndexMapExtras) -> i64 { return len(map.entries) as i64; }
+
+fn ecs_eim_slice_len(slice: EcsEntityIndexMapSlice) -> i64 { return len(slice.entries) as i64; }
+
+fn ecs_eim_insert(map: EcsEntityIndexMapExtras, key: i64, value: i32) -> EcsEntityIndexMapExtras {
+    let i: i64 = 0;
+    let n = len(map.entries) as i64;
+    while i < n {
+        if map.entries[i].key == key {
+            map.entries[i].value = value;
+            return map;
+        };
+        i = i + 1;
+    }
+    map.entries.push(EcsEntityIndexMapPair { key: key, value: value });
+    return map;
+}
+
+fn ecs_eim_as_slice(map: EcsEntityIndexMapExtras) -> EcsEntityIndexMapSlice {
+    return EcsEntityIndexMapSlice { entries: map.entries };
+}
+
+fn ecs_eim_slice_new() -> EcsEntityIndexMapSlice {
+    return EcsEntityIndexMapSlice { entries: Vec::new() };
+}
+
+fn ecs_eim_slice_pair_at(slice: EcsEntityIndexMapSlice, index: i64) -> EcsEimPairResult {
+    if index < 0 { return EcsEimPairResult { has: 0, key: -1, value: 0 }; };
+    if index >= len(slice.entries) as i64 { return EcsEimPairResult { has: 0, key: -1, value: 0 }; };
+    let pair = slice.entries[index];
+    return EcsEimPairResult { has: 1, key: pair.key, value: pair.value };
+}
+
+fn ecs_eim_slice_get_index_mut(slice: EcsEntityIndexMapSlice, index: i64, new_value: i32) -> EcsEimSlicePairResult {
+    if index < 0 { return EcsEimSlicePairResult { slice: slice, pair: EcsEimPairResult { has: 0, key: -1, value: 0 } }; };
+    if index >= len(slice.entries) as i64 { return EcsEimSlicePairResult { slice: slice, pair: EcsEimPairResult { has: 0, key: -1, value: 0 } }; };
+    let key = slice.entries[index].key;
+    slice.entries[index].value = new_value;
+    return EcsEimSlicePairResult { slice: slice, pair: EcsEimPairResult { has: 1, key: key, value: new_value } };
+}
+
+fn ecs_eim_slice_range(slice: EcsEntityIndexMapSlice, start: i64, end: i64) -> EcsEimSliceResult {
+    let n = len(slice.entries) as i64;
+    if start < 0 { return EcsEimSliceResult { has: 0, slice: ecs_eim_slice_new() }; };
+    if end < start { return EcsEimSliceResult { has: 0, slice: ecs_eim_slice_new() }; };
+    if end > n { return EcsEimSliceResult { has: 0, slice: ecs_eim_slice_new() }; };
+    let out: Vec<EcsEntityIndexMapPair> = Vec::new();
+    let i = start;
+    while i < end {
+        out.push(slice.entries[i]);
+        i = i + 1;
+    }
+    return EcsEimSliceResult { has: 1, slice: EcsEntityIndexMapSlice { entries: out } };
+}
+
+fn ecs_eim_get_range(map: EcsEntityIndexMapExtras, start: i64, end: i64) -> EcsEimSliceResult {
+    return ecs_eim_slice_range(ecs_eim_as_slice(map), start, end);
+}
+
+fn ecs_eim_slice_first(slice: EcsEntityIndexMapSlice) -> EcsEimPairResult {
+    return ecs_eim_slice_pair_at(slice, 0);
+}
+
+fn ecs_eim_slice_last(slice: EcsEntityIndexMapSlice) -> EcsEimPairResult {
+    return ecs_eim_slice_pair_at(slice, (len(slice.entries) as i64) - 1);
+}
+
+fn ecs_eim_slice_split_at_clamped(slice: EcsEntityIndexMapSlice, cut: i64) -> EcsEimSplitResult {
+    let n = len(slice.entries) as i64;
+    let left: Vec<EcsEntityIndexMapPair> = Vec::new();
+    let right: Vec<EcsEntityIndexMapPair> = Vec::new();
+    let i: i64 = 0;
+    while i < n {
+        if i < cut { left.push(slice.entries[i]); };
+        if i >= cut { right.push(slice.entries[i]); };
+        i = i + 1;
+    }
+    return EcsEimSplitResult { left: EcsEntityIndexMapSlice { entries: left }, right: EcsEntityIndexMapSlice { entries: right } };
+}
+
+fn ecs_eim_slice_split_at(slice: EcsEntityIndexMapSlice, index: i64) -> EcsEimSplitResult {
+    let n = len(slice.entries) as i64;
+    if index <= 0 { return ecs_eim_slice_split_at_clamped(slice, 0); };
+    if index >= n { return ecs_eim_slice_split_at_clamped(slice, n); };
+    return ecs_eim_slice_split_at_clamped(slice, index);
+}
+
+fn ecs_eim_slice_split_first(slice: EcsEntityIndexMapSlice) -> EcsEimSplitPairResult {
+    let first = ecs_eim_slice_first(slice);
+    if first.has == 0 { return EcsEimSplitPairResult { has: 0, key: -1, value: 0, rest: ecs_eim_slice_new() }; };
+    let split = ecs_eim_slice_split_at(slice, 1);
+    return EcsEimSplitPairResult { has: 1, key: first.key, value: first.value, rest: split.right };
+}
+
+fn ecs_eim_slice_split_last(slice: EcsEntityIndexMapSlice) -> EcsEimSplitPairResult {
+    let last = ecs_eim_slice_last(slice);
+    if last.has == 0 { return EcsEimSplitPairResult { has: 0, key: -1, value: 0, rest: ecs_eim_slice_new() }; };
+    let split = ecs_eim_slice_split_at(slice, (len(slice.entries) as i64) - 1);
+    return EcsEimSplitPairResult { has: 1, key: last.key, value: last.value, rest: split.left };
+}
+
+fn ecs_eim_iter_from_slice(slice: EcsEntityIndexMapSlice) -> EcsEntityIndexMapIter {
+    return EcsEntityIndexMapIter { entries: slice.entries, front: 0, back: len(slice.entries) as i64 };
+}
+
+fn ecs_eim_iter(map: EcsEntityIndexMapExtras) -> EcsEntityIndexMapIter {
+    return ecs_eim_iter_from_slice(ecs_eim_as_slice(map));
+}
+
+fn ecs_eim_iter_remaining(iter: EcsEntityIndexMapIter) -> i64 {
+    let remaining = iter.back - iter.front;
+    if remaining < 0 { return 0; };
+    return remaining;
+}
+
+fn ecs_eim_iter_next(iter: EcsEntityIndexMapIter) -> EcsEimIterNext {
+    if iter.front >= iter.back { return EcsEimIterNext { iter: iter, has: 0, key: -1, value: 0 }; };
+    let pair = iter.entries[iter.front];
+    iter.front = iter.front + 1;
+    return EcsEimIterNext { iter: iter, has: 1, key: pair.key, value: pair.value };
+}
+
+fn ecs_eim_iter_next_back(iter: EcsEntityIndexMapIter) -> EcsEimIterNext {
+    if iter.front >= iter.back { return EcsEimIterNext { iter: iter, has: 0, key: -1, value: 0 }; };
+    iter.back = iter.back - 1;
+    let pair = iter.entries[iter.back];
+    return EcsEimIterNext { iter: iter, has: 1, key: pair.key, value: pair.value };
+}
+
+fn ecs_eim_iter_as_slice(iter: EcsEntityIndexMapIter) -> EcsEntityIndexMapSlice {
+    let out: Vec<EcsEntityIndexMapPair> = Vec::new();
+    let i = iter.front;
+    while i < iter.back {
+        out.push(iter.entries[i]);
+        i = i + 1;
+    }
+    return EcsEntityIndexMapSlice { entries: out };
+}
+
+fn ecs_eim_keys_from_slice(slice: EcsEntityIndexMapSlice) -> EcsEntityIndexMapKeys {
+    let keys: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n = len(slice.entries) as i64;
+    while i < n {
+        keys.push(slice.entries[i].key);
+        i = i + 1;
+    }
+    return EcsEntityIndexMapKeys { keys: keys, front: 0, back: len(keys) as i64, trusted_unique: 1 };
+}
+
+fn ecs_eim_keys(map: EcsEntityIndexMapExtras) -> EcsEntityIndexMapKeys {
+    return ecs_eim_keys_from_slice(ecs_eim_as_slice(map));
+}
+
+fn ecs_eim_keys_remaining(keys: EcsEntityIndexMapKeys) -> i64 {
+    let remaining = keys.back - keys.front;
+    if remaining < 0 { return 0; };
+    return remaining;
+}
+
+fn ecs_eim_keys_next(keys: EcsEntityIndexMapKeys) -> EcsEimKeyNext {
+    if keys.front >= keys.back { return EcsEimKeyNext { iter: keys, has: 0, key: -1 }; };
+    let key = keys.keys[keys.front];
+    keys.front = keys.front + 1;
+    return EcsEimKeyNext { iter: keys, has: 1, key: key };
+}
+
+fn ecs_eim_keys_next_back(keys: EcsEntityIndexMapKeys) -> EcsEimKeyNext {
+    if keys.front >= keys.back { return EcsEimKeyNext { iter: keys, has: 0, key: -1 }; };
+    keys.back = keys.back - 1;
+    let key = keys.keys[keys.back];
+    return EcsEimKeyNext { iter: keys, has: 1, key: key };
+}
+
+fn ecs_eim_keys_index(keys: EcsEntityIndexMapKeys, index: i64) -> i64 {
+    let absolute = keys.front + index;
+    if index < 0 { return -1; };
+    if absolute >= keys.back { return -1; };
+    return keys.keys[absolute];
+}
+
+fn ecs_eim_values_sum(slice: EcsEntityIndexMapSlice) -> i64 {
+    let sum: i64 = 0;
+    let i: i64 = 0;
+    let n = len(slice.entries) as i64;
+    while i < n {
+        sum = sum + (slice.entries[i].value as i64);
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn ecs_eim_drain_clamped(map: EcsEntityIndexMapExtras, start: i64, end: i64) -> EcsEimDrainResult {
+    let n = len(map.entries) as i64;
+    let kept: Vec<EcsEntityIndexMapPair> = Vec::new();
+    let drained: Vec<EcsEntityIndexMapPair> = Vec::new();
+    let i: i64 = 0;
+    while i < n {
+        if i >= start {
+            if i < end { drained.push(map.entries[i]); };
+        };
+        if i < start { kept.push(map.entries[i]); };
+        if i >= end { kept.push(map.entries[i]); };
+        i = i + 1;
+    }
+    let out_map = EcsEntityIndexMapExtras { entries: kept };
+    let out_iter = EcsEntityIndexMapIter { entries: drained, front: 0, back: len(drained) as i64 };
+    return EcsEimDrainResult { map: out_map, drained: out_iter };
+}
+
+fn ecs_eim_drain(map: EcsEntityIndexMapExtras, start: i64, end: i64) -> EcsEimDrainResult {
+    let n = len(map.entries) as i64;
+    if start <= 0 {
+        if end >= n { return ecs_eim_drain_clamped(map, 0, n); };
+        if end < 0 { return ecs_eim_drain_clamped(map, 0, 0); };
+        return ecs_eim_drain_clamped(map, 0, end);
+    };
+    if start >= n { return ecs_eim_drain_clamped(map, n, n); };
+    if end <= start { return ecs_eim_drain_clamped(map, start, start); };
+    if end >= n { return ecs_eim_drain_clamped(map, start, n); };
+    return ecs_eim_drain_clamped(map, start, end);
+}
+

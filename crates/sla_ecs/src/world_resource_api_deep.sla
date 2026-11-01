@@ -1,0 +1,722 @@
+// Deepened Bevy ECS World resource management API.
+// Mirrors src/world/mod.rs resource surface:
+//   insert/init/remove/contains/get resource
+//   is_resource_added / is_resource_changed / get_resource_change_ticks
+//   get_or_insert_with / modify_resource
+//   non-send insert/init/remove/contains/get
+//   resource_scope / try_resource_scope (extract then reinsert)
+// Fixed capacity: 4 send resources + 2 non-send.
+// Shallow lib/world_resource_api.sla retained.
+
+const ECS_WRA_ERR_OK: i32 = 0;
+const ECS_WRA_ERR_MISSING: i32 = 1;
+const ECS_WRA_ERR_FULL: i32 = 2;
+const ECS_WRA_ERR_SCOPED: i32 = 3;
+
+struct EcsWraDeep {
+    // send resources (4 slots)
+    id0: i32, v0: i64, add0: i64, ch0: i64,
+    id1: i32, v1: i64, add1: i64, ch1: i64,
+    id2: i32, v2: i64, add2: i64, ch2: i64,
+    id3: i32, v3: i64, add3: i64, ch3: i64,
+    rlen: i32,
+    // non-send (2 slots) + thread id for ownership model
+    ns0: i32, nsv0: i64, nst0: i32,
+    ns1: i32, nsv1: i64, nst1: i32,
+    nslen: i32,
+    call_thread: i32,
+    current_tick: i64,
+    // resource_scope: temporarily extracted id (-1 none)
+    scoped_id: i32,
+    scoped_value: i64,
+    scoped_add: i64,
+    scoped_ch: i64,
+    scoped_active: bool,
+}
+
+fn ecs_wra_deep_new(call_thread: i32) -> EcsWraDeep {
+    return EcsWraDeep {
+        id0: -1, v0: 0, add0: 0, ch0: 0,
+        id1: -1, v1: 0, add1: 0, ch1: 0,
+        id2: -1, v2: 0, add2: 0, ch2: 0,
+        id3: -1, v3: 0, add3: 0, ch3: 0,
+        rlen: 0,
+        ns0: -1, nsv0: 0, nst0: 0,
+        ns1: -1, nsv1: 0, nst1: 0,
+        nslen: 0,
+        call_thread: call_thread,
+        current_tick: 0,
+        scoped_id: -1, scoped_value: 0, scoped_add: 0, scoped_ch: 0, scoped_active: false,
+    };
+}
+
+fn ecs_wra_deep_rlen(w: EcsWraDeep) -> i32 { return w.rlen; }
+fn ecs_wra_deep_nslen(w: EcsWraDeep) -> i32 { return w.nslen; }
+fn ecs_wra_deep_tick(w: EcsWraDeep) -> i64 { return w.current_tick; }
+fn ecs_wra_deep_call_thread(w: EcsWraDeep) -> i32 { return w.call_thread; }
+fn ecs_wra_deep_scoped_active(w: EcsWraDeep) -> bool { return w.scoped_active; }
+
+fn ecs_wra_deep_rebuild(
+    id0: i32, v0: i64, add0: i64, ch0: i64,
+    id1: i32, v1: i64, add1: i64, ch1: i64,
+    id2: i32, v2: i64, add2: i64, ch2: i64,
+    id3: i32, v3: i64, add3: i64, ch3: i64,
+    rlen: i32,
+    ns0: i32, nsv0: i64, nst0: i32,
+    ns1: i32, nsv1: i64, nst1: i32,
+    nslen: i32,
+    call_thread: i32, current_tick: i64,
+    scoped_id: i32, scoped_value: i64, scoped_add: i64, scoped_ch: i64, scoped_active: bool
+) -> EcsWraDeep {
+    return EcsWraDeep {
+        id0: id0, v0: v0, add0: add0, ch0: ch0,
+        id1: id1, v1: v1, add1: add1, ch1: ch1,
+        id2: id2, v2: v2, add2: add2, ch2: ch2,
+        id3: id3, v3: v3, add3: add3, ch3: ch3,
+        rlen: rlen,
+        ns0: ns0, nsv0: nsv0, nst0: nst0,
+        ns1: ns1, nsv1: nsv1, nst1: nst1,
+        nslen: nslen,
+        call_thread: call_thread, current_tick: current_tick,
+        scoped_id: scoped_id, scoped_value: scoped_value, scoped_add: scoped_add, scoped_ch: scoped_ch,
+        scoped_active: scoped_active,
+    };
+}
+
+fn ecs_wra_deep_bump_tick(w: EcsWraDeep) -> EcsWraDeep {
+    return ecs_wra_deep_rebuild(
+        w.id0, w.v0, w.add0, w.ch0,
+        w.id1, w.v1, w.add1, w.ch1,
+        w.id2, w.v2, w.add2, w.ch2,
+        w.id3, w.v3, w.add3, w.ch3,
+        w.rlen,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick + 1,
+        w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+    );
+}
+
+fn ecs_wra_deep_contains(w: EcsWraDeep, resource_id: i32) -> bool {
+    if w.rlen >= 1 {
+        if w.id0 == resource_id { return true; };
+    };
+    if w.rlen >= 2 {
+        if w.id1 == resource_id { return true; };
+    };
+    if w.rlen >= 3 {
+        if w.id2 == resource_id { return true; };
+    };
+    if w.rlen >= 4 {
+        if w.id3 == resource_id { return true; };
+    };
+    return false;
+}
+
+struct EcsWraGetDeep {
+    ok: bool,
+    err: i32,
+    value: i64,
+    add_tick: i64,
+    ch_tick: i64,
+}
+
+fn ecs_wra_get_ok(g: EcsWraGetDeep) -> bool { return g.ok; }
+fn ecs_wra_get_err(g: EcsWraGetDeep) -> i32 { return g.err; }
+fn ecs_wra_get_value(g: EcsWraGetDeep) -> i64 { return g.value; }
+fn ecs_wra_get_add(g: EcsWraGetDeep) -> i64 { return g.add_tick; }
+fn ecs_wra_get_ch(g: EcsWraGetDeep) -> i64 { return g.ch_tick; }
+
+fn ecs_wra_get_fail(err: i32) -> EcsWraGetDeep {
+    return EcsWraGetDeep { ok: false, err: err, value: 0, add_tick: 0, ch_tick: 0 };
+}
+
+fn ecs_wra_get_ok_val(value: i64, add_tick: i64, ch_tick: i64) -> EcsWraGetDeep {
+    return EcsWraGetDeep { ok: true, err: ECS_WRA_ERR_OK, value: value, add_tick: add_tick, ch_tick: ch_tick };
+}
+
+fn ecs_wra_deep_get(w: EcsWraDeep, resource_id: i32) -> EcsWraGetDeep {
+    if w.rlen >= 1 {
+        if w.id0 == resource_id { return ecs_wra_get_ok_val(w.v0, w.add0, w.ch0); };
+    };
+    if w.rlen >= 2 {
+        if w.id1 == resource_id { return ecs_wra_get_ok_val(w.v1, w.add1, w.ch1); };
+    };
+    if w.rlen >= 3 {
+        if w.id2 == resource_id { return ecs_wra_get_ok_val(w.v2, w.add2, w.ch2); };
+    };
+    if w.rlen >= 4 {
+        if w.id3 == resource_id { return ecs_wra_get_ok_val(w.v3, w.add3, w.ch3); };
+    };
+    return ecs_wra_get_fail(ECS_WRA_ERR_MISSING);
+}
+
+struct EcsWraSetDeep {
+    ok: bool,
+    err: i32,
+    world: EcsWraDeep,
+    value: i64,
+}
+
+fn ecs_wra_set_ok(s: EcsWraSetDeep) -> bool { return s.ok; }
+fn ecs_wra_set_err(s: EcsWraSetDeep) -> i32 { return s.err; }
+fn ecs_wra_set_world(s: EcsWraSetDeep) -> EcsWraDeep { return s.world; }
+fn ecs_wra_set_value(s: EcsWraSetDeep) -> i64 { return s.value; }
+
+fn ecs_wra_set_fail(w: EcsWraDeep, err: i32) -> EcsWraSetDeep {
+    return EcsWraSetDeep { ok: false, err: err, world: w, value: 0 };
+}
+
+fn ecs_wra_set_ok_w(w: EcsWraDeep, value: i64) -> EcsWraSetDeep {
+    return EcsWraSetDeep { ok: true, err: ECS_WRA_ERR_OK, world: w, value: value };
+}
+
+fn ecs_wra_deep_insert(w: EcsWraDeep, resource_id: i32, value: i64) -> EcsWraSetDeep {
+    let tick = w.current_tick;
+    if w.rlen >= 1 {
+        if w.id0 == resource_id {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, value, w.add0, tick,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), value);
+        };
+    };
+    if w.rlen >= 2 {
+        if w.id1 == resource_id {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, value, w.add1, tick,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), value);
+        };
+    };
+    if w.rlen >= 3 {
+        if w.id2 == resource_id {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, value, w.add2, tick,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), value);
+        };
+    };
+    if w.rlen >= 4 {
+        if w.id3 == resource_id {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, value, w.add3, tick,
+                w.rlen,
+                w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), value);
+        };
+    };
+    if w.rlen == 0 {
+        return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+            resource_id, value, tick, tick,
+            w.id1, w.v1, w.add1, w.ch1,
+            w.id2, w.v2, w.add2, w.ch2,
+            w.id3, w.v3, w.add3, w.ch3,
+            1,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        ), value);
+    };
+    if w.rlen == 1 {
+        return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            resource_id, value, tick, tick,
+            w.id2, w.v2, w.add2, w.ch2,
+            w.id3, w.v3, w.add3, w.ch3,
+            2,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        ), value);
+    };
+    if w.rlen == 2 {
+        return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            w.id1, w.v1, w.add1, w.ch1,
+            resource_id, value, tick, tick,
+            w.id3, w.v3, w.add3, w.ch3,
+            3,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        ), value);
+    };
+    if w.rlen == 3 {
+        return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            w.id1, w.v1, w.add1, w.ch1,
+            w.id2, w.v2, w.add2, w.ch2,
+            resource_id, value, tick, tick,
+            4,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        ), value);
+    };
+    return ecs_wra_set_fail(w, ECS_WRA_ERR_FULL);
+}
+
+fn ecs_wra_deep_init(w: EcsWraDeep, resource_id: i32) -> EcsWraSetDeep {
+    if ecs_wra_deep_contains(w, resource_id) {
+        return ecs_wra_set_ok_w(w, ecs_wra_get_value(ecs_wra_deep_get(w, resource_id)));
+    };
+    return ecs_wra_deep_insert(w, resource_id, 0);
+}
+
+fn ecs_wra_deep_get_or_insert_with(w: EcsWraDeep, resource_id: i32, default_value: i64) -> EcsWraSetDeep {
+    if ecs_wra_deep_contains(w, resource_id) {
+        let g = ecs_wra_deep_get(w, resource_id);
+        return ecs_wra_set_ok_w(w, g.value);
+    };
+    return ecs_wra_deep_insert(w, resource_id, default_value);
+}
+
+fn ecs_wra_deep_remove_slot0(w: EcsWraDeep) -> EcsWraDeep {
+    if w.rlen == 1 {
+        return ecs_wra_deep_rebuild(
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, 0,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        );
+    };
+    if w.rlen == 2 {
+        return ecs_wra_deep_rebuild(
+            w.id1, w.v1, w.add1, w.ch1,
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, 1,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        );
+    };
+    if w.rlen == 3 {
+        return ecs_wra_deep_rebuild(
+            w.id2, w.v2, w.add2, w.ch2,
+            w.id1, w.v1, w.add1, w.ch1,
+            -1, 0, 0, 0, -1, 0, 0, 0, 2,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        );
+    };
+    return ecs_wra_deep_rebuild(
+        w.id3, w.v3, w.add3, w.ch3,
+        w.id1, w.v1, w.add1, w.ch1,
+        w.id2, w.v2, w.add2, w.ch2,
+        -1, 0, 0, 0, 3,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick,
+        w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+    );
+}
+
+fn ecs_wra_deep_remove_slot1(w: EcsWraDeep) -> EcsWraDeep {
+    if w.rlen == 2 {
+        return ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, 1,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        );
+    };
+    if w.rlen == 3 {
+        return ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            w.id2, w.v2, w.add2, w.ch2,
+            -1, 0, 0, 0, -1, 0, 0, 0, 2,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        );
+    };
+    return ecs_wra_deep_rebuild(
+        w.id0, w.v0, w.add0, w.ch0,
+        w.id3, w.v3, w.add3, w.ch3,
+        w.id2, w.v2, w.add2, w.ch2,
+        -1, 0, 0, 0, 3,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick,
+        w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+    );
+}
+
+fn ecs_wra_deep_remove_slot2(w: EcsWraDeep) -> EcsWraDeep {
+    if w.rlen == 3 {
+        return ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            w.id1, w.v1, w.add1, w.ch1,
+            -1, 0, 0, 0, -1, 0, 0, 0, 2,
+            w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        );
+    };
+    return ecs_wra_deep_rebuild(
+        w.id0, w.v0, w.add0, w.ch0,
+        w.id1, w.v1, w.add1, w.ch1,
+        w.id3, w.v3, w.add3, w.ch3,
+        -1, 0, 0, 0, 3,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick,
+        w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+    );
+}
+
+fn ecs_wra_deep_remove_slot3(w: EcsWraDeep) -> EcsWraDeep {
+    return ecs_wra_deep_rebuild(
+        w.id0, w.v0, w.add0, w.ch0,
+        w.id1, w.v1, w.add1, w.ch1,
+        w.id2, w.v2, w.add2, w.ch2,
+        -1, 0, 0, 0, 3,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick,
+        w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+    );
+}
+
+fn ecs_wra_deep_remove(w: EcsWraDeep, resource_id: i32) -> EcsWraSetDeep {
+    if w.rlen >= 1 {
+        if w.id0 == resource_id {
+            let val = w.v0;
+            return ecs_wra_set_ok_w(ecs_wra_deep_remove_slot0(w), val);
+        };
+    };
+    if w.rlen >= 2 {
+        if w.id1 == resource_id {
+            let val = w.v1;
+            return ecs_wra_set_ok_w(ecs_wra_deep_remove_slot1(w), val);
+        };
+    };
+    if w.rlen >= 3 {
+        if w.id2 == resource_id {
+            let val = w.v2;
+            return ecs_wra_set_ok_w(ecs_wra_deep_remove_slot2(w), val);
+        };
+    };
+    if w.rlen >= 4 {
+        if w.id3 == resource_id {
+            let val = w.v3;
+            return ecs_wra_set_ok_w(ecs_wra_deep_remove_slot3(w), val);
+        };
+    };
+    return ecs_wra_set_fail(w, ECS_WRA_ERR_MISSING);
+}
+
+fn ecs_wra_deep_is_added(w: EcsWraDeep, resource_id: i32, last_run: i64, this_run: i64) -> bool {
+    let g = ecs_wra_deep_get(w, resource_id);
+    if g.ok != true { return false; };
+    if g.add_tick > last_run {
+        if g.add_tick <= this_run { return true; };
+    };
+    return false;
+}
+
+fn ecs_wra_deep_is_changed(w: EcsWraDeep, resource_id: i32, last_run: i64, this_run: i64) -> bool {
+    let g = ecs_wra_deep_get(w, resource_id);
+    if g.ok != true { return false; };
+    if g.ch_tick > last_run {
+        if g.ch_tick <= this_run { return true; };
+    };
+    return false;
+}
+
+fn ecs_wra_deep_modify(w: EcsWraDeep, resource_id: i32, delta: i64) -> EcsWraSetDeep {
+    let g = ecs_wra_deep_get(w, resource_id);
+    if g.ok != true { return ecs_wra_set_fail(w, ECS_WRA_ERR_MISSING); };
+    let nv = g.value + delta;
+    return ecs_wra_deep_insert(w, resource_id, nv);
+}
+
+// non-send
+fn ecs_wra_deep_contains_non_send(w: EcsWraDeep, resource_id: i32) -> bool {
+    if w.nslen >= 1 {
+        if w.ns0 == resource_id { return true; };
+    };
+    if w.nslen >= 2 {
+        if w.ns1 == resource_id { return true; };
+    };
+    return false;
+}
+
+fn ecs_wra_deep_get_non_send(w: EcsWraDeep, resource_id: i32) -> EcsWraGetDeep {
+    if w.nslen >= 1 {
+        if w.ns0 == resource_id {
+            let thr_ok = w.nst0 == w.call_thread;
+            if thr_ok != true {
+                // still return value but mark err as SCOPED reuse for thread mismatch? use MISSING no —
+                // model: ok true if present; separate thread check via nst comparison in tests using accessor
+            };
+            return ecs_wra_get_ok_val(w.nsv0, w.nst0 as i64, 0);
+        };
+    };
+    if w.nslen >= 2 {
+        if w.ns1 == resource_id {
+            return ecs_wra_get_ok_val(w.nsv1, w.nst1 as i64, 0);
+        };
+    };
+    return ecs_wra_get_fail(ECS_WRA_ERR_MISSING);
+}
+
+fn ecs_wra_deep_non_send_thread_ok(w: EcsWraDeep, resource_id: i32) -> bool {
+    if w.nslen >= 1 {
+        if w.ns0 == resource_id { return w.nst0 == w.call_thread; };
+    };
+    if w.nslen >= 2 {
+        if w.ns1 == resource_id { return w.nst1 == w.call_thread; };
+    };
+    return false;
+}
+
+fn ecs_wra_deep_insert_non_send(w: EcsWraDeep, resource_id: i32, value: i64, owner_thread: i32) -> EcsWraSetDeep {
+    if w.nslen >= 1 {
+        if w.ns0 == resource_id {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns0, value, owner_thread, w.ns1, w.nsv1, w.nst1, w.nslen,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), value);
+        };
+    };
+    if w.nslen >= 2 {
+        if w.ns1 == resource_id {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns0, w.nsv0, w.nst0, w.ns1, value, owner_thread, w.nslen,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), value);
+        };
+    };
+    if w.nslen == 0 {
+        return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            w.id1, w.v1, w.add1, w.ch1,
+            w.id2, w.v2, w.add2, w.ch2,
+            w.id3, w.v3, w.add3, w.ch3,
+            w.rlen,
+            resource_id, value, owner_thread, w.ns1, w.nsv1, w.nst1, 1,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        ), value);
+    };
+    if w.nslen == 1 {
+        return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+            w.id0, w.v0, w.add0, w.ch0,
+            w.id1, w.v1, w.add1, w.ch1,
+            w.id2, w.v2, w.add2, w.ch2,
+            w.id3, w.v3, w.add3, w.ch3,
+            w.rlen,
+            w.ns0, w.nsv0, w.nst0, resource_id, value, owner_thread, 2,
+            w.call_thread, w.current_tick,
+            w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+        ), value);
+    };
+    return ecs_wra_set_fail(w, ECS_WRA_ERR_FULL);
+}
+
+fn ecs_wra_deep_init_non_send(w: EcsWraDeep, resource_id: i32, owner_thread: i32) -> EcsWraSetDeep {
+    if ecs_wra_deep_contains_non_send(w, resource_id) {
+        return ecs_wra_set_ok_w(w, ecs_wra_get_value(ecs_wra_deep_get_non_send(w, resource_id)));
+    };
+    return ecs_wra_deep_insert_non_send(w, resource_id, 0, owner_thread);
+}
+
+fn ecs_wra_deep_remove_non_send(w: EcsWraDeep, resource_id: i32) -> EcsWraSetDeep {
+    if w.nslen >= 1 {
+        if w.ns0 == resource_id {
+            let val = w.nsv0;
+            if w.nslen == 1 {
+                return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                    w.id0, w.v0, w.add0, w.ch0,
+                    w.id1, w.v1, w.add1, w.ch1,
+                    w.id2, w.v2, w.add2, w.ch2,
+                    w.id3, w.v3, w.add3, w.ch3,
+                    w.rlen,
+                    -1, 0, 0, -1, 0, 0, 0,
+                    w.call_thread, w.current_tick,
+                    w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+                ), val);
+            };
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns1, w.nsv1, w.nst1, -1, 0, 0, 1,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), val);
+        };
+    };
+    if w.nslen >= 2 {
+        if w.ns1 == resource_id {
+            let val = w.nsv1;
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w.id0, w.v0, w.add0, w.ch0,
+                w.id1, w.v1, w.add1, w.ch1,
+                w.id2, w.v2, w.add2, w.ch2,
+                w.id3, w.v3, w.add3, w.ch3,
+                w.rlen,
+                w.ns0, w.nsv0, w.nst0, -1, 0, 0, 1,
+                w.call_thread, w.current_tick,
+                w.scoped_id, w.scoped_value, w.scoped_add, w.scoped_ch, w.scoped_active
+            ), val);
+        };
+    };
+    return ecs_wra_set_fail(w, ECS_WRA_ERR_MISSING);
+}
+
+// resource_scope: extract resource temporarily
+fn ecs_wra_deep_resource_scope_begin(w: EcsWraDeep, resource_id: i32) -> EcsWraSetDeep {
+    if w.scoped_active { return ecs_wra_set_fail(w, ECS_WRA_ERR_SCOPED); };
+    let g = ecs_wra_deep_get(w, resource_id);
+    if g.ok != true { return ecs_wra_set_fail(w, ECS_WRA_ERR_MISSING); };
+    let rem = ecs_wra_deep_remove(w, resource_id);
+    let w2 = rem.world;
+    let w3 = ecs_wra_deep_rebuild(
+        w2.id0, w2.v0, w2.add0, w2.ch0,
+        w2.id1, w2.v1, w2.add1, w2.ch1,
+        w2.id2, w2.v2, w2.add2, w2.ch2,
+        w2.id3, w2.v3, w2.add3, w2.ch3,
+        w2.rlen,
+        w2.ns0, w2.nsv0, w2.nst0, w2.ns1, w2.nsv1, w2.nst1, w2.nslen,
+        w2.call_thread, w2.current_tick,
+        resource_id, g.value, g.add_tick, g.ch_tick, true
+    );
+    return ecs_wra_set_ok_w(w3, g.value);
+}
+
+fn ecs_wra_deep_try_resource_scope_begin(w: EcsWraDeep, resource_id: i32) -> EcsWraSetDeep {
+    return ecs_wra_deep_resource_scope_begin(w, resource_id);
+}
+
+fn ecs_wra_deep_resource_scope_end(w: EcsWraDeep) -> EcsWraSetDeep {
+    if w.scoped_active != true { return ecs_wra_set_fail(w, ECS_WRA_ERR_MISSING); };
+    let sid = w.scoped_id;
+    let sval = w.scoped_value;
+    let sadd = w.scoped_add;
+    let sch = w.scoped_ch;
+    // clear scope first then reinsert with preserved ticks via insert then patch
+    let cleared = ecs_wra_deep_rebuild(
+        w.id0, w.v0, w.add0, w.ch0,
+        w.id1, w.v1, w.add1, w.ch1,
+        w.id2, w.v2, w.add2, w.ch2,
+        w.id3, w.v3, w.add3, w.ch3,
+        w.rlen,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick,
+        -1, 0, 0, 0, false
+    );
+    let ins = ecs_wra_deep_insert(cleared, sid, sval);
+    if ins.ok != true { return ins; };
+    // restore original add/ch ticks (insert sets both to current_tick)
+    let w2 = ins.world;
+    // re-set ticks by slot match
+    if w2.rlen >= 1 {
+        if w2.id0 == sid {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w2.id0, w2.v0, sadd, sch,
+                w2.id1, w2.v1, w2.add1, w2.ch1,
+                w2.id2, w2.v2, w2.add2, w2.ch2,
+                w2.id3, w2.v3, w2.add3, w2.ch3,
+                w2.rlen,
+                w2.ns0, w2.nsv0, w2.nst0, w2.ns1, w2.nsv1, w2.nst1, w2.nslen,
+                w2.call_thread, w2.current_tick,
+                -1, 0, 0, 0, false
+            ), sval);
+        };
+    };
+    if w2.rlen >= 2 {
+        if w2.id1 == sid {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w2.id0, w2.v0, w2.add0, w2.ch0,
+                w2.id1, w2.v1, sadd, sch,
+                w2.id2, w2.v2, w2.add2, w2.ch2,
+                w2.id3, w2.v3, w2.add3, w2.ch3,
+                w2.rlen,
+                w2.ns0, w2.nsv0, w2.nst0, w2.ns1, w2.nsv1, w2.nst1, w2.nslen,
+                w2.call_thread, w2.current_tick,
+                -1, 0, 0, 0, false
+            ), sval);
+        };
+    };
+    if w2.rlen >= 3 {
+        if w2.id2 == sid {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w2.id0, w2.v0, w2.add0, w2.ch0,
+                w2.id1, w2.v1, w2.add1, w2.ch1,
+                w2.id2, w2.v2, sadd, sch,
+                w2.id3, w2.v3, w2.add3, w2.ch3,
+                w2.rlen,
+                w2.ns0, w2.nsv0, w2.nst0, w2.ns1, w2.nsv1, w2.nst1, w2.nslen,
+                w2.call_thread, w2.current_tick,
+                -1, 0, 0, 0, false
+            ), sval);
+        };
+    };
+    if w2.rlen >= 4 {
+        if w2.id3 == sid {
+            return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+                w2.id0, w2.v0, w2.add0, w2.ch0,
+                w2.id1, w2.v1, w2.add1, w2.ch1,
+                w2.id2, w2.v2, w2.add2, w2.ch2,
+                w2.id3, w2.v3, sadd, sch,
+                w2.rlen,
+                w2.ns0, w2.nsv0, w2.nst0, w2.ns1, w2.nsv1, w2.nst1, w2.nslen,
+                w2.call_thread, w2.current_tick,
+                -1, 0, 0, 0, false
+            ), sval);
+        };
+    };
+    return ecs_wra_set_ok_w(w2, sval);
+}
+
+// mutate scoped value before end
+fn ecs_wra_deep_resource_scope_set(w: EcsWraDeep, value: i64) -> EcsWraSetDeep {
+    if w.scoped_active != true { return ecs_wra_set_fail(w, ECS_WRA_ERR_MISSING); };
+    let tick = w.current_tick;
+    return ecs_wra_set_ok_w(ecs_wra_deep_rebuild(
+        w.id0, w.v0, w.add0, w.ch0,
+        w.id1, w.v1, w.add1, w.ch1,
+        w.id2, w.v2, w.add2, w.ch2,
+        w.id3, w.v3, w.add3, w.ch3,
+        w.rlen,
+        w.ns0, w.nsv0, w.nst0, w.ns1, w.nsv1, w.nst1, w.nslen,
+        w.call_thread, w.current_tick,
+        w.scoped_id, value, w.scoped_add, tick, true
+    ), value);
+}

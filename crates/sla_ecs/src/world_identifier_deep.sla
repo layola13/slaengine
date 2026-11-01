@@ -1,0 +1,238 @@
+// Deepened Bevy ECS WorldId surface.
+// Mirrors src/world/identifier.rs:
+//   WorldId(usize) unique, never-reused monotonic allocation via AtomicUsize MAX_WORLD_ID
+//   WorldId::new() -> Option (None on exhausted supply / overflow)
+//   FromWorld: returns world.id()
+//   SystemParam (ReadOnly): get_param -> world.id(), empty state, no access
+//   ExclusiveSystemParam: init captures world.id(); get_param returns that state
+//   SparseSetIndex: sparse_set_index / get_sparse_set_index
+// Shallow lib/world_identifier.sla retained.
+
+// usize::MAX stand-in safe for default-backend LEB (same pattern as batching_deep)
+const ECS_WID_USIZE_MAX: i64 = 2147483647;
+
+// Exhaustion threshold for modeled allocator (Bevy: checked_add(1) fails at usize::MAX)
+// Use a smaller explicit cap for tests that force overflow without huge loops.
+// Production-ish max still available as ECS_WID_USIZE_MAX.
+const ECS_WID_DEFAULT_CAP: i64 = 2147483647;
+
+// === WorldId ===
+struct EcsWorldIdDeep {
+    id: i64,
+}
+
+fn ecs_wid_deep_from_raw(raw: i64) -> EcsWorldIdDeep {
+    return EcsWorldIdDeep { id: raw };
+}
+
+fn ecs_wid_deep_get(w: EcsWorldIdDeep) -> i64 { return w.id; }
+
+fn ecs_wid_deep_eq(a: EcsWorldIdDeep, b: EcsWorldIdDeep) -> bool {
+    return a.id == b.id;
+}
+
+fn ecs_wid_deep_ne(a: EcsWorldIdDeep, b: EcsWorldIdDeep) -> bool {
+    return a.id != b.id;
+}
+
+fn ecs_wid_deep_lt(a: EcsWorldIdDeep, b: EcsWorldIdDeep) -> bool {
+    return a.id < b.id;
+}
+
+fn ecs_wid_deep_hash(w: EcsWorldIdDeep) -> i64 {
+    // Hash stand-in: identity (Bevy derives Hash on the usize)
+    return w.id;
+}
+
+// === Global allocator model (MAX_WORLD_ID AtomicUsize) ===
+// fetch_update: val.checked_add(1) maps to None when val == cap.
+struct EcsWorldIdAllocatorDeep {
+    next: i64,   // current MAX_WORLD_ID (next id to issue)
+    cap: i64,    // exclusive upper bound; new() fails when next >= cap after add fail
+    // Bevy: never reuses dropped ids. Track issued count and a "drop" counter that
+    // does NOT free ids back into the pool.
+    issued: i64,
+    dropped: i64,
+}
+
+fn ecs_wid_alloc_new() -> EcsWorldIdAllocatorDeep {
+    return EcsWorldIdAllocatorDeep {
+        next: 0,
+        cap: ECS_WID_DEFAULT_CAP,
+        issued: 0,
+        dropped: 0,
+    };
+}
+
+fn ecs_wid_alloc_with_cap(cap: i64) -> EcsWorldIdAllocatorDeep {
+    // cap is exclusive max next value; if cap <= 0 treat as exhausted immediately
+    let c = cap;
+    if c < 0 { c = 0; };
+    return EcsWorldIdAllocatorDeep {
+        next: 0,
+        cap: c,
+        issued: 0,
+        dropped: 0,
+    };
+}
+
+// Simulate store near overflow (for overflow tests without huge loops)
+fn ecs_wid_alloc_store_next(a: EcsWorldIdAllocatorDeep, next: i64) -> EcsWorldIdAllocatorDeep {
+    a.next = next;
+    return a;
+}
+
+fn ecs_wid_alloc_peek(a: EcsWorldIdAllocatorDeep) -> i64 { return a.next; }
+fn ecs_wid_alloc_cap(a: EcsWorldIdAllocatorDeep) -> i64 { return a.cap; }
+fn ecs_wid_alloc_issued(a: EcsWorldIdAllocatorDeep) -> i64 { return a.issued; }
+fn ecs_wid_alloc_dropped(a: EcsWorldIdAllocatorDeep) -> i64 { return a.dropped; }
+
+// WorldId::new() -> Option: returns (ok, id, allocator')
+// Uses fetch_update semantics: issue current next, then next = next+1 if next+1 does not overflow cap.
+// Bevy: fetch_update returns Ok(previous) if update succeeds; previous becomes the WorldId.
+fn ecs_wid_new(a: EcsWorldIdAllocatorDeep) -> (EcsWorldIdAllocatorDeep, bool, EcsWorldIdDeep) {
+    // checked_add(1) fails when next == cap (or would exceed)
+    // Bevy: Atomic fetch_update with val.checked_add(1); map previous value to WorldId.
+    // When next is already at the point where +1 overflows, return None and leave state.
+    if a.next >= a.cap {
+        return (a, false, ecs_wid_deep_from_raw(0));
+    };
+    // Also fail if next + 1 would overflow the modeled i64 positive range
+    if a.next >= ECS_WID_USIZE_MAX {
+        return (a, false, ecs_wid_deep_from_raw(0));
+    };
+    let id = a.next;
+    a.next = id + 1;
+    a.issued = a.issued + 1;
+    return (a, true, ecs_wid_deep_from_raw(id));
+}
+
+// Drop of a World does NOT free the id (never-reuse guarantee)
+fn ecs_wid_drop_id(a: EcsWorldIdAllocatorDeep, _w: EcsWorldIdDeep) -> EcsWorldIdAllocatorDeep {
+    a.dropped = a.dropped + 1;
+    // deliberately do not push id back / decrement next
+    return a;
+}
+
+// After drop, the same raw value must not be re-issued by future new() calls
+// (because next only moves forward). Helper for tests.
+fn ecs_wid_was_ever_issued(a: EcsWorldIdAllocatorDeep, raw: i64) -> bool {
+    // issued ids are [0, next)
+    if raw < 0 { return false; };
+    return raw < a.next;
+}
+
+// Uniqueness over a batch of allocations
+fn ecs_wid_batch_unique(a: EcsWorldIdAllocatorDeep, count: i64) -> (EcsWorldIdAllocatorDeep, bool) {
+    // allocate `count` ids and verify all distinct via consecutive monotonic property
+    let i: i64 = 0;
+    let prev: i64 = 0 - 1;
+    let ok: bool = true;
+    while i < count {
+        let r = ecs_wid_new(a);
+        a = r.0;
+        if r.1 != true {
+            ok = false;
+            // stop early
+            i = count;
+        };
+        if r.1 == true {
+            if r.2.id <= prev {
+                ok = false;
+            };
+            prev = r.2.id;
+        };
+        i = i + 1;
+    }
+    return (a, ok);
+}
+
+// === FromWorld ===
+// FromWorld::from_world(world) -> world.id()
+struct EcsWorldHandleDeep {
+    world_id: EcsWorldIdDeep,
+}
+
+fn ecs_wid_world_handle(id: EcsWorldIdDeep) -> EcsWorldHandleDeep {
+    return EcsWorldHandleDeep { world_id: id };
+}
+
+fn ecs_wid_world_id(w: EcsWorldHandleDeep) -> EcsWorldIdDeep {
+    return w.world_id;
+}
+
+fn ecs_wid_from_world(w: EcsWorldHandleDeep) -> EcsWorldIdDeep {
+    return w.world_id;
+}
+
+// === SystemParam model ===
+// State = (); Item = WorldId; init_state no-op; init_access no component access;
+// get_param returns world.id(); ReadOnlySystemParam marker.
+struct EcsWorldIdSystemParamStateDeep {
+    // empty state stand-in
+    dummy: i32,
+}
+
+fn ecs_wid_sp_init_state() -> EcsWorldIdSystemParamStateDeep {
+    return EcsWorldIdSystemParamStateDeep { dummy: 0 };
+}
+
+// init_access: no FilteredAccessSet mutation — modeled as access count remaining 0
+fn ecs_wid_sp_init_access_touches_components() -> bool {
+    return false;
+}
+
+fn ecs_wid_sp_get_param(
+    _state: EcsWorldIdSystemParamStateDeep,
+    world: EcsWorldHandleDeep
+) -> (bool, EcsWorldIdDeep) {
+    // always Ok(world.id()) — no validation error path in Bevy impl
+    return (true, ecs_wid_from_world(world));
+}
+
+fn ecs_wid_sp_is_read_only() -> bool {
+    return true;
+}
+
+// === ExclusiveSystemParam model ===
+// State = WorldId (captured at init from world.id()); Item = WorldId
+struct EcsWorldIdExclusiveStateDeep {
+    world_id: EcsWorldIdDeep,
+}
+
+fn ecs_wid_esp_init(world: EcsWorldHandleDeep) -> EcsWorldIdExclusiveStateDeep {
+    return EcsWorldIdExclusiveStateDeep { world_id: ecs_wid_from_world(world) };
+}
+
+fn ecs_wid_esp_get_param(state: EcsWorldIdExclusiveStateDeep) -> (bool, EcsWorldIdDeep) {
+    return (true, state.world_id);
+}
+
+// === SparseSetIndex ===
+fn ecs_wid_sparse_set_index(w: EcsWorldIdDeep) -> i64 {
+    return w.id;
+}
+
+fn ecs_wid_get_sparse_set_index(value: i64) -> EcsWorldIdDeep {
+    return ecs_wid_deep_from_raw(value);
+}
+
+// Round-trip SparseSetIndex
+fn ecs_wid_sparse_roundtrip(w: EcsWorldIdDeep) -> bool {
+    let idx = ecs_wid_sparse_set_index(w);
+    let back = ecs_wid_get_sparse_set_index(idx);
+    return ecs_wid_deep_eq(w, back);
+}
+
+// System run simulation: register + run returns world.id via SystemParam
+fn ecs_wid_run_system_param(world: EcsWorldHandleDeep) -> EcsWorldIdDeep {
+    let state = ecs_wid_sp_init_state();
+    let r = ecs_wid_sp_get_param(state, world);
+    return r.1;
+}
+
+fn ecs_wid_run_exclusive_system_param(world: EcsWorldHandleDeep) -> EcsWorldIdDeep {
+    let state = ecs_wid_esp_init(world);
+    let r = ecs_wid_esp_get_param(state);
+    return r.1;
+}

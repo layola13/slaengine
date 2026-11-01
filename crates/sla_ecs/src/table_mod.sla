@@ -1,0 +1,211 @@
+// Bevy ECS storage (src/storage/table/mod.rs):
+// Table + TableId + TableRow + Tables collection
+// A Table stores component data for entities that share the same component set (archetype).
+
+struct EcsTableId {
+    value: i32,
+}
+
+fn ecs_table_id_new(value: i32) -> EcsTableId {
+    return EcsTableId { value: value };
+}
+
+fn ecs_table_id_value(id: EcsTableId) -> i32 { return id.value; }
+fn ecs_table_id_index(id: EcsTableId) -> i32 { return id.value; }
+
+struct EcsTableRow {
+    value: i32,
+}
+
+fn ecs_table_row_new(value: i32) -> EcsTableRow {
+    return EcsTableRow { value: value };
+}
+
+fn ecs_table_row_value(r: EcsTableRow) -> i32 { return r.value; }
+fn ecs_table_row_index(r: EcsTableRow) -> i32 { return r.value; }
+
+struct EcsTable {
+    id: i32,
+    entities: Vec<i64>,
+    // Component columns: component_id -> data handles
+    component_ids: Vec<i32>,
+    columns_data: Vec<Vec<i64>>,
+    // Per-column added/changed ticks (flattened: column_idx * entity_count + row)
+    added_ticks: Vec<Vec<i64>>,
+    changed_ticks: Vec<Vec<i64>>,
+    capacity: i64,
+}
+
+fn ecs_table_new(id: i32, capacity: i64) -> EcsTable {
+    return EcsTable {
+        id: id, entities: Vec::new(),
+        component_ids: Vec::new(), columns_data: Vec::new(),
+        added_ticks: Vec::new(), changed_ticks: Vec::new(),
+        capacity: capacity
+    };
+}
+
+fn ecs_table_add_column(t: EcsTable, component_id: i32) -> EcsTable {
+    t.component_ids.push(component_id);
+    t.columns_data.push(Vec::new());
+    t.added_ticks.push(Vec::new());
+    t.changed_ticks.push(Vec::new());
+    return t;
+}
+
+fn ecs_table_id(t: EcsTable) -> i32 { return t.id; }
+fn ecs_table_entity_count(t: EcsTable) -> i64 { return len(t.entities) as i64; }
+fn ecs_table_entity_capacity(t: EcsTable) -> i64 { return t.capacity; }
+fn ecs_table_component_count(t: EcsTable) -> i64 { return len(t.component_ids) as i64; }
+fn ecs_table_is_empty(t: EcsTable) -> bool { return len(t.entities) == 0; }
+
+fn ecs_table_entities(t: EcsTable) -> Vec<i64> { return t.entities; }
+
+fn ecs_table_has_column(t: EcsTable, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(t.component_ids) as i64;
+    while i < n {
+        if t.component_ids[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_table_get_column_index(t: EcsTable, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(t.component_ids) as i64;
+    while i < n {
+        if t.component_ids[i] == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// allocate: add an entity to the table, returns the row index
+fn ecs_table_allocate(t: EcsTable, entity: i64, tick: i64) -> (EcsTable, i32) {
+    let row = len(t.entities) as i32;
+    t.entities.push(entity);
+    // Initialize each column with default value
+    let i: i64 = 0;
+    let n: i64 = len(t.columns_data) as i64;
+    while i < n {
+        t.columns_data[i].push(0);
+        t.added_ticks[i].push(tick);
+        t.changed_ticks[i].push(tick);
+        i = i + 1;
+    }
+    return (t, row);
+}
+
+// get: get component data at (component_id, row)
+fn ecs_table_get(t: EcsTable, component_id: i32, row: i32) -> (bool, i64) {
+    let col_idx = ecs_table_get_column_index(t, component_id);
+    if col_idx < 0 { return (false, 0); };
+    if row < 0 { return (false, 0); };
+    if row >= len(t.columns_data[col_idx]) as i32 { return (false, 0); };
+    return (true, t.columns_data[col_idx][row]);
+}
+
+// set: set component data at (component_id, row)
+fn ecs_table_set(t: EcsTable, component_id: i32, row: i32, data: i64, tick: i64) -> (EcsTable, bool) {
+    let col_idx = ecs_table_get_column_index(t, component_id);
+    if col_idx < 0 { return (t, false); };
+    if row < 0 { return (t, false); };
+    if row >= len(t.columns_data[col_idx]) as i32 { return (t, false); };
+    t.columns_data[col_idx][row] = data;
+    t.changed_ticks[col_idx][row] = tick;
+    return (t, true);
+}
+
+// get_added_tick
+fn ecs_table_get_added_tick(t: EcsTable, component_id: i32, row: i32) -> (bool, i64) {
+    let col_idx = ecs_table_get_column_index(t, component_id);
+    if col_idx < 0 { return (false, 0); };
+    if row < 0 { return (false, 0); };
+    if row >= len(t.added_ticks[col_idx]) as i32 { return (false, 0); };
+    return (true, t.added_ticks[col_idx][row]);
+}
+
+// get_changed_tick
+fn ecs_table_get_changed_tick(t: EcsTable, component_id: i32, row: i32) -> (bool, i64) {
+    let col_idx = ecs_table_get_column_index(t, component_id);
+    if col_idx < 0 { return (false, 0); };
+    if row < 0 { return (false, 0); };
+    if row >= len(t.changed_ticks[col_idx]) as i32 { return (false, 0); };
+    return (true, t.changed_ticks[col_idx][row]);
+}
+
+// get_drop_for: check if a column has a drop function (always true in our model)
+fn ecs_table_get_drop_for(t: EcsTable, component_id: i32) -> bool {
+    return ecs_table_has_column(t, component_id);
+}
+
+// swap_remove: remove entity at row by swapping with last
+fn ecs_table_swap_remove(t: EcsTable, row: i32) -> (EcsTable, bool) {
+    let n = len(t.entities) as i32;
+    if row < 0 { return (t, false); };
+    if row >= n { return (t, false); };
+    let last_idx = n - 1;
+    if row != last_idx {
+        t.entities[row] = t.entities[last_idx];
+        // Swap each column
+        let i: i64 = 0;
+        let cn: i64 = len(t.columns_data) as i64;
+        while i < cn {
+            t.columns_data[i][row] = t.columns_data[i][last_idx];
+            t.added_ticks[i][row] = t.added_ticks[i][last_idx];
+            t.changed_ticks[i][row] = t.changed_ticks[i][last_idx];
+            i = i + 1;
+        }
+    };
+    t.entities.pop();
+    let i: i64 = 0;
+    let cn: i64 = len(t.columns_data) as i64;
+    while i < cn {
+        t.columns_data[i].pop();
+        t.added_ticks[i].pop();
+        t.changed_ticks[i].pop();
+        i = i + 1;
+    }
+    return (t, true);
+}
+
+// get_entity_at_row
+fn ecs_table_get_entity_at_row(t: EcsTable, row: i32) -> (bool, i64) {
+    if row < 0 { return (false, 0); };
+    if row >= len(t.entities) as i32 { return (false, 0); };
+    return (true, t.entities[row]);
+}
+
+// === Tables collection ===
+struct EcsTables {
+    tables: Vec<EcsTable>,
+    next_id: i32,
+}
+
+fn ecs_tables_new() -> EcsTables {
+    return EcsTables { tables: Vec::new(), next_id: 0 };
+}
+
+fn ecs_tables_len(t: EcsTables) -> i64 { return len(t.tables) as i64; }
+fn ecs_tables_is_empty(t: EcsTables) -> bool { return len(t.tables) == 0; }
+
+fn ecs_tables_get(t: EcsTables, id: i32) -> (bool, EcsTable) {
+    let i: i64 = 0;
+    let n: i64 = len(t.tables) as i64;
+    while i < n {
+        if t.tables[i].id == id { return (true, t.tables[i]); };
+        i = i + 1;
+    }
+    return (false, ecs_table_new(0, 0));
+}
+
+fn ecs_tables_create(t: EcsTables, capacity: i64) -> (EcsTables, i32) {
+    let id = t.next_id;
+    t.next_id = t.next_id + 1;
+    let table = ecs_table_new(id, capacity);
+    t.tables.push(table);
+    return (t, id);
+}
+
+fn ecs_tables_count(t: EcsTables) -> i64 { return len(t.tables) as i64; }

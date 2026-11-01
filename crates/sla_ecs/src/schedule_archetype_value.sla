@@ -1,0 +1,204 @@
+// Sequential schedule for ArchetypeValueWorld<T, R, M>.
+// Access metadata remains component-id based, while systems execute against the
+// archetype-backed value world.
+@import "commands_archetype_value.sla"
+
+struct ArchetypeValueSystemAccess {
+    read_components: Vec<i32>,
+    write_components: Vec<i32>,
+    reads_resource: bool,
+    writes_resource: bool,
+    reads_messages: bool,
+    writes_messages: bool,
+}
+
+struct ArchetypeValueSystem<T, R, M> {
+    run: fn(ArchetypeValueWorld<T, R, M>) -> ArchetypeValueWorld<T, R, M>,
+    access: ArchetypeValueSystemAccess,
+}
+
+struct ArchetypeValueSchedule<T, R, M> {
+    systems: Vec<ArchetypeValueSystem<T, R, M>>,
+    conflict_count: i32,
+}
+
+fn archetype_value_system_access_none() -> ArchetypeValueSystemAccess {
+    let read_components: Vec<i32> = Vec::new();
+    let write_components: Vec<i32> = Vec::new();
+    return ArchetypeValueSystemAccess { read_components: read_components, write_components: write_components, reads_resource: false, writes_resource: false, reads_messages: false, writes_messages: false };
+}
+
+fn archetype_value_access_read_component(access: ArchetypeValueSystemAccess, component_id: i32) -> ArchetypeValueSystemAccess {
+    access.read_components.push(component_id);
+    return access;
+}
+
+fn archetype_value_access_write_component(access: ArchetypeValueSystemAccess, component_id: i32) -> ArchetypeValueSystemAccess {
+    access.write_components.push(component_id);
+    return access;
+}
+
+fn archetype_value_access_read_resource(access: ArchetypeValueSystemAccess) -> ArchetypeValueSystemAccess {
+    access.reads_resource = true;
+    return access;
+}
+
+fn archetype_value_access_write_resource(access: ArchetypeValueSystemAccess) -> ArchetypeValueSystemAccess {
+    access.writes_resource = true;
+    return access;
+}
+
+fn archetype_value_access_read_messages(access: ArchetypeValueSystemAccess) -> ArchetypeValueSystemAccess {
+    access.reads_messages = true;
+    return access;
+}
+
+fn archetype_value_access_write_messages(access: ArchetypeValueSystemAccess) -> ArchetypeValueSystemAccess {
+    access.writes_messages = true;
+    return access;
+}
+
+fn archetype_value_component_list_has(values: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(values) as i64;
+    while i < cnt {
+        if values[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn archetype_value_access_component_conflicts(left: ArchetypeValueSystemAccess, right: ArchetypeValueSystemAccess) -> bool {
+    let i: i64 = 0;
+    let left_writes = len(left.write_components) as i64;
+    while i < left_writes {
+        let component_id = left.write_components[i];
+        if archetype_value_component_list_has(right.read_components, component_id) { return true; };
+        if archetype_value_component_list_has(right.write_components, component_id) { return true; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let right_writes = len(right.write_components) as i64;
+    while j < right_writes {
+        let component_id = right.write_components[j];
+        if archetype_value_component_list_has(left.read_components, component_id) { return true; };
+        if archetype_value_component_list_has(left.write_components, component_id) { return true; };
+        j = j + 1;
+    }
+    return false;
+}
+
+fn archetype_value_access_conflicts(left: ArchetypeValueSystemAccess, right: ArchetypeValueSystemAccess) -> bool {
+    if archetype_value_access_component_conflicts(left, right) { return true; };
+    if left.writes_resource { if right.reads_resource { return true; }; if right.writes_resource { return true; }; };
+    if right.writes_resource { if left.reads_resource { return true; }; if left.writes_resource { return true; }; };
+    if left.writes_messages { if right.reads_messages { return true; }; if right.writes_messages { return true; }; };
+    if right.writes_messages { if left.reads_messages { return true; }; if left.writes_messages { return true; }; };
+    return false;
+}
+
+fn archetype_value_system_new<T, R, M>(run: fn(ArchetypeValueWorld<T, R, M>) -> ArchetypeValueWorld<T, R, M>, access: ArchetypeValueSystemAccess) -> ArchetypeValueSystem<T, R, M> {
+    return ArchetypeValueSystem<T, R, M> { run: run, access: access };
+}
+
+fn archetype_value_schedule_default<T, R, M>() -> ArchetypeValueSchedule<T, R, M> {
+    let systems: Vec<ArchetypeValueSystem<T, R, M>> = Vec::new();
+    return ArchetypeValueSchedule<T, R, M> { systems: systems, conflict_count: 0 };
+}
+
+fn archetype_value_schedule_add_systems<T, R, M>(schedule: ArchetypeValueSchedule<T, R, M>, system: ArchetypeValueSystem<T, R, M>) -> ArchetypeValueSchedule<T, R, M> {
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        if archetype_value_access_conflicts(schedule.systems[i].access, system.access) {
+            schedule.conflict_count = schedule.conflict_count + 1;
+        };
+        i = i + 1;
+    }
+    schedule.systems.push(system);
+    return schedule;
+}
+
+fn archetype_value_schedule_conflict_count<T, R, M>(schedule: ArchetypeValueSchedule<T, R, M>) -> i32 {
+    return schedule.conflict_count;
+}
+
+fn archetype_value_schedule_run<T, R, M>(schedule: ArchetypeValueSchedule<T, R, M>, world: ArchetypeValueWorld<T, R, M>) -> ArchetypeValueWorld<T, R, M> {
+    world = archetype_value_world_increment_tick<T, R, M>(world);
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        let system = schedule.systems[i];
+        let run = system.run;
+        world = run(world);
+        i = i + 1;
+    }
+    return world;
+}
+
+struct ArchetypeScheduleData { amount: i32 }
+struct ArchetypeScheduleTime { tick: i32 }
+struct ArchetypeScheduleEvent { amount: i32 }
+
+fn archetype_schedule_time_default() -> ArchetypeScheduleTime { return ArchetypeScheduleTime { tick: 0 }; }
+fn archetype_schedule_event_default() -> ArchetypeScheduleEvent { return ArchetypeScheduleEvent { amount: 0 }; }
+
+fn archetype_schedule_world_new() -> ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent> {
+    return archetype_value_world_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_time_default(), archetype_schedule_event_default());
+}
+
+fn archetype_schedule_move_system(world: ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>) -> ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent> {
+    let q = archetype_value_world_query_pair_mut_first<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(world, 1, 2);
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        let item = q.items[i];
+        world = archetype_value_world_pair_write_first<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(world, item, ArchetypeScheduleData { amount: item.first.value.amount + item.second.amount });
+        i = i + 1;
+    }
+    return world;
+}
+
+fn archetype_schedule_resource_system(world: ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>) -> ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent> {
+    return archetype_value_world_insert_resource<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(world, ArchetypeScheduleTime { tick: world.archetypes.registry.change_tick });
+}
+
+fn archetype_schedule_message_system(world: ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>) -> ArchetypeValueWorld<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent> {
+    return archetype_value_world_write_message<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(world, ArchetypeScheduleEvent { amount: 9 });
+}
+
+@test "archetype value schedule runs systems in order"() {
+    let w0 = archetype_schedule_world_new();
+    let (w1, position) = archetype_value_world_register_table<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w0);
+    let (w2, velocity) = archetype_value_world_register_table<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w1);
+    let (w3, entity) = archetype_value_world_spawn<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w2);
+    let w4 = archetype_value_world_insert<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w3, entity, position.id, ArchetypeScheduleData { amount: 3 });
+    let w5 = archetype_value_world_insert<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w4, entity, velocity.id, ArchetypeScheduleData { amount: 4 });
+    let group_before = archetype_value_world_entity_archetype_id<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w5, entity);
+    let move_access = archetype_value_access_read_component(archetype_value_access_write_component(archetype_value_system_access_none(), position.id), velocity.id);
+    let resource_access = archetype_value_access_write_resource(archetype_value_system_access_none());
+    let message_access = archetype_value_access_write_messages(archetype_value_system_access_none());
+    let s0 = archetype_value_schedule_default<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>();
+    let s1 = archetype_value_schedule_add_systems<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s0, archetype_value_system_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_move_system, move_access));
+    let s2 = archetype_value_schedule_add_systems<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s1, archetype_value_system_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_resource_system, resource_access));
+    let s3 = archetype_value_schedule_add_systems<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s2, archetype_value_system_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_message_system, message_access));
+    let w6 = archetype_value_schedule_run<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s3, w5);
+    if archetype_value_world_entity_archetype_id<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w6, entity) != group_before { panic(9980); };
+    let position_out = archetype_value_world_get<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w6, entity, position.id);
+    let time = archetype_value_world_get_resource<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w6);
+    let read = archetype_value_world_read_message<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(w6, message_reader_new(), archetype_schedule_event_default());
+    if position_out.amount != 7 { panic(9981); };
+    if time.tick != 2 { panic(9982); };
+    if read.value.amount != 9 { panic(9983); };
+}
+
+@test "archetype value schedule records component id conflicts"() {
+    let write_position = archetype_value_access_write_component(archetype_value_system_access_none(), 1);
+    let read_position = archetype_value_access_read_component(archetype_value_system_access_none(), 1);
+    let write_message = archetype_value_access_write_messages(archetype_value_system_access_none());
+    let s0 = archetype_value_schedule_default<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>();
+    let s1 = archetype_value_schedule_add_systems<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s0, archetype_value_system_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_move_system, write_position));
+    let s2 = archetype_value_schedule_add_systems<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s1, archetype_value_system_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_move_system, read_position));
+    let s3 = archetype_value_schedule_add_systems<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s2, archetype_value_system_new<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(archetype_schedule_message_system, write_message));
+    if archetype_value_schedule_conflict_count<ArchetypeScheduleData, ArchetypeScheduleTime, ArchetypeScheduleEvent>(s3) != 1 { panic(9984); };
+}

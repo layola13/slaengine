@@ -1,0 +1,186 @@
+// Deferred command queue for DynamicWorld<A, B, R, M>.
+// The command stream stores operation metadata; typed payloads live in separate
+// Vec columns so apply order is preserved without needing dummy generic values.
+@import "world_dynamic.sla"
+
+const DYNAMIC_COMMAND_INSERT_A: i32 = 1;
+const DYNAMIC_COMMAND_INSERT_B: i32 = 2;
+const DYNAMIC_COMMAND_DESPAWN: i32 = 3;
+const DYNAMIC_COMMAND_INSERT_RESOURCE: i32 = 4;
+const DYNAMIC_COMMAND_WRITE_MESSAGE: i32 = 5;
+
+struct DynamicCommand {
+    kind: i32,
+    entity: Entity,
+    value_index: i64,
+}
+
+struct Commands<A, B, R, M> {
+    items: Vec<DynamicCommand>,
+    a_values: Vec<A>,
+    b_values: Vec<B>,
+    resource_values: Vec<R>,
+    message_values: Vec<M>,
+}
+
+fn commands_new<A, B, R, M>() -> Commands<A, B, R, M> {
+    let items: Vec<DynamicCommand> = Vec::new();
+    let a_values: Vec<A> = Vec::new();
+    let b_values: Vec<B> = Vec::new();
+    let resource_values: Vec<R> = Vec::new();
+    let message_values: Vec<M> = Vec::new();
+    return Commands<A, B, R, M> {
+        items: items,
+        a_values: a_values,
+        b_values: b_values,
+        resource_values: resource_values,
+        message_values: message_values,
+    };
+}
+
+fn dynamic_command(kind: i32, entity: Entity, value_index: i64) -> DynamicCommand {
+    return DynamicCommand { kind: kind, entity: entity, value_index: value_index };
+}
+
+fn commands_len<A, B, R, M>(commands: Commands<A, B, R, M>) -> i64 {
+    return len(commands.items) as i64;
+}
+
+fn commands_reserve_entity<A, B, R, M>(world: DynamicWorld<A, B, R, M>, commands: Commands<A, B, R, M>) -> (DynamicWorld<A, B, R, M>, Commands<A, B, R, M>, Entity) {
+    let (next_world, entity) = dynamic_world_spawn<A, B, R, M>(world);
+    return (next_world, commands, entity);
+}
+
+fn commands_insert_a<A, B, R, M>(commands: Commands<A, B, R, M>, entity: Entity, value: A) -> Commands<A, B, R, M> {
+    commands.a_values.push(value);
+    let idx = (len(commands.a_values) as i64) - 1;
+    commands.items.push(dynamic_command(DYNAMIC_COMMAND_INSERT_A, entity, idx));
+    return commands;
+}
+
+fn commands_insert_b<A, B, R, M>(commands: Commands<A, B, R, M>, entity: Entity, value: B) -> Commands<A, B, R, M> {
+    commands.b_values.push(value);
+    let idx = (len(commands.b_values) as i64) - 1;
+    commands.items.push(dynamic_command(DYNAMIC_COMMAND_INSERT_B, entity, idx));
+    return commands;
+}
+
+fn commands_despawn<A, B, R, M>(commands: Commands<A, B, R, M>, entity: Entity) -> Commands<A, B, R, M> {
+    commands.items.push(dynamic_command(DYNAMIC_COMMAND_DESPAWN, entity, -1));
+    return commands;
+}
+
+fn commands_insert_resource<A, B, R, M>(commands: Commands<A, B, R, M>, value: R) -> Commands<A, B, R, M> {
+    commands.resource_values.push(value);
+    let idx = (len(commands.resource_values) as i64) - 1;
+    commands.items.push(dynamic_command(DYNAMIC_COMMAND_INSERT_RESOURCE, entity_placeholder(), idx));
+    return commands;
+}
+
+fn commands_write_message<A, B, R, M>(commands: Commands<A, B, R, M>, value: M) -> Commands<A, B, R, M> {
+    commands.message_values.push(value);
+    let idx = (len(commands.message_values) as i64) - 1;
+    commands.items.push(dynamic_command(DYNAMIC_COMMAND_WRITE_MESSAGE, entity_placeholder(), idx));
+    return commands;
+}
+
+fn commands_apply_insert_a<A, B, R, M>(world: DynamicWorld<A, B, R, M>, commands: Commands<A, B, R, M>, command: DynamicCommand) -> DynamicWorld<A, B, R, M> {
+    if command.kind == DYNAMIC_COMMAND_INSERT_A {
+        return dynamic_world_insert_a<A, B, R, M>(world, command.entity, commands.a_values[command.value_index]);
+    };
+    return world;
+}
+
+fn commands_apply_insert_b<A, B, R, M>(world: DynamicWorld<A, B, R, M>, commands: Commands<A, B, R, M>, command: DynamicCommand) -> DynamicWorld<A, B, R, M> {
+    if command.kind == DYNAMIC_COMMAND_INSERT_B {
+        return dynamic_world_insert_b<A, B, R, M>(world, command.entity, commands.b_values[command.value_index]);
+    };
+    return world;
+}
+
+fn commands_apply_despawn<A, B, R, M>(world: DynamicWorld<A, B, R, M>, command: DynamicCommand) -> DynamicWorld<A, B, R, M> {
+    if command.kind == DYNAMIC_COMMAND_DESPAWN {
+        return dynamic_world_despawn<A, B, R, M>(world, command.entity);
+    };
+    return world;
+}
+
+fn commands_apply_resource<A, B, R, M>(world: DynamicWorld<A, B, R, M>, commands: Commands<A, B, R, M>, command: DynamicCommand) -> DynamicWorld<A, B, R, M> {
+    if command.kind == DYNAMIC_COMMAND_INSERT_RESOURCE {
+        return dynamic_world_insert_resource<A, B, R, M>(world, commands.resource_values[command.value_index]);
+    };
+    return world;
+}
+
+fn commands_apply_message<A, B, R, M>(world: DynamicWorld<A, B, R, M>, commands: Commands<A, B, R, M>, command: DynamicCommand) -> DynamicWorld<A, B, R, M> {
+    if command.kind == DYNAMIC_COMMAND_WRITE_MESSAGE {
+        return dynamic_world_write_message<A, B, R, M>(world, commands.message_values[command.value_index]);
+    };
+    return world;
+}
+
+fn commands_apply<A, B, R, M>(world: DynamicWorld<A, B, R, M>, commands: Commands<A, B, R, M>) -> (DynamicWorld<A, B, R, M>, Commands<A, B, R, M>) {
+    let i: i64 = 0;
+    let cnt = commands_len<A, B, R, M>(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = commands_apply_insert_a<A, B, R, M>(world, commands, command);
+        world = commands_apply_insert_b<A, B, R, M>(world, commands, command);
+        world = commands_apply_despawn<A, B, R, M>(world, command);
+        world = commands_apply_resource<A, B, R, M>(world, commands, command);
+        world = commands_apply_message<A, B, R, M>(world, commands, command);
+        i = i + 1;
+    }
+    let cleared = commands_new<A, B, R, M>();
+    return (world, cleared);
+}
+
+struct CommandsDynPos { x: i32, y: i32 }
+struct CommandsDynVel { x: i32, y: i32 }
+struct CommandsDynTime { tick: i32 }
+struct CommandsDynEvent { amount: i32 }
+
+fn commands_dyn_event_default() -> CommandsDynEvent { return CommandsDynEvent { amount: 0 }; }
+fn commands_dyn_time_default() -> CommandsDynTime { return CommandsDynTime { tick: 0 }; }
+
+fn commands_test_world_new() -> DynamicWorld<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent> {
+    return dynamic_world_new<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(commands_dyn_time_default(), commands_dyn_event_default());
+}
+
+fn commands_test_new() -> Commands<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent> {
+    return commands_new<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>();
+}
+
+@test "commands defer component insertion until apply"() {
+    let w0 = commands_test_world_new();
+    let c0 = commands_test_new();
+    let (w1, c1, entity) = commands_reserve_entity<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w0, c0);
+    let c2 = commands_insert_a<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c1, entity, CommandsDynPos { x: 4, y: 0 });
+    let c3 = commands_insert_b<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c2, entity, CommandsDynVel { x: 2, y: 0 });
+    if dynamic_world_has_a<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w1, entity) != false { panic(8500); };
+    if commands_len<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c3) != 2 { panic(8501); };
+    let (w2, c4) = commands_apply<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w1, c3);
+    if dynamic_world_has_a<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w2, entity) != true { panic(8502); };
+    if dynamic_world_has_b<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w2, entity) != true { panic(8503); };
+    if commands_len<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c4) != 0 { panic(8504); };
+}
+
+@test "commands apply resource messages and despawn in order"() {
+    let w0 = commands_test_world_new();
+    let c0 = commands_test_new();
+    let (w1, c1, entity) = commands_reserve_entity<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w0, c0);
+    let c2 = commands_insert_a<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c1, entity, CommandsDynPos { x: 7, y: 0 });
+    let (w2, c3) = commands_apply<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w1, c2);
+    if dynamic_world_has_a<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w2, entity) != true { panic(8510); };
+    let c4 = commands_insert_resource<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c3, CommandsDynTime { tick: 5 });
+    let c5 = commands_write_message<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c4, CommandsDynEvent { amount: 9 });
+    let c6 = commands_despawn<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c5, entity);
+    let (w3, c7) = commands_apply<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w2, c6);
+    if dynamic_world_is_alive<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w3, entity) != false { panic(8511); };
+    let time = dynamic_world_get_resource<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w3);
+    if time.tick != 5 { panic(8512); };
+    let read = dynamic_world_read_message<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(w3, message_reader_new(), commands_dyn_event_default());
+    if read.has_value != true { panic(8513); };
+    if read.value.amount != 9 { panic(8514); };
+    if commands_len<CommandsDynPos, CommandsDynVel, CommandsDynTime, CommandsDynEvent>(c7) != 0 { panic(8515); };
+}

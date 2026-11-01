@@ -1,0 +1,314 @@
+// Deepened Bevy ECS ObserverDescriptor + Observer run-state extras.
+// Mirrors src/observer/distributed_storage.rs:
+//   ObserverDescriptor::{with_event_keys, with_components, with_entities, event_keys, components, entities}
+//   Observer::{with_entity, with_entities, with_component, with_components, with_event_key,
+//              with_error_handler, last_trigger_id, despawned_watched_entities}
+//   auto-despawn when all watched entities despawned
+// Fixed capacity: 4 event_keys / components / entities. Shallow lib/observer_descriptor_extras.sla retained.
+
+struct EcsOdeDescDeep {
+    ek0: i64, ek1: i64, ek2: i64, ek3: i64, ek_len: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c_len: i32,
+    e0: i64, e1: i64, e2: i64, e3: i64, e_len: i32,
+}
+
+fn ecs_ode_desc_new() -> EcsOdeDescDeep {
+    return EcsOdeDescDeep {
+        ek0: 0, ek1: 0, ek2: 0, ek3: 0, ek_len: 0,
+        c0: -1, c1: -1, c2: -1, c3: -1, c_len: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0, e_len: 0,
+    };
+}
+
+fn ecs_ode_desc_ek_len(d: EcsOdeDescDeep) -> i32 { return d.ek_len; }
+fn ecs_ode_desc_c_len(d: EcsOdeDescDeep) -> i32 { return d.c_len; }
+fn ecs_ode_desc_e_len(d: EcsOdeDescDeep) -> i32 { return d.e_len; }
+
+fn ecs_ode_desc_rebuild(
+    ek0: i64, ek1: i64, ek2: i64, ek3: i64, ek_len: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c_len: i32,
+    e0: i64, e1: i64, e2: i64, e3: i64, e_len: i32
+) -> EcsOdeDescDeep {
+    return EcsOdeDescDeep {
+        ek0: ek0, ek1: ek1, ek2: ek2, ek3: ek3, ek_len: ek_len,
+        c0: c0, c1: c1, c2: c2, c3: c3, c_len: c_len,
+        e0: e0, e1: e1, e2: e2, e3: e3, e_len: e_len,
+    };
+}
+
+fn ecs_ode_desc_with_event_key(d: EcsOdeDescDeep, key: i64) -> EcsOdeDescDeep {
+    if d.ek_len == 0 {
+        return ecs_ode_desc_rebuild(key, d.ek1, d.ek2, d.ek3, 1, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    if d.ek_len == 1 {
+        return ecs_ode_desc_rebuild(d.ek0, key, d.ek2, d.ek3, 2, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    if d.ek_len == 2 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, key, d.ek3, 3, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    if d.ek_len == 3 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, key, 4, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    return d;
+}
+
+// with_event_keys batch: push up to 4 keys (unused slots ignored via n)
+fn ecs_ode_desc_with_event_keys(d: EcsOdeDescDeep, k0: i64, k1: i64, k2: i64, k3: i64, n: i32) -> EcsOdeDescDeep {
+    let d2 = d;
+    if n >= 1 { d2 = ecs_ode_desc_with_event_key(d2, k0); };
+    if n >= 2 { d2 = ecs_ode_desc_with_event_key(d2, k1); };
+    if n >= 3 { d2 = ecs_ode_desc_with_event_key(d2, k2); };
+    if n >= 4 { d2 = ecs_ode_desc_with_event_key(d2, k3); };
+    return d2;
+}
+
+fn ecs_ode_desc_with_component(d: EcsOdeDescDeep, cid: i32) -> EcsOdeDescDeep {
+    if d.c_len == 0 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, cid, d.c1, d.c2, d.c3, 1, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    if d.c_len == 1 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, cid, d.c2, d.c3, 2, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    if d.c_len == 2 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, d.c1, cid, d.c3, 3, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    if d.c_len == 3 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, d.c1, d.c2, cid, 4, d.e0, d.e1, d.e2, d.e3, d.e_len);
+    };
+    return d;
+}
+
+fn ecs_ode_desc_with_components(d: EcsOdeDescDeep, c0: i32, c1: i32, c2: i32, c3: i32, n: i32) -> EcsOdeDescDeep {
+    let d2 = d;
+    if n >= 1 { d2 = ecs_ode_desc_with_component(d2, c0); };
+    if n >= 2 { d2 = ecs_ode_desc_with_component(d2, c1); };
+    if n >= 3 { d2 = ecs_ode_desc_with_component(d2, c2); };
+    if n >= 4 { d2 = ecs_ode_desc_with_component(d2, c3); };
+    return d2;
+}
+
+fn ecs_ode_desc_with_entity(d: EcsOdeDescDeep, entity: i64) -> EcsOdeDescDeep {
+    if d.e_len == 0 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, d.c1, d.c2, d.c3, d.c_len, entity, d.e1, d.e2, d.e3, 1);
+    };
+    if d.e_len == 1 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, entity, d.e2, d.e3, 2);
+    };
+    if d.e_len == 2 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, d.e1, entity, d.e3, 3);
+    };
+    if d.e_len == 3 {
+        return ecs_ode_desc_rebuild(d.ek0, d.ek1, d.ek2, d.ek3, d.ek_len, d.c0, d.c1, d.c2, d.c3, d.c_len, d.e0, d.e1, d.e2, entity, 4);
+    };
+    return d;
+}
+
+fn ecs_ode_desc_with_entities(d: EcsOdeDescDeep, e0: i64, e1: i64, e2: i64, e3: i64, n: i32) -> EcsOdeDescDeep {
+    let d2 = d;
+    if n >= 1 { d2 = ecs_ode_desc_with_entity(d2, e0); };
+    if n >= 2 { d2 = ecs_ode_desc_with_entity(d2, e1); };
+    if n >= 3 { d2 = ecs_ode_desc_with_entity(d2, e2); };
+    if n >= 4 { d2 = ecs_ode_desc_with_entity(d2, e3); };
+    return d2;
+}
+
+fn ecs_ode_desc_event_key_at(d: EcsOdeDescDeep, idx: i32) -> i64 {
+    if idx == 0 { return d.ek0; };
+    if idx == 1 { return d.ek1; };
+    if idx == 2 { return d.ek2; };
+    if idx == 3 { return d.ek3; };
+    return 0;
+}
+
+fn ecs_ode_desc_component_at(d: EcsOdeDescDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.c0; };
+    if idx == 1 { return d.c1; };
+    if idx == 2 { return d.c2; };
+    if idx == 3 { return d.c3; };
+    return -1;
+}
+
+fn ecs_ode_desc_entity_at(d: EcsOdeDescDeep, idx: i32) -> i64 {
+    if idx == 0 { return d.e0; };
+    if idx == 1 { return d.e1; };
+    if idx == 2 { return d.e2; };
+    if idx == 3 { return d.e3; };
+    return 0;
+}
+
+fn ecs_ode_desc_contains_event_key(d: EcsOdeDescDeep, key: i64) -> bool {
+    if d.ek_len >= 1 {
+        if d.ek0 == key { return true; };
+    };
+    if d.ek_len >= 2 {
+        if d.ek1 == key { return true; };
+    };
+    if d.ek_len >= 3 {
+        if d.ek2 == key { return true; };
+    };
+    if d.ek_len >= 4 {
+        if d.ek3 == key { return true; };
+    };
+    return false;
+}
+
+fn ecs_ode_desc_contains_component(d: EcsOdeDescDeep, cid: i32) -> bool {
+    if d.c_len >= 1 {
+        if d.c0 == cid { return true; };
+    };
+    if d.c_len >= 2 {
+        if d.c1 == cid { return true; };
+    };
+    if d.c_len >= 3 {
+        if d.c2 == cid { return true; };
+    };
+    if d.c_len >= 4 {
+        if d.c3 == cid { return true; };
+    };
+    return false;
+}
+
+fn ecs_ode_desc_contains_entity(d: EcsOdeDescDeep, entity: i64) -> bool {
+    if d.e_len >= 1 {
+        if d.e0 == entity { return true; };
+    };
+    if d.e_len >= 2 {
+        if d.e1 == entity { return true; };
+    };
+    if d.e_len >= 3 {
+        if d.e2 == entity { return true; };
+    };
+    if d.e_len >= 4 {
+        if d.e3 == entity { return true; };
+    };
+    return false;
+}
+
+// Observer with descriptor + run state
+struct EcsOdeObsDeep {
+    descriptor: EcsOdeDescDeep,
+    last_trigger_id: i32,
+    despawned_watched_entities: i32,
+    error_handler_id: i32,
+    name_id: i64,
+    // observer entity still alive
+    alive: bool,
+}
+
+fn ecs_ode_obs_new() -> EcsOdeObsDeep {
+    return EcsOdeObsDeep {
+        descriptor: ecs_ode_desc_new(), last_trigger_id: 0, despawned_watched_entities: 0,
+        error_handler_id: 0, name_id: 0, alive: true,
+    };
+}
+
+fn ecs_ode_obs_descriptor(o: EcsOdeObsDeep) -> EcsOdeDescDeep { return o.descriptor; }
+fn ecs_ode_obs_last_trigger_id(o: EcsOdeObsDeep) -> i32 { return o.last_trigger_id; }
+fn ecs_ode_obs_despawned_watched(o: EcsOdeObsDeep) -> i32 { return o.despawned_watched_entities; }
+fn ecs_ode_obs_error_handler(o: EcsOdeObsDeep) -> i32 { return o.error_handler_id; }
+fn ecs_ode_obs_name(o: EcsOdeObsDeep) -> i64 { return o.name_id; }
+fn ecs_ode_obs_alive(o: EcsOdeObsDeep) -> bool { return o.alive; }
+
+fn ecs_ode_obs_rebuild(
+    descriptor: EcsOdeDescDeep, last_trigger_id: i32, despawned_watched_entities: i32,
+    error_handler_id: i32, name_id: i64, alive: bool
+) -> EcsOdeObsDeep {
+    return EcsOdeObsDeep {
+        descriptor: descriptor, last_trigger_id: last_trigger_id,
+        despawned_watched_entities: despawned_watched_entities,
+        error_handler_id: error_handler_id, name_id: name_id, alive: alive,
+    };
+}
+
+fn ecs_ode_obs_with_event_key(o: EcsOdeObsDeep, key: i64) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        ecs_ode_desc_with_event_key(o.descriptor, key),
+        o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_component(o: EcsOdeObsDeep, cid: i32) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        ecs_ode_desc_with_component(o.descriptor, cid),
+        o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_entity(o: EcsOdeObsDeep, entity: i64) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        ecs_ode_desc_with_entity(o.descriptor, entity),
+        o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_entities(o: EcsOdeObsDeep, e0: i64, e1: i64, e2: i64, e3: i64, n: i32) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        ecs_ode_desc_with_entities(o.descriptor, e0, e1, e2, e3, n),
+        o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_components(o: EcsOdeObsDeep, c0: i32, c1: i32, c2: i32, c3: i32, n: i32) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        ecs_ode_desc_with_components(o.descriptor, c0, c1, c2, c3, n),
+        o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_event_keys(o: EcsOdeObsDeep, k0: i64, k1: i64, k2: i64, k3: i64, n: i32) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        ecs_ode_desc_with_event_keys(o.descriptor, k0, k1, k2, k3, n),
+        o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_error_handler(o: EcsOdeObsDeep, handler: i32) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        o.descriptor, o.last_trigger_id, o.despawned_watched_entities, handler, o.name_id, o.alive
+    );
+}
+
+fn ecs_ode_obs_with_name(o: EcsOdeObsDeep, name_id: i64) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        o.descriptor, o.last_trigger_id, o.despawned_watched_entities, o.error_handler_id, name_id, o.alive
+    );
+}
+
+// run: bump last_trigger_id
+fn ecs_ode_obs_run(o: EcsOdeObsDeep) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        o.descriptor, o.last_trigger_id + 1, o.despawned_watched_entities,
+        o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+// record watched entity despawn; auto-despawn observer when all watched entities gone
+fn ecs_ode_obs_record_despawned(o: EcsOdeObsDeep) -> EcsOdeObsDeep {
+    let dcount = o.despawned_watched_entities + 1;
+    let total = o.descriptor.e_len;
+    let alive = o.alive;
+    if total > 0 {
+        if dcount >= total {
+            alive = false;
+        };
+    };
+    return ecs_ode_obs_rebuild(
+        o.descriptor, o.last_trigger_id, dcount, o.error_handler_id, o.name_id, alive
+    );
+}
+
+fn ecs_ode_obs_reset_run_state(o: EcsOdeObsDeep) -> EcsOdeObsDeep {
+    return ecs_ode_obs_rebuild(
+        o.descriptor, 0, 0, o.error_handler_id, o.name_id, o.alive
+    );
+}
+
+// match event key for global or component-filtered interest
+fn ecs_ode_obs_matches_event(o: EcsOdeObsDeep, key: i64) -> bool {
+    if o.alive != true { return false; };
+    if o.descriptor.ek_len == 0 {
+        // empty event_keys: dynamic runner may still register; treat as no match for typed path
+        return false;
+    };
+    return ecs_ode_desc_contains_event_key(o.descriptor, key);
+}

@@ -1,0 +1,174 @@
+// Deferred command queue for RegistryValueWorld<T, R, M>.
+// Commands carry registry component ids, so one queue can insert values into any
+// registered homogeneous value column while preserving Bevy-style apply order.
+@import "world_registry_store.sla"
+
+const REGISTRY_VALUE_COMMAND_INSERT_COMPONENT: i32 = 1;
+const REGISTRY_VALUE_COMMAND_DESPAWN: i32 = 2;
+const REGISTRY_VALUE_COMMAND_INSERT_RESOURCE: i32 = 3;
+const REGISTRY_VALUE_COMMAND_WRITE_MESSAGE: i32 = 4;
+
+struct RegistryValueCommand {
+    kind: i32,
+    entity: Entity,
+    component_id: i32,
+    value_index: i64,
+}
+
+struct RegistryValueCommands<T, R, M> {
+    items: Vec<RegistryValueCommand>,
+    component_values: Vec<T>,
+    resource_values: Vec<R>,
+    message_values: Vec<M>,
+}
+
+fn registry_value_commands_new<T, R, M>() -> RegistryValueCommands<T, R, M> {
+    let items: Vec<RegistryValueCommand> = Vec::new();
+    let component_values: Vec<T> = Vec::new();
+    let resource_values: Vec<R> = Vec::new();
+    let message_values: Vec<M> = Vec::new();
+    return RegistryValueCommands<T, R, M> {
+        items: items,
+        component_values: component_values,
+        resource_values: resource_values,
+        message_values: message_values,
+    };
+}
+
+fn registry_value_command(kind: i32, entity: Entity, component_id: i32, value_index: i64) -> RegistryValueCommand {
+    return RegistryValueCommand { kind: kind, entity: entity, component_id: component_id, value_index: value_index };
+}
+
+fn registry_value_commands_len<T, R, M>(commands: RegistryValueCommands<T, R, M>) -> i64 {
+    return len(commands.items) as i64;
+}
+
+fn registry_value_commands_reserve_entity<T, R, M>(world: RegistryValueWorld<T, R, M>, commands: RegistryValueCommands<T, R, M>) -> (RegistryValueWorld<T, R, M>, RegistryValueCommands<T, R, M>, Entity) {
+    let (next_world, entity) = registry_value_world_spawn<T, R, M>(world);
+    return (next_world, commands, entity);
+}
+
+fn registry_value_commands_insert<T, R, M>(commands: RegistryValueCommands<T, R, M>, entity: Entity, component_id: i32, value: T) -> RegistryValueCommands<T, R, M> {
+    commands.component_values.push(value);
+    let idx = (len(commands.component_values) as i64) - 1;
+    commands.items.push(registry_value_command(REGISTRY_VALUE_COMMAND_INSERT_COMPONENT, entity, component_id, idx));
+    return commands;
+}
+
+fn registry_value_commands_despawn<T, R, M>(commands: RegistryValueCommands<T, R, M>, entity: Entity) -> RegistryValueCommands<T, R, M> {
+    commands.items.push(registry_value_command(REGISTRY_VALUE_COMMAND_DESPAWN, entity, 0, -1));
+    return commands;
+}
+
+fn registry_value_commands_insert_resource<T, R, M>(commands: RegistryValueCommands<T, R, M>, value: R) -> RegistryValueCommands<T, R, M> {
+    commands.resource_values.push(value);
+    let idx = (len(commands.resource_values) as i64) - 1;
+    commands.items.push(registry_value_command(REGISTRY_VALUE_COMMAND_INSERT_RESOURCE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn registry_value_commands_write_message<T, R, M>(commands: RegistryValueCommands<T, R, M>, value: M) -> RegistryValueCommands<T, R, M> {
+    commands.message_values.push(value);
+    let idx = (len(commands.message_values) as i64) - 1;
+    commands.items.push(registry_value_command(REGISTRY_VALUE_COMMAND_WRITE_MESSAGE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn registry_value_commands_apply_insert<T, R, M>(world: RegistryValueWorld<T, R, M>, commands: RegistryValueCommands<T, R, M>, command: RegistryValueCommand) -> RegistryValueWorld<T, R, M> {
+    if command.kind == REGISTRY_VALUE_COMMAND_INSERT_COMPONENT {
+        return registry_value_world_insert<T, R, M>(world, command.entity, command.component_id, commands.component_values[command.value_index]);
+    };
+    return world;
+}
+
+fn registry_value_commands_apply_despawn<T, R, M>(world: RegistryValueWorld<T, R, M>, command: RegistryValueCommand) -> RegistryValueWorld<T, R, M> {
+    if command.kind == REGISTRY_VALUE_COMMAND_DESPAWN {
+        return registry_value_world_despawn<T, R, M>(world, command.entity);
+    };
+    return world;
+}
+
+fn registry_value_commands_apply_resource<T, R, M>(world: RegistryValueWorld<T, R, M>, commands: RegistryValueCommands<T, R, M>, command: RegistryValueCommand) -> RegistryValueWorld<T, R, M> {
+    if command.kind == REGISTRY_VALUE_COMMAND_INSERT_RESOURCE {
+        return registry_value_world_insert_resource<T, R, M>(world, commands.resource_values[command.value_index]);
+    };
+    return world;
+}
+
+fn registry_value_commands_apply_message<T, R, M>(world: RegistryValueWorld<T, R, M>, commands: RegistryValueCommands<T, R, M>, command: RegistryValueCommand) -> RegistryValueWorld<T, R, M> {
+    if command.kind == REGISTRY_VALUE_COMMAND_WRITE_MESSAGE {
+        return registry_value_world_write_message<T, R, M>(world, commands.message_values[command.value_index]);
+    };
+    return world;
+}
+
+fn registry_value_commands_apply<T, R, M>(world: RegistryValueWorld<T, R, M>, commands: RegistryValueCommands<T, R, M>) -> (RegistryValueWorld<T, R, M>, RegistryValueCommands<T, R, M>) {
+    let i: i64 = 0;
+    let cnt = registry_value_commands_len<T, R, M>(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = registry_value_commands_apply_insert<T, R, M>(world, commands, command);
+        world = registry_value_commands_apply_despawn<T, R, M>(world, command);
+        world = registry_value_commands_apply_resource<T, R, M>(world, commands, command);
+        world = registry_value_commands_apply_message<T, R, M>(world, commands, command);
+        i = i + 1;
+    }
+    let cleared = registry_value_commands_new<T, R, M>();
+    return (world, cleared);
+}
+
+struct RegValueCmdData { amount: i32 }
+struct RegValueCmdTime { tick: i32 }
+struct RegValueCmdEvent { amount: i32 }
+
+fn reg_value_cmd_time_default() -> RegValueCmdTime { return RegValueCmdTime { tick: 0 }; }
+fn reg_value_cmd_event_default() -> RegValueCmdEvent { return RegValueCmdEvent { amount: 0 }; }
+
+fn reg_value_cmd_world_new() -> RegistryValueWorld<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent> {
+    return registry_value_world_new<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(reg_value_cmd_time_default(), reg_value_cmd_event_default());
+}
+
+fn reg_value_cmd_commands_new() -> RegistryValueCommands<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent> {
+    return registry_value_commands_new<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>();
+}
+
+@test "registry value commands defer component insertions until apply"() {
+    let w0 = reg_value_cmd_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w0);
+    let (w2, mana) = registry_value_world_register_table<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w1);
+    let c0 = reg_value_cmd_commands_new();
+    let (w3, c1, entity) = registry_value_commands_reserve_entity<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w2, c0);
+    let c2 = registry_value_commands_insert<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c1, entity, health.id, RegValueCmdData { amount: 10 });
+    let c3 = registry_value_commands_insert<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c2, entity, mana.id, RegValueCmdData { amount: 4 });
+    if registry_value_world_has<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w3, entity, health.id) != false { panic(9100); };
+    if registry_value_commands_len<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c3) != 2 { panic(9101); };
+    let (w4, c4) = registry_value_commands_apply<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w3, c3);
+    if registry_value_world_has<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4, entity, health.id) != true { panic(9102); };
+    if registry_value_world_has<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4, entity, mana.id) != true { panic(9103); };
+    if registry_value_commands_len<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c4) != 0 { panic(9104); };
+    let pairs = registry_value_world_query_pair<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4, health.id, mana.id);
+    if len(pairs.items) != 1 { panic(9105); };
+    if pairs.items[0].first.amount + pairs.items[0].second.amount != 14 { panic(9106); };
+}
+
+@test "registry value commands apply resource message and despawn in order"() {
+    let w0 = reg_value_cmd_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w0);
+    let c0 = reg_value_cmd_commands_new();
+    let (w2, c1, entity) = registry_value_commands_reserve_entity<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w1, c0);
+    let c2 = registry_value_commands_insert<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c1, entity, health.id, RegValueCmdData { amount: 5 });
+    let (w3, c3) = registry_value_commands_apply<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w2, c2);
+    if registry_value_world_has<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w3, entity, health.id) != true { panic(9110); };
+    let c4 = registry_value_commands_insert_resource<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c3, RegValueCmdTime { tick: 8 });
+    let c5 = registry_value_commands_write_message<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c4, RegValueCmdEvent { amount: 6 });
+    let c6 = registry_value_commands_despawn<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c5, entity);
+    let (w4, c7) = registry_value_commands_apply<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w3, c6);
+    if registry_value_world_is_alive<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4, entity) != false { panic(9111); };
+    if registry_value_world_has<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4, entity, health.id) != false { panic(9112); };
+    let time = registry_value_world_get_resource<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4);
+    if time.tick != 8 { panic(9113); };
+    let read = registry_value_world_read_message<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(w4, message_reader_new(), reg_value_cmd_event_default());
+    if read.has_value != true { panic(9114); };
+    if read.value.amount != 6 { panic(9115); };
+    if registry_value_commands_len<RegValueCmdData, RegValueCmdTime, RegValueCmdEvent>(c7) != 0 { panic(9116); };
+}

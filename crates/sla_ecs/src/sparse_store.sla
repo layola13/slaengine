@@ -1,0 +1,134 @@
+// Sparse-set component storage.
+// Dense vectors keep iteration compact; sparse locations map entity id to the
+// current dense slot so remove can swap the last dense element into the hole.
+@import "sa_std/vec.sa"
+@import "entity.sla"
+
+struct SparseLocation {
+    entity_id: i32,
+    dense_slot: i64,
+}
+
+struct SparseComponentStore<T> {
+    dense_entities: Vec<i32>,
+    values: Vec<T>,
+    sparse: Vec<SparseLocation>,
+}
+
+fn sparse_store_new<T>() -> SparseComponentStore<T> {
+    let dense_entities: Vec<i32> = Vec::new();
+    let values: Vec<T> = Vec::new();
+    let sparse: Vec<SparseLocation> = Vec::new();
+    return SparseComponentStore<T> { dense_entities: dense_entities, values: values, sparse: sparse };
+}
+
+fn sparse_store_count<T>(s: SparseComponentStore<T>) -> i64 {
+    return len(s.dense_entities) as i64;
+}
+
+fn sparse_store_sparse_slot_of<T>(s: SparseComponentStore<T>, eid: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(s.sparse) as i64;
+    while i < cnt {
+        let loc = s.sparse[i];
+        if loc.entity_id == eid { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn sparse_store_slot_of<T>(s: SparseComponentStore<T>, eid: i32) -> i64 {
+    let sparse_slot = sparse_store_sparse_slot_of<T>(s, eid);
+    if sparse_slot < 0 { return -1; };
+    let loc = s.sparse[sparse_slot];
+    return loc.dense_slot;
+}
+
+fn sparse_store_has<T>(s: SparseComponentStore<T>, eid: i32) -> bool {
+    return sparse_store_sparse_slot_of<T>(s, eid) >= 0;
+}
+
+fn sparse_store_insert<T>(s: SparseComponentStore<T>, eid: i32, value: T) -> SparseComponentStore<T> {
+    let sparse_slot = sparse_store_sparse_slot_of<T>(s, eid);
+    if sparse_slot >= 0 {
+        panic(4402);
+    };
+    let dense_slot = len(s.dense_entities) as i64;
+    s.dense_entities.push(eid);
+    s.values.push(value);
+    s.sparse.push(SparseLocation { entity_id: eid, dense_slot: dense_slot });
+    return s;
+}
+
+fn sparse_store_get<T>(s: SparseComponentStore<T>, eid: i32) -> T {
+    let dense_slot = sparse_store_slot_of<T>(s, eid);
+    if dense_slot < 0 { panic(4401); };
+    return s.values[dense_slot];
+}
+
+fn sparse_store_write<T>(s: SparseComponentStore<T>, dense_slot: i64, value: T) -> SparseComponentStore<T> {
+    s.values[dense_slot] = value;
+    return s;
+}
+
+fn sparse_store_remove<T>(s: SparseComponentStore<T>, eid: i32) -> SparseComponentStore<T> {
+    let sparse_slot = sparse_store_sparse_slot_of<T>(s, eid);
+    if sparse_slot < 0 { return s; };
+    let loc = s.sparse[sparse_slot];
+    let dense_slot = loc.dense_slot;
+    let last = (len(s.dense_entities) as i64) - 1;
+    let last_entity = s.dense_entities[last];
+    if dense_slot != last {
+        s.dense_entities[dense_slot] = last_entity;
+        s.values[dense_slot] = s.values[last];
+        let moved_sparse_slot = sparse_store_sparse_slot_of<T>(s, last_entity);
+        let moved_loc = s.sparse[moved_sparse_slot];
+        moved_loc.dense_slot = dense_slot;
+        s.sparse[moved_sparse_slot] = moved_loc;
+    };
+    let removed_entity = s.dense_entities.remove(last);
+    let removed_value = s.values.remove(last);
+    let removed_loc = s.sparse.remove(sparse_slot);
+    return s;
+}
+
+struct SparsePoint {
+    x: i32,
+    y: i32,
+}
+
+fn sparse_point(x: i32, y: i32) -> SparsePoint {
+    return SparsePoint { x: x, y: y };
+}
+
+@test "sparse store insert get grows beyond fixed capacity"() {
+    let s = sparse_store_new<SparsePoint>();
+    let i: i32 = 0;
+    while i < 24 {
+        s = sparse_store_insert<SparsePoint>(s, i, sparse_point(i, i + 10));
+        i = i + 1;
+    }
+    if sparse_store_count<SparsePoint>(s) != 24 { panic(4410); };
+    let p = sparse_store_get<SparsePoint>(s, 23);
+    if p.x != 23 { panic(4411); };
+    if p.y != 33 { panic(4412); };
+}
+
+@test "sparse store write and remove update sparse mapping"() {
+    let s0 = sparse_store_new<SparsePoint>();
+    let s1 = sparse_store_insert<SparsePoint>(s0, 1, sparse_point(10, 0));
+    let s2 = sparse_store_insert<SparsePoint>(s1, 2, sparse_point(20, 0));
+    let s3 = sparse_store_insert<SparsePoint>(s2, 3, sparse_point(30, 0));
+    let slot = sparse_store_slot_of<SparsePoint>(s3, 2);
+    let s5 = sparse_store_write<SparsePoint>(s3, slot, sparse_point(26, 6));
+    let written = sparse_store_get<SparsePoint>(s5, 2);
+    if written.x != 26 { panic(4421); };
+    let s6 = sparse_store_remove<SparsePoint>(s5, 2);
+    if sparse_store_count<SparsePoint>(s6) != 2 { panic(4422); };
+    if sparse_store_has<SparsePoint>(s6, 2) != false { panic(4423); };
+    if sparse_store_has<SparsePoint>(s6, 3) != true { panic(4424); };
+    let moved_slot = sparse_store_slot_of<SparsePoint>(s6, 3);
+    if moved_slot != slot { panic(4425); };
+    let moved = sparse_store_get<SparsePoint>(s6, 3);
+    if moved.x != 30 { panic(4426); };
+}

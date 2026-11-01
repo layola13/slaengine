@@ -1,0 +1,192 @@
+// Deepened Bevy ECS DetectChanges / DetectChangesMut surface.
+// Mirrors src/change_detection/traits.rs (+ tick is_newer_than rules):
+//   DetectChanges: is_added / is_changed / is_added_after / is_changed_after
+//                  last_changed / added / this_run / last_run / changed_by
+//   DetectChangesMut: set_changed / set_added / set_last_changed / set_last_added
+//                     bypass_change_detection / set_if_neq / replace_if_neq / clone_from_if_neq
+// Uses u32-wrap tick math aligned with change_detection_tick_deep (inlined helpers).
+// Shallow lib/change_detection_traits.sla + lib/change_detection.sla retained.
+
+const ECS_CDTR_U32_MOD: i64 = 4294967296;
+const ECS_CDTR_MAX_CHANGE_AGE: i64 = 3258167296;
+
+fn ecs_cdtr_wrap(x: i64) -> i64 {
+    let m = ECS_CDTR_U32_MOD;
+    let r = x % m;
+    if r < 0 { return r + m; };
+    return r;
+}
+
+fn ecs_cdtr_rel(a: i64, b: i64) -> i64 {
+    return ecs_cdtr_wrap(a - b);
+}
+
+fn ecs_cdtr_min(a: i64, b: i64) -> i64 {
+    if a < b { return a; };
+    return b;
+}
+
+fn ecs_cdtr_is_newer_than(tick: i64, last_run: i64, this_run: i64) -> bool {
+    let since_insert = ecs_cdtr_rel(this_run, tick);
+    let since_system = ecs_cdtr_rel(this_run, last_run);
+    let a = ecs_cdtr_min(since_insert, ECS_CDTR_MAX_CHANGE_AGE);
+    let b = ecs_cdtr_min(since_system, ECS_CDTR_MAX_CHANGE_AGE);
+    return b > a;
+}
+
+// Smart pointer model holding Inner + ticks + system run ticks + changed_by
+struct EcsCdtrMutDeep {
+    value: i64,
+    added: i64,
+    changed: i64,
+    last_run: i64,
+    this_run: i64,
+    changed_by: i64,
+    has_changed_by: bool,
+    // counts for diagnostics
+    set_changed_count: i64,
+    bypass_count: i64,
+}
+
+fn ecs_cdtr_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdtrMutDeep {
+    return EcsCdtrMutDeep {
+        value: value,
+        added: ecs_cdtr_wrap(added),
+        changed: ecs_cdtr_wrap(changed),
+        last_run: ecs_cdtr_wrap(last_run),
+        this_run: ecs_cdtr_wrap(this_run),
+        changed_by: 0,
+        has_changed_by: false,
+        set_changed_count: 0,
+        bypass_count: 0,
+    };
+}
+
+fn ecs_cdtr_value(d: EcsCdtrMutDeep) -> i64 { return d.value; }
+fn ecs_cdtr_added(d: EcsCdtrMutDeep) -> i64 { return d.added; }
+fn ecs_cdtr_last_changed(d: EcsCdtrMutDeep) -> i64 { return d.changed; }
+fn ecs_cdtr_this_run(d: EcsCdtrMutDeep) -> i64 { return d.this_run; }
+fn ecs_cdtr_last_run(d: EcsCdtrMutDeep) -> i64 { return d.last_run; }
+fn ecs_cdtr_changed_by(d: EcsCdtrMutDeep) -> i64 { return d.changed_by; }
+fn ecs_cdtr_has_changed_by(d: EcsCdtrMutDeep) -> bool { return d.has_changed_by; }
+fn ecs_cdtr_set_changed_count(d: EcsCdtrMutDeep) -> i64 { return d.set_changed_count; }
+fn ecs_cdtr_bypass_count(d: EcsCdtrMutDeep) -> i64 { return d.bypass_count; }
+
+// DetectChanges
+fn ecs_cdtr_is_added(d: EcsCdtrMutDeep) -> bool {
+    return ecs_cdtr_is_newer_than(d.added, d.last_run, d.this_run);
+}
+
+fn ecs_cdtr_is_changed(d: EcsCdtrMutDeep) -> bool {
+    return ecs_cdtr_is_newer_than(d.changed, d.last_run, d.this_run);
+}
+
+fn ecs_cdtr_is_added_after(d: EcsCdtrMutDeep, other: i64) -> bool {
+    // is_newer_than(added, other, this_run) — treat other as last_run reference
+    return ecs_cdtr_is_newer_than(d.added, other, d.this_run);
+}
+
+fn ecs_cdtr_is_changed_after(d: EcsCdtrMutDeep, other: i64) -> bool {
+    return ecs_cdtr_is_newer_than(d.changed, other, d.this_run);
+}
+
+// only mutated (changed but not added) — scalarize ticks once (UseAfterMove)
+fn ecs_cdtr_is_mutated_only(d: EcsCdtrMutDeep) -> bool {
+    let added = d.added;
+    let changed = d.changed;
+    let last_run = d.last_run;
+    let this_run = d.this_run;
+    let is_ch = ecs_cdtr_is_newer_than(changed, last_run, this_run);
+    let is_ad = ecs_cdtr_is_newer_than(added, last_run, this_run);
+    return is_ch && (is_ad != true);
+}
+
+// DetectChangesMut
+fn ecs_cdtr_set_changed(d: EcsCdtrMutDeep) -> EcsCdtrMutDeep {
+    d.changed = d.this_run;
+    d.set_changed_count = d.set_changed_count + 1;
+    return d;
+}
+
+fn ecs_cdtr_set_changed_with_caller(d: EcsCdtrMutDeep, caller: i64) -> EcsCdtrMutDeep {
+    d = ecs_cdtr_set_changed(d);
+    d.changed_by = caller;
+    d.has_changed_by = true;
+    return d;
+}
+
+fn ecs_cdtr_set_added(d: EcsCdtrMutDeep) -> EcsCdtrMutDeep {
+    d.added = d.this_run;
+    d.changed = d.this_run;
+    d.set_changed_count = d.set_changed_count + 1;
+    return d;
+}
+
+fn ecs_cdtr_set_last_changed(d: EcsCdtrMutDeep, tick: i64) -> EcsCdtrMutDeep {
+    d.changed = ecs_cdtr_wrap(tick);
+    return d;
+}
+
+// Bevy: set_last_added modifies both added and changed together
+fn ecs_cdtr_set_last_added(d: EcsCdtrMutDeep, tick: i64) -> EcsCdtrMutDeep {
+    let t = ecs_cdtr_wrap(tick);
+    d.added = t;
+    d.changed = t;
+    return d;
+}
+
+fn ecs_cdtr_bypass(d: EcsCdtrMutDeep, value: i64) -> EcsCdtrMutDeep {
+    d.value = value;
+    d.bypass_count = d.bypass_count + 1;
+    return d;
+}
+
+// set_if_neq: compare via bypass path then set_changed if different
+fn ecs_cdtr_set_if_neq(d: EcsCdtrMutDeep, value: i64) -> (EcsCdtrMutDeep, bool) {
+    if d.value == value {
+        return (d, false);
+    };
+    d = ecs_cdtr_bypass(d, value);
+    d = ecs_cdtr_set_changed(d);
+    return (d, true);
+}
+
+// replace_if_neq: returns old value when replaced
+struct EcsCdtrReplaceDeep {
+    d: EcsCdtrMutDeep,
+    replaced: bool,
+    old_value: i64,
+}
+
+fn ecs_cdtr_replace_d(r: EcsCdtrReplaceDeep) -> EcsCdtrMutDeep { return r.d; }
+fn ecs_cdtr_replace_replaced(r: EcsCdtrReplaceDeep) -> bool { return r.replaced; }
+fn ecs_cdtr_replace_old(r: EcsCdtrReplaceDeep) -> i64 { return r.old_value; }
+
+fn ecs_cdtr_replace_if_neq(d: EcsCdtrMutDeep, value: i64) -> EcsCdtrReplaceDeep {
+    if d.value == value {
+        return EcsCdtrReplaceDeep { d: d, replaced: false, old_value: d.value };
+    };
+    let old = d.value;
+    d = ecs_cdtr_bypass(d, value);
+    d = ecs_cdtr_set_changed(d);
+    return EcsCdtrReplaceDeep { d: d, replaced: true, old_value: old };
+}
+
+// clone_from_if_neq: same as set_if_neq for Copy/Clone i64 model
+fn ecs_cdtr_clone_from_if_neq(d: EcsCdtrMutDeep, value: i64) -> (EcsCdtrMutDeep, bool) {
+    return ecs_cdtr_set_if_neq(d, value);
+}
+
+// Advance system run: last_run <- this_run; this_run <- new
+fn ecs_cdtr_advance_run(d: EcsCdtrMutDeep, new_this_run: i64) -> EcsCdtrMutDeep {
+    d.last_run = d.this_run;
+    d.this_run = ecs_cdtr_wrap(new_this_run);
+    return d;
+}
+
+// DerefMut-style write: assigns value and flags changed
+fn ecs_cdtr_deref_mut_write(d: EcsCdtrMutDeep, value: i64) -> EcsCdtrMutDeep {
+    d.value = value;
+    d = ecs_cdtr_set_changed(d);
+    return d;
+}

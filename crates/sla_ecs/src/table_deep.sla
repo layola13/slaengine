@@ -1,0 +1,680 @@
+// Deepened Bevy ECS table storage surface.
+// Mirrors src/storage/table/mod.rs + column.rs:
+//   TableId / TableRow
+//   Column: initialize/replace/swap_remove/clear/ticks/changed_by/drop
+//   Table: builder columns, allocate, get/set, has_column, swap_remove row
+//   Tables: multi-table registry (empty table 0 reserved)
+// Shallow lib/table_mod.sla + lib/table_column.sla retained.
+// Fixed capacity: 4 columns, 8 rows, 4 tables.
+
+// === ids ===
+struct EcsTdId {
+    value: i32,
+}
+
+fn ecs_td_id_new(v: i32) -> EcsTdId {
+    return EcsTdId { value: v };
+}
+
+fn ecs_td_id_value(id: EcsTdId) -> i32 {
+    return id.value;
+}
+
+struct EcsTdRow {
+    value: i32,
+}
+
+fn ecs_td_row_new(v: i32) -> EcsTdRow {
+    return EcsTdRow { value: v };
+}
+
+fn ecs_td_row_value(r: EcsTdRow) -> i32 {
+    return r.value;
+}
+
+// === Column (capacity 8) ===
+struct EcsTdColumn {
+    component_id: i32,
+    component_size: i64,
+    has_drop: bool,
+    capacity: i32,
+    len: i32,
+    d0: i64, d1: i64, d2: i64, d3: i64, d4: i64, d5: i64, d6: i64, d7: i64,
+    a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64,
+    c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64, c6: i64, c7: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64,
+}
+
+fn ecs_td_col_new(component_id: i32, component_size: i64, capacity: i32, has_drop: bool) -> EcsTdColumn {
+    return EcsTdColumn {
+        component_id: component_id,
+        component_size: component_size,
+        has_drop: has_drop,
+        capacity: capacity,
+        len: 0,
+        d0: 0, d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, d6: 0, d7: 0,
+        a0: 0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, c4: 0, c5: 0, c6: 0, c7: 0,
+        b0: 0, b1: 0, b2: 0, b3: 0, b4: 0, b5: 0, b6: 0, b7: 0,
+    };
+}
+
+fn ecs_td_col_len(c: EcsTdColumn) -> i32 {
+    return c.len;
+}
+
+fn ecs_td_col_capacity(c: EcsTdColumn) -> i32 {
+    return c.capacity;
+}
+
+fn ecs_td_col_component_id(c: EcsTdColumn) -> i32 {
+    return c.component_id;
+}
+
+fn ecs_td_col_has_drop(c: EcsTdColumn) -> bool {
+    return c.has_drop;
+}
+
+fn ecs_td_col_get_data(c: EcsTdColumn, row: i32) -> (bool, i64) {
+    if row < 0 {
+        return (false, 0);
+    };
+    if row >= c.len {
+        return (false, 0);
+    };
+    if row == 0 { return (true, c.d0); };
+    if row == 1 { return (true, c.d1); };
+    if row == 2 { return (true, c.d2); };
+    if row == 3 { return (true, c.d3); };
+    if row == 4 { return (true, c.d4); };
+    if row == 5 { return (true, c.d5); };
+    if row == 6 { return (true, c.d6); };
+    if row == 7 { return (true, c.d7); };
+    return (false, 0);
+}
+
+fn ecs_td_col_get_added(c: EcsTdColumn, row: i32) -> (bool, i64) {
+    if row < 0 || row >= c.len { return (false, 0); };
+    if row == 0 { return (true, c.a0); };
+    if row == 1 { return (true, c.a1); };
+    if row == 2 { return (true, c.a2); };
+    if row == 3 { return (true, c.a3); };
+    if row == 4 { return (true, c.a4); };
+    if row == 5 { return (true, c.a5); };
+    if row == 6 { return (true, c.a6); };
+    if row == 7 { return (true, c.a7); };
+    return (false, 0);
+}
+
+fn ecs_td_col_get_changed(c: EcsTdColumn, row: i32) -> (bool, i64) {
+    if row < 0 || row >= c.len { return (false, 0); };
+    if row == 0 { return (true, c.c0); };
+    if row == 1 { return (true, c.c1); };
+    if row == 2 { return (true, c.c2); };
+    if row == 3 { return (true, c.c3); };
+    if row == 4 { return (true, c.c4); };
+    if row == 5 { return (true, c.c5); };
+    if row == 6 { return (true, c.c6); };
+    if row == 7 { return (true, c.c7); };
+    return (false, 0);
+}
+
+fn ecs_td_col_get_changed_by(c: EcsTdColumn, row: i32) -> (bool, i64) {
+    if row < 0 || row >= c.len { return (false, 0); };
+    if row == 0 { return (true, c.b0); };
+    if row == 1 { return (true, c.b1); };
+    if row == 2 { return (true, c.b2); };
+    if row == 3 { return (true, c.b3); };
+    if row == 4 { return (true, c.b4); };
+    if row == 5 { return (true, c.b5); };
+    if row == 6 { return (true, c.b6); };
+    if row == 7 { return (true, c.b7); };
+    return (false, 0);
+}
+
+fn ecs_td_col_set_row(c: EcsTdColumn, row: i32, data: i64, added: i64, changed: i64, by: i64) -> EcsTdColumn {
+    if row == 0 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: data, d1: c.d1, d2: c.d2, d3: c.d3, d4: c.d4, d5: c.d5, d6: c.d6, d7: c.d7,
+            a0: added, a1: c.a1, a2: c.a2, a3: c.a3, a4: c.a4, a5: c.a5, a6: c.a6, a7: c.a7,
+            c0: changed, c1: c.c1, c2: c.c2, c3: c.c3, c4: c.c4, c5: c.c5, c6: c.c6, c7: c.c7,
+            b0: by, b1: c.b1, b2: c.b2, b3: c.b3, b4: c.b4, b5: c.b5, b6: c.b6, b7: c.b7,
+        };
+    };
+    if row == 1 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: data, d2: c.d2, d3: c.d3, d4: c.d4, d5: c.d5, d6: c.d6, d7: c.d7,
+            a0: c.a0, a1: added, a2: c.a2, a3: c.a3, a4: c.a4, a5: c.a5, a6: c.a6, a7: c.a7,
+            c0: c.c0, c1: changed, c2: c.c2, c3: c.c3, c4: c.c4, c5: c.c5, c6: c.c6, c7: c.c7,
+            b0: c.b0, b1: by, b2: c.b2, b3: c.b3, b4: c.b4, b5: c.b5, b6: c.b6, b7: c.b7,
+        };
+    };
+    if row == 2 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: c.d1, d2: data, d3: c.d3, d4: c.d4, d5: c.d5, d6: c.d6, d7: c.d7,
+            a0: c.a0, a1: c.a1, a2: added, a3: c.a3, a4: c.a4, a5: c.a5, a6: c.a6, a7: c.a7,
+            c0: c.c0, c1: c.c1, c2: changed, c3: c.c3, c4: c.c4, c5: c.c5, c6: c.c6, c7: c.c7,
+            b0: c.b0, b1: c.b1, b2: by, b3: c.b3, b4: c.b4, b5: c.b5, b6: c.b6, b7: c.b7,
+        };
+    };
+    if row == 3 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: c.d1, d2: c.d2, d3: data, d4: c.d4, d5: c.d5, d6: c.d6, d7: c.d7,
+            a0: c.a0, a1: c.a1, a2: c.a2, a3: added, a4: c.a4, a5: c.a5, a6: c.a6, a7: c.a7,
+            c0: c.c0, c1: c.c1, c2: c.c2, c3: changed, c4: c.c4, c5: c.c5, c6: c.c6, c7: c.c7,
+            b0: c.b0, b1: c.b1, b2: c.b2, b3: by, b4: c.b4, b5: c.b5, b6: c.b6, b7: c.b7,
+        };
+    };
+    if row == 4 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: c.d1, d2: c.d2, d3: c.d3, d4: data, d5: c.d5, d6: c.d6, d7: c.d7,
+            a0: c.a0, a1: c.a1, a2: c.a2, a3: c.a3, a4: added, a5: c.a5, a6: c.a6, a7: c.a7,
+            c0: c.c0, c1: c.c1, c2: c.c2, c3: c.c3, c4: changed, c5: c.c5, c6: c.c6, c7: c.c7,
+            b0: c.b0, b1: c.b1, b2: c.b2, b3: c.b3, b4: by, b5: c.b5, b6: c.b6, b7: c.b7,
+        };
+    };
+    if row == 5 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: c.d1, d2: c.d2, d3: c.d3, d4: c.d4, d5: data, d6: c.d6, d7: c.d7,
+            a0: c.a0, a1: c.a1, a2: c.a2, a3: c.a3, a4: c.a4, a5: added, a6: c.a6, a7: c.a7,
+            c0: c.c0, c1: c.c1, c2: c.c2, c3: c.c3, c4: c.c4, c5: changed, c6: c.c6, c7: c.c7,
+            b0: c.b0, b1: c.b1, b2: c.b2, b3: c.b3, b4: c.b4, b5: by, b6: c.b6, b7: c.b7,
+        };
+    };
+    if row == 6 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: c.d1, d2: c.d2, d3: c.d3, d4: c.d4, d5: c.d5, d6: data, d7: c.d7,
+            a0: c.a0, a1: c.a1, a2: c.a2, a3: c.a3, a4: c.a4, a5: c.a5, a6: added, a7: c.a7,
+            c0: c.c0, c1: c.c1, c2: c.c2, c3: c.c3, c4: c.c4, c5: c.c5, c6: changed, c7: c.c7,
+            b0: c.b0, b1: c.b1, b2: c.b2, b3: c.b3, b4: c.b4, b5: c.b5, b6: by, b7: c.b7,
+        };
+    };
+    if row == 7 {
+        return EcsTdColumn {
+            component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+            capacity: c.capacity, len: c.len,
+            d0: c.d0, d1: c.d1, d2: c.d2, d3: c.d3, d4: c.d4, d5: c.d5, d6: c.d6, d7: data,
+            a0: c.a0, a1: c.a1, a2: c.a2, a3: c.a3, a4: c.a4, a5: c.a5, a6: c.a6, a7: added,
+            c0: c.c0, c1: c.c1, c2: c.c2, c3: c.c3, c4: c.c4, c5: c.c5, c6: c.c6, c7: changed,
+            b0: c.b0, b1: c.b1, b2: c.b2, b3: c.b3, b4: c.b4, b5: c.b5, b6: c.b6, b7: by,
+        };
+    };
+    return c;
+}
+
+fn ecs_td_col_with_len(c: EcsTdColumn, len: i32) -> EcsTdColumn {
+    return EcsTdColumn {
+        component_id: c.component_id, component_size: c.component_size, has_drop: c.has_drop,
+        capacity: c.capacity, len: len,
+        d0: c.d0, d1: c.d1, d2: c.d2, d3: c.d3, d4: c.d4, d5: c.d5, d6: c.d6, d7: c.d7,
+        a0: c.a0, a1: c.a1, a2: c.a2, a3: c.a3, a4: c.a4, a5: c.a5, a6: c.a6, a7: c.a7,
+        c0: c.c0, c1: c.c1, c2: c.c2, c3: c.c3, c4: c.c4, c5: c.c5, c6: c.c6, c7: c.c7,
+        b0: c.b0, b1: c.b1, b2: c.b2, b3: c.b3, b4: c.b4, b5: c.b5, b6: c.b6, b7: c.b7,
+    };
+}
+
+// initialize at end (row == len)
+fn ecs_td_col_initialize(c: EcsTdColumn, data: i64, tick: i64, by: i64) -> EcsTdColumn {
+    if c.len >= c.capacity { return c; };
+    if c.len >= 8 { return c; };
+    let row = c.len;
+    let c2 = ecs_td_col_with_len(c, row + 1);
+    return ecs_td_col_set_row(c2, row, data, tick, tick, by);
+}
+
+// replace existing row: updates data + changed tick + changed_by; keeps added
+fn ecs_td_col_replace(c: EcsTdColumn, row: i32, data: i64, tick: i64, by: i64) -> EcsTdColumn {
+    if row < 0 || row >= c.len { return c; };
+    let added_r = ecs_td_col_get_added(c, row);
+    return ecs_td_col_set_row(c, row, data, added_r.1, tick, by);
+}
+
+fn ecs_td_col_clear(c: EcsTdColumn) -> EcsTdColumn {
+    return ecs_td_col_new(c.component_id, c.component_size, c.capacity, c.has_drop);
+}
+
+fn ecs_td_col_swap_remove(c: EcsTdColumn, row: i32) -> EcsTdColumn {
+    if row < 0 || row >= c.len { return c; };
+    let last = c.len - 1;
+    if row != last {
+        let d = ecs_td_col_get_data(c, last);
+        let a = ecs_td_col_get_added(c, last);
+        let ch = ecs_td_col_get_changed(c, last);
+        let b = ecs_td_col_get_changed_by(c, last);
+        c = ecs_td_col_set_row(c, row, d.1, a.1, ch.1, b.1);
+    };
+    return ecs_td_col_with_len(c, last);
+}
+
+fn ecs_td_col_check_ticks(c: EcsTdColumn, max_tick: i64) -> EcsTdColumn {
+    // clamp first 4 rows (enough for tests)
+    let out = c;
+    if out.len >= 1 {
+        let a = out.a0; let ch = out.c0;
+        if a > max_tick { a = max_tick; };
+        if ch > max_tick { ch = max_tick; };
+        out = ecs_td_col_set_row(out, 0, out.d0, a, ch, out.b0);
+    };
+    if out.len >= 2 {
+        let a = out.a1; let ch = out.c1;
+        if a > max_tick { a = max_tick; };
+        if ch > max_tick { ch = max_tick; };
+        out = ecs_td_col_set_row(out, 1, out.d1, a, ch, out.b1);
+    };
+    if out.len >= 3 {
+        let a = out.a2; let ch = out.c2;
+        if a > max_tick { a = max_tick; };
+        if ch > max_tick { ch = max_tick; };
+        out = ecs_td_col_set_row(out, 2, out.d2, a, ch, out.b2);
+    };
+    if out.len >= 4 {
+        let a = out.a3; let ch = out.c3;
+        if a > max_tick { a = max_tick; };
+        if ch > max_tick { ch = max_tick; };
+        out = ecs_td_col_set_row(out, 3, out.d3, a, ch, out.b3);
+    };
+    return out;
+}
+
+// === Table (up to 4 columns, 8 entities) ===
+struct EcsTdTable {
+    id: i32,
+    capacity: i32,
+    entity_count: i32,
+    component_count: i32,
+    e0: i64, e1: i64, e2: i64, e3: i64, e4: i64, e5: i64, e6: i64, e7: i64,
+    col0: EcsTdColumn,
+    col1: EcsTdColumn,
+    col2: EcsTdColumn,
+    col3: EcsTdColumn,
+}
+
+fn ecs_td_table_empty_col() -> EcsTdColumn {
+    return ecs_td_col_new(-1, 0, 8, false);
+}
+
+fn ecs_td_table_new(id: i32, capacity: i32) -> EcsTdTable {
+    return EcsTdTable {
+        id: id,
+        capacity: capacity,
+        entity_count: 0,
+        component_count: 0,
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        col0: ecs_td_table_empty_col(),
+        col1: ecs_td_table_empty_col(),
+        col2: ecs_td_table_empty_col(),
+        col3: ecs_td_table_empty_col(),
+    };
+}
+
+fn ecs_td_table_id(t: EcsTdTable) -> i32 { return t.id; }
+fn ecs_td_table_entity_count(t: EcsTdTable) -> i32 { return t.entity_count; }
+fn ecs_td_table_capacity(t: EcsTdTable) -> i32 { return t.capacity; }
+fn ecs_td_table_component_count(t: EcsTdTable) -> i32 { return t.component_count; }
+fn ecs_td_table_is_empty(t: EcsTdTable) -> bool {
+    if t.entity_count == 0 { return true; };
+    return false;
+}
+
+fn ecs_td_table_add_column(t: EcsTdTable, component_id: i32, component_size: i64, has_drop: bool) -> EcsTdTable {
+    if t.component_count >= 4 { return t; };
+    let col = ecs_td_col_new(component_id, component_size, t.capacity, has_drop);
+    if t.component_count == 0 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: 1,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: col, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if t.component_count == 1 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: 2,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: col, col2: t.col2, col3: t.col3,
+        };
+    };
+    if t.component_count == 2 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: 3,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: col, col3: t.col3,
+        };
+    };
+    return EcsTdTable {
+        id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: 4,
+        e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+        col0: t.col0, col1: t.col1, col2: t.col2, col3: col,
+    };
+}
+
+fn ecs_td_table_has_column(t: EcsTdTable, component_id: i32) -> bool {
+    if t.component_count >= 1 {
+        if t.col0.component_id == component_id { return true; };
+    };
+    if t.component_count >= 2 {
+        if t.col1.component_id == component_id { return true; };
+    };
+    if t.component_count >= 3 {
+        if t.col2.component_id == component_id { return true; };
+    };
+    if t.component_count >= 4 {
+        if t.col3.component_id == component_id { return true; };
+    };
+    return false;
+}
+
+fn ecs_td_table_column_index(t: EcsTdTable, component_id: i32) -> i32 {
+    if t.component_count >= 1 {
+        if t.col0.component_id == component_id { return 0; };
+    };
+    if t.component_count >= 2 {
+        if t.col1.component_id == component_id { return 1; };
+    };
+    if t.component_count >= 3 {
+        if t.col2.component_id == component_id { return 2; };
+    };
+    if t.component_count >= 4 {
+        if t.col3.component_id == component_id { return 3; };
+    };
+    return -1;
+}
+
+fn ecs_td_table_get_column(t: EcsTdTable, idx: i32) -> EcsTdColumn {
+    if idx == 0 { return t.col0; };
+    if idx == 1 { return t.col1; };
+    if idx == 2 { return t.col2; };
+    if idx == 3 { return t.col3; };
+    return ecs_td_table_empty_col();
+}
+
+fn ecs_td_table_set_column(t: EcsTdTable, idx: i32, col: EcsTdColumn) -> EcsTdTable {
+    if idx == 0 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: col, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if idx == 1 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: col, col2: t.col2, col3: t.col3,
+        };
+    };
+    if idx == 2 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: col, col3: t.col3,
+        };
+    };
+    if idx == 3 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: col,
+        };
+    };
+    return t;
+}
+
+fn ecs_td_table_set_entity(t: EcsTdTable, row: i32, entity: i64) -> EcsTdTable {
+    if row == 0 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: entity, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 1 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: entity, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 2 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: entity, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 3 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: entity, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 4 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: entity, e5: t.e5, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 5 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: entity, e6: t.e6, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 6 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: entity, e7: t.e7,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    if row == 7 {
+        return EcsTdTable {
+            id: t.id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+            e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: entity,
+            col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+        };
+    };
+    return t;
+}
+
+fn ecs_td_table_get_entity(t: EcsTdTable, row: i32) -> i64 {
+    if row == 0 { return t.e0; };
+    if row == 1 { return t.e1; };
+    if row == 2 { return t.e2; };
+    if row == 3 { return t.e3; };
+    if row == 4 { return t.e4; };
+    if row == 5 { return t.e5; };
+    if row == 6 { return t.e6; };
+    if row == 7 { return t.e7; };
+    return 0;
+}
+
+fn ecs_td_table_with_count(t: EcsTdTable, count: i32) -> EcsTdTable {
+    return EcsTdTable {
+        id: t.id, capacity: t.capacity, entity_count: count, component_count: t.component_count,
+        e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+        col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+    };
+}
+
+// allocate entity: append row to entities + each column with default 0 at tick
+fn ecs_td_table_allocate(t: EcsTdTable, entity: i64, tick: i64) -> (EcsTdTable, i32) {
+    if t.entity_count >= t.capacity { return (t, -1); };
+    if t.entity_count >= 8 { return (t, -1); };
+    let row = t.entity_count;
+    let t2 = ecs_td_table_set_entity(t, row, entity);
+    t2 = ecs_td_table_with_count(t2, row + 1);
+    if t2.component_count >= 1 {
+        let c = ecs_td_col_initialize(t2.col0, 0, tick, 0);
+        t2 = ecs_td_table_set_column(t2, 0, c);
+    };
+    if t2.component_count >= 2 {
+        let c = ecs_td_col_initialize(t2.col1, 0, tick, 0);
+        t2 = ecs_td_table_set_column(t2, 1, c);
+    };
+    if t2.component_count >= 3 {
+        let c = ecs_td_col_initialize(t2.col2, 0, tick, 0);
+        t2 = ecs_td_table_set_column(t2, 2, c);
+    };
+    if t2.component_count >= 4 {
+        let c = ecs_td_col_initialize(t2.col3, 0, tick, 0);
+        t2 = ecs_td_table_set_column(t2, 3, c);
+    };
+    return (t2, row);
+}
+
+fn ecs_td_table_set_component(t: EcsTdTable, component_id: i32, row: i32, data: i64, tick: i64, by: i64) -> EcsTdTable {
+    let idx = ecs_td_table_column_index(t, component_id);
+    if idx < 0 { return t; };
+    let col = ecs_td_table_get_column(t, idx);
+    col = ecs_td_col_replace(col, row, data, tick, by);
+    return ecs_td_table_set_column(t, idx, col);
+}
+
+fn ecs_td_table_get_component(t: EcsTdTable, component_id: i32, row: i32) -> (bool, i64) {
+    let idx = ecs_td_table_column_index(t, component_id);
+    if idx < 0 { return (false, 0); };
+    let col = ecs_td_table_get_column(t, idx);
+    return ecs_td_col_get_data(col, row);
+}
+
+fn ecs_td_table_get_added_tick(t: EcsTdTable, component_id: i32, row: i32) -> (bool, i64) {
+    let idx = ecs_td_table_column_index(t, component_id);
+    if idx < 0 { return (false, 0); };
+    return ecs_td_col_get_added(ecs_td_table_get_column(t, idx), row);
+}
+
+fn ecs_td_table_get_changed_tick(t: EcsTdTable, component_id: i32, row: i32) -> (bool, i64) {
+    let idx = ecs_td_table_column_index(t, component_id);
+    if idx < 0 { return (false, 0); };
+    return ecs_td_col_get_changed(ecs_td_table_get_column(t, idx), row);
+}
+
+// swap_remove row: swap with last entity+columns
+fn ecs_td_table_swap_remove(t: EcsTdTable, row: i32) -> EcsTdTable {
+    if row < 0 || row >= t.entity_count { return t; };
+    let last = t.entity_count - 1;
+    if row != last {
+        let ent = ecs_td_table_get_entity(t, last);
+        t = ecs_td_table_set_entity(t, row, ent);
+    };
+    if t.component_count >= 1 {
+        let c = ecs_td_col_swap_remove(t.col0, row);
+        t = ecs_td_table_set_column(t, 0, c);
+    };
+    if t.component_count >= 2 {
+        let c = ecs_td_col_swap_remove(t.col1, row);
+        t = ecs_td_table_set_column(t, 1, c);
+    };
+    if t.component_count >= 3 {
+        let c = ecs_td_col_swap_remove(t.col2, row);
+        t = ecs_td_table_set_column(t, 2, c);
+    };
+    if t.component_count >= 4 {
+        let c = ecs_td_col_swap_remove(t.col3, row);
+        t = ecs_td_table_set_column(t, 3, c);
+    };
+    return ecs_td_table_with_count(t, last);
+}
+
+fn ecs_td_table_clear(t: EcsTdTable) -> EcsTdTable {
+    let out = ecs_td_table_new(t.id, t.capacity);
+    // re-add columns with same ids
+    if t.component_count >= 1 {
+        out = ecs_td_table_add_column(out, t.col0.component_id, t.col0.component_size, t.col0.has_drop);
+    };
+    if t.component_count >= 2 {
+        out = ecs_td_table_add_column(out, t.col1.component_id, t.col1.component_size, t.col1.has_drop);
+    };
+    if t.component_count >= 3 {
+        out = ecs_td_table_add_column(out, t.col2.component_id, t.col2.component_size, t.col2.has_drop);
+    };
+    if t.component_count >= 4 {
+        out = ecs_td_table_add_column(out, t.col3.component_id, t.col3.component_size, t.col3.has_drop);
+    };
+    return out;
+}
+
+// === Tables registry (slot 0 reserved empty table) ===
+struct EcsTdTables {
+    // tables 0..3; len is number of tables including empty
+    len: i32,
+    t0: EcsTdTable,
+    t1: EcsTdTable,
+    t2: EcsTdTable,
+    t3: EcsTdTable,
+}
+
+fn ecs_td_tables_new() -> EcsTdTables {
+    // Bevy Tables always has empty table at TableId(0)
+    return EcsTdTables {
+        len: 1,
+        t0: ecs_td_table_new(0, 0),
+        t1: ecs_td_table_new(1, 8),
+        t2: ecs_td_table_new(2, 8),
+        t3: ecs_td_table_new(3, 8),
+    };
+}
+
+fn ecs_td_tables_len(ts: EcsTdTables) -> i32 { return ts.len; }
+
+fn ecs_td_tables_is_empty(ts: EcsTdTables) -> bool {
+    // never truly empty: always has table 0
+    if ts.len == 0 { return true; };
+    return false;
+}
+
+fn ecs_td_tables_get(ts: EcsTdTables, id: i32) -> (bool, EcsTdTable) {
+    if id < 0 || id >= ts.len { return (false, ecs_td_table_new(-1, 0)); };
+    if id == 0 { return (true, ts.t0); };
+    if id == 1 { return (true, ts.t1); };
+    if id == 2 { return (true, ts.t2); };
+    if id == 3 { return (true, ts.t3); };
+    return (false, ecs_td_table_new(-1, 0));
+}
+
+fn ecs_td_tables_set(ts: EcsTdTables, id: i32, t: EcsTdTable) -> EcsTdTables {
+    if id == 0 {
+        return EcsTdTables { len: ts.len, t0: t, t1: ts.t1, t2: ts.t2, t3: ts.t3 };
+    };
+    if id == 1 {
+        return EcsTdTables { len: ts.len, t0: ts.t0, t1: t, t2: ts.t2, t3: ts.t3 };
+    };
+    if id == 2 {
+        return EcsTdTables { len: ts.len, t0: ts.t0, t1: ts.t1, t2: t, t3: ts.t3 };
+    };
+    if id == 3 {
+        return EcsTdTables { len: ts.len, t0: ts.t0, t1: ts.t1, t2: ts.t2, t3: t };
+    };
+    return ts;
+}
+
+// push a built table; returns (tables, new TableId)
+fn ecs_td_tables_push(ts: EcsTdTables, t: EcsTdTable) -> (EcsTdTables, i32) {
+    if ts.len >= 4 { return (ts, -1); };
+    let id = ts.len;
+    let t2 = EcsTdTable {
+        id: id, capacity: t.capacity, entity_count: t.entity_count, component_count: t.component_count,
+        e0: t.e0, e1: t.e1, e2: t.e2, e3: t.e3, e4: t.e4, e5: t.e5, e6: t.e6, e7: t.e7,
+        col0: t.col0, col1: t.col1, col2: t.col2, col3: t.col3,
+    };
+    let out = ecs_td_tables_set(ts, id, t2);
+    out = EcsTdTables { len: id + 1, t0: out.t0, t1: out.t1, t2: out.t2, t3: out.t3 };
+    return (out, id);
+}

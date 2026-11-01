@@ -1,0 +1,148 @@
+// Bevy ECS Local<T> + StaticSystemParam + SystemParamValidationError — mirrors
+// src/system/system_param.rs.
+//
+//   pub struct Local<'s, T: FromWorld + Send + 'static>(&'s mut T) { Deref/DerefMut }
+//   pub struct StaticSystemParam<'w,'s,P: SystemParam>(SystemParamItem<'w,'s,P>)
+//     pub fn into_inner(self) -> SystemParamItem  -- extract the inner param
+//   pub struct SystemParamValidationError { skipped: bool, message, param, field }
+//     pub fn skipped<T>(message) -> Self   -- skip the system (If<T>'d gate semantics)
+//     pub fn invalid<T>(message) -> Self   -- error, don't skip (default panic path)
+//     pub fn new<T>(skipped, message, field) -> Self
+//     EMPTY sentinel (skipped=false, empty message/param/field)
+//
+// `T` is modelled as a type-id i32 (per SLA rule 12 — no generics over types). `Cow<'static,str>`
+// and `DebugName` are modelled as raw i64 message-id sentinels via a registry; we keep the
+// observable contract: skipped boolean + param-id + field-id + the Display format prefix.
+
+// === EcsLocal<T> ===
+// `Local<'s, T>(&'s mut T)` is shared mutable state initialized once per system via FromWorld.
+// Models: a single i64 slot plus an "initialized_from_world" flag. Deref reads; DerefMut writes.
+struct EcsLocal {
+    value: i64,
+    initialized: bool,
+}
+
+fn ecs_local_new_from_world(initial_value: i64) -> EcsLocal {
+    // FromWorld::from_world: the default value is constructed once and shared.
+    return EcsLocal { value: initial_value, initialized: true };
+}
+
+fn ecs_local_new_uninit() -> EcsLocal {
+    return EcsLocal { value: 0, initialized: false };
+}
+
+fn ecs_local_get(l: EcsLocal) -> i64 {
+    return l.value;
+}
+
+// DerefMut — mutate the shared slot (returns new model per SLA rule 6).
+fn ecs_local_set(l: EcsLocal, value: i64) -> EcsLocal {
+    l.value = value;
+    l.initialized = true;
+    return l;
+}
+
+fn ecs_local_is_initialized(l: EcsLocal) -> bool {
+    return l.initialized;
+}
+
+// === EcsStaticSystemParam<P> ===
+// `StaticSystemParam<'w,'s,P>(SystemParamItem<'w,'s,P>)` wraps a borrowed SystemParam item.
+// into_inner consumes the wrapper and returns the inner. Deref/DerefMut read/write the inner.
+struct EcsStaticSystemParam {
+    inner: i64,
+}
+
+fn ecs_static_system_param_new(inner: i64) -> EcsStaticSystemParam {
+    return EcsStaticSystemParam { inner: inner };
+}
+
+// into_inner — extract the inner SystemParamItem (consumes self).
+fn ecs_static_system_param_into_inner(p: EcsStaticSystemParam) -> i64 {
+    return p.inner;
+}
+
+// Deref — read the inner value.
+fn ecs_static_system_param_get(p: EcsStaticSystemParam) -> i64 {
+    return p.inner;
+}
+
+// DerefMut — write the inner value (returns new model per SLA rule 6).
+fn ecs_static_system_param_set(p: EcsStaticSystemParam, value: i64) -> EcsStaticSystemParam {
+    p.inner = value;
+    return p;
+}
+
+// === EcsSystemParamValidationError ===
+// { skipped: bool, message, param: DebugName, field }
+// param is modelled as a param-id i32 (DebugName.type_name::<T>() becomes type_name id).
+// field is modelled as a field-id i32 ("::"-prefixed field name sentinel; 0 = empty).
+struct EcsSystemParamValidationError {
+    skipped: bool,
+    message: i64,
+    param: i32,
+    field: i32,
+}
+
+fn ecs_spve_empty() -> EcsSystemParamValidationError {
+    return EcsSystemParamValidationError { skipped: false, message: 0, param: 0, field: 0 };
+}
+
+// new<T>(skipped, message, field) -> Self — initializes param to the type-id of T.
+fn ecs_spve_new(type_id: i32, skipped: bool, message: i64, field: i32) -> EcsSystemParamValidationError {
+    return EcsSystemParamValidationError { skipped: skipped, message: message, param: type_id, field: field };
+}
+
+// skipped<T>(message) -> Self — skip the system (skipped=true, no field).
+fn ecs_spve_skipped(type_id: i32, message: i64) -> EcsSystemParamValidationError {
+    return EcsSystemParamValidationError { skipped: true, message: message, param: type_id, field: 0 };
+}
+
+// invalid<T>(message) -> Self — error, don't skip (skipped=false, no field).
+fn ecs_spve_invalid(type_id: i32, message: i64) -> EcsSystemParamValidationError {
+    return EcsSystemParamValidationError { skipped: false, message: message, param: type_id, field: 0 };
+}
+
+fn ecs_spve_skipped_get(e: EcsSystemParamValidationError) -> bool {
+    return e.skipped;
+}
+
+fn ecs_spve_message(e: EcsSystemParamValidationError) -> i64 {
+    return e.message;
+}
+
+fn ecs_spve_param(e: EcsSystemParamValidationError) -> i32 {
+    return e.param;
+}
+
+fn ecs_spve_field(e: EcsSystemParamValidationError) -> i32 {
+    return e.field;
+}
+
+// Display — "Parameter `{shortname}{field}` failed validation: {message}". shortname is the
+// short form of the DebugName (after the last "::"); modelled as a stable integer short of the
+// type-id for the tests. The field prefix "::" is added when field != 0.
+struct SpveDisplayResult {
+    param_short: i32,
+    has_field: bool,
+    message: i64,
+}
+
+fn ecs_spve_dr_param(r: SpveDisplayResult) -> i32 {
+    return r.param_short;
+}
+
+fn ecs_spve_dr_has_field(r: SpveDisplayResult) -> bool {
+    return r.has_field;
+}
+
+fn ecs_spve_dr_message(r: SpveDisplayResult) -> i64 {
+    return r.message;
+}
+
+fn ecs_spve_display(e: EcsSystemParamValidationError) -> SpveDisplayResult {
+    let has_field = e.field != 0;
+    // shortname = the part after the last "::" — modelled as the raw type-id (the caller can
+    // resolve it through the type-name registry; we just return the id here).
+    return SpveDisplayResult { param_short: e.param, has_field: has_field, message: e.message };
+}

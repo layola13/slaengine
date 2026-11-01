@@ -1,0 +1,130 @@
+// Deepened Bevy ECS message registry update + mut iterators.
+// Mirrors message registry should_update/run_updates surface.
+// Fixed 4 registered message ids. Shallow retained.
+
+const ECS_MRU_NO: i32 = 0;
+const ECS_MRU_YES: i32 = 1;
+const ECS_MRU_FORCED: i32 = 2;
+
+struct EcsMruDeep {
+    m0: i32, m1: i32, m2: i32, m3: i32,
+    len: i32,
+    update_signal: bool,
+    update_count: i64,
+    last_change_tick: i32,
+}
+
+fn ecs_mru_deep_new() -> EcsMruDeep {
+    return EcsMruDeep {
+        m0: -1, m1: -1, m2: -1, m3: -1, len: 0,
+        update_signal: false, update_count: 0, last_change_tick: 0,
+    };
+}
+
+fn ecs_mru_deep_count(r: EcsMruDeep) -> i32 { return r.len; }
+fn ecs_mru_deep_has_signal(r: EcsMruDeep) -> bool { return r.update_signal; }
+fn ecs_mru_deep_update_count(r: EcsMruDeep) -> i64 { return r.update_count; }
+fn ecs_mru_deep_last_tick(r: EcsMruDeep) -> i32 { return r.last_change_tick; }
+
+fn ecs_mru_deep_rebuild(
+    m0: i32, m1: i32, m2: i32, m3: i32, len: i32,
+    update_signal: bool, update_count: i64, last_change_tick: i32
+) -> EcsMruDeep {
+    return EcsMruDeep {
+        m0: m0, m1: m1, m2: m2, m3: m3, len: len,
+        update_signal: update_signal, update_count: update_count, last_change_tick: last_change_tick,
+    };
+}
+
+fn ecs_mru_deep_is_registered(r: EcsMruDeep, message_id: i32) -> bool {
+    if r.len >= 1 { if r.m0 == message_id { return true; }; };
+    if r.len >= 2 { if r.m1 == message_id { return true; }; };
+    if r.len >= 3 { if r.m2 == message_id { return true; }; };
+    if r.len >= 4 { if r.m3 == message_id { return true; }; };
+    return false;
+}
+
+fn ecs_mru_deep_register(r: EcsMruDeep, message_id: i32) -> EcsMruDeep {
+    if ecs_mru_deep_is_registered(r, message_id) { return r; };
+    if r.len == 0 { return ecs_mru_deep_rebuild(message_id, r.m1, r.m2, r.m3, 1, r.update_signal, r.update_count, r.last_change_tick); };
+    if r.len == 1 { return ecs_mru_deep_rebuild(r.m0, message_id, r.m2, r.m3, 2, r.update_signal, r.update_count, r.last_change_tick); };
+    if r.len == 2 { return ecs_mru_deep_rebuild(r.m0, r.m1, message_id, r.m3, 3, r.update_signal, r.update_count, r.last_change_tick); };
+    if r.len == 3 { return ecs_mru_deep_rebuild(r.m0, r.m1, r.m2, message_id, 4, r.update_signal, r.update_count, r.last_change_tick); };
+    return r;
+}
+
+// remove by rebuild compact
+fn ecs_mru_deep_deregister(r: EcsMruDeep, message_id: i32) -> EcsMruDeep {
+    if ecs_mru_deep_is_registered(r, message_id) != true { return r; };
+    let out = ecs_mru_deep_new();
+    out = ecs_mru_deep_rebuild(out.m0, out.m1, out.m2, out.m3, 0, r.update_signal, r.update_count, r.last_change_tick);
+    if r.len >= 1 { if r.m0 != message_id { out = ecs_mru_deep_register(out, r.m0); }; };
+    if r.len >= 2 { if r.m1 != message_id { out = ecs_mru_deep_register(out, r.m1); }; };
+    if r.len >= 3 { if r.m2 != message_id { out = ecs_mru_deep_register(out, r.m2); }; };
+    if r.len >= 4 { if r.m3 != message_id { out = ecs_mru_deep_register(out, r.m3); }; };
+    return out;
+}
+
+fn ecs_mru_deep_signal(r: EcsMruDeep, signal: bool) -> EcsMruDeep {
+    return ecs_mru_deep_rebuild(r.m0, r.m1, r.m2, r.m3, r.len, signal, r.update_count, r.last_change_tick);
+}
+
+fn ecs_mru_deep_should_update(r: EcsMruDeep) -> i32 {
+    if r.update_signal { return ECS_MRU_FORCED; };
+    if r.len > 0 { return ECS_MRU_YES; };
+    return ECS_MRU_NO;
+}
+
+fn ecs_mru_deep_run_updates(r: EcsMruDeep, current_tick: i32) -> EcsMruDeep {
+    let should = ecs_mru_deep_should_update(r);
+    if should == ECS_MRU_NO {
+        return r;
+    };
+    return ecs_mru_deep_rebuild(r.m0, r.m1, r.m2, r.m3, r.len, false, r.update_count + 1, current_tick);
+}
+
+// mut iterator remaining model
+struct EcsMmiDeep {
+    remaining: i64,
+    cursor: i64,
+}
+
+fn ecs_mmi_deep_new(remaining: i64) -> EcsMmiDeep {
+    return EcsMmiDeep { remaining: remaining, cursor: 0 };
+}
+
+fn ecs_mmi_deep_len(it: EcsMmiDeep) -> i64 { return it.remaining; }
+fn ecs_mmi_deep_is_empty(it: EcsMmiDeep) -> bool { return it.remaining == 0; }
+
+fn ecs_mmi_deep_without_id(it: EcsMmiDeep) -> EcsMmiDeep { return it; }
+
+fn ecs_mmi_deep_advance(it: EcsMmiDeep) -> EcsMmiDeep {
+    if it.remaining <= 0 { return it; };
+    return EcsMmiDeep { remaining: it.remaining - 1, cursor: it.cursor + 1 };
+}
+
+// par iter batching
+struct EcsMmpDeep {
+    remaining: i64,
+    batch_size: i64,
+}
+
+fn ecs_mmp_deep_new(remaining: i64) -> EcsMmpDeep {
+    return EcsMmpDeep { remaining: remaining, batch_size: 1 };
+}
+
+fn ecs_mmp_deep_batching(p: EcsMmpDeep, batch_size: i64) -> EcsMmpDeep {
+    let b = batch_size;
+    if b < 1 { b = 1; };
+    return EcsMmpDeep { remaining: p.remaining, batch_size: b };
+}
+
+fn ecs_mmp_deep_len(p: EcsMmpDeep) -> i64 { return p.remaining; }
+
+fn ecs_mmp_deep_batch_count(p: EcsMmpDeep) -> i64 {
+    if p.remaining <= 0 { return 0; };
+    if p.batch_size <= 0 { return p.remaining; };
+    return (p.remaining + p.batch_size - 1) / p.batch_size;
+}
+
+fn ecs_mmp_deep_for_each(p: EcsMmpDeep) -> i64 { return p.remaining; }

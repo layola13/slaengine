@@ -1,0 +1,144 @@
+// Bevy ECS observer runner + On system param + TriggerContext.
+// Mirrors src/observer/mod.rs + system_param.rs + runner.rs + condition.rs.
+
+// === Trigger types ===
+const ECS_TRIGGER_GLOBAL: i32 = 0;
+const ECS_TRIGGER_ENTITY: i32 = 1;
+const ECS_TRIGGER_PROPAGATE: i32 = 2;
+const ECS_TRIGGER_COMPONENTS: i32 = 3;
+
+struct EcsTrigger {
+    kind: i32,
+    target_entity: i64,
+    event_key: i32,
+    propagate: bool,
+    original_target: i64,
+}
+
+fn ecs_trigger_global(event_key: i32) -> EcsTrigger {
+    return EcsTrigger { kind: ECS_TRIGGER_GLOBAL, target_entity: 0, event_key: event_key, propagate: false, original_target: 0 };
+}
+
+fn ecs_trigger_entity(event_key: i32, entity: i64) -> EcsTrigger {
+    return EcsTrigger { kind: ECS_TRIGGER_ENTITY, target_entity: entity, event_key: event_key, propagate: false, original_target: entity };
+}
+
+fn ecs_trigger_propagate(event_key: i32, entity: i64, auto_propagate: bool) -> EcsTrigger {
+    return EcsTrigger { kind: ECS_TRIGGER_PROPAGATE, target_entity: entity, event_key: event_key, propagate: auto_propagate, original_target: entity };
+}
+
+fn ecs_trigger_kind(t: EcsTrigger) -> i32 { return t.kind; }
+fn ecs_trigger_target(t: EcsTrigger) -> i64 { return t.target_entity; }
+fn ecs_trigger_event_key(t: EcsTrigger) -> i32 { return t.event_key; }
+fn ecs_trigger_get_propagate(t: EcsTrigger) -> bool { return t.propagate; }
+fn ecs_trigger_original_target(t: EcsTrigger) -> i64 { return t.original_target; }
+
+fn ecs_trigger_set_propagate(t: EcsTrigger, should_propagate: bool) -> EcsTrigger {
+    t.propagate = should_propagate;
+    return t;
+}
+
+// === On<E>: observer system param providing event + trigger access ===
+struct EcsOn {
+    event_value: i32,
+    event_key: i32,
+    trigger: EcsTrigger,
+    observer_entity: i64,
+    caller: i64,
+}
+
+fn ecs_on_new(event_value: i32, event_key: i32, trigger: EcsTrigger) -> EcsOn {
+    return EcsOn { event_value: event_value, event_key: event_key, trigger: trigger, observer_entity: 0, caller: 0 };
+}
+
+fn ecs_on_event(o: EcsOn) -> i32 { return o.event_value; }
+fn ecs_on_event_key(o: EcsOn) -> i32 { return o.event_key; }
+fn ecs_on_trigger(o: EcsOn) -> EcsTrigger { return o.trigger; }
+fn ecs_on_observer(o: EcsOn) -> i64 { return o.observer_entity; }
+fn ecs_on_caller(o: EcsOn) -> i64 { return o.caller; }
+fn ecs_on_propagate(o: EcsOn) -> bool { return ecs_trigger_get_propagate(o.trigger); }
+
+fn ecs_on_set_propagate(o: EcsOn, should_propagate: bool) -> EcsOn {
+    o.trigger = ecs_trigger_set_propagate(o.trigger, should_propagate);
+    return o;
+}
+
+// === Observer registration and triggering ===
+struct EcsObserverEntry {
+    observer_id: i32,
+    event_key: i32,
+    target_entity: i64,
+    is_active: bool,
+    run_count: i64,
+}
+
+struct EcsObserverRegistry {
+    observers: Vec<EcsObserverEntry>,
+    next_id: i32,
+}
+
+fn ecs_observer_registry_new() -> EcsObserverRegistry {
+    return EcsObserverRegistry { observers: Vec::new(), next_id: 0 };
+}
+
+fn ecs_observer_registry_add(reg: EcsObserverRegistry, event_key: i32, target_entity: i64) -> (EcsObserverRegistry, i32) {
+    let id = reg.next_id;
+    reg.observers.push(EcsObserverEntry { observer_id: id, event_key: event_key, target_entity: target_entity, is_active: true, run_count: 0 });
+    reg.next_id = id + 1;
+    return (reg, id);
+}
+
+fn ecs_observer_registry_trigger(reg: EcsObserverRegistry, trigger: EcsTrigger) -> EcsObserverRegistry {
+    let i: i64 = 0;
+    let cnt = len(reg.observers) as i64;
+    while i < cnt {
+        if reg.observers[i].is_active {
+            if reg.observers[i].event_key == ecs_trigger_event_key(trigger) {
+                if reg.observers[i].target_entity == 0 || reg.observers[i].target_entity == ecs_trigger_target(trigger) {
+                    reg.observers[i].run_count = reg.observers[i].run_count + 1;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return reg;
+}
+
+fn ecs_observer_registry_deactivate(reg: EcsObserverRegistry, observer_id: i32) -> EcsObserverRegistry {
+    let i: i64 = 0;
+    let cnt = len(reg.observers) as i64;
+    while i < cnt {
+        if reg.observers[i].observer_id == observer_id { reg.observers[i].is_active = false; };
+        i = i + 1;
+    }
+    return reg;
+}
+
+fn ecs_observer_registry_count(reg: EcsObserverRegistry) -> i64 { return len(reg.observers) as i64; }
+
+fn ecs_observer_run_count(reg: EcsObserverRegistry, observer_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(reg.observers) as i64;
+    while i < cnt {
+        if reg.observers[i].observer_id == observer_id { return reg.observers[i].run_count; };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// === ObserverWithCondition: observer with a run condition ===
+struct EcsObserverWithCondition {
+    observer_id: i32,
+    condition_met: bool,
+}
+
+fn ecs_observer_with_condition_new(observer_id: i32) -> EcsObserverWithCondition {
+    return EcsObserverWithCondition { observer_id: observer_id, condition_met: true };
+}
+
+fn ecs_observer_with_condition_run_if(owc: EcsObserverWithCondition, condition: bool) -> EcsObserverWithCondition {
+    owc.condition_met = condition;
+    return owc;
+}
+
+fn ecs_observer_with_condition_should_run(owc: EcsObserverWithCondition) -> bool { return owc.condition_met; }

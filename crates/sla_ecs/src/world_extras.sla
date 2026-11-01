@@ -1,0 +1,612 @@
+// Bevy ECS World extras — required-component try/register-by-id + modify_component/resource + spawn_at/empty_at/batch + World accessor facades.
+// Mirrors src/world/mod.rs gaps not already in lib/ecs_world.sla.
+// NOTE: results are surfaced via dedicated result-struct single-field accessors (the SA backend
+// corrupts the .1 slot of (i32,i32) tuples returned from lib fns).
+
+// === Result structs ===
+
+struct ReqCompResult {
+    ok: i32,
+    err_kind: i32,
+    err_a: i32,
+    err_b: i32,
+}
+
+struct ReqQueryResult {
+    found: i32,
+    count: i32,
+}
+
+struct ReqNthResult {
+    found: i32,
+    required_id: i32,
+    constructor_id: i32,
+}
+
+struct AllocResult {
+    alloc: EcsWorldEntityAllocator,
+    idx: i32,
+    generation: i32,
+}
+
+struct ResourceGetResult {
+    found: i32,
+    entity_idx: i32,
+}
+
+struct SpawnBatchResult {
+    facade: EcsWorldSpawnFacade,
+    count: i32,
+    first: i32,
+}
+
+struct SpawnAtResult {
+    facade: EcsWorldSpawnFacade,
+    ok: i32,
+    error_code: i32,
+    entity_idx: i32,
+}
+
+struct QueueAtResult {
+    found: i32,
+    type_id: i32,
+    storage_kind: i32,
+}
+
+struct QueueApplyResult {
+    queue: EcsWorldComponentsQueue,
+    applied: i32,
+}
+
+struct ModifyResult {
+    facade: EcsWorldSpawnFacade,
+    ok: i32,
+    error_code: i32,
+    present: i32,
+}
+
+struct ModifyResourceResult {
+    resources: EcsWorldResourceEntities,
+    facade: EcsWorldSpawnFacade,
+    ok: i32,
+    error_code: i32,
+    present: i32,
+}
+
+// === RequiredComponentsError variants (src/component/required.rs) ===
+// 0 = DuplicateRegistration, 1 = CyclicRequirement, 2 = ArchetypeExists
+
+fn ecs_req_err_kind(kind: i32, a: i32, b: i32) -> ReqCompResult {
+    let e = ReqCompResult { ok: 0, err_kind: kind, err_a: a, err_b: b };
+    return e;
+}
+
+fn ecs_req_ok_placeholder() -> ReqCompResult {
+    let e = ReqCompResult { ok: 1, err_kind: 0, err_a: 0, err_b: 0 };
+    return e;
+}
+
+fn ecs_req_result_ok(r: ReqCompResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_req_result_kind(r: ReqCompResult) -> i32 {
+    return r.err_kind;
+}
+
+fn ecs_req_result_a(r: ReqCompResult) -> i32 {
+    return r.err_a;
+}
+
+fn ecs_req_result_b(r: ReqCompResult) -> i32 {
+    return r.err_b;
+}
+
+fn ecs_req_result_is_dup(r: ReqCompResult) -> bool {
+    return r.err_kind == 0;
+}
+
+fn ecs_req_result_is_cyclic(r: ReqCompResult) -> bool {
+    return r.err_kind == 1;
+}
+
+fn ecs_req_result_is_archetype_exists(r: ReqCompResult) -> bool {
+    return r.err_kind == 2;
+}
+
+struct RegisterResult {
+    registry: EcsWorldRequiredRegistry,
+    result: ReqCompResult,
+}
+
+fn ecs_register_result_registry(r: RegisterResult) -> EcsWorldRequiredRegistry {
+    return r.registry;
+}
+
+fn ecs_register_result_result(r: RegisterResult) -> ReqCompResult {
+    return r.result;
+}
+
+// === SpawnError variants ===
+fn ecs_spawn_err_invalid() -> i32 {
+    return 0;
+}
+
+fn ecs_spawn_err_already_spawned() -> i32 {
+    return 1;
+}
+
+fn ecs_spawn_err_is_invalid(code: i32) -> bool {
+    return code == 0;
+}
+
+fn ecs_spawn_err_is_already_spawned(code: i32) -> bool {
+    return code == 1;
+}
+
+// === EntityMutableFetchError variants ===
+fn ecs_entity_fetch_err_not_spawned() -> i32 {
+    return 0;
+}
+
+fn ecs_entity_fetch_err_aliased_mutability() -> i32 {
+    return 1;
+}
+
+fn ecs_entity_fetch_err_is_not_spawned(code: i32) -> bool {
+    return code == 0;
+}
+
+fn ecs_entity_fetch_err_is_aliased(code: i32) -> bool {
+    return code == 1;
+}
+
+// === Required-component registry ===
+
+struct EcsWorldRequiredRegistry {
+    requiree_ids: Vec<i32>,
+    required_ids: Vec<i32>,
+    constructor_ids: Vec<i32>,
+    registered_component_ids: Vec<i32>,
+    archetyped_ids: Vec<i32>,
+}
+
+fn ecs_world_req_registry_new() -> EcsWorldRequiredRegistry {
+    let r = EcsWorldRequiredRegistry { requiree_ids: Vec::new(), required_ids: Vec::new(), constructor_ids: Vec::new(), registered_component_ids: Vec::new(), archetyped_ids: Vec::new() };
+    return r;
+}
+
+fn ecs_world_req_registry_next_free_type_id(reg: EcsWorldRequiredRegistry, used: Vec<i32>) -> i32 {
+    let id: i32 = 1;
+    let scan: i32 = 0;
+    while scan < 200 {
+        let conflict: bool = false;
+        let u: i32 = 0; let ulen: i32 = len(used) as i32;
+        while u < ulen { if used[u] == id { conflict = true; }; u = u + 1; }
+        let r: i32 = 0; let rlen: i32 = len(reg.registered_component_ids) as i32;
+        while r < rlen { if reg.registered_component_ids[r] == id { conflict = true; }; r = r + 1; }
+        if !conflict { break; };
+        id = id + 1;
+        scan = scan + 1;
+    }
+    return id;
+}
+
+fn ecs_world_req_registry_register_component(reg: EcsWorldRequiredRegistry, type_id: i32) -> EcsWorldRequiredRegistry {
+    reg.registered_component_ids.push(type_id);
+    return reg;
+}
+
+fn ecs_world_req_registry_mark_archetyped(reg: EcsWorldRequiredRegistry, type_id: i32) -> EcsWorldRequiredRegistry {
+    reg.archetyped_ids.push(type_id);
+    return reg;
+}
+
+fn ecs_world_req_registry_is_archetyped(reg: EcsWorldRequiredRegistry, type_id: i32) -> bool {
+    let n: i32 = len(reg.archetyped_ids) as i32;
+    let i: i32 = 0;
+    while i < n { if reg.archetyped_ids[i] == type_id { return true; }; i = i + 1; }
+    return false;
+}
+
+// try_register_required_components_with: returns ReqCompResult (struct).
+fn ecs_world_req_registry_try_register_with(reg: EcsWorldRequiredRegistry, requiree_id: i32, required_id: i32, constructor_id: i32) -> RegisterResult {
+    reg = ecs_world_req_registry_register_component(reg, requiree_id);
+    reg = ecs_world_req_registry_register_component(reg, required_id);
+    if ecs_world_req_registry_is_archetyped(reg, requiree_id) {
+        let err = ecs_req_err_kind(2, requiree_id, 0);
+        let r = RegisterResult { registry: reg, result: err };
+        return r;
+    };
+    let n: i32 = len(reg.requiree_ids) as i32;
+    let i: i32 = 0;
+    while i < n { if reg.requiree_ids[i] == requiree_id && reg.required_ids[i] == required_id { let err = ecs_req_err_kind(0, requiree_id, required_id); let r = RegisterResult { registry: reg, result: err }; return r; }; i = i + 1; }
+    reg.requiree_ids.push(requiree_id);
+    reg.required_ids.push(required_id);
+    reg.constructor_ids.push(constructor_id);
+    let ok = ecs_req_ok_placeholder();
+    let r = RegisterResult { registry: reg, result: ok };
+    return r;
+}
+
+fn ecs_world_req_registry_try_register(reg: EcsWorldRequiredRegistry, requiree_id: i32, required_id: i32) -> RegisterResult {
+    return ecs_world_req_registry_try_register_with(reg, requiree_id, required_id, 0);
+}
+
+// get_required_components_by_id: returns ReqQueryResult (struct)
+fn ecs_world_req_registry_get_required_by_id(reg: EcsWorldRequiredRegistry, requiree_id: i32) -> ReqQueryResult {
+    let n: i32 = len(reg.requiree_ids) as i32;
+    let count: i32 = 0;
+    let i: i32 = 0;
+    while i < n { if reg.requiree_ids[i] == requiree_id { count = count + 1; }; i = i + 1; }
+    if count > 0 {
+        let r = ReqQueryResult { found: 1, count: count };
+        return r;
+    };
+    let r = ReqQueryResult { found: 0, count: 0 };
+    return r;
+}
+
+fn ecs_req_query_found(r: ReqQueryResult) -> bool {
+    return r.found == 1;
+}
+
+fn ecs_req_query_count(r: ReqQueryResult) -> i32 {
+    return r.count;
+}
+
+// get_required_nth: returns ReqNthResult (struct)
+fn ecs_world_req_registry_get_required_nth(reg: EcsWorldRequiredRegistry, requiree_id: i32, nth: i32) -> ReqNthResult {
+    let n: i32 = len(reg.requiree_ids) as i32;
+    let seen: i32 = 0;
+    let i: i32 = 0;
+    while i < n { if reg.requiree_ids[i] == requiree_id { if seen == nth { let r = ReqNthResult { found: 1, required_id: reg.required_ids[i], constructor_id: reg.constructor_ids[i] }; return r; }; seen = seen + 1; }; i = i + 1; }
+    let r = ReqNthResult { found: 0, required_id: 0, constructor_id: 0 };
+    return r;
+}
+
+fn ecs_req_nth_found(r: ReqNthResult) -> bool {
+    return r.found == 1;
+}
+
+fn ecs_req_nth_required_id(r: ReqNthResult) -> i32 {
+    return r.required_id;
+}
+
+fn ecs_req_nth_constructor_id(r: ReqNthResult) -> i32 {
+    return r.constructor_id;
+}
+
+// === EntityAllocator facade ===
+
+struct EcsWorldEntityAllocator {
+    next_index: i32,
+    generation: i32,
+    free_indices: Vec<i32>,
+    spawned_indices: Vec<i32>,
+}
+
+fn ecs_world_entity_allocator_new() -> EcsWorldEntityAllocator {
+    let a = EcsWorldEntityAllocator { next_index: 0, generation: 1, free_indices: Vec::new(), spawned_indices: Vec::new() };
+    return a;
+}
+
+fn ecs_world_entity_allocator_alloc(a: EcsWorldEntityAllocator) -> AllocResult {
+    let idx: i32 = 0;
+    if len(a.free_indices) > 0 {
+        idx = a.free_indices[0];
+        a.free_indices.remove(0);
+    } else {
+        idx = a.next_index;
+        a.next_index = a.next_index + 1;
+    };
+    a.spawned_indices.push(idx);
+    let r = AllocResult { alloc: a, idx: idx, generation: a.generation };
+    return r;
+}
+
+fn ecs_world_entity_allocator_alloc_idx(r: AllocResult) -> i32 {
+    return r.idx;
+}
+
+fn ecs_world_entity_allocator_alloc_gen(r: AllocResult) -> i32 {
+    return r.generation;
+}
+
+fn ecs_world_entity_allocator_alloc_allocator(r: AllocResult) -> EcsWorldEntityAllocator {
+    return r.alloc;
+}
+
+fn ecs_world_entity_allocator_free(a: EcsWorldEntityAllocator, idx: i32) -> EcsWorldEntityAllocator {
+    a.free_indices.push(idx);
+    let n: i32 = len(a.spawned_indices) as i32;
+    let i: i32 = 0;
+    while i < n { if a.spawned_indices[i] == idx { a.spawned_indices.remove(i); break; }; i = i + 1; }
+    return a;
+}
+
+fn ecs_world_entity_allocator_is_spawned(a: EcsWorldEntityAllocator, idx: i32) -> bool {
+    let n: i32 = len(a.spawned_indices) as i32;
+    let i: i32 = 0;
+    while i < n { if a.spawned_indices[i] == idx { return true; }; i = i + 1; }
+    return false;
+}
+
+fn ecs_world_entity_allocator_check_can_spawn_at(a: EcsWorldEntityAllocator, idx: i32) -> i32 {
+    if ecs_world_entity_allocator_is_spawned(a, idx) { return ecs_spawn_err_already_spawned(); };
+    return -1;
+}
+
+fn ecs_world_entity_allocator_spawned_count(a: EcsWorldEntityAllocator) -> i32 {
+    return len(a.spawned_indices) as i32;
+}
+
+// === ResourceEntities facade ===
+
+struct EcsWorldResourceEntities {
+    component_ids: Vec<i32>,
+    entity_indices: Vec<i32>,
+}
+
+fn ecs_world_resource_entities_new() -> EcsWorldResourceEntities {
+    let r = EcsWorldResourceEntities { component_ids: Vec::new(), entity_indices: Vec::new() };
+    return r;
+}
+
+fn ecs_world_resource_entities_insert(re: EcsWorldResourceEntities, component_id: i32, entity_idx: i32) -> EcsWorldResourceEntities {
+    let n: i32 = len(re.component_ids) as i32;
+    let i: i32 = 0;
+    while i < n { if re.component_ids[i] == component_id { re.entity_indices[i] = entity_idx; return re; }; i = i + 1; }
+    re.component_ids.push(component_id);
+    re.entity_indices.push(entity_idx);
+    return re;
+}
+
+fn ecs_world_resource_entities_get(re: EcsWorldResourceEntities, component_id: i32) -> ResourceGetResult {
+    let n: i32 = len(re.component_ids) as i32;
+    let i: i32 = 0;
+    while i < n { if re.component_ids[i] == component_id { let r = ResourceGetResult { found: 1, entity_idx: re.entity_indices[i] }; return r; }; i = i + 1; }
+    let r = ResourceGetResult { found: 0, entity_idx: 0 };
+    return r;
+}
+
+fn ecs_world_resource_entities_get_found(r: ResourceGetResult) -> bool {
+    return r.found == 1;
+}
+
+fn ecs_world_resource_entities_get_entity_idx(r: ResourceGetResult) -> i32 {
+    return r.entity_idx;
+}
+
+fn ecs_world_resource_entities_len(re: EcsWorldResourceEntities) -> i32 {
+    return len(re.component_ids) as i32;
+}
+
+// === spawn_at / spawn_empty_at / spawn_batch ===
+
+struct EcsWorldSpawnFacade {
+    allocator: EcsWorldEntityAllocator,
+    spawned_types: Vec<i32>,
+}
+
+fn ecs_world_spawn_facade_new() -> EcsWorldSpawnFacade {
+    let f = EcsWorldSpawnFacade { allocator: ecs_world_entity_allocator_new(), spawned_types: Vec::new() };
+    return f;
+}
+
+fn ecs_world_spawn_facade_allocator(f: EcsWorldSpawnFacade) -> EcsWorldEntityAllocator {
+    return f.allocator;
+}
+
+fn ecs_world_spawn_facade_spawn_at(f: EcsWorldSpawnFacade, entity_idx: i32, type_id: i32) -> SpawnAtResult {
+    let check: i32 = ecs_world_entity_allocator_check_can_spawn_at(f.allocator, entity_idx);
+    if check != -1 { let r = SpawnAtResult { facade: f, ok: 0, error_code: check, entity_idx: -1 }; return r; };
+    f.allocator.spawned_indices.push(entity_idx);
+    f.spawned_types.push(type_id);
+    let r = SpawnAtResult { facade: f, ok: 1, error_code: -1, entity_idx: entity_idx };
+    return r;
+}
+
+fn ecs_spawn_at_facade(r: SpawnAtResult) -> EcsWorldSpawnFacade {
+    return r.facade;
+}
+
+fn ecs_spawn_at_ok(r: SpawnAtResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_spawn_at_error_code(r: SpawnAtResult) -> i32 {
+    return r.error_code;
+}
+
+fn ecs_spawn_at_entity_idx(r: SpawnAtResult) -> i32 {
+    return r.entity_idx;
+}
+
+fn ecs_world_spawn_facade_spawn_empty_at(f: EcsWorldSpawnFacade, entity_idx: i32) -> SpawnAtResult {
+    let check: i32 = ecs_world_entity_allocator_check_can_spawn_at(f.allocator, entity_idx);
+    if check != -1 { let r = SpawnAtResult { facade: f, ok: 0, error_code: check, entity_idx: -1 }; return r; };
+    f.allocator.spawned_indices.push(entity_idx);
+    f.spawned_types.push(0);
+    let r = SpawnAtResult { facade: f, ok: 1, error_code: -1, entity_idx: entity_idx };
+    return r;
+}
+
+fn ecs_world_spawn_facade_spawn_batch(f: EcsWorldSpawnFacade, type_ids: Vec<i32>) -> SpawnBatchResult {
+    let n: i32 = len(type_ids) as i32;
+    let first: i32 = -1;
+    let i: i32 = 0;
+    while i < n {
+        let res = ecs_world_entity_allocator_alloc(f.allocator);
+        f.allocator = res.alloc;
+        f.spawned_types.push(type_ids[i]);
+        if i == 0 { first = res.idx; };
+        i = i + 1;
+    }
+    let r = SpawnBatchResult { facade: f, count: n, first: first };
+    return r;
+}
+
+fn ecs_spawn_batch_facade(r: SpawnBatchResult) -> EcsWorldSpawnFacade {
+    return r.facade;
+}
+
+fn ecs_spawn_batch_count(r: SpawnBatchResult) -> i32 {
+    return r.count;
+}
+
+fn ecs_spawn_batch_first(r: SpawnBatchResult) -> i32 {
+    return r.first;
+}
+
+// === components_queue / components_registrator facade ===
+
+struct EcsWorldComponentsQueue {
+    queued_type_ids: Vec<i32>,
+    queued_storage_kinds: Vec<i32>,
+}
+
+fn ecs_world_components_queue_new() -> EcsWorldComponentsQueue {
+    let q = EcsWorldComponentsQueue { queued_type_ids: Vec::new(), queued_storage_kinds: Vec::new() };
+    return q;
+}
+
+fn ecs_world_components_queue_at(q: EcsWorldComponentsQueue, idx: i32) -> QueueAtResult {
+    let n: i32 = len(q.queued_type_ids) as i32;
+    if idx < 0 || idx >= n { let r = QueueAtResult { found: 0, type_id: 0, storage_kind: 0 }; return r; };
+    let r = QueueAtResult { found: 1, type_id: q.queued_type_ids[idx], storage_kind: q.queued_storage_kinds[idx] };
+    return r;
+}
+
+fn ecs_queue_at_found(r: QueueAtResult) -> bool {
+    return r.found == 1;
+}
+
+fn ecs_queue_at_type_id(r: QueueAtResult) -> i32 {
+    return r.type_id;
+}
+
+fn ecs_queue_at_storage_kind(r: QueueAtResult) -> i32 {
+    return r.storage_kind;
+}
+
+fn ecs_world_components_queue_len(q: EcsWorldComponentsQueue) -> i32 {
+    return len(q.queued_type_ids) as i32;
+}
+
+fn ecs_world_components_queue_enqueue(q: EcsWorldComponentsQueue, type_id: i32, storage_kind: i32) -> EcsWorldComponentsQueue {
+    q.queued_type_ids.push(type_id);
+    q.queued_storage_kinds.push(storage_kind);
+    return q;
+}
+
+fn ecs_world_components_queue_apply(q: EcsWorldComponentsQueue) -> QueueApplyResult {
+    let n: i32 = len(q.queued_type_ids) as i32;
+    let i: i32 = 0;
+    while i < n { q.queued_type_ids.remove(0); q.queued_storage_kinds.remove(0); i = i + 1; }
+    let r = QueueApplyResult { queue: q, applied: n };
+    return r;
+}
+
+fn ecs_queue_apply_queue(r: QueueApplyResult) -> EcsWorldComponentsQueue {
+    return r.queue;
+}
+
+fn ecs_queue_apply_applied(r: QueueApplyResult) -> i32 {
+    return r.applied;
+}
+
+// === as_unsafe_world_cell / as_unsafe_world_cell_readonly facade ===
+
+struct EcsUnsafeWorldCell {
+    world_ptr: i64,
+    readonly: bool,
+}
+
+fn ecs_world_unsafe_cell_new(world_ptr: i64) -> EcsUnsafeWorldCell {
+    let c = EcsUnsafeWorldCell { world_ptr: world_ptr, readonly: false };
+    return c;
+}
+
+fn ecs_world_unsafe_cell_readonly(world_ptr: i64) -> EcsUnsafeWorldCell {
+    let c = EcsUnsafeWorldCell { world_ptr: world_ptr, readonly: true };
+    return c;
+}
+
+fn ecs_world_unsafe_cell_ptr(c: EcsUnsafeWorldCell) -> i64 {
+    return c.world_ptr;
+}
+
+fn ecs_world_unsafe_cell_is_readonly(c: EcsUnsafeWorldCell) -> bool {
+    return c.readonly;
+}
+
+// === modify_component / modify_component_by_id ===
+
+fn ecs_world_modify_component(facade: EcsWorldSpawnFacade, entity_idx: i32, type_id: i32, mutator_handle: i32, new_value: i32) -> ModifyResult {
+    if !ecs_world_entity_allocator_is_spawned(facade.allocator, entity_idx) { let r = ModifyResult { facade: facade, ok: 0, error_code: ecs_entity_fetch_err_not_spawned(), present: 0 }; return r; };
+    let n: i32 = len(facade.spawned_types) as i32;
+    let i: i32 = 0;
+    let mut_idx: i32 = -1;
+    while i < n { if facade.spawned_types[i] == type_id && i == entity_idx { mut_idx = i; break; }; i = i + 1; }
+    if mut_idx < 0 { let r = ModifyResult { facade: facade, ok: 1, error_code: -1, present: 0 }; return r; };
+    facade.spawned_types[mut_idx] = new_value;
+    let _ = mutator_handle;
+    let r = ModifyResult { facade: facade, ok: 1, error_code: -1, present: 1 };
+    return r;
+}
+
+fn ecs_modify_facade(r: ModifyResult) -> EcsWorldSpawnFacade {
+    return r.facade;
+}
+
+fn ecs_modify_ok(r: ModifyResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_modify_error_code(r: ModifyResult) -> i32 {
+    return r.error_code;
+}
+
+fn ecs_modify_present(r: ModifyResult) -> i32 {
+    return r.present;
+}
+
+// === modify_resource / modify_resource_by_id ===
+
+fn ecs_world_modify_resource(re: EcsWorldResourceEntities, facade: EcsWorldSpawnFacade, component_id: i32, mutator_handle: i32, new_value: i32) -> ModifyResourceResult {
+    let pkg = ecs_world_resource_entities_get(re, component_id);
+    if !ecs_world_resource_entities_get_found(pkg) { let r = ModifyResourceResult { resources: re, facade: facade, ok: 1, error_code: -1, present: 0 }; return r; };
+    let ent_idx = ecs_world_resource_entities_get_entity_idx(pkg);
+    let cm = ecs_world_modify_component(facade, ent_idx, component_id, mutator_handle, new_value);
+    let r = ModifyResourceResult { resources: re, facade: ecs_modify_facade(cm), ok: ecs_modify_ok(cm), error_code: ecs_modify_error_code(cm), present: ecs_modify_present(cm) };
+    return r;
+}
+
+fn ecs_modify_resource_resources(r: ModifyResourceResult) -> EcsWorldResourceEntities {
+    return r.resources;
+}
+
+fn ecs_modify_resource_facade(r: ModifyResourceResult) -> EcsWorldSpawnFacade {
+    return r.facade;
+}
+
+fn ecs_modify_resource_ok(r: ModifyResourceResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_modify_resource_error_code(r: ModifyResourceResult) -> i32 {
+    return r.error_code;
+}
+
+fn ecs_modify_resource_present(r: ModifyResourceResult) -> i32 {
+    return r.present;
+}
+
+fn ecs_world_modify_component_by_id(facade: EcsWorldSpawnFacade, entity_idx: i32, component_id: i32, mutator_handle: i32, new_value: i32) -> ModifyResult {
+    return ecs_world_modify_component(facade, entity_idx, component_id, mutator_handle, new_value);
+}
+
+fn ecs_world_modify_resource_by_id(re: EcsWorldResourceEntities, facade: EcsWorldSpawnFacade, component_id: i32, mutator_handle: i32, new_value: i32) -> ModifyResourceResult {
+    return ecs_world_modify_resource(re, facade, component_id, mutator_handle, new_value);
+}

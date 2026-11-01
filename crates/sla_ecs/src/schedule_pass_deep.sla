@@ -1,0 +1,429 @@
+// Deepened Bevy ECS schedule::pass surface.
+// Mirrors src/schedule/pass.rs: ScheduleBuildPass trait, FlattenedDependencies (added_edges
+// tracking), collapse_set edge generation, object-safe ScheduleBuildPassObj adapter.
+// Also models src/schedule/node.rs NodeId/SystemKey/SystemSetKey surface used by passes.
+
+// === NodeKind (NodeId::is_system / is_set) ===
+const ECS_NODE_KIND_SYSTEM: i32 = 0;
+const ECS_NODE_KIND_SET: i32 = 1;
+
+struct EcsNodeId {
+    kind: i32,
+    key: i64,   // the SystemKey or SystemSetKey id
+}
+
+fn ecs_node_id_system(key: i64) -> EcsNodeId {
+    return EcsNodeId { kind: ECS_NODE_KIND_SYSTEM, key: key };
+}
+
+fn ecs_node_id_set(key: i64) -> EcsNodeId {
+    return EcsNodeId { kind: ECS_NODE_KIND_SET, key: key };
+}
+
+fn ecs_node_id_is_system(n: EcsNodeId) -> bool { return n.kind == ECS_NODE_KIND_SYSTEM; }
+fn ecs_node_id_is_set(n: EcsNodeId) -> bool { return n.kind == ECS_NODE_KIND_SET; }
+fn ecs_node_id_kind(n: EcsNodeId) -> i32 { return n.kind; }
+fn ecs_node_id_key(n: EcsNodeId) -> i64 { return n.key; }
+
+// TryFrom<NodeId> for SystemKey / SystemSetKey (node.rs lines 256-284)
+// Returns (ok, key): ok=true means the conversion succeeded for the requested kind.
+fn ecs_node_id_as_system(n: EcsNodeId) -> (bool, i64) {
+    if n.kind == ECS_NODE_KIND_SYSTEM { return (true, n.key); };
+    return (false, n.key);
+}
+
+fn ecs_node_id_as_set(n: EcsNodeId) -> (bool, i64) {
+    if n.kind == ECS_NODE_KIND_SET { return (true, n.key); };
+    return (false, n.key);
+}
+
+// `kind(&self) -> &'static str` proxy: 0 -> "system", 1 -> "system set"
+fn ecs_node_id_kind_label(n: EcsNodeId) -> i64 {
+    if n.kind == ECS_NODE_KIND_SYSTEM { return 0; };
+    return 1;
+}
+
+// === SystemKey / SystemSetKey ===
+// Bevy uses `new_key_type!` to generate opaque wrappers around KeyData (an index + generation).
+// We model the id as a compact i64 (combined index/generation) since the interior layout is
+// non-observable over the pass surface.
+struct EcsSystemKey {
+    id: i64,
+}
+
+struct EcsSystemSetKey {
+    id: i64,
+}
+
+fn ecs_p_system_key_new(id: i64) -> EcsSystemKey { return EcsSystemKey { id: id }; }
+fn ecs_p_system_key_id(k: EcsSystemKey) -> i64 { return k.id; }
+fn ecs_p_system_key_eq(a: EcsSystemKey, b: EcsSystemKey) -> bool { return a.id == b.id; }
+
+fn ecs_p_system_set_key_new(id: i64) -> EcsSystemSetKey { return EcsSystemSetKey { id: id }; }
+fn ecs_p_system_set_key_id(k: EcsSystemSetKey) -> i64 { return k.id; }
+fn ecs_p_system_set_key_eq(a: EcsSystemSetKey, b: EcsSystemSetKey) -> bool { return a.id == b.id; }
+
+// GraphNodeId::kind proxy
+fn ecs_p_system_key_kind_label(_k: EcsSystemKey) -> i64 { return 0; }
+fn ecs_p_system_set_key_kind_label(_k: EcsSystemSetKey) -> i64 { return 1; }
+
+// From<SystemKey> for NodeId / From<SystemSetKey> for NodeId (node.rs lines 329-345)
+fn ecs_node_id_from_system_key(k: EcsSystemKey) -> EcsNodeId { return ecs_node_id_system(k.id); }
+fn ecs_node_id_from_set_key(k: EcsSystemSetKey) -> EcsNodeId { return ecs_node_id_set(k.id); }
+
+// === FlattenedDependencies<'a> (pass.rs lines 50-118) ===
+// Bevy wraps a `&mut Dag<SystemKey>` plus a `&mut HashSet<(SystemKey, SystemKey)>` for added_edge
+// tracking. We model the DAG value (edges over SystemKey ids) plus a parallel added-edge set.
+struct EcsFlatDeps {
+    nodes: Vec<i64>,            // SystemKey ids in the DAG (insertion order)
+    edges_from: Vec<i64>,       // flattened (system_1, system_2) pairs
+    edges_to: Vec<i64>,
+    added_from: Vec<i64>,       // flattened pairs that were *added* by a build pass
+    added_to: Vec<i64>,
+}
+
+fn ecs_flat_deps_new() -> EcsFlatDeps {
+    return EcsFlatDeps {
+        nodes: Vec::new(),
+        edges_from: Vec::new(),
+        edges_to: Vec::new(),
+        added_from: Vec::new(),
+        added_to: Vec::new(),
+    };
+}
+
+fn ecs_flat_deps_node_count(d: EcsFlatDeps) -> i64 { return len(d.nodes) as i64; }
+fn ecs_flat_deps_edge_count(d: EcsFlatDeps) -> i64 { return len(d.edges_from) as i64; }
+fn ecs_flat_deps_added_count(d: EcsFlatDeps) -> i64 { return len(d.added_from) as i64; }
+fn ecs_flat_deps_nodes(d: EcsFlatDeps) -> Vec<i64> { return d.nodes; }
+
+fn ecs_flat_deps_add_node(d: EcsFlatDeps, key: i64) -> EcsFlatDeps {
+    if ecs_vec_contains_i64(d.nodes, key) { return d; };
+    d.nodes.push(key);
+    return d;
+}
+
+// `add_edge(system_1, system_2)`: forward to the DAG plus record in added_edges.
+fn ecs_flat_deps_add_edge(d: EcsFlatDeps, system_1: i64, system_2: i64) -> EcsFlatDeps {
+    // ensure nodes exist like Dag::add_edge
+    d = ecs_flat_deps_add_node(d, system_1);
+    d = ecs_flat_deps_add_node(d, system_2);
+    d.edges_from.push(system_1);
+    d.edges_to.push(system_2);
+    // record add only if not already present in added set
+    if ecs_flat_deps_added_contains(d, system_1, system_2) == false {
+        d.added_from.push(system_1);
+        d.added_to.push(system_2);
+    };
+    return d;
+}
+
+// `remove_edge(system_1, system_2)`: forward to the DAG, do NOT record.
+// Matches Bevy: "We intentionally don't record edges ... because these redundant edges are
+// actually important. It would be confusing if a visualizer omitted the removed edges."
+fn ecs_flat_deps_remove_edge(d: EcsFlatDeps, system_1: i64, system_2: i64) -> (EcsFlatDeps, bool) {
+    let new_from: Vec<i64> = Vec::new();
+    let new_to: Vec<i64> = Vec::new();
+    let removed = false;
+    let i: i64 = 0;
+    let n: i64 = len(d.edges_from) as i64;
+    while i < n {
+        if d.edges_from[i] == system_1 && d.edges_to[i] == system_2 {
+            removed = true;
+        } else {
+            new_from.push(d.edges_from[i]);
+            new_to.push(d.edges_to[i]);
+        };
+        i = i + 1;
+    }
+    d.edges_from = new_from;
+    d.edges_to = new_to;
+    return (d, removed);
+}
+
+fn ecs_flat_deps_added_contains(d: EcsFlatDeps, a: i64, b: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(d.added_from) as i64;
+    while i < n {
+        if d.added_from[i] == a && d.added_to[i] == b { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// `added_edges` snapshot (system_1, system_2) flattened
+fn ecs_flat_deps_added_edges(d: EcsFlatDeps) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(d.added_from) as i64;
+    while i < n {
+        out.push(d.added_from[i]);
+        out.push(d.added_to[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_flat_deps_contains_edge(d: EcsFlatDeps, a: i64, b: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(d.edges_from) as i64;
+    while i < n {
+        if d.edges_from[i] == a && d.edges_to[i] == b { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// toposort: Kahn's algorithm over SystemKey ids. Returns (ok, sorted_ids).
+// Matches FlattenedDependencies::toposort which forwards to Dag::toposort.
+fn ecs_flat_deps_toposort(d: EcsFlatDeps) -> (bool, Vec<i64>) {
+    let n: i64 = len(d.nodes) as i64;
+    let indeg: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < n {
+        indeg.push(0);
+        i = i + 1;
+    }
+    let ne: i64 = len(d.edges_from) as i64;
+    let j: i64 = 0;
+    while j < ne {
+        let t = d.edges_to[j];
+        let k: i64 = 0;
+        while k < n {
+            if d.nodes[k] == t { indeg[k] = indeg[k] + 1; };
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    let queue: Vec<i64> = Vec::new();
+    let q: i64 = 0;
+    while q < n {
+        if indeg[q] == 0 { queue.push(q); };
+        q = q + 1;
+    }
+    let sorted: Vec<i64> = Vec::new();
+    let qi: i64 = 0;
+    while qi < (len(queue) as i64) {
+        let idx = queue[qi];
+        sorted.push(d.nodes[idx]);
+        let src = d.nodes[idx];
+        let e: i64 = 0;
+        while e < ne {
+            if d.edges_from[e] == src {
+                let t = d.edges_to[e];
+                let k: i64 = 0;
+                while k < n {
+                    if d.nodes[k] == t {
+                        indeg[k] = indeg[k] - 1;
+                        if indeg[k] == 0 { queue.push(k); };
+                    };
+                    k = k + 1;
+                }
+            };
+            e = e + 1;
+        }
+        qi = qi + 1;
+    }
+    if (len(sorted) as i64) != n { return (false, Vec::new()); };
+    return (true, sorted);
+}
+
+// toposort_and_graph: returns (ok, sorted, nodes, edges_flat). Matches Dag::toposort_and_graph.
+fn ecs_flat_deps_toposort_and_graph(d: EcsFlatDeps) -> (bool, Vec<i64>, Vec<i64>, Vec<i64>) {
+    let r = ecs_flat_deps_toposort(d);
+    return (r.0, r.1, d.nodes, ecs_flat_deps_all_edges_flat(d));
+}
+
+fn ecs_flat_deps_all_edges_flat(d: EcsFlatDeps) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(d.edges_from) as i64;
+    while i < n {
+        out.push(d.edges_from[i]);
+        out.push(d.edges_to[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// === ScheduleBuildPass::collapse_set ===
+// For each `set`, called with the systems associated with the set plus an immutable DiGraph
+// reference, and returns an iterator of (from, to) edges to insert. A common collapsing policy:
+// for each ordered pair of systems in the set, add system->system edges so the set's order is
+// preserved. We model two concrete collapsing strategies plus the generic producer.
+const ECS_COLLAPSE_CHAIN: i32 = 0;   // successor-style: system_i -> system_{i+1}
+const ECS_COLLAPSE_BUCKET: i32 = 1;  // fan: first -> every later; then bucket pairwise -- full clique
+
+// generic producer: takes the systems Vec (in set membership order) and a strategy, returns
+// flattened (from, to, from, to, ...) pairs.
+fn ecs_collapse_set_produce(systems: Vec<i64>, strategy: i32) -> Vec<i64> {
+    let out: Vec<i64> = Vec::new();
+    let n: i64 = len(systems) as i64;
+    let i: i64 = 0;
+    while i < n {
+        let j: i64 = i + 1;
+        while j < n {
+            if strategy == ECS_COLLAPSE_BUCKET {
+                out.push(systems[i]);
+                out.push(systems[j]);
+            } else {
+                if j == i + 1 {
+                    out.push(systems[i]);
+                    out.push(systems[j]);
+                };
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Apply collapse output to a FlattenedDependencies as system->system dependency edges.
+fn ecs_flat_deps_apply_collapse(d: EcsFlatDeps, edges: Vec<i64>) -> EcsFlatDeps {
+    let i: i64 = 0;
+    let n: i64 = len(edges) as i64;
+    while i + 1 < n {
+        d = ecs_flat_deps_add_edge(d, edges[i], edges[i + 1]);
+        i = i + 2;
+    }
+    return d;
+}
+
+// === ScheduleBuildPass::add_dependency ===
+// Called with (from: NodeId, to: NodeId, options: Option<&EdgeOptions>). Options presence gates
+// whether the dependency is recorded as a configured dependency vs an anonymous edge.
+struct EcsDependencyOptions {
+    has_options: bool,
+    edge_options_type_id: i64,  // TypeId of T::EdgeOptions
+    configured: bool,           // "true" means explicitly configured (collapse/affect toposort)
+}
+
+fn ecs_dep_options_none() -> EcsDependencyOptions {
+    return EcsDependencyOptions { has_options: false, edge_options_type_id: 0, configured: false };
+}
+
+fn ecs_dep_options_some(type_id: i64) -> EcsDependencyOptions {
+    return EcsDependencyOptions { has_options: true, edge_options_type_id: type_id, configured: true };
+}
+
+fn ecs_dep_options_is_some(o: EcsDependencyOptions) -> bool { return o.has_options; }
+fn ecs_dep_options_is_none(o: EcsDependencyOptions) -> bool { return o.has_options == false; }
+fn ecs_dep_options_type_id(o: EcsDependencyOptions) -> i64 { return o.edge_options_type_id; }
+fn ecs_dep_options_configured(o: EcsDependencyOptions) -> bool { return o.configured; }
+
+// ScheduleBuildPass::add_dependency: forward the edge into the FlattenedDependencies.
+// Bevy's blanket default does not gate by options; the options are advisory.
+fn ecs_pass_add_dependency(d: EcsFlatDeps, from: EcsNodeId, to: EcsNodeId, options: EcsDependencyOptions) -> EcsFlatDeps {
+    // Bevy treats System nodes inside add_dependency as system->system edges. Set->system or
+    // system->set edges are collapsed later (collapse_set is the system-set bridge); for the pass
+    // surface we only record system->system direct dependencies.
+    if ecs_node_id_is_system(from) && ecs_node_id_is_system(to) {
+        d = ecs_flat_deps_add_edge(d, ecs_node_id_key(from), ecs_node_id_key(to));
+    };
+    let _ = options;
+    return d;
+}
+
+// === ScheduleBuildPassObj object-safe adapter (pass.rs lines 119-165) ===
+// Mirror the blanket `impl<T: ScheduleBuildPass> ScheduleBuildPassObj for T`. The adapter routes
+// `add_dependency` through the `TypeIdMap<Box<dyn Any>>` lookup to find the matching EdgeOptions
+// value for the concrete pass and then invoke the generic `add_dependency`.
+struct EcsPassObjAdapter {
+    pass_kind: i32,              // identifies the concrete pass T (dispatcher key)
+    edge_options_type_id: i64,   // TypeId for `T::EdgeOptions`
+}
+
+fn ecs_pass_obj_adapter_new(pass_kind: i32, edge_options_type_id: i64) -> EcsPassObjAdapter {
+    return EcsPassObjAdapter { pass_kind: pass_kind, edge_options_type_id: edge_options_type_id };
+}
+
+fn ecs_pass_obj_adapter_pass_kind(a: EcsPassObjAdapter) -> i32 { return a.pass_kind; }
+fn ecs_pass_obj_adapter_edge_options_type_id(a: EcsPassObjAdapter) -> i64 { return a.edge_options_type_id; }
+
+// TypeIdMap lookup: given a registered options type id, return Some(EdgeOptions) if present.
+// Mirrors `all_options.get(&TypeId::of::<T::EdgeOptions>()).and_then(|x| x.downcast_ref().)`.
+fn ecs_pass_obj_adapter_resolve_options(map_type_ids: Vec<i64>, map_values: Vec<EcsDependencyOptions>, target_type_id: i64) -> EcsDependencyOptions {
+    let i: i64 = 0;
+    let n: i64 = len(map_type_ids) as i64;
+    while i < n {
+        if map_type_ids[i] == target_type_id {
+            let v = map_values[i];
+            if ecs_dep_options_is_some(v) { return v; };
+            return ecs_dep_options_none();
+        };
+        i = i + 1;
+    }
+    return ecs_dep_options_none();
+}
+
+// `ScheduleBuildPassObj::add_dependency` dispatches: lookup options in the TypeIdMap, then call the
+// concrete pass's `add_dependency` (here modeled as the generic `ecs_pass_add_dependency`).
+fn ecs_pass_obj_adapter_add_dependency(a: EcsPassObjAdapter, d: EcsFlatDeps, map_type_ids: Vec<i64>, map_values: Vec<EcsDependencyOptions>, from: EcsNodeId, to: EcsNodeId) -> EcsFlatDeps {
+    let opt = ecs_pass_obj_adapter_resolve_options(map_type_ids, map_values, a.edge_options_type_id);
+    return ecs_pass_add_dependency(d, from, to, opt);
+}
+
+// `ScheduleBuildPassObj::collapse_set`: collect iterator into `dependencies_to_add`.
+fn ecs_pass_obj_adapter_collapse_set(a: EcsPassObjAdapter, _set: EcsSystemSetKey, systems: Vec<i64>, _dependency_flattening_nodes: Vec<i64>, dependencies_to_add: Vec<i64>, strategy: i32) -> Vec<i64> {
+    let produced = ecs_collapse_set_produce(systems, strategy);
+    let i: i64 = 0;
+    let n: i64 = len(produced) as i64;
+    while i < n {
+        dependencies_to_add.push(produced[i]);
+        i = i + 1;
+    }
+    let _ = a;
+    return dependencies_to_add;
+}
+
+// === Vec<i64> helpers ===
+fn ecs_vec_contains_i64(v: Vec<i64>, x: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(v) as i64;
+    while i < n {
+        if v[i] == x { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === Additional ScheduleBuildPass trait proxy: `build` ===
+// Bevy `build(&mut self, world, graph, dependency_flattened) -> Result<(), ScheduleBuildError>`.
+// We model the error as a kind enum: 0 = ok, 1 = cycle, 2 = custom. The build facade hands off to
+// the pass implementation; here we expose a generic build that runs toposort over the supplied
+// FlattenedDependencies and reports cycle failures as the ScheduleBuildError family.
+const ECS_PASS_BUILD_OK: i32 = 0;
+const ECS_PASS_BUILD_ERR_CYCLE: i32 = 1;
+const ECS_PASS_BUILD_ERR_CUSTOM: i32 = 2;
+
+struct EcsPassBuildResult {
+    kind: i32,
+    sorted: Vec<i64>,
+    error_node: i64,    // the offending node/key for cycle surfacing
+}
+
+fn ecs_pass_build_result_ok(sorted: Vec<i64>) -> EcsPassBuildResult {
+    return EcsPassBuildResult { kind: ECS_PASS_BUILD_OK, sorted: sorted, error_node: -1 };
+}
+
+fn ecs_pass_build_result_cycle() -> EcsPassBuildResult {
+    return EcsPassBuildResult { kind: ECS_PASS_BUILD_ERR_CYCLE, sorted: Vec::new(), error_node: -1 };
+}
+
+fn ecs_pass_build_result_custom(node: i64) -> EcsPassBuildResult {
+    return EcsPassBuildResult { kind: ECS_PASS_BUILD_ERR_CUSTOM, sorted: Vec::new(), error_node: node };
+}
+
+fn ecs_pass_build_result_is_ok(r: EcsPassBuildResult) -> bool { return r.kind == ECS_PASS_BUILD_OK; }
+fn ecs_pass_build_result_is_cycle(r: EcsPassBuildResult) -> bool { return r.kind == ECS_PASS_BUILD_ERR_CYCLE; }
+fn ecs_pass_build_result_is_custom(r: EcsPassBuildResult) -> bool { return r.kind == ECS_PASS_BUILD_ERR_CUSTOM; }
+fn ecs_pass_build_result_sorted(r: EcsPassBuildResult) -> Vec<i64> { return r.sorted; }
+fn ecs_pass_build_result_error_node(r: EcsPassBuildResult) -> i64 { return r.error_node; }
+
+// Generic build: run toposort over the flattened deps, surface Ok or Cycle.
+fn ecs_pass_build_generic(d: EcsFlatDeps) -> EcsPassBuildResult {
+    let r = ecs_flat_deps_toposort(d);
+    if r.0 { return ecs_pass_build_result_ok(r.1); };
+    return ecs_pass_build_result_cycle();
+}

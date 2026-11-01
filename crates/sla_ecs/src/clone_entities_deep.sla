@@ -1,0 +1,373 @@
+// Deepened Bevy ECS clone_entities context surface.
+// Mirrors src/entity/clone_entities.rs:
+//   SourceComponent read
+//   EntityMapper get_or_alloc / get / resolve
+//   ComponentCloneCtx write/move/queue
+//   EntityClonerState filter/behavior flags
+// Fixed capacity: 4 mapper pairs, 4 queued entities.
+// Shallow lib/clone_entities.sla retained.
+
+const ECS_CE_BEH_IGNORE: i32 = 0;
+const ECS_CE_BEH_CLONE: i32 = 1;
+const ECS_CE_BEH_MOVE: i32 = 2;
+
+// SourceComponent
+struct EcsCeSrcDeep {
+    component_id: i32,
+    component_size: i64,
+    data_handle: i64,
+}
+
+fn ecs_ce_src_new(component_id: i32, component_size: i64, data_handle: i64) -> EcsCeSrcDeep {
+    return EcsCeSrcDeep {
+        component_id: component_id, component_size: component_size, data_handle: data_handle,
+    };
+}
+
+fn ecs_ce_src_id(s: EcsCeSrcDeep) -> i32 { return s.component_id; }
+fn ecs_ce_src_size(s: EcsCeSrcDeep) -> i64 { return s.component_size; }
+fn ecs_ce_src_ptr(s: EcsCeSrcDeep) -> i64 { return s.data_handle; }
+
+struct EcsCeReadDeep {
+    ok: bool,
+    value: i64,
+}
+
+fn ecs_ce_read_ok(r: EcsCeReadDeep) -> bool { return r.ok; }
+fn ecs_ce_read_value(r: EcsCeReadDeep) -> i64 { return r.value; }
+
+fn ecs_ce_src_read(s: EcsCeSrcDeep, requested_id: i32) -> EcsCeReadDeep {
+    if s.component_id != requested_id {
+        return EcsCeReadDeep { ok: false, value: 0 };
+    };
+    return EcsCeReadDeep { ok: true, value: s.data_handle };
+}
+
+// EntityMapper fixed 4
+struct EcsCeMapDeep {
+    s0: i64, t0: i64,
+    s1: i64, t1: i64,
+    s2: i64, t2: i64,
+    s3: i64, t3: i64,
+    len: i32,
+    next_target: i64,
+}
+
+fn ecs_ce_map_new(start_target: i64) -> EcsCeMapDeep {
+    return EcsCeMapDeep {
+        s0: 0, t0: 0, s1: 0, t1: 0, s2: 0, t2: 0, s3: 0, t3: 0,
+        len: 0, next_target: start_target,
+    };
+}
+
+fn ecs_ce_map_len(m: EcsCeMapDeep) -> i32 { return m.len; }
+fn ecs_ce_map_next(m: EcsCeMapDeep) -> i64 { return m.next_target; }
+
+fn ecs_ce_map_rebuild(
+    s0: i64, t0: i64, s1: i64, t1: i64, s2: i64, t2: i64, s3: i64, t3: i64,
+    len: i32, next_target: i64
+) -> EcsCeMapDeep {
+    return EcsCeMapDeep {
+        s0: s0, t0: t0, s1: s1, t1: t1, s2: s2, t2: t2, s3: s3, t3: t3,
+        len: len, next_target: next_target,
+    };
+}
+
+struct EcsCeMapGetDeep {
+    ok: bool,
+    target: i64,
+    map: EcsCeMapDeep,
+}
+
+fn ecs_ce_map_get_ok(g: EcsCeMapGetDeep) -> bool { return g.ok; }
+fn ecs_ce_map_get_target(g: EcsCeMapGetDeep) -> i64 { return g.target; }
+fn ecs_ce_map_get_map(g: EcsCeMapGetDeep) -> EcsCeMapDeep { return g.map; }
+
+fn ecs_ce_map_get(m: EcsCeMapDeep, source: i64) -> EcsCeMapGetDeep {
+    if m.len >= 1 {
+        if m.s0 == source {
+            return EcsCeMapGetDeep { ok: true, target: m.t0, map: m };
+        };
+    };
+    if m.len >= 2 {
+        if m.s1 == source {
+            return EcsCeMapGetDeep { ok: true, target: m.t1, map: m };
+        };
+    };
+    if m.len >= 3 {
+        if m.s2 == source {
+            return EcsCeMapGetDeep { ok: true, target: m.t2, map: m };
+        };
+    };
+    if m.len >= 4 {
+        if m.s3 == source {
+            return EcsCeMapGetDeep { ok: true, target: m.t3, map: m };
+        };
+    };
+    return EcsCeMapGetDeep { ok: false, target: 0, map: m };
+}
+
+fn ecs_ce_map_has(m: EcsCeMapDeep, source: i64) -> bool {
+    return ecs_ce_map_get(m, source).ok;
+}
+
+fn ecs_ce_map_resolve(m: EcsCeMapDeep, entity: i64) -> i64 {
+    let g = ecs_ce_map_get(m, entity);
+    if g.ok { return g.target; };
+    return entity;
+}
+
+fn ecs_ce_map_get_or_alloc(m: EcsCeMapDeep, source: i64) -> EcsCeMapGetDeep {
+    let g = ecs_ce_map_get(m, source);
+    if g.ok { return g; };
+    let target = m.next_target;
+    if m.len == 0 {
+        return EcsCeMapGetDeep {
+            ok: true, target: target,
+            map: ecs_ce_map_rebuild(source, target, m.s1, m.t1, m.s2, m.t2, m.s3, m.t3, 1, target + 1),
+        };
+    };
+    if m.len == 1 {
+        return EcsCeMapGetDeep {
+            ok: true, target: target,
+            map: ecs_ce_map_rebuild(m.s0, m.t0, source, target, m.s2, m.t2, m.s3, m.t3, 2, target + 1),
+        };
+    };
+    if m.len == 2 {
+        return EcsCeMapGetDeep {
+            ok: true, target: target,
+            map: ecs_ce_map_rebuild(m.s0, m.t0, m.s1, m.t1, source, target, m.s3, m.t3, 3, target + 1),
+        };
+    };
+    if m.len == 3 {
+        return EcsCeMapGetDeep {
+            ok: true, target: target,
+            map: ecs_ce_map_rebuild(m.s0, m.t0, m.s1, m.t1, m.s2, m.t2, source, target, 4, target + 1),
+        };
+    };
+    // full: return source unmapped without grow
+    return EcsCeMapGetDeep { ok: false, target: source, map: m };
+}
+
+// ComponentCloneCtx
+struct EcsCeCtxDeep {
+    component_id: i32,
+    source: i64,
+    target: i64,
+    written: bool,
+    moved: bool,
+    moving: bool,
+    linked: bool,
+    component_size: i64,
+    // queued entities for recursive clone
+    q0: i64, q1: i64, q2: i64, q3: i64,
+    qlen: i32,
+}
+
+fn ecs_ce_ctx_new(component_id: i32, source: i64, target: i64, component_size: i64, moving: bool) -> EcsCeCtxDeep {
+    return EcsCeCtxDeep {
+        component_id: component_id, source: source, target: target,
+        written: false, moved: false, moving: moving, linked: false, component_size: component_size,
+        q0: 0, q1: 0, q2: 0, q3: 0, qlen: 0,
+    };
+}
+
+fn ecs_ce_ctx_component_id(c: EcsCeCtxDeep) -> i32 { return c.component_id; }
+fn ecs_ce_ctx_source(c: EcsCeCtxDeep) -> i64 { return c.source; }
+fn ecs_ce_ctx_target(c: EcsCeCtxDeep) -> i64 { return c.target; }
+fn ecs_ce_ctx_written(c: EcsCeCtxDeep) -> bool { return c.written; }
+fn ecs_ce_ctx_moved(c: EcsCeCtxDeep) -> bool { return c.moved; }
+fn ecs_ce_ctx_moving(c: EcsCeCtxDeep) -> bool { return c.moving; }
+fn ecs_ce_ctx_linked(c: EcsCeCtxDeep) -> bool { return c.linked; }
+fn ecs_ce_ctx_size(c: EcsCeCtxDeep) -> i64 { return c.component_size; }
+fn ecs_ce_ctx_qlen(c: EcsCeCtxDeep) -> i32 { return c.qlen; }
+
+fn ecs_ce_ctx_rebuild(
+    component_id: i32, source: i64, target: i64, written: bool, moved: bool, moving: bool, linked: bool,
+    component_size: i64, q0: i64, q1: i64, q2: i64, q3: i64, qlen: i32
+) -> EcsCeCtxDeep {
+    return EcsCeCtxDeep {
+        component_id: component_id, source: source, target: target,
+        written: written, moved: moved, moving: moving, linked: linked, component_size: component_size,
+        q0: q0, q1: q1, q2: q2, q3: q3, qlen: qlen,
+    };
+}
+
+fn ecs_ce_ctx_set_linked(c: EcsCeCtxDeep, linked: bool) -> EcsCeCtxDeep {
+    return ecs_ce_ctx_rebuild(
+        c.component_id, c.source, c.target, c.written, c.moved, c.moving, linked, c.component_size,
+        c.q0, c.q1, c.q2, c.q3, c.qlen
+    );
+}
+
+fn ecs_ce_ctx_write(c: EcsCeCtxDeep) -> EcsCeCtxDeep {
+    return ecs_ce_ctx_rebuild(
+        c.component_id, c.source, c.target, true, c.moved, c.moving, c.linked, c.component_size,
+        c.q0, c.q1, c.q2, c.q3, c.qlen
+    );
+}
+
+fn ecs_ce_ctx_write_moved(c: EcsCeCtxDeep) -> EcsCeCtxDeep {
+    return ecs_ce_ctx_rebuild(
+        c.component_id, c.source, c.target, true, true, c.moving, c.linked, c.component_size,
+        c.q0, c.q1, c.q2, c.q3, c.qlen
+    );
+}
+
+fn ecs_ce_ctx_queue_entity(c: EcsCeCtxDeep, entity: i64) -> EcsCeCtxDeep {
+    if c.qlen == 0 {
+        return ecs_ce_ctx_rebuild(
+            c.component_id, c.source, c.target, c.written, c.moved, c.moving, c.linked, c.component_size,
+            entity, c.q1, c.q2, c.q3, 1
+        );
+    };
+    if c.qlen == 1 {
+        return ecs_ce_ctx_rebuild(
+            c.component_id, c.source, c.target, c.written, c.moved, c.moving, c.linked, c.component_size,
+            c.q0, entity, c.q2, c.q3, 2
+        );
+    };
+    if c.qlen == 2 {
+        return ecs_ce_ctx_rebuild(
+            c.component_id, c.source, c.target, c.written, c.moved, c.moving, c.linked, c.component_size,
+            c.q0, c.q1, entity, c.q3, 3
+        );
+    };
+    if c.qlen == 3 {
+        return ecs_ce_ctx_rebuild(
+            c.component_id, c.source, c.target, c.written, c.moved, c.moving, c.linked, c.component_size,
+            c.q0, c.q1, c.q2, entity, 4
+        );
+    };
+    return c;
+}
+
+fn ecs_ce_ctx_queued_at(c: EcsCeCtxDeep, idx: i32) -> i64 {
+    if idx == 0 {
+        if c.qlen >= 1 { return c.q0; };
+    };
+    if idx == 1 {
+        if c.qlen >= 2 { return c.q1; };
+    };
+    if idx == 2 {
+        if c.qlen >= 3 { return c.q2; };
+    };
+    if idx == 3 {
+        if c.qlen >= 4 { return c.q3; };
+    };
+    return -1;
+}
+
+// EntityClonerState lite
+struct EcsCeStateDeep {
+    moving: bool,
+    linked: bool,
+    default_behavior: i32,
+    // per-component override ids (4)
+    o0: i32, ob0: i32,
+    o1: i32, ob1: i32,
+    o2: i32, ob2: i32,
+    o3: i32, ob3: i32,
+    olen: i32,
+}
+
+fn ecs_ce_state_new() -> EcsCeStateDeep {
+    return EcsCeStateDeep {
+        moving: false, linked: false, default_behavior: ECS_CE_BEH_CLONE,
+        o0: -1, ob0: 0, o1: -1, ob1: 0, o2: -1, ob2: 0, o3: -1, ob3: 0, olen: 0,
+    };
+}
+
+fn ecs_ce_state_moving(s: EcsCeStateDeep) -> bool { return s.moving; }
+fn ecs_ce_state_linked(s: EcsCeStateDeep) -> bool { return s.linked; }
+fn ecs_ce_state_default(s: EcsCeStateDeep) -> i32 { return s.default_behavior; }
+
+fn ecs_ce_state_rebuild(
+    moving: bool, linked: bool, default_behavior: i32,
+    o0: i32, ob0: i32, o1: i32, ob1: i32, o2: i32, ob2: i32, o3: i32, ob3: i32, olen: i32
+) -> EcsCeStateDeep {
+    return EcsCeStateDeep {
+        moving: moving, linked: linked, default_behavior: default_behavior,
+        o0: o0, ob0: ob0, o1: o1, ob1: ob1, o2: o2, ob2: ob2, o3: o3, ob3: ob3, olen: olen,
+    };
+}
+
+fn ecs_ce_state_set_moving(s: EcsCeStateDeep, moving: bool) -> EcsCeStateDeep {
+    return ecs_ce_state_rebuild(moving, s.linked, s.default_behavior, s.o0, s.ob0, s.o1, s.ob1, s.o2, s.ob2, s.o3, s.ob3, s.olen);
+}
+
+fn ecs_ce_state_set_linked(s: EcsCeStateDeep, linked: bool) -> EcsCeStateDeep {
+    return ecs_ce_state_rebuild(s.moving, linked, s.default_behavior, s.o0, s.ob0, s.o1, s.ob1, s.o2, s.ob2, s.o3, s.ob3, s.olen);
+}
+
+fn ecs_ce_state_set_default(s: EcsCeStateDeep, behavior: i32) -> EcsCeStateDeep {
+    return ecs_ce_state_rebuild(s.moving, s.linked, behavior, s.o0, s.ob0, s.o1, s.ob1, s.o2, s.ob2, s.o3, s.ob3, s.olen);
+}
+
+fn ecs_ce_state_override(s: EcsCeStateDeep, component_id: i32, behavior: i32) -> EcsCeStateDeep {
+    if s.olen >= 1 {
+        if s.o0 == component_id {
+            return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, behavior, s.o1, s.ob1, s.o2, s.ob2, s.o3, s.ob3, s.olen);
+        };
+    };
+    if s.olen >= 2 {
+        if s.o1 == component_id {
+            return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, s.ob0, s.o1, behavior, s.o2, s.ob2, s.o3, s.ob3, s.olen);
+        };
+    };
+    if s.olen >= 3 {
+        if s.o2 == component_id {
+            return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, s.ob0, s.o1, s.ob1, s.o2, behavior, s.o3, s.ob3, s.olen);
+        };
+    };
+    if s.olen >= 4 {
+        if s.o3 == component_id {
+            return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, s.ob0, s.o1, s.ob1, s.o2, s.ob2, s.o3, behavior, s.olen);
+        };
+    };
+    if s.olen == 0 {
+        return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, component_id, behavior, s.o1, s.ob1, s.o2, s.ob2, s.o3, s.ob3, 1);
+    };
+    if s.olen == 1 {
+        return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, s.ob0, component_id, behavior, s.o2, s.ob2, s.o3, s.ob3, 2);
+    };
+    if s.olen == 2 {
+        return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, s.ob0, s.o1, s.ob1, component_id, behavior, s.o3, s.ob3, 3);
+    };
+    if s.olen == 3 {
+        return ecs_ce_state_rebuild(s.moving, s.linked, s.default_behavior, s.o0, s.ob0, s.o1, s.ob1, s.o2, s.ob2, component_id, behavior, 4);
+    };
+    return s;
+}
+
+fn ecs_ce_state_behavior_of(s: EcsCeStateDeep, component_id: i32) -> i32 {
+    if s.olen >= 1 {
+        if s.o0 == component_id { return s.ob0; };
+    };
+    if s.olen >= 2 {
+        if s.o1 == component_id { return s.ob1; };
+    };
+    if s.olen >= 3 {
+        if s.o2 == component_id { return s.ob2; };
+    };
+    if s.olen >= 4 {
+        if s.o3 == component_id { return s.ob3; };
+    };
+    return s.default_behavior;
+}
+
+fn ecs_ce_state_should_write(s: EcsCeStateDeep, component_id: i32) -> bool {
+    let b = ecs_ce_state_behavior_of(s, component_id);
+    if b == ECS_CE_BEH_IGNORE { return false; };
+    return true;
+}
+
+// apply clone for one component using state+src+ctx
+fn ecs_ce_apply(s: EcsCeStateDeep, src: EcsCeSrcDeep, ctx: EcsCeCtxDeep) -> EcsCeCtxDeep {
+    if ecs_ce_state_should_write(s, src.component_id) != true { return ctx; };
+    let b = ecs_ce_state_behavior_of(s, src.component_id);
+    if b == ECS_CE_BEH_MOVE {
+        return ecs_ce_ctx_write_moved(ctx);
+    };
+    return ecs_ce_ctx_write(ctx);
+}

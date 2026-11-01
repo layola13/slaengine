@@ -1,0 +1,374 @@
+// Deepened Bevy ECS relationship related-methods extras (src/relationship/related_methods.rs pub
+// fns not covered by lib/relationship_related_methods.sla):
+//   add_one_related / detach_all_related / despawn_related / despawn_children /
+//   with_related / with_related_entities / spawned_with_related /
+//   insert_recursive (BFS) / remove_recursive (BFS).
+// Shallow: lib/relationship_methods_extras.sla (Vec-backed model + result structs +
+// multi-loop BFS recursion).
+
+// The deep variant mirrors the surface on cap-8 related-entities × cap-4 descendants-per-related
+// parallel-array structured storage (no Vec, no recursion). recursive BFS (insert_recursive /
+// remove_recursive) counts visits over related + descendant ladder flatly to avoid 'mut' counter
+// / while-loop accumulation RegisterRedefinitions (Batch 373) and the SA backend's swallowed
+// field-assign inside `buf = push(buf, x)` if/while blocks (Batch 378).
+
+const ECS_REM_RELATED_CAP_DEEP: i32 = 8;
+const ECS_REM_DESC_CAP_DEEP: i32 = 4;
+
+// === Result structs ===
+struct EcsRelExtrasDespawnDeep {
+    despawned_count: i32,
+    first_despawned: i64,
+}
+fn ecs_rel_extras_despawn_count(r: EcsRelExtrasDespawnDeep) -> i32 { return r.despawned_count; }
+fn ecs_rel_extras_despawn_first(r: EcsRelExtrasDespawnDeep) -> i64 { return r.first_despawned; }
+
+struct EcsRelExtrasTraverseDeep {
+    visited_count: i32,
+    first_visited: i64,
+}
+fn ecs_rel_extras_rec_count(r: EcsRelExtrasTraverseDeep) -> i32 { return r.visited_count; }
+fn ecs_rel_extras_rec_first(r: EcsRelExtrasTraverseDeep) -> i64 { return r.first_visited; }
+
+// === Model: cap-8 related (r0..r7) + cap-4 descendants per related (d<ridx>_<0..3> + dcnt per slot) ===
+struct EcsRelExtrasDeep {
+    entity_id: i64,
+    r0: i64, r1: i64, r2: i64, r3: i64, r4: i64, r5: i64, r6: i64, r7: i64,
+    r_count: i32,
+    // slot r0 descendants:
+    d0_0: i64, d0_1: i64, d0_2: i64, d0_3: i64, d0_cnt: i32,
+    d1_0: i64, d1_1: i64, d1_2: i64, d1_3: i64, d1_cnt: i32,
+    d2_0: i64, d2_1: i64, d2_2: i64, d2_3: i64, d2_cnt: i32,
+    d3_0: i64, d3_1: i64, d3_2: i64, d3_3: i64, d3_cnt: i32,
+    d4_0: i64, d4_1: i64, d4_2: i64, d4_3: i64, d4_cnt: i32,
+    d5_0: i64, d5_1: i64, d5_2: i64, d5_3: i64, d5_cnt: i32,
+    d6_0: i64, d6_1: i64, d6_2: i64, d6_3: i64, d6_cnt: i32,
+    d7_0: i64, d7_1: i64, d7_2: i64, d7_3: i64, d7_cnt: i32,
+    spawned_with_related: i32,
+}
+
+fn ecs_rel_extras_deep_new(entity_id: i64) -> EcsRelExtrasDeep {
+    return EcsRelExtrasDeep {
+        entity_id: entity_id,
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0,
+        r_count: 0,
+        d0_0: 0, d0_1: 0, d0_2: 0, d0_3: 0, d0_cnt: 0,
+        d1_0: 0, d1_1: 0, d1_2: 0, d1_3: 0, d1_cnt: 0,
+        d2_0: 0, d2_1: 0, d2_2: 0, d2_3: 0, d2_cnt: 0,
+        d3_0: 0, d3_1: 0, d3_2: 0, d3_3: 0, d3_cnt: 0,
+        d4_0: 0, d4_1: 0, d4_2: 0, d4_3: 0, d4_cnt: 0,
+        d5_0: 0, d5_1: 0, d5_2: 0, d5_3: 0, d5_cnt: 0,
+        d6_0: 0, d6_1: 0, d6_2: 0, d6_3: 0, d6_cnt: 0,
+        d7_0: 0, d7_1: 0, d7_2: 0, d7_3: 0, d7_cnt: 0,
+        spawned_with_related: 0,
+    };
+}
+
+fn ecs_rel_extras_deep_entity(r: EcsRelExtrasDeep) -> i64 { return r.entity_id; }
+fn ecs_rel_extras_deep_related_count(r: EcsRelExtrasDeep) -> i32 { return r.r_count; }
+fn ecs_rel_extras_deep_spawned_with_related(r: EcsRelExtrasDeep) -> i32 { return r.spawned_with_related; }
+
+// reader_r_at(idx) — sentinel -1 for out-of-range.
+fn _ecs_rel_extras_deep_r_at(r: EcsRelExtrasDeep, idx: i32) -> i64 {
+    if idx < 0 { return -1; };
+    if idx >= r.r_count { return -1; };
+    if idx == 0 { return r.r0; };
+    if idx == 1 { return r.r1; };
+    if idx == 2 { return r.r2; };
+    if idx == 3 { return r.r3; };
+    if idx == 4 { return r.r4; };
+    if idx == 5 { return r.r5; };
+    if idx == 6 { return r.r6; };
+    return r.r7;
+}
+
+// _index_of — linear scan returning slot idx (i64) or -1.
+fn _ecs_rel_extras_deep_index_of(r: EcsRelExtrasDeep, entity: i64) -> i64 {
+    if r.r_count > 0 && r.r0 == entity { return 0; };
+    if r.r_count > 1 && r.r1 == entity { return 1; };
+    if r.r_count > 2 && r.r2 == entity { return 2; };
+    if r.r_count > 3 && r.r3 == entity { return 3; };
+    if r.r_count > 4 && r.r4 == entity { return 4; };
+    if r.r_count > 5 && r.r5 == entity { return 5; };
+    if r.r_count > 6 && r.r6 == entity { return 6; };
+    if r.r_count > 7 && r.r7 == entity { return 7; };
+    return -1;
+}
+
+// reader_dcount_at(slot) — number of recorded descendants at `slot`.
+fn _ecs_rel_extras_deep_dcount(r: EcsRelExtrasDeep, slot: i64) -> i32 {
+    if slot == 0 { return r.d0_cnt; };
+    if slot == 1 { return r.d1_cnt; };
+    if slot == 2 { return r.d2_cnt; };
+    if slot == 3 { return r.d3_cnt; };
+    if slot == 4 { return r.d4_cnt; };
+    if slot == 5 { return r.d5_cnt; };
+    if slot == 6 { return r.d6_cnt; };
+    return r.d7_cnt;
+}
+
+fn _ecs_rel_extras_deep_d_at(r: EcsRelExtrasDeep, slot: i64, child_idx: i32) -> i64 {
+    if slot == 0 {
+        if child_idx == 0 { return r.d0_0; };
+        if child_idx == 1 { return r.d0_1; };
+        if child_idx == 2 { return r.d0_2; };
+        return r.d0_3;
+    };
+    if slot == 1 {
+        if child_idx == 0 { return r.d1_0; };
+        if child_idx == 1 { return r.d1_1; };
+        if child_idx == 2 { return r.d1_2; };
+        return r.d1_3;
+    };
+    if slot == 2 {
+        if child_idx == 0 { return r.d2_0; };
+        if child_idx == 1 { return r.d2_1; };
+        if child_idx == 2 { return r.d2_2; };
+        return r.d2_3;
+    };
+    if slot == 3 {
+        if child_idx == 0 { return r.d3_0; };
+        if child_idx == 1 { return r.d3_1; };
+        if child_idx == 2 { return r.d3_2; };
+        return r.d3_3;
+    };
+    if slot == 4 {
+        if child_idx == 0 { return r.d4_0; };
+        if child_idx == 1 { return r.d4_1; };
+        if child_idx == 2 { return r.d4_2; };
+        return r.d4_3;
+    };
+    if slot == 5 {
+        if child_idx == 0 { return r.d5_0; };
+        if child_idx == 1 { return r.d5_1; };
+        if child_idx == 2 { return r.d5_2; };
+        return r.d5_3;
+    };
+    if slot == 6 {
+        if child_idx == 0 { return r.d6_0; };
+        if child_idx == 1 { return r.d6_1; };
+        if child_idx == 2 { return r.d6_2; };
+        return r.d6_3;
+    };
+    if child_idx == 0 { return r.d7_0; };
+    if child_idx == 1 { return r.d7_1; };
+    if child_idx == 2 { return r.d7_2; };
+    return r.d7_3;
+}
+
+// public reader related_at(idx) — sentinel -1 for out-of-range (mirror shallow).
+fn ecs_rel_extras_deep_related_at(r: EcsRelExtrasDeep, idx: i32) -> i64 {
+    return _ecs_rel_extras_deep_r_at(r, idx);
+}
+
+// add_one_related(relationship_id, entity): if not already present, push entity into the next
+// related slot (cap-8 silent reject). Field-assign via flat parallel-if cascade-of-return ladder
+// (Batch 377 shape — avoids the SA backend's swallowed field-assign inside the nested push-ladder
+// form observed in Batch 378). `relationship_id` is an incompatible-generic collapse carried
+// for API parity but carries no behaviour in our fixed-slot model.
+fn ecs_rel_extras_deep_add_one_related(r: EcsRelExtrasDeep, relationship_id: i32, entity: i64) -> EcsRelExtrasDeep {
+    if _ecs_rel_extras_deep_index_of(r, entity) >= 0 { return r; };
+    if r.r_count >= ECS_REM_RELATED_CAP_DEEP { return r; };
+    if r.r_count == 0 { r.r0 = entity; r.d0_cnt = 0; r.r_count = 1; return r; };
+    if r.r_count == 1 { r.r1 = entity; r.d1_cnt = 0; r.r_count = 2; return r; };
+    if r.r_count == 2 { r.r2 = entity; r.d2_cnt = 0; r.r_count = 3; return r; };
+    if r.r_count == 3 { r.r3 = entity; r.d3_cnt = 0; r.r_count = 4; return r; };
+    if r.r_count == 4 { r.r4 = entity; r.d4_cnt = 0; r.r_count = 5; return r; };
+    if r.r_count == 5 { r.r5 = entity; r.d5_cnt = 0; r.r_count = 6; return r; };
+    if r.r_count == 6 { r.r6 = entity; r.d6_cnt = 0; r.r_count = 7; return r; };
+    r.r7 = entity; r.d7_cnt = 0; r.r_count = 8;
+    return r;
+}
+
+// detach_all_related(relationship_id): clear related + descendants (model the shallow's
+// `let empty = Vec::new(); r.related = empty` regression to a fixed-slot clear).
+fn ecs_rel_extras_deep_detach_all_related(r: EcsRelExtrasDeep, relationship_id: i32) -> EcsRelExtrasDeep {
+    r.r0 = 0; r.r1 = 0; r.r2 = 0; r.r3 = 0; r.r4 = 0; r.r5 = 0; r.r6 = 0; r.r7 = 0;
+    r.r_count = 0;
+    r.d0_0 = 0; r.d0_1 = 0; r.d0_2 = 0; r.d0_3 = 0; r.d0_cnt = 0;
+    r.d1_0 = 0; r.d1_1 = 0; r.d1_2 = 0; r.d1_3 = 0; r.d1_cnt = 0;
+    r.d2_0 = 0; r.d2_1 = 0; r.d2_2 = 0; r.d2_3 = 0; r.d2_cnt = 0;
+    r.d3_0 = 0; r.d3_1 = 0; r.d3_2 = 0; r.d3_3 = 0; r.d3_cnt = 0;
+    r.d4_0 = 0; r.d4_1 = 0; r.d4_2 = 0; r.d4_3 = 0; r.d4_cnt = 0;
+    r.d5_0 = 0; r.d5_1 = 0; r.d5_2 = 0; r.d5_3 = 0; r.d5_cnt = 0;
+    r.d6_0 = 0; r.d6_1 = 0; r.d6_2 = 0; r.d6_3 = 0; r.d6_cnt = 0;
+    r.d7_0 = 0; r.d7_1 = 0; r.d7_2 = 0; r.d7_3 = 0; r.d7_cnt = 0;
+    return r;
+}
+
+// add_descendant(parent_entity, descendant_entity): if the parent is already a related slot,
+// push the descendant into that slot's d-slot ladder (cascade-of-return — Batch 377 shape, avoids
+// nested-push-ladder SA-swallow); otherwise create a new related slot first (within the cumulative
+// cap-8 boundary) and push into it in the SAME cascade-of-return. cap-4 silent-reject each add.
+fn ecs_rel_extras_deep_add_descendant(r: EcsRelExtrasDeep, parent_entity: i64, descendant_entity: i64) -> EcsRelExtrasDeep {
+    let slot = _ecs_rel_extras_deep_index_of(r, parent_entity);
+    if slot == 0 {
+        if r.d0_cnt == 0 { r.d0_0 = descendant_entity; r.d0_cnt = 1; return r; };
+        if r.d0_cnt == 1 { r.d0_1 = descendant_entity; r.d0_cnt = 2; return r; };
+        if r.d0_cnt == 2 { r.d0_2 = descendant_entity; r.d0_cnt = 3; return r; };
+        if r.d0_cnt == 3 { r.d0_3 = descendant_entity; r.d0_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 1 {
+        if r.d1_cnt == 0 { r.d1_0 = descendant_entity; r.d1_cnt = 1; return r; };
+        if r.d1_cnt == 1 { r.d1_1 = descendant_entity; r.d1_cnt = 2; return r; };
+        if r.d1_cnt == 2 { r.d1_2 = descendant_entity; r.d1_cnt = 3; return r; };
+        if r.d1_cnt == 3 { r.d1_3 = descendant_entity; r.d1_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 2 {
+        if r.d2_cnt == 0 { r.d2_0 = descendant_entity; r.d2_cnt = 1; return r; };
+        if r.d2_cnt == 1 { r.d2_1 = descendant_entity; r.d2_cnt = 2; return r; };
+        if r.d2_cnt == 2 { r.d2_2 = descendant_entity; r.d2_cnt = 3; return r; };
+        if r.d2_cnt == 3 { r.d2_3 = descendant_entity; r.d2_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 3 {
+        if r.d3_cnt == 0 { r.d3_0 = descendant_entity; r.d3_cnt = 1; return r; };
+        if r.d3_cnt == 1 { r.d3_1 = descendant_entity; r.d3_cnt = 2; return r; };
+        if r.d3_cnt == 2 { r.d3_2 = descendant_entity; r.d3_cnt = 3; return r; };
+        if r.d3_cnt == 3 { r.d3_3 = descendant_entity; r.d3_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 4 {
+        if r.d4_cnt == 0 { r.d4_0 = descendant_entity; r.d4_cnt = 1; return r; };
+        if r.d4_cnt == 1 { r.d4_1 = descendant_entity; r.d4_cnt = 2; return r; };
+        if r.d4_cnt == 2 { r.d4_2 = descendant_entity; r.d4_cnt = 3; return r; };
+        if r.d4_cnt == 3 { r.d4_3 = descendant_entity; r.d4_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 5 {
+        if r.d5_cnt == 0 { r.d5_0 = descendant_entity; r.d5_cnt = 1; return r; };
+        if r.d5_cnt == 1 { r.d5_1 = descendant_entity; r.d5_cnt = 2; return r; };
+        if r.d5_cnt == 2 { r.d5_2 = descendant_entity; r.d5_cnt = 3; return r; };
+        if r.d5_cnt == 3 { r.d5_3 = descendant_entity; r.d5_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 6 {
+        if r.d6_cnt == 0 { r.d6_0 = descendant_entity; r.d6_cnt = 1; return r; };
+        if r.d6_cnt == 1 { r.d6_1 = descendant_entity; r.d6_cnt = 2; return r; };
+        if r.d6_cnt == 2 { r.d6_2 = descendant_entity; r.d6_cnt = 3; return r; };
+        if r.d6_cnt == 3 { r.d6_3 = descendant_entity; r.d6_cnt = 4; return r; };
+        return r;
+    };
+    if slot == 7 {
+        if r.d7_cnt == 0 { r.d7_0 = descendant_entity; r.d7_cnt = 1; return r; };
+        if r.d7_cnt == 1 { r.d7_1 = descendant_entity; r.d7_cnt = 2; return r; };
+        if r.d7_cnt == 2 { r.d7_2 = descendant_entity; r.d7_cnt = 3; return r; };
+        if r.d7_cnt == 3 { r.d7_3 = descendant_entity; r.d7_cnt = 4; return r; };
+        return r;
+    };
+    // slot < 0 → parent not yet a related slot. Create slot plus descendant push in one cascade
+    // of-return body per r_count branch.
+    if r.r_count >= ECS_REM_RELATED_CAP_DEEP { return r; };
+    if r.r_count == 0 { r.r0 = parent_entity; r.d0_0 = descendant_entity; r.d0_cnt = 1; r.r_count = 1; return r; };
+    if r.r_count == 1 { r.r1 = parent_entity; r.d1_0 = descendant_entity; r.d1_cnt = 1; r.r_count = 2; return r; };
+    if r.r_count == 2 { r.r2 = parent_entity; r.d2_0 = descendant_entity; r.d2_cnt = 1; r.r_count = 3; return r; };
+    if r.r_count == 3 { r.r3 = parent_entity; r.d3_0 = descendant_entity; r.d3_cnt = 1; r.r_count = 4; return r; };
+    if r.r_count == 4 { r.r4 = parent_entity; r.d4_0 = descendant_entity; r.d4_cnt = 1; r.r_count = 5; return r; };
+    if r.r_count == 5 { r.r5 = parent_entity; r.d5_0 = descendant_entity; r.d5_cnt = 1; r.r_count = 6; return r; };
+    if r.r_count == 6 { r.r6 = parent_entity; r.d6_0 = descendant_entity; r.d6_cnt = 1; r.r_count = 7; return r; };
+    r.r7 = parent_entity; r.d7_0 = descendant_entity; r.d7_cnt = 1; r.r_count = 8;
+    return r;
+}
+
+// despawn_related(relationship_target_id): returns RelatedDespawnResult-shaped struct with
+// the pre-despawn queued-entity count and first id, modeling the BFS over the related list. The
+// shallow's editor-side despawn also clears the related list (model: detach_all_related is exposed
+// separately for the deep variant so tests may explicitly call it after despawn_related returned
+// the queue — since SLA structs are by-value the despawn-related count can never be issued
+// post-clear via the same call result, so the contract splits cleanly).
+fn ecs_rel_extras_deep_despawn_related(r: EcsRelExtrasDeep, relationship_target_id: i32) -> EcsRelExtrasDespawnDeep {
+    let n = r.r_count;
+    if n == 0 { return EcsRelExtrasDespawnDeep { despawned_count: 0, first_despawned: -1 }; };
+    let first = _ecs_rel_extras_deep_r_at(r, 0);
+    return EcsRelExtrasDespawnDeep { despawned_count: n, first_despawned: first };
+}
+
+// despawn_children(): Children-specialization equivalent (relationship_target_id = 0 default).
+fn ecs_rel_extras_deep_despawn_children(r: EcsRelExtrasDeep) -> EcsRelExtrasDespawnDeep {
+    return ecs_rel_extras_deep_despawn_related(r, 0);
+}
+
+// with_related(relationship_id, bundle_id, next_entity): spawn a new related entity at the next
+// free slot, bump spawned_with_related. cap-8 silent reject.
+fn ecs_rel_extras_deep_with_related(r: EcsRelExtrasDeep, relationship_id: i32, bundle_id: i32, next_entity: i64) -> EcsRelExtrasDeep {
+    if r.r_count >= ECS_REM_RELATED_CAP_DEEP { return r; };
+    if r.r_count == 0 { r.r0 = next_entity; r.d0_cnt = 0; r.r_count = 1; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    if r.r_count == 1 { r.r1 = next_entity; r.d1_cnt = 0; r.r_count = 2; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    if r.r_count == 2 { r.r2 = next_entity; r.d2_cnt = 0; r.r_count = 3; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    if r.r_count == 3 { r.r3 = next_entity; r.d3_cnt = 0; r.r_count = 4; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    if r.r_count == 4 { r.r4 = next_entity; r.d4_cnt = 0; r.r_count = 5; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    if r.r_count == 5 { r.r5 = next_entity; r.d5_cnt = 0; r.r_count = 6; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    if r.r_count == 6 { r.r6 = next_entity; r.d6_cnt = 0; r.r_count = 7; r.spawned_with_related = r.spawned_with_related + 1; return r; };
+    r.r7 = next_entity; r.d7_cnt = 0; r.r_count = 8; r.spawned_with_related = r.spawned_with_related + 1;
+    return r;
+}
+
+// with_related_entities(relationship_id, bundle_count, next_entity_start): spawn `bundle_count`
+// related entities (one per bundle_id slot in the shallow's Vec<i32>) starting at next_entity_
+// start. Returns the updated model (spawned_with_related bumped accordingly).
+fn ecs_rel_extras_deep_with_related_entities(r: EcsRelExtrasDeep, relationship_id: i32, bundle_count: i32, next_entity_start: i64) -> EcsRelExtrasDeep {
+    // Use the flat cascade-of-return on r_count from 0..7 — plus sequentially name the
+    // spawned-after-each-step to maintain the Batch 378 accumulator-flat convention.
+    let b_next = next_entity_start - 1;
+    if bundle_count > 0 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 1);
+    };
+    if bundle_count > 1 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 2);
+    };
+    if bundle_count > 2 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 3);
+    };
+    if bundle_count > 3 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 4);
+    };
+    if bundle_count > 4 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 5);
+    };
+    if bundle_count > 5 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 6);
+    };
+    if bundle_count > 6 && r.r_count + 0 < ECS_REM_RELATED_CAP_DEEP {
+        r = ecs_rel_extras_deep_with_related(r, relationship_id, 0, b_next + 7);
+    };
+    return r;
+}
+
+// _ecs_rel_extras_deep_total_visits: visited count of the BFS over related + descendants.
+// Sums r_count plus each slot's desc count across the cap-8 ladder using flat `let`-ladder
+// accumulation (no `mut` counter / no while-loop accumulation — Batch 373 / 378 family rules).
+// Descendant slots for absent related slots (idx >= r_count) are always 0 in our model: the only
+// mutator that pushes descendants (add_descendant) will create the related slot first, so absent
+// slots have their dcnt saturated at 0 by detach_all_deep (or never yet pushed).
+fn _ecs_rel_extras_deep_total_visits(r: EcsRelExtrasDeep) -> i32 {
+    let c0 = r.r_count;
+    let c1 = c0 + _ecs_rel_extras_deep_dcount(r, 0);
+    let c2 = c1 + _ecs_rel_extras_deep_dcount(r, 1);
+    let c3 = c2 + _ecs_rel_extras_deep_dcount(r, 2);
+    let c4 = c3 + _ecs_rel_extras_deep_dcount(r, 3);
+    let c5 = c4 + _ecs_rel_extras_deep_dcount(r, 4);
+    let c6 = c5 + _ecs_rel_extras_deep_dcount(r, 5);
+    let c7 = c6 + _ecs_rel_extras_deep_dcount(r, 6);
+    let c8 = c7 + _ecs_rel_extras_deep_dcount(r, 7);
+    return c8;
+}
+
+// insert_recursive(relationship_target_id, bundle_id): BFS over related + descendants; returns
+// RecursiveTraverseResult { visited_count, first_visited }. The visited_count is
+// r_count + sum of descendant counts across PRESENT related slots, computed via the flat
+// cs-precount ladder above (no mut counter, no while-loop accumulation — Batch 378 rule).
+fn ecs_rel_extras_deep_insert_recursive(r: EcsRelExtrasDeep, relationship_target_id: i32, bundle_id: i32) -> EcsRelExtrasTraverseDeep {
+    let n = r.r_count;
+    if n == 0 { return EcsRelExtrasTraverseDeep { visited_count: 0, first_visited: -1 }; };
+    let first = _ecs_rel_extras_deep_r_at(r, 0);
+    let visits = _ecs_rel_extras_deep_total_visits(r);
+    return EcsRelExtrasTraverseDeep { visited_count: visits, first_visited: first };
+}
+
+// remove_recursive(relationship_target_id, bundle_id): symmetric BFS removal-traversal, mirrors
+// insert_recursive's visited-count semantics.
+fn ecs_rel_extras_deep_remove_recursive(r: EcsRelExtrasDeep, relationship_target_id: i32, bundle_id: i32) -> EcsRelExtrasTraverseDeep {
+    return ecs_rel_extras_deep_insert_recursive(r, relationship_target_id, bundle_id);
+}

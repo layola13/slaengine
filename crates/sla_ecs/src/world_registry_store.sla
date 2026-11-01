@@ -1,0 +1,408 @@
+// Registry-owned typed value columns.
+// A RegistryValueWorld<T, R, M> can own any number of registered component
+// columns whose values share the same Sla type T. This removes the fixed A/B
+// value-column shape for homogeneous component groups.
+@import "world_registry.sla"
+@import "dyn_store.sla"
+@import "resource.sla"
+@import "messages.sla"
+@import "query_dynamic.sla"
+
+struct RegistryValueColumn<T> {
+    component_id: i32,
+    values: DynamicComponentStore<T>,
+}
+
+struct RegistryValueWorld<T, R, M> {
+    registry: RegistryWorld,
+    value_columns: Vec<RegistryValueColumn<T>>,
+    resource: ResourceSlot<R>,
+    messages: Messages<M>,
+}
+
+struct RegistryValueMut<T> {
+    entity: Entity,
+    component_id: i32,
+    slot: i64,
+    value: T,
+}
+
+struct RegistryValuePair<T> {
+    entity: Entity,
+    first: T,
+    second: T,
+}
+
+struct RegistryValuePairMut<T> {
+    first: RegistryValueMut<T>,
+    second_component_id: i32,
+    second: T,
+}
+
+fn registry_value_column_new<T>(component_id: i32) -> RegistryValueColumn<T> {
+    return RegistryValueColumn<T> { component_id: component_id, values: dyn_store_new<T>() };
+}
+
+fn registry_value_world_new<T, R, M>(default_r: R, default_m: M) -> RegistryValueWorld<T, R, M> {
+    let value_columns: Vec<RegistryValueColumn<T>> = Vec::new();
+    return RegistryValueWorld<T, R, M> {
+        registry: registry_world_new(),
+        value_columns: value_columns,
+        resource: resource_slot_new<R>(default_r),
+        messages: messages_new<M>(default_m),
+    };
+}
+
+fn registry_value_world_column_slot<T, R, M>(world: RegistryValueWorld<T, R, M>, component_id: i32) -> i64 {
+    let i: i64 = 0;
+    let cnt = len(world.value_columns) as i64;
+    while i < cnt {
+        if world.value_columns[i].component_id == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn registry_value_world_register_table<T, R, M>(world: RegistryValueWorld<T, R, M>) -> (RegistryValueWorld<T, R, M>, ComponentInfo) {
+    let (registry, info) = registry_world_register_table(world.registry);
+    world.registry = registry;
+    world.value_columns.push(registry_value_column_new<T>(info.id));
+    return (world, info);
+}
+
+fn registry_value_world_register_sparse_set<T, R, M>(world: RegistryValueWorld<T, R, M>) -> (RegistryValueWorld<T, R, M>, ComponentInfo) {
+    let (registry, info) = registry_world_register_sparse_set(world.registry);
+    world.registry = registry;
+    world.value_columns.push(registry_value_column_new<T>(info.id));
+    return (world, info);
+}
+
+fn registry_value_world_spawn<T, R, M>(world: RegistryValueWorld<T, R, M>) -> (RegistryValueWorld<T, R, M>, Entity) {
+    let (registry, entity) = registry_world_spawn(world.registry);
+    world.registry = registry;
+    return (world, entity);
+}
+
+fn registry_value_world_increment_tick<T, R, M>(world: RegistryValueWorld<T, R, M>) -> RegistryValueWorld<T, R, M> {
+    world.registry = registry_world_increment_tick(world.registry);
+    return world;
+}
+
+fn registry_value_world_is_alive<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity) -> bool {
+    return registry_world_is_alive(world.registry, entity);
+}
+
+fn registry_value_world_insert<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity, component_id: i32, value: T) -> RegistryValueWorld<T, R, M> {
+    world.registry = registry_world_insert_component(world.registry, entity, component_id);
+    let column_slot = registry_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { panic(8950); };
+    let value_slot = dyn_store_slot_of<T>(world.value_columns[column_slot].values, entity.id);
+    if value_slot >= 0 {
+        world.value_columns[column_slot].values = dyn_store_write<T>(world.value_columns[column_slot].values, value_slot, value);
+        return world;
+    };
+    world.value_columns[column_slot].values = dyn_store_insert<T>(world.value_columns[column_slot].values, entity.id, value);
+    return world;
+}
+
+fn registry_value_world_remove<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity, component_id: i32) -> RegistryValueWorld<T, R, M> {
+    world.registry = registry_world_remove_component(world.registry, entity, component_id);
+    let column_slot = registry_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { return world; };
+    world.value_columns[column_slot].values = dyn_store_remove<T>(world.value_columns[column_slot].values, entity.id);
+    return world;
+}
+
+fn registry_value_world_has<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity, component_id: i32) -> bool {
+    return registry_world_has_component(world.registry, entity, component_id);
+}
+
+fn registry_value_world_get<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity, component_id: i32) -> T {
+    if registry_value_world_has<T, R, M>(world, entity, component_id) != true { panic(8951); };
+    let column_slot = registry_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { panic(8952); };
+    return dyn_store_get<T>(world.value_columns[column_slot].values, entity.id);
+}
+
+fn registry_value_world_added_since<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity, component_id: i32, tick: i32) -> bool {
+    return registry_world_component_added_since(world.registry, entity, component_id, tick);
+}
+
+fn registry_value_world_changed_since<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity, component_id: i32, tick: i32) -> bool {
+    return registry_world_component_changed_since(world.registry, entity, component_id, tick);
+}
+
+fn registry_value_world_query<T, R, M>(world: RegistryValueWorld<T, R, M>, component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_component(world.registry, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: registry_value_world_get<T, R, M>(world, entity, component_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_without<T, R, M>(world: RegistryValueWorld<T, R, M>, component_id: i32, without_component_id: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_with_without(world.registry, component_id, without_component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: registry_value_world_get<T, R, M>(world, entity, component_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_changed<T, R, M>(world: RegistryValueWorld<T, R, M>, component_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_changed_since(world.registry, component_id, tick);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        query.items.push(EntityItem<T> { entity: entity, value: registry_value_world_get<T, R, M>(world, entity, component_id) });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_added<T, R, M>(world: RegistryValueWorld<T, R, M>, component_id: i32, tick: i32) -> Query<EntityItem<T>> {
+    let query = query_new<EntityItem<T>>();
+    let entities = registry_world_query_component(world.registry, component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if registry_world_component_added_since(world.registry, entity, component_id, tick) {
+            query.items.push(EntityItem<T> { entity: entity, value: registry_value_world_get<T, R, M>(world, entity, component_id) });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_pair<T, R, M>(world: RegistryValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32) -> Query<RegistryValuePair<T>> {
+    let query = query_new<RegistryValuePair<T>>();
+    let entities = registry_world_query_component(world.registry, first_component_id);
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if registry_value_world_has<T, R, M>(world, entity, second_component_id) {
+            query.items.push(RegistryValuePair<T> {
+                entity: entity,
+                first: registry_value_world_get<T, R, M>(world, entity, first_component_id),
+                second: registry_value_world_get<T, R, M>(world, entity, second_component_id),
+            });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_pair_without<T, R, M>(world: RegistryValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32, without_component_id: i32) -> Query<RegistryValuePair<T>> {
+    let query = query_new<RegistryValuePair<T>>();
+    let pairs = registry_value_world_query_pair<T, R, M>(world, first_component_id, second_component_id);
+    let i: i64 = 0;
+    let cnt = len(pairs.items) as i64;
+    while i < cnt {
+        let item = pairs.items[i];
+        if registry_value_world_has<T, R, M>(world, item.entity, without_component_id) != true {
+            query.items.push(item);
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_mut<T, R, M>(world: RegistryValueWorld<T, R, M>, component_id: i32) -> Query<RegistryValueMut<T>> {
+    let query = query_new<RegistryValueMut<T>>();
+    let entities = registry_world_query_component(world.registry, component_id);
+    let column_slot = registry_value_world_column_slot<T, R, M>(world, component_id);
+    if column_slot < 0 { return query; };
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        let value_slot = dyn_store_slot_of<T>(world.value_columns[column_slot].values, entity.id);
+        query.items.push(RegistryValueMut<T> {
+            entity: entity,
+            component_id: component_id,
+            slot: value_slot,
+            value: dyn_store_get<T>(world.value_columns[column_slot].values, entity.id),
+        });
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_query_pair_mut_first<T, R, M>(world: RegistryValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32) -> Query<RegistryValuePairMut<T>> {
+    let query = query_new<RegistryValuePairMut<T>>();
+    let entities = registry_world_query_component(world.registry, first_component_id);
+    let first_column_slot = registry_value_world_column_slot<T, R, M>(world, first_component_id);
+    if first_column_slot < 0 { return query; };
+    let i: i64 = 0;
+    let cnt = len(entities.items) as i64;
+    while i < cnt {
+        let entity = entities.items[i];
+        if registry_value_world_has<T, R, M>(world, entity, second_component_id) {
+            let value_slot = dyn_store_slot_of<T>(world.value_columns[first_column_slot].values, entity.id);
+            query.items.push(RegistryValuePairMut<T> {
+                first: RegistryValueMut<T> {
+                    entity: entity,
+                    component_id: first_component_id,
+                    slot: value_slot,
+                    value: dyn_store_get<T>(world.value_columns[first_column_slot].values, entity.id),
+                },
+                second_component_id: second_component_id,
+                second: registry_value_world_get<T, R, M>(world, entity, second_component_id),
+            });
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn registry_value_world_write<T, R, M>(world: RegistryValueWorld<T, R, M>, item: RegistryValueMut<T>, value: T) -> RegistryValueWorld<T, R, M> {
+    if registry_value_world_is_alive<T, R, M>(world, item.entity) != true { return world; };
+    let column_slot = registry_value_world_column_slot<T, R, M>(world, item.component_id);
+    if column_slot < 0 { return world; };
+    world.value_columns[column_slot].values = dyn_store_write<T>(world.value_columns[column_slot].values, item.slot, value);
+    world.registry = registry_world_insert_component(world.registry, item.entity, item.component_id);
+    return world;
+}
+
+fn registry_value_world_pair_write_first<T, R, M>(world: RegistryValueWorld<T, R, M>, item: RegistryValuePairMut<T>, value: T) -> RegistryValueWorld<T, R, M> {
+    return registry_value_world_write<T, R, M>(world, item.first, value);
+}
+
+fn registry_value_world_despawn<T, R, M>(world: RegistryValueWorld<T, R, M>, entity: Entity) -> RegistryValueWorld<T, R, M> {
+    if registry_value_world_is_alive<T, R, M>(world, entity) != true { return world; };
+    let i: i64 = 0;
+    let cnt = len(world.value_columns) as i64;
+    while i < cnt {
+        world.value_columns[i].values = dyn_store_remove<T>(world.value_columns[i].values, entity.id);
+        i = i + 1;
+    }
+    world.registry = registry_world_despawn(world.registry, entity);
+    return world;
+}
+
+fn registry_value_world_insert_resource<T, R, M>(world: RegistryValueWorld<T, R, M>, value: R) -> RegistryValueWorld<T, R, M> {
+    world.resource = resource_insert<R>(world.resource, value);
+    return world;
+}
+
+fn registry_value_world_get_resource<T, R, M>(world: RegistryValueWorld<T, R, M>) -> R {
+    return resource_get<R>(world.resource);
+}
+
+fn registry_value_world_write_message<T, R, M>(world: RegistryValueWorld<T, R, M>, value: M) -> RegistryValueWorld<T, R, M> {
+    world.messages = messages_write<M>(world.messages, value);
+    return world;
+}
+
+fn registry_value_world_read_message<T, R, M>(world: RegistryValueWorld<T, R, M>, reader: MessageReader, default_value: M) -> MessageRead<M> {
+    return messages_read_next<M>(world.messages, reader, default_value);
+}
+
+struct RegValueData { amount: i32 }
+struct RegValueTime { tick: i32 }
+struct RegValueEvent { amount: i32 }
+
+fn reg_value_time_default() -> RegValueTime { return RegValueTime { tick: 0 }; }
+fn reg_value_event_default() -> RegValueEvent { return RegValueEvent { amount: 0 }; }
+
+fn reg_value_world_new() -> RegistryValueWorld<RegValueData, RegValueTime, RegValueEvent> {
+    return registry_value_world_new<RegValueData, RegValueTime, RegValueEvent>(reg_value_time_default(), reg_value_event_default());
+}
+
+@test "registry value world owns multiple component columns"() {
+    let w0 = reg_value_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w0);
+    let (w2, mana) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w1);
+    let (w3, selected) = registry_value_world_register_sparse_set<RegValueData, RegValueTime, RegValueEvent>(w2);
+    let (w4, e1) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w3);
+    let (w5, e2) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w4);
+    let w6 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w5, e1, health.id, RegValueData { amount: 10 });
+    let w7 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w6, e1, mana.id, RegValueData { amount: 4 });
+    let w8 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w7, e2, health.id, RegValueData { amount: 8 });
+    let w9 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w8, e2, selected.id, RegValueData { amount: 1 });
+    if registry_value_world_get<RegValueData, RegValueTime, RegValueEvent>(w9, e1, health.id).amount != 10 { panic(8960); };
+    if registry_value_world_get<RegValueData, RegValueTime, RegValueEvent>(w9, e1, mana.id).amount != 4 { panic(8961); };
+    let health_all = registry_value_world_query<RegValueData, RegValueTime, RegValueEvent>(w9, health.id);
+    if len(health_all.items) != 2 { panic(8962); };
+    let unselected_health = registry_value_world_query_without<RegValueData, RegValueTime, RegValueEvent>(w9, health.id, selected.id);
+    if len(unselected_health.items) != 1 { panic(8963); };
+    if unselected_health.items[0].entity.id != e1.id { panic(8964); };
+}
+
+@test "registry value world mut writeback and changed query"() {
+    let w0 = reg_value_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w0);
+    let (w2, entity) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w1);
+    let w3 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w2, entity, health.id, RegValueData { amount: 3 });
+    let before = w3.registry.change_tick;
+    let w4 = registry_value_world_increment_tick<RegValueData, RegValueTime, RegValueEvent>(w3);
+    let q = registry_value_world_query_mut<RegValueData, RegValueTime, RegValueEvent>(w4, health.id);
+    if len(q.items) != 1 { panic(8970); };
+    let item = q.items[0];
+    let w5 = registry_value_world_write<RegValueData, RegValueTime, RegValueEvent>(w4, item, RegValueData { amount: item.value.amount + 7 });
+    let out = registry_value_world_get<RegValueData, RegValueTime, RegValueEvent>(w5, entity, health.id);
+    if out.amount != 10 { panic(8971); };
+    if registry_value_world_added_since<RegValueData, RegValueTime, RegValueEvent>(w5, entity, health.id, before) != false { panic(8972); };
+    if registry_value_world_changed_since<RegValueData, RegValueTime, RegValueEvent>(w5, entity, health.id, before) != true { panic(8973); };
+    let changed = registry_value_world_query_changed<RegValueData, RegValueTime, RegValueEvent>(w5, health.id, before);
+    if len(changed.items) != 1 { panic(8974); };
+}
+
+@test "registry value world pair query filters added and mut writeback"() {
+    let w0 = reg_value_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w0);
+    let (w2, mana) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w1);
+    let (w3, selected) = registry_value_world_register_sparse_set<RegValueData, RegValueTime, RegValueEvent>(w2);
+    let (w4, e1) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w3);
+    let (w5, e2) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w4);
+    let (w6, e3) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w5);
+    let before = w6.registry.change_tick;
+    let w7 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w6, e1, health.id, RegValueData { amount: 10 });
+    let w8 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w7, e1, mana.id, RegValueData { amount: 2 });
+    let w9 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w8, e2, health.id, RegValueData { amount: 7 });
+    let w10 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w9, e2, mana.id, RegValueData { amount: 5 });
+    let w11 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w10, e2, selected.id, RegValueData { amount: 1 });
+    let w12 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w11, e3, health.id, RegValueData { amount: 3 });
+    let added = registry_value_world_query_added<RegValueData, RegValueTime, RegValueEvent>(w12, health.id, before - 1);
+    if len(added.items) != 3 { panic(8975); };
+    let pairs = registry_value_world_query_pair<RegValueData, RegValueTime, RegValueEvent>(w12, health.id, mana.id);
+    if len(pairs.items) != 2 { panic(8976); };
+    if pairs.items[0].first.amount + pairs.items[0].second.amount != 12 { panic(8977); };
+    let unselected = registry_value_world_query_pair_without<RegValueData, RegValueTime, RegValueEvent>(w12, health.id, mana.id, selected.id);
+    if len(unselected.items) != 1 { panic(8978); };
+    if unselected.items[0].entity.id != e1.id { panic(8979); };
+    let w13 = registry_value_world_increment_tick<RegValueData, RegValueTime, RegValueEvent>(w12);
+    let mut_pairs = registry_value_world_query_pair_mut_first<RegValueData, RegValueTime, RegValueEvent>(w13, health.id, mana.id);
+    let item = mut_pairs.items[0];
+    let w14 = registry_value_world_pair_write_first<RegValueData, RegValueTime, RegValueEvent>(w13, item, RegValueData { amount: item.first.value.amount + item.second.amount });
+    let out = registry_value_world_get<RegValueData, RegValueTime, RegValueEvent>(w14, e1, health.id);
+    if out.amount != 12 { panic(8984); };
+    if registry_value_world_changed_since<RegValueData, RegValueTime, RegValueEvent>(w14, e1, health.id, before) != true { panic(8985); };
+}
+
+@test "registry value world despawn removes all value columns"() {
+    let w0 = reg_value_world_new();
+    let (w1, health) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w0);
+    let (w2, mana) = registry_value_world_register_table<RegValueData, RegValueTime, RegValueEvent>(w1);
+    let (w3, entity) = registry_value_world_spawn<RegValueData, RegValueTime, RegValueEvent>(w2);
+    let w4 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w3, entity, health.id, RegValueData { amount: 5 });
+    let w5 = registry_value_world_insert<RegValueData, RegValueTime, RegValueEvent>(w4, entity, mana.id, RegValueData { amount: 6 });
+    let w6 = registry_value_world_despawn<RegValueData, RegValueTime, RegValueEvent>(w5, entity);
+    if registry_value_world_is_alive<RegValueData, RegValueTime, RegValueEvent>(w6, entity) != false { panic(8980); };
+    if registry_value_world_has<RegValueData, RegValueTime, RegValueEvent>(w6, entity, health.id) != false { panic(8981); };
+    if dyn_store_has<RegValueData>(w6.value_columns[0].values, entity.id) != false { panic(8982); };
+    if dyn_store_has<RegValueData>(w6.value_columns[1].values, entity.id) != false { panic(8983); };
+}

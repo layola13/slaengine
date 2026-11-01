@@ -1,0 +1,481 @@
+// Deep self-contained Bevy ECS EcsAccessType + EcsAccessLevel + AccessConflictError — mirrors
+// lib/query_access_iter_extras.sla (324 lines) with fixed-cap (cap-16) scalar slot families.
+// No @import. All structs carry @derive(copy). Vec<i32> access_reads / access_writes are replaced
+// by cap-16 i32 slot families (r0..r15 + rn, w0..w15 + wn) with accessor helpers. Booleans are
+// stored as i32 (0/1) to simplify scalar-slot mutation; accessor functions return `!= 0`.
+//
+// EcsAccessLevelDeep encoded as (level_kind, component_id):
+//   level_kind 0 => Read(id), 1 => Write(id), 2 => ReadAll, 3 => WriteAll.
+//   component_id is meaningful for kinds 0/1 (sentinel -1 for kinds 2/3).
+// EcsAccessTypeDeep encoded as (variant, level_kind, component_id, access_id):
+//   variant 0 => Empty, 1 => Component(level), 2 => Access(access_id).
+
+const ECS_ACC_DEEP_CAP: i32 = 16;
+
+// === EcsAccessLevelDeep ===
+@derive(copy)
+struct EcsAccessLevelDeep {
+    level_kind: i32,
+    component_id: i32,
+}
+
+fn ecs_access_level_deep_read(component_id: i32) -> EcsAccessLevelDeep {
+    return EcsAccessLevelDeep { level_kind: 0, component_id: component_id };
+}
+
+fn ecs_access_level_deep_write(component_id: i32) -> EcsAccessLevelDeep {
+    return EcsAccessLevelDeep { level_kind: 1, component_id: component_id };
+}
+
+fn ecs_access_level_deep_read_all() -> EcsAccessLevelDeep {
+    return EcsAccessLevelDeep { level_kind: 2, component_id: (0 - 1) };
+}
+
+fn ecs_access_level_deep_write_all() -> EcsAccessLevelDeep {
+    return EcsAccessLevelDeep { level_kind: 3, component_id: (0 - 1) };
+}
+
+fn ecs_access_level_deep_kind(l: EcsAccessLevelDeep) -> i32 {
+    return l.level_kind;
+}
+
+fn ecs_access_level_deep_component_id(l: EcsAccessLevelDeep) -> i32 {
+    return l.component_id;
+}
+
+// === Cap-16 i32 list helpers (reads and writes slot families) ===
+// We use a single reusable EcsAccIdListDeep struct so callers can build the read set and the
+// write set independently before passing them to ecs_access_type_deep_access.
+@derive(copy)
+struct EcsAccIdListDeep {
+    v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32,
+    v8: i32, v9: i32, v10: i32, v11: i32, v12: i32, v13: i32, v14: i32, v15: i32,
+    vn: i32,
+}
+
+fn ecs_acc_id_list_deep_new() -> EcsAccIdListDeep {
+    return EcsAccIdListDeep {
+        v0: 0, v1: 0, v2: 0, v3: 0, v4: 0, v5: 0, v6: 0, v7: 0,
+        v8: 0, v9: 0, v10: 0, v11: 0, v12: 0, v13: 0, v14: 0, v15: 0,
+        vn: 0,
+    };
+}
+
+fn _ecs_acc_id_list_deep_at(list: EcsAccIdListDeep, idx: i32) -> i32 {
+    if idx == 0 { return list.v0; };
+    if idx == 1 { return list.v1; };
+    if idx == 2 { return list.v2; };
+    if idx == 3 { return list.v3; };
+    if idx == 4 { return list.v4; };
+    if idx == 5 { return list.v5; };
+    if idx == 6 { return list.v6; };
+    if idx == 7 { return list.v7; };
+    if idx == 8 { return list.v8; };
+    if idx == 9 { return list.v9; };
+    if idx == 10 { return list.v10; };
+    if idx == 11 { return list.v11; };
+    if idx == 12 { return list.v12; };
+    if idx == 13 { return list.v13; };
+    if idx == 14 { return list.v14; };
+    if idx == 15 { return list.v15; };
+    panic(145400);
+}
+
+fn _ecs_acc_id_list_deep_set(list: EcsAccIdListDeep, idx: i32, value: i32) -> EcsAccIdListDeep {
+    if idx == 0 { list.v0 = value; return list; };
+    if idx == 1 { list.v1 = value; return list; };
+    if idx == 2 { list.v2 = value; return list; };
+    if idx == 3 { list.v3 = value; return list; };
+    if idx == 4 { list.v4 = value; return list; };
+    if idx == 5 { list.v5 = value; return list; };
+    if idx == 6 { list.v6 = value; return list; };
+    if idx == 7 { list.v7 = value; return list; };
+    if idx == 8 { list.v8 = value; return list; };
+    if idx == 9 { list.v9 = value; return list; };
+    if idx == 10 { list.v10 = value; return list; };
+    if idx == 11 { list.v11 = value; return list; };
+    if idx == 12 { list.v12 = value; return list; };
+    if idx == 13 { list.v13 = value; return list; };
+    if idx == 14 { list.v14 = value; return list; };
+    if idx == 15 { list.v15 = value; return list; };
+    panic(145401);
+}
+
+fn ecs_acc_id_list_deep_push(list: EcsAccIdListDeep, value: i32) -> EcsAccIdListDeep {
+    if list.vn >= ECS_ACC_DEEP_CAP { return list; };
+    list = _ecs_acc_id_list_deep_set(list, list.vn, value);
+    list.vn = list.vn + 1;
+    return list;
+}
+
+fn ecs_acc_id_list_deep_len(list: EcsAccIdListDeep) -> i32 {
+    return list.vn;
+}
+
+fn ecs_acc_id_list_deep_at(list: EcsAccIdListDeep, idx: i32) -> i32 {
+    return _ecs_acc_id_list_deep_at(list, idx);
+}
+
+fn _ecs_acc_id_list_deep_contains(list: EcsAccIdListDeep, value: i32) -> bool {
+    let i: i32 = 0;
+    while i < list.vn {
+        if _ecs_acc_id_list_deep_at(list, i) == value { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === EcsAccessTypeDeep ===
+@derive(copy)
+struct EcsAccessTypeDeep {
+    variant: i32,
+    level_kind: i32,
+    component_id: i32,
+    access_id: i32,
+    // Cap-16 read ids (borrowed Access).
+    r0: i32, r1: i32, r2: i32, r3: i32, r4: i32, r5: i32, r6: i32, r7: i32,
+    r8: i32, r9: i32, r10: i32, r11: i32, r12: i32, r13: i32, r14: i32, r15: i32,
+    rn: i32,
+    // Cap-16 write ids (borrowed Access).
+    w0: i32, w1: i32, w2: i32, w3: i32, w4: i32, w5: i32, w6: i32, w7: i32,
+    w8: i32, w9: i32, w10: i32, w11: i32, w12: i32, w13: i32, w14: i32, w15: i32,
+    wn: i32,
+    // Booleans stored as i32 (0/1) to simplify scalar-slot mutation.
+    read_all: i32,
+    write_all: i32,
+}
+
+fn ecs_access_type_deep_empty() -> EcsAccessTypeDeep {
+    return EcsAccessTypeDeep {
+        variant: 0, level_kind: 0, component_id: (0 - 1), access_id: (0 - 1),
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0,
+        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0, rn: 0,
+        w0: 0, w1: 0, w2: 0, w3: 0, w4: 0, w5: 0, w6: 0, w7: 0,
+        w8: 0, w9: 0, w10: 0, w11: 0, w12: 0, w13: 0, w14: 0, w15: 0, wn: 0,
+        read_all: 0, write_all: 0,
+    };
+}
+
+fn ecs_access_type_deep_component(level: EcsAccessLevelDeep) -> EcsAccessTypeDeep {
+    return EcsAccessTypeDeep {
+        variant: 1, level_kind: level.level_kind, component_id: level.component_id, access_id: (0 - 1),
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0,
+        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0, rn: 0,
+        w0: 0, w1: 0, w2: 0, w3: 0, w4: 0, w5: 0, w6: 0, w7: 0,
+        w8: 0, w9: 0, w10: 0, w11: 0, w12: 0, w13: 0, w14: 0, w15: 0, wn: 0,
+        read_all: 0, write_all: 0,
+    };
+}
+
+fn ecs_access_type_deep_access(access_id: i32, reads: EcsAccIdListDeep, writes: EcsAccIdListDeep, read_all: bool, write_all: bool) -> EcsAccessTypeDeep {
+    let r_all: i32 = 0;
+    if read_all { r_all = 1; };
+    let w_all: i32 = 0;
+    if write_all { w_all = 1; };
+    let t = EcsAccessTypeDeep {
+        variant: 2, level_kind: 0, component_id: (0 - 1), access_id: access_id,
+        r0: reads.v0, r1: reads.v1, r2: reads.v2, r3: reads.v3, r4: reads.v4, r5: reads.v5, r6: reads.v6, r7: reads.v7,
+        r8: reads.v8, r9: reads.v9, r10: reads.v10, r11: reads.v11, r12: reads.v12, r13: reads.v13, r14: reads.v14, r15: reads.v15,
+        rn: reads.vn,
+        w0: writes.v0, w1: writes.v1, w2: writes.v2, w3: writes.v3, w4: writes.v4, w5: writes.v5, w6: writes.v6, w7: writes.v7,
+        w8: writes.v8, w9: writes.v9, w10: writes.v10, w11: writes.v11, w12: writes.v12, w13: writes.v13, w14: writes.v14, w15: writes.v15,
+        wn: writes.vn,
+        read_all: r_all, write_all: w_all,
+    };
+    return t;
+}
+
+fn ecs_access_type_deep_variant(t: EcsAccessTypeDeep) -> i32 {
+    return t.variant;
+}
+
+fn ecs_access_type_deep_level_kind(t: EcsAccessTypeDeep) -> i32 {
+    return t.level_kind;
+}
+
+fn ecs_access_type_deep_component_id(t: EcsAccessTypeDeep) -> i32 {
+    return t.component_id;
+}
+
+fn ecs_access_type_deep_access_id(t: EcsAccessTypeDeep) -> i32 {
+    return t.access_id;
+}
+
+// Internal access slot reader mirroring the Vec-based _ecs_access_has_read / _has_write.
+fn _ecacc_read_at(t: EcsAccessTypeDeep, idx: i32) -> i32 {
+    if idx == 0 { return t.r0; };
+    if idx == 1 { return t.r1; };
+    if idx == 2 { return t.r2; };
+    if idx == 3 { return t.r3; };
+    if idx == 4 { return t.r4; };
+    if idx == 5 { return t.r5; };
+    if idx == 6 { return t.r6; };
+    if idx == 7 { return t.r7; };
+    if idx == 8 { return t.r8; };
+    if idx == 9 { return t.r9; };
+    if idx == 10 { return t.r10; };
+    if idx == 11 { return t.r11; };
+    if idx == 12 { return t.r12; };
+    if idx == 13 { return t.r13; };
+    if idx == 14 { return t.r14; };
+    if idx == 15 { return t.r15; };
+    panic(145402);
+}
+
+fn _ecacc_write_at(t: EcsAccessTypeDeep, idx: i32) -> i32 {
+    if idx == 0 { return t.w0; };
+    if idx == 1 { return t.w1; };
+    if idx == 2 { return t.w2; };
+    if idx == 3 { return t.w3; };
+    if idx == 4 { return t.w4; };
+    if idx == 5 { return t.w5; };
+    if idx == 6 { return t.w6; };
+    if idx == 7 { return t.w7; };
+    if idx == 8 { return t.w8; };
+    if idx == 9 { return t.w9; };
+    if idx == 10 { return t.w10; };
+    if idx == 11 { return t.w11; };
+    if idx == 12 { return t.w12; };
+    if idx == 13 { return t.w13; };
+    if idx == 14 { return t.w14; };
+    if idx == 15 { return t.w15; };
+    panic(145403);
+}
+
+// === EcsAccessConflictErrorDeep ===
+@derive(copy)
+struct EcsAccessConflictErrorDeep {
+    a_variant: i32,
+    a_level_kind: i32,
+    a_component_id: i32,
+    b_variant: i32,
+    b_level_kind: i32,
+    b_component_id: i32,
+}
+
+fn ecs_ace_deep_a_variant(e: EcsAccessConflictErrorDeep) -> i32 { return e.a_variant; }
+fn ecs_ace_deep_a_level(e: EcsAccessConflictErrorDeep) -> i32 { return e.a_level_kind; }
+fn ecs_ace_deep_a_component_id(e: EcsAccessConflictErrorDeep) -> i32 { return e.a_component_id; }
+fn ecs_ace_deep_b_variant(e: EcsAccessConflictErrorDeep) -> i32 { return e.b_variant; }
+fn ecs_ace_deep_b_level(e: EcsAccessConflictErrorDeep) -> i32 { return e.b_level_kind; }
+fn ecs_ace_deep_b_component_id(e: EcsAccessConflictErrorDeep) -> i32 { return e.b_component_id; }
+
+// === AccessIsCompatibleResultDeep (replaces tuple (bool, EcsAccessConflictError)) ===
+// Flat: the conflict error's fields are inlined directly here (no nested
+// @derive(copy) struct) to avoid the SA backend MemoryLeak when a test reads
+// `r.conflict.X` repeatedly. See docs/issue.md for the underlying SA bug.
+@derive(copy)
+struct AccessIsCompatibleResultDeep {
+    ok: i32,
+    a_variant: i32,
+    a_level_kind: i32,
+    a_component_id: i32,
+    b_variant: i32,
+    b_level_kind: i32,
+    b_component_id: i32,
+}
+
+fn ecs_acr_deep_ok(r: AccessIsCompatibleResultDeep) -> bool {
+    return r.ok == 1;
+}
+
+fn ecs_acr_deep_conflict_a_variant(r: AccessIsCompatibleResultDeep) -> i32 {
+    return r.a_variant;
+}
+
+fn ecs_acr_deep_conflict_b_variant(r: AccessIsCompatibleResultDeep) -> i32 {
+    return r.b_variant;
+}
+
+fn ecs_acr_deep_conflict_a_component_id(r: AccessIsCompatibleResultDeep) -> i32 {
+    return r.a_component_id;
+}
+
+fn ecs_acr_deep_conflict_b_component_id(r: AccessIsCompatibleResultDeep) -> i32 {
+    return r.b_component_id;
+}
+
+fn ecs_acr_deep_conflict_a_level(r: AccessIsCompatibleResultDeep) -> i32 {
+    return r.a_level_kind;
+}
+
+fn ecs_acr_deep_conflict_b_level(r: AccessIsCompatibleResultDeep) -> i32 {
+    return r.b_level_kind;
+}
+
+fn ecs_ace_deep_empty() -> EcsAccessConflictErrorDeep {
+    return EcsAccessConflictErrorDeep {
+        a_variant: 0, a_level_kind: 0, a_component_id: (0 - 1),
+        b_variant: 0, b_level_kind: 0, b_component_id: (0 - 1),
+    };
+}
+
+fn ecs_ace_deep_build(a: EcsAccessTypeDeep, b: EcsAccessTypeDeep) -> EcsAccessConflictErrorDeep {
+    return EcsAccessConflictErrorDeep {
+        a_variant: a.variant, a_level_kind: a.level_kind, a_component_id: a.component_id,
+        b_variant: b.variant, b_level_kind: b.level_kind, b_component_id: b.component_id,
+    };
+}
+
+fn _ecs_access_deep_has_write(t: EcsAccessTypeDeep, component_id: i32) -> bool {
+    if t.write_all != 0 { return true; };
+    let i: i32 = 0;
+    while i < t.wn {
+        if _ecacc_write_at(t, i) == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _ecs_access_deep_has_read(t: EcsAccessTypeDeep, component_id: i32) -> bool {
+    if t.read_all != 0 { return true; };
+    let i: i32 = 0;
+    while i < t.rn {
+        if _ecacc_read_at(t, i) == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _ecs_access_deep_has_any_write(t: EcsAccessTypeDeep) -> bool {
+    if t.write_all != 0 { return true; };
+    return t.wn > 0;
+}
+
+fn _ecs_access_deep_has_any_read(t: EcsAccessTypeDeep) -> bool {
+    if t.read_all != 0 { return true; };
+    return t.rn > 0;
+}
+
+// === is_compatible — mirrors the Bevy match matrix ===
+fn ecs_access_type_deep_is_compatible(a: EcsAccessTypeDeep, b: EcsAccessTypeDeep) -> AccessIsCompatibleResultDeep {
+    let empty_ok = AccessIsCompatibleResultDeep { ok: 1, a_variant: 0, a_level_kind: 0, a_component_id: (0 - 1), b_variant: 0, b_level_kind: 0, b_component_id: (0 - 1) };
+    let conflict_fail = AccessIsCompatibleResultDeep { ok: 0, a_variant: a.variant, a_level_kind: a.level_kind, a_component_id: a.component_id, b_variant: b.variant, b_level_kind: b.level_kind, b_component_id: b.component_id };
+    // (Empty, _) and (_, Empty) are Ok.
+    if a.variant == 0 || b.variant == 0 {
+        return empty_ok;
+    };
+    // Both Component variants:
+    if a.variant == 1 && b.variant == 1 {
+        if (a.level_kind == 2 && b.level_kind == 1) || (a.level_kind == 1 && b.level_kind == 2) {
+            return conflict_fail;
+        };
+        if a.level_kind == 3 || b.level_kind == 3 {
+            return conflict_fail;
+        };
+        if (a.level_kind == 0 && b.level_kind == 0)
+            || (a.level_kind == 2 && b.level_kind == 0)
+            || (a.level_kind == 0 && b.level_kind == 2)
+            || (a.level_kind == 2 && b.level_kind == 2) {
+            return empty_ok;
+        };
+        if a.component_id == b.component_id {
+            return conflict_fail;
+        };
+        return empty_ok;
+    };
+    // Component vs Access (borrowed) — a is Component, b is Access.
+    if a.variant == 1 && b.variant == 2 {
+        // Component(Read(cid)) + Access -> Err iff access.has_write(cid)
+        if a.level_kind == 0 {
+            if _ecs_access_deep_has_write(b, a.component_id) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        // Component(Write(cid)) + Access -> Err iff access.has_read(cid)
+        if a.level_kind == 1 {
+            if _ecs_access_deep_has_read(b, a.component_id) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        // Component(ReadAll) + Access -> Err iff access.has_any_write()
+        if a.level_kind == 2 {
+            if _ecs_access_deep_has_any_write(b) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        // Component(WriteAll) + Access -> Err iff access.has_any_read()
+        if a.level_kind == 3 {
+            if _ecs_access_deep_has_any_read(b) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        return empty_ok;
+    };
+    // Access vs Component — symmetric. We reuse the Component-vs-Access guards but mirror.
+    if a.variant == 2 && b.variant == 1 {
+        if b.level_kind == 0 {
+            if _ecs_access_deep_has_write(a, b.component_id) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        if b.level_kind == 1 {
+            if _ecs_access_deep_has_read(a, b.component_id) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        if b.level_kind == 2 {
+            if _ecs_access_deep_has_any_write(a) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        if b.level_kind == 3 {
+            if _ecs_access_deep_has_any_read(a) {
+                return conflict_fail;
+            };
+            return empty_ok;
+        };
+        return empty_ok;
+    };
+    // Access vs Access — rely on the borrowed Access::is_compatible. Returns true on conflict.
+    if a.variant == 2 && b.variant == 2 {
+        let conflict = _ecs_borrowed_access_deep_is_compatible(a, b);
+        if conflict {
+            return conflict_fail;
+        };
+        return empty_ok;
+    };
+    return empty_ok;
+}
+
+// Borrowed-Access deep compatibility (mirrors Access::is_compatible). Returns true on conflict.
+fn _ecs_borrowed_access_deep_is_compatible(a: EcsAccessTypeDeep, b: EcsAccessTypeDeep) -> bool {
+    if a.write_all != 0 || b.write_all != 0 {
+        return true;
+    };
+    let i: i32 = 0;
+    while i < a.wn {
+        let wid = _ecacc_write_at(a, i);
+        if b.read_all != 0 { return true; };
+        let j: i32 = 0;
+        while j < b.wn {
+            if _ecacc_write_at(b, j) == wid { return true; };
+            j = j + 1;
+        }
+        let k: i32 = 0;
+        while k < b.rn {
+            if _ecacc_read_at(b, k) == wid { return true; };
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    let m: i32 = 0;
+    while m < b.wn {
+        let wid = _ecacc_write_at(b, m);
+        if a.read_all != 0 { return true; };
+        let n: i32 = 0;
+        while n < a.rn {
+            if _ecacc_read_at(a, n) == wid { return true; };
+            n = n + 1;
+        }
+        m = m + 1;
+    }
+    return false;
+}

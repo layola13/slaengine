@@ -1,0 +1,173 @@
+// Bevy TaskPool drop/shutdown observable model.
+//
+// Bevy TaskPool::drop closes the shutdown channel, joins every worker thread,
+// runs per-worker destroy callbacks as worker scopes exit, and propagates a
+// worker join panic only when the current thread is not already panicking.
+// This module records those lifecycle outcomes explicitly.
+@import "sa_std/vec.sa"
+
+struct EcsTaskPoolShutdownI32 {
+    worker_count: i64,
+    shutdown_closed: bool,
+    joined_worker_ids: Vec<i64>,
+    worker_panic_flags: Vec<bool>,
+    destroy_callback_flags: Vec<bool>,
+    drop_count: i64,
+}
+
+struct EcsTaskPoolDropResultI32 {
+    pool: EcsTaskPoolShutdownI32,
+    closed_shutdown: bool,
+    joined_count: i64,
+    destroy_callback_count: i64,
+    worker_panic_count: i64,
+    propagated_panic: bool,
+    suppressed_panic: bool,
+}
+
+fn ecs_task_pool_shutdown_i32_new(worker_count: i64) -> EcsTaskPoolShutdownI32 {
+    let count = worker_count;
+    if count < 0 { count = 0; };
+    let joined_worker_ids: Vec<i64> = Vec::new();
+    let worker_panic_flags: Vec<bool> = Vec::new();
+    let destroy_callback_flags: Vec<bool> = Vec::new();
+    let i: i64 = 0;
+    while i < count {
+        worker_panic_flags.push(false);
+        destroy_callback_flags.push(false);
+        i = i + 1;
+    }
+    return EcsTaskPoolShutdownI32 { worker_count: count, shutdown_closed: false, joined_worker_ids: joined_worker_ids, worker_panic_flags: worker_panic_flags, destroy_callback_flags: destroy_callback_flags, drop_count: 0 };
+}
+
+fn ecs_task_pool_shutdown_worker_slot_i32(pool: EcsTaskPoolShutdownI32, worker_id: i64) -> i64 {
+    if worker_id < 0 { return -1; };
+    if worker_id >= pool.worker_count { return -1; };
+    return worker_id;
+}
+
+fn ecs_task_pool_shutdown_mark_worker_panicked_i32(pool: EcsTaskPoolShutdownI32, worker_id: i64) -> EcsTaskPoolShutdownI32 {
+    let slot = ecs_task_pool_shutdown_worker_slot_i32(pool, worker_id);
+    if slot >= 0 { pool.worker_panic_flags[slot] = true; };
+    return pool;
+}
+
+fn ecs_task_pool_shutdown_mark_destroy_callback_i32(pool: EcsTaskPoolShutdownI32, worker_id: i64) -> EcsTaskPoolShutdownI32 {
+    let slot = ecs_task_pool_shutdown_worker_slot_i32(pool, worker_id);
+    if slot >= 0 { pool.destroy_callback_flags[slot] = true; };
+    return pool;
+}
+
+fn ecs_task_pool_shutdown_joined_slot_i32(pool: EcsTaskPoolShutdownI32, worker_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(pool.joined_worker_ids) as i64;
+    while i < n {
+        if pool.joined_worker_ids[i] == worker_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_task_pool_shutdown_destroy_callback_count_i32(pool: EcsTaskPoolShutdownI32) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n = len(pool.destroy_callback_flags) as i64;
+    while i < n {
+        if pool.destroy_callback_flags[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_task_pool_shutdown_worker_panic_count_i32(pool: EcsTaskPoolShutdownI32) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n = len(pool.worker_panic_flags) as i64;
+    while i < n {
+        if pool.worker_panic_flags[i] { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+fn ecs_task_pool_drop_result_i32(pool: EcsTaskPoolShutdownI32, closed_shutdown: bool, joined_count: i64, destroy_callback_count: i64, worker_panic_count: i64, propagated_panic: bool, suppressed_panic: bool) -> EcsTaskPoolDropResultI32 {
+    return EcsTaskPoolDropResultI32 { pool: pool, closed_shutdown: closed_shutdown, joined_count: joined_count, destroy_callback_count: destroy_callback_count, worker_panic_count: worker_panic_count, propagated_panic: propagated_panic, suppressed_panic: suppressed_panic };
+}
+
+fn ecs_task_pool_shutdown_drop_i32(pool: EcsTaskPoolShutdownI32, outer_thread_panicking: bool) -> EcsTaskPoolDropResultI32 {
+    let closed_shutdown = false;
+    if pool.shutdown_closed != true {
+        pool.shutdown_closed = true;
+        closed_shutdown = true;
+    };
+    let i: i64 = 0;
+    while i < pool.worker_count {
+        if ecs_task_pool_shutdown_joined_slot_i32(pool, i) < 0 {
+            pool.joined_worker_ids.push(i);
+        };
+        if pool.destroy_callback_flags[i] != true {
+            pool.destroy_callback_flags[i] = true;
+        };
+        i = i + 1;
+    }
+    pool.drop_count = pool.drop_count + 1;
+    let worker_panics = ecs_task_pool_shutdown_worker_panic_count_i32(pool);
+    let propagated = worker_panics > 0 && outer_thread_panicking != true;
+    let suppressed = worker_panics > 0 && outer_thread_panicking;
+    return ecs_task_pool_drop_result_i32(pool, closed_shutdown, len(pool.joined_worker_ids) as i64, ecs_task_pool_shutdown_destroy_callback_count_i32(pool), worker_panics, propagated, suppressed);
+}
+
+@test "task pool shutdown closes channel and joins every worker"() {
+    let pool = ecs_task_pool_shutdown_i32_new(3);
+    let dropped = ecs_task_pool_shutdown_drop_i32(pool, false);
+    if dropped.closed_shutdown != true { panic(32010); };
+    if dropped.pool.shutdown_closed != true { panic(32011); };
+    if dropped.joined_count != 3 { panic(32012); };
+    if dropped.destroy_callback_count != 3 { panic(32013); };
+    if dropped.propagated_panic { panic(32014); };
+}
+
+@test "task pool shutdown is idempotent for already closed pool"() {
+    let pool = ecs_task_pool_shutdown_i32_new(2);
+    let first = ecs_task_pool_shutdown_drop_i32(pool, false);
+    let second = ecs_task_pool_shutdown_drop_i32(first.pool, false);
+    if second.closed_shutdown { panic(32020); };
+    if second.joined_count != 2 { panic(32021); };
+    if second.destroy_callback_count != 2 { panic(32022); };
+    if second.pool.drop_count != 2 { panic(32023); };
+}
+
+@test "task pool shutdown propagates worker panic when caller is not panicking"() {
+    let pool0 = ecs_task_pool_shutdown_i32_new(2);
+    let pool1 = ecs_task_pool_shutdown_mark_worker_panicked_i32(pool0, 1);
+    let dropped = ecs_task_pool_shutdown_drop_i32(pool1, false);
+    if dropped.worker_panic_count != 1 { panic(32030); };
+    if dropped.propagated_panic != true { panic(32031); };
+    if dropped.suppressed_panic { panic(32032); };
+}
+
+@test "task pool shutdown suppresses worker panic while caller is panicking"() {
+    let pool0 = ecs_task_pool_shutdown_i32_new(2);
+    let pool1 = ecs_task_pool_shutdown_mark_worker_panicked_i32(pool0, 0);
+    let dropped = ecs_task_pool_shutdown_drop_i32(pool1, true);
+    if dropped.worker_panic_count != 1 { panic(32040); };
+    if dropped.propagated_panic { panic(32041); };
+    if dropped.suppressed_panic != true { panic(32042); };
+}
+
+@test "task pool shutdown ignores invalid worker ids"() {
+    let pool0 = ecs_task_pool_shutdown_i32_new(1);
+    let pool1 = ecs_task_pool_shutdown_mark_worker_panicked_i32(pool0, 7);
+    let pool2 = ecs_task_pool_shutdown_mark_destroy_callback_i32(pool1, -1);
+    let dropped = ecs_task_pool_shutdown_drop_i32(pool2, false);
+    if dropped.worker_panic_count != 0 { panic(32050); };
+    if dropped.destroy_callback_count != 1 { panic(32051); };
+}
+
+@test "task pool shutdown preserves pre-run destroy callback accounting"() {
+    let pool0 = ecs_task_pool_shutdown_i32_new(3);
+    let pool1 = ecs_task_pool_shutdown_mark_destroy_callback_i32(pool0, 1);
+    let dropped = ecs_task_pool_shutdown_drop_i32(pool1, false);
+    if dropped.destroy_callback_count != 3 { panic(32060); };
+    if dropped.pool.destroy_callback_flags[1] != true { panic(32061); };
+}

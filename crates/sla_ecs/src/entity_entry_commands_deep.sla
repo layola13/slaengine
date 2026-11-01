@@ -1,0 +1,281 @@
+// Deepened Bevy ECS EntityEntryCommands surface.
+// Mirrors src/system/commands/mod.rs EntityEntryCommands:
+//   and_modify (only if present; queues entity command)
+//   reborrow
+//   or_insert / or_try_insert (insert_if_new / try_insert_if_new)
+//   or_insert_with / or_try_insert_with (lazy default; try silences missing entity)
+//   or_default / or_from_world
+//   entity() back to EntityCommands
+// Deferred queue of ops applied on flush; entity_exists gate for try vs non-try.
+// Fixed op log capacity: 8. Shallow lib/entity_entry_commands.sla retained.
+
+const ECS_EEC_D_AND_MODIFY: i32 = 0;
+const ECS_EEC_D_OR_INSERT: i32 = 1;
+const ECS_EEC_D_OR_TRY_INSERT: i32 = 2;
+const ECS_EEC_D_OR_INSERT_WITH: i32 = 3;
+const ECS_EEC_D_OR_TRY_INSERT_WITH: i32 = 4;
+const ECS_EEC_D_OR_DEFAULT: i32 = 5;
+const ECS_EEC_D_OR_FROM_WORLD: i32 = 6;
+
+fn ecs_eec_d_op_and_modify() -> i32 { return ECS_EEC_D_AND_MODIFY; }
+fn ecs_eec_d_op_or_insert() -> i32 { return ECS_EEC_D_OR_INSERT; }
+fn ecs_eec_d_op_or_try_insert() -> i32 { return ECS_EEC_D_OR_TRY_INSERT; }
+fn ecs_eec_d_op_or_insert_with() -> i32 { return ECS_EEC_D_OR_INSERT_WITH; }
+fn ecs_eec_d_op_or_try_insert_with() -> i32 { return ECS_EEC_D_OR_TRY_INSERT_WITH; }
+fn ecs_eec_d_op_or_default() -> i32 { return ECS_EEC_D_OR_DEFAULT; }
+fn ecs_eec_d_op_or_from_world() -> i32 { return ECS_EEC_D_OR_FROM_WORLD; }
+
+struct EcsEecDeep {
+    entity: i64,
+    component_id: i32,
+    // entity presence in world (for try_* silence vs error)
+    entity_exists: bool,
+    // current component state
+    has_component: bool,
+    value: i64,
+    // deferred op log (kind + arg) capacity 8
+    k0: i32, a0: i64,
+    k1: i32, a1: i64,
+    k2: i32, a2: i64,
+    k3: i32, a3: i64,
+    k4: i32, a4: i64,
+    k5: i32, a5: i64,
+    k6: i32, a6: i64,
+    k7: i32, a7: i64,
+    op_len: i32,
+    // error accounting: non-try ops on missing entity
+    error_count: i64,
+    last_error: i32, // 0=none, 1=entity_not_found
+    // with-factory invoke count (lazy defaults only when inserting)
+    factory_invokes: i64,
+    // reborrow generation
+    reborrow_gen: i64,
+}
+
+fn ecs_eec_deep_new(entity: i64, component_id: i32, entity_exists: bool, has_component: bool, value: i64) -> EcsEecDeep {
+    return EcsEecDeep {
+        entity: entity, component_id: component_id, entity_exists: entity_exists,
+        has_component: has_component, value: value,
+        k0: -1, a0: 0, k1: -1, a1: 0, k2: -1, a2: 0, k3: -1, a3: 0,
+        k4: -1, a4: 0, k5: -1, a5: 0, k6: -1, a6: 0, k7: -1, a7: 0,
+        op_len: 0, error_count: 0, last_error: 0, factory_invokes: 0, reborrow_gen: 0,
+    };
+}
+
+fn ecs_eec_deep_entity(e: EcsEecDeep) -> i64 { return e.entity; }
+fn ecs_eec_deep_component_id(e: EcsEecDeep) -> i32 { return e.component_id; }
+fn ecs_eec_deep_entity_exists(e: EcsEecDeep) -> bool { return e.entity_exists; }
+fn ecs_eec_deep_has_component(e: EcsEecDeep) -> bool { return e.has_component; }
+fn ecs_eec_deep_value(e: EcsEecDeep) -> i64 { return e.value; }
+fn ecs_eec_deep_op_len(e: EcsEecDeep) -> i32 { return e.op_len; }
+fn ecs_eec_deep_error_count(e: EcsEecDeep) -> i64 { return e.error_count; }
+fn ecs_eec_deep_last_error(e: EcsEecDeep) -> i32 { return e.last_error; }
+fn ecs_eec_deep_factory_invokes(e: EcsEecDeep) -> i64 { return e.factory_invokes; }
+fn ecs_eec_deep_reborrow_gen(e: EcsEecDeep) -> i64 { return e.reborrow_gen; }
+
+fn ecs_eec_deep_rebuild(
+    entity: i64, component_id: i32, entity_exists: bool, has_component: bool, value: i64,
+    k0: i32, a0: i64, k1: i32, a1: i64, k2: i32, a2: i64, k3: i32, a3: i64,
+    k4: i32, a4: i64, k5: i32, a5: i64, k6: i32, a6: i64, k7: i32, a7: i64,
+    op_len: i32, error_count: i64, last_error: i32, factory_invokes: i64, reborrow_gen: i64
+) -> EcsEecDeep {
+    return EcsEecDeep {
+        entity: entity, component_id: component_id, entity_exists: entity_exists,
+        has_component: has_component, value: value,
+        k0: k0, a0: a0, k1: k1, a1: a1, k2: k2, a2: a2, k3: k3, a3: a3,
+        k4: k4, a4: a4, k5: k5, a5: a5, k6: k6, a6: a6, k7: k7, a7: a7,
+        op_len: op_len, error_count: error_count, last_error: last_error,
+        factory_invokes: factory_invokes, reborrow_gen: reborrow_gen,
+    };
+}
+
+fn ecs_eec_deep_push_op(e: EcsEecDeep, kind: i32, arg: i64) -> EcsEecDeep {
+    if e.op_len == 0 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            kind, arg, e.k1, e.a1, e.k2, e.a2, e.k3, e.a3,
+            e.k4, e.a4, e.k5, e.a5, e.k6, e.a6, e.k7, e.a7,
+            1, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 1 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, kind, arg, e.k2, e.a2, e.k3, e.a3,
+            e.k4, e.a4, e.k5, e.a5, e.k6, e.a6, e.k7, e.a7,
+            2, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 2 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, e.k1, e.a1, kind, arg, e.k3, e.a3,
+            e.k4, e.a4, e.k5, e.a5, e.k6, e.a6, e.k7, e.a7,
+            3, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 3 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, e.k1, e.a1, e.k2, e.a2, kind, arg,
+            e.k4, e.a4, e.k5, e.a5, e.k6, e.a6, e.k7, e.a7,
+            4, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 4 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, e.k1, e.a1, e.k2, e.a2, e.k3, e.a3,
+            kind, arg, e.k5, e.a5, e.k6, e.a6, e.k7, e.a7,
+            5, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 5 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, e.k1, e.a1, e.k2, e.a2, e.k3, e.a3,
+            e.k4, e.a4, kind, arg, e.k6, e.a6, e.k7, e.a7,
+            6, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 6 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, e.k1, e.a1, e.k2, e.a2, e.k3, e.a3,
+            e.k4, e.a4, e.k5, e.a5, kind, arg, e.k7, e.a7,
+            7, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    if e.op_len == 7 {
+        return ecs_eec_deep_rebuild(
+            e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+            e.k0, e.a0, e.k1, e.a1, e.k2, e.a2, e.k3, e.a3,
+            e.k4, e.a4, e.k5, e.a5, e.k6, e.a6, kind, arg,
+            8, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+        );
+    };
+    return e;
+}
+
+fn ecs_eec_deep_op_kind_at(e: EcsEecDeep, idx: i32) -> i32 {
+    if idx == 0 { return e.k0; };
+    if idx == 1 { return e.k1; };
+    if idx == 2 { return e.k2; };
+    if idx == 3 { return e.k3; };
+    if idx == 4 { return e.k4; };
+    if idx == 5 { return e.k5; };
+    if idx == 6 { return e.k6; };
+    if idx == 7 { return e.k7; };
+    return -1;
+}
+
+fn ecs_eec_deep_op_arg_at(e: EcsEecDeep, idx: i32) -> i64 {
+    if idx == 0 { return e.a0; };
+    if idx == 1 { return e.a1; };
+    if idx == 2 { return e.a2; };
+    if idx == 3 { return e.a3; };
+    if idx == 4 { return e.a4; };
+    if idx == 5 { return e.a5; };
+    if idx == 6 { return e.a6; };
+    if idx == 7 { return e.a7; };
+    return 0;
+}
+
+// reborrow: smaller lifetime clone of command handle
+fn ecs_eec_deep_reborrow(e: EcsEecDeep) -> EcsEecDeep {
+    return ecs_eec_deep_rebuild(
+        e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+        e.k0, e.a0, e.k1, e.a1, e.k2, e.a2, e.k3, e.a3,
+        e.k4, e.a4, e.k5, e.a5, e.k6, e.a6, e.k7, e.a7,
+        e.op_len, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen + 1
+    );
+}
+
+// entity(): return EntityCommands identity (entity id)
+fn ecs_eec_deep_entity_commands(e: EcsEecDeep) -> i64 { return e.entity; }
+
+// and_modify: only if component present; records op with delta arg
+fn ecs_eec_deep_and_modify(e: EcsEecDeep, delta: i64) -> EcsEecDeep {
+    let e2 = ecs_eec_deep_push_op(e, ECS_EEC_D_AND_MODIFY, delta);
+    if e2.entity_exists != true {
+        return ecs_eec_deep_rebuild(
+            e2.entity, e2.component_id, e2.entity_exists, e2.has_component, e2.value,
+            e2.k0, e2.a0, e2.k1, e2.a1, e2.k2, e2.a2, e2.k3, e2.a3,
+            e2.k4, e2.a4, e2.k5, e2.a5, e2.k6, e2.a6, e2.k7, e2.a7,
+            e2.op_len, e2.error_count + 1, 1, e2.factory_invokes, e2.reborrow_gen
+        );
+    };
+    if e2.has_component {
+        return ecs_eec_deep_rebuild(
+            e2.entity, e2.component_id, e2.entity_exists, true, e2.value + delta,
+            e2.k0, e2.a0, e2.k1, e2.a1, e2.k2, e2.a2, e2.k3, e2.a3,
+            e2.k4, e2.a4, e2.k5, e2.a5, e2.k6, e2.a6, e2.k7, e2.a7,
+            e2.op_len, e2.error_count, e2.last_error, e2.factory_invokes, e2.reborrow_gen
+        );
+    };
+    return e2;
+}
+
+// insert_if_new core
+fn ecs_eec_deep_insert_if_new(e: EcsEecDeep, kind: i32, default_val: i64, invoke_factory: bool, silence_missing: bool) -> EcsEecDeep {
+    let e2 = ecs_eec_deep_push_op(e, kind, default_val);
+    if e2.entity_exists != true {
+        if silence_missing {
+            return e2;
+        };
+        return ecs_eec_deep_rebuild(
+            e2.entity, e2.component_id, e2.entity_exists, e2.has_component, e2.value,
+            e2.k0, e2.a0, e2.k1, e2.a1, e2.k2, e2.a2, e2.k3, e2.a3,
+            e2.k4, e2.a4, e2.k5, e2.a5, e2.k6, e2.a6, e2.k7, e2.a7,
+            e2.op_len, e2.error_count + 1, 1, e2.factory_invokes, e2.reborrow_gen
+        );
+    };
+    if e2.has_component {
+        // Keep mode: do not replace; factory not invoked
+        return e2;
+    };
+    let fi = e2.factory_invokes;
+    if invoke_factory {
+        fi = fi + 1;
+    };
+    return ecs_eec_deep_rebuild(
+        e2.entity, e2.component_id, e2.entity_exists, true, default_val,
+        e2.k0, e2.a0, e2.k1, e2.a1, e2.k2, e2.a2, e2.k3, e2.a3,
+        e2.k4, e2.a4, e2.k5, e2.a5, e2.k6, e2.a6, e2.k7, e2.a7,
+        e2.op_len, e2.error_count, e2.last_error, fi, e2.reborrow_gen
+    );
+}
+
+fn ecs_eec_deep_or_insert(e: EcsEecDeep, default_val: i64) -> EcsEecDeep {
+    return ecs_eec_deep_insert_if_new(e, ECS_EEC_D_OR_INSERT, default_val, false, false);
+}
+
+fn ecs_eec_deep_or_try_insert(e: EcsEecDeep, default_val: i64) -> EcsEecDeep {
+    return ecs_eec_deep_insert_if_new(e, ECS_EEC_D_OR_TRY_INSERT, default_val, false, true);
+}
+
+fn ecs_eec_deep_or_insert_with(e: EcsEecDeep, default_val: i64) -> EcsEecDeep {
+    return ecs_eec_deep_insert_if_new(e, ECS_EEC_D_OR_INSERT_WITH, default_val, true, false);
+}
+
+fn ecs_eec_deep_or_try_insert_with(e: EcsEecDeep, default_val: i64) -> EcsEecDeep {
+    return ecs_eec_deep_insert_if_new(e, ECS_EEC_D_OR_TRY_INSERT_WITH, default_val, true, true);
+}
+
+fn ecs_eec_deep_or_default(e: EcsEecDeep) -> EcsEecDeep {
+    // T::default modeled as 0; factory invoked only when inserting
+    return ecs_eec_deep_insert_if_new(e, ECS_EEC_D_OR_DEFAULT, 0, true, false);
+}
+
+fn ecs_eec_deep_or_from_world(e: EcsEecDeep, from_world_value: i64) -> EcsEecDeep {
+    return ecs_eec_deep_insert_if_new(e, ECS_EEC_D_OR_FROM_WORLD, from_world_value, true, false);
+}
+
+// flush: clear op log after apply (state already applied eagerly for model simplicity)
+fn ecs_eec_deep_flush(e: EcsEecDeep) -> EcsEecDeep {
+    return ecs_eec_deep_rebuild(
+        e.entity, e.component_id, e.entity_exists, e.has_component, e.value,
+        -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0,
+        0, e.error_count, e.last_error, e.factory_invokes, e.reborrow_gen
+    );
+}

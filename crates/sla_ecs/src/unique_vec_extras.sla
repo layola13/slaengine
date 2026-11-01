@@ -1,0 +1,274 @@
+// Additional Bevy ECS UniqueEntityEquivalentVec<T> surface.
+// Mirrors src/entity/unique_vec.rs methods that are not covered by lib/unique_vec.sla:
+// reserve/try_reserve/shrink, append, drain, splice, resize_with, leak/spare capacity,
+// and the uniqueness-guaranteed FromEntitySetIterator path.
+
+struct EcsUniqueVecExtras {
+    items: Vec<i64>,
+    capacity_hint: i64,
+    leaked: i32,
+}
+
+struct EcsUniqueVecTryReserveResult {
+    vec: EcsUniqueVecExtras,
+    ok: i32,
+}
+
+struct EcsUniqueVecDrainResult {
+    vec: EcsUniqueVecExtras,
+    removed_count: i64,
+    first_removed: i64,
+    removed_sum: i64,
+}
+
+struct EcsUniqueVecSpliceResult {
+    vec: EcsUniqueVecExtras,
+    removed_count: i64,
+    first_removed: i64,
+    inserted_count: i64,
+}
+
+struct EcsUniqueVecSplitResult {
+    left: EcsUniqueVecExtras,
+    right: EcsUniqueVecExtras,
+}
+
+fn ecs_uve_max_i64(a: i64, b: i64) -> i64 {
+    if a > b { return a; };
+    return b;
+}
+
+fn ecs_uve_len(v: EcsUniqueVecExtras) -> i64 { return len(v.items) as i64; }
+
+fn ecs_uve_new() -> EcsUniqueVecExtras {
+    return EcsUniqueVecExtras { items: Vec::new(), capacity_hint: 0, leaked: 0 };
+}
+
+fn ecs_uve_with_capacity(capacity: i64) -> EcsUniqueVecExtras {
+    let cap = capacity;
+    if cap < 0 { cap = 0; };
+    return EcsUniqueVecExtras { items: Vec::new(), capacity_hint: cap, leaked: 0 };
+}
+
+fn ecs_uve_from_vec_unchecked(items: Vec<i64>) -> EcsUniqueVecExtras {
+    let n = len(items) as i64;
+    return EcsUniqueVecExtras { items: items, capacity_hint: n, leaked: 0 };
+}
+
+fn ecs_uve_from_entity_set_iter(items: Vec<i64>) -> EcsUniqueVecExtras {
+    // Bevy's FromEntitySetIterator trusts the iterator uniqueness guarantee and inserts unchecked.
+    return ecs_uve_from_vec_unchecked(items);
+}
+
+fn ecs_uve_capacity(v: EcsUniqueVecExtras) -> i64 {
+    return ecs_uve_max_i64(v.capacity_hint, ecs_uve_len(v));
+}
+
+fn ecs_uve_is_empty(v: EcsUniqueVecExtras) -> bool { return ecs_uve_len(v) == 0; }
+
+fn ecs_uve_spare_capacity(v: EcsUniqueVecExtras) -> i64 {
+    return ecs_uve_capacity(v) - ecs_uve_len(v);
+}
+
+fn ecs_uve_contains(v: EcsUniqueVecExtras, entity: i64) -> bool {
+    let i: i64 = 0;
+    let n = ecs_uve_len(v);
+    while i < n {
+        if v.items[i] == entity { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_uve_at(v: EcsUniqueVecExtras, index: i64) -> i64 {
+    if index < 0 { return -1; };
+    if index >= ecs_uve_len(v) { return -1; };
+    return v.items[index];
+}
+
+fn ecs_uve_push_unchecked(v: EcsUniqueVecExtras, entity: i64) -> EcsUniqueVecExtras {
+    v.items.push(entity);
+    if ecs_uve_len(v) > v.capacity_hint { v.capacity_hint = ecs_uve_len(v); };
+    return v;
+}
+
+fn ecs_uve_reserve(v: EcsUniqueVecExtras, additional: i64) -> EcsUniqueVecExtras {
+    if additional <= 0 { return v; };
+    let required = ecs_uve_len(v) + additional;
+    if required > v.capacity_hint { v.capacity_hint = required; };
+    return v;
+}
+
+fn ecs_uve_reserve_exact(v: EcsUniqueVecExtras, additional: i64) -> EcsUniqueVecExtras {
+    return ecs_uve_reserve(v, additional);
+}
+
+fn ecs_uve_try_reserve(v: EcsUniqueVecExtras, additional: i64) -> EcsUniqueVecTryReserveResult {
+    if additional < 0 { return EcsUniqueVecTryReserveResult { vec: v, ok: 0 }; };
+    let out = ecs_uve_reserve(v, additional);
+    return EcsUniqueVecTryReserveResult { vec: out, ok: 1 };
+}
+
+fn ecs_uve_try_reserve_exact(v: EcsUniqueVecExtras, additional: i64) -> EcsUniqueVecTryReserveResult {
+    return ecs_uve_try_reserve(v, additional);
+}
+
+fn ecs_uve_shrink_to_fit(v: EcsUniqueVecExtras) -> EcsUniqueVecExtras {
+    v.capacity_hint = ecs_uve_len(v);
+    return v;
+}
+
+fn ecs_uve_shrink_to(v: EcsUniqueVecExtras, min_capacity: i64) -> EcsUniqueVecExtras {
+    let min_cap = min_capacity;
+    if min_cap < 0 { min_cap = 0; };
+    v.capacity_hint = ecs_uve_max_i64(ecs_uve_len(v), min_cap);
+    return v;
+}
+
+fn ecs_uve_append(v: EcsUniqueVecExtras, other: EcsUniqueVecExtras) -> EcsUniqueVecExtras {
+    let i: i64 = 0;
+    let n = ecs_uve_len(other);
+    while i < n {
+        v.items.push(other.items[i]);
+        i = i + 1;
+    }
+    if ecs_uve_len(v) > v.capacity_hint { v.capacity_hint = ecs_uve_len(v); };
+    return v;
+}
+
+fn ecs_uve_split_off(v: EcsUniqueVecExtras, at: i64) -> EcsUniqueVecSplitResult {
+    let n = ecs_uve_len(v);
+    if at <= 0 {
+        let left_empty: Vec<i64> = Vec::new();
+        let left_zero = EcsUniqueVecExtras { items: left_empty, capacity_hint: 0, leaked: v.leaked };
+        let right_all = EcsUniqueVecExtras { items: v.items, capacity_hint: n, leaked: 0 };
+        return EcsUniqueVecSplitResult { left: left_zero, right: right_all };
+    };
+    if at >= n {
+        let right_empty: Vec<i64> = Vec::new();
+        let left_all = EcsUniqueVecExtras { items: v.items, capacity_hint: ecs_uve_capacity(v), leaked: v.leaked };
+        let right_zero = EcsUniqueVecExtras { items: right_empty, capacity_hint: 0, leaked: 0 };
+        return EcsUniqueVecSplitResult { left: left_all, right: right_zero };
+    };
+    let cut = at;
+    let left_items: Vec<i64> = Vec::new();
+    let right_items: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    while i < n {
+        if i < cut { left_items.push(v.items[i]); };
+        if i >= cut { right_items.push(v.items[i]); };
+        i = i + 1;
+    }
+    let retained_capacity = v.capacity_hint - (n - cut);
+    let left_capacity = ecs_uve_max_i64(cut, retained_capacity);
+    let left = EcsUniqueVecExtras { items: left_items, capacity_hint: left_capacity, leaked: v.leaked };
+    let right = EcsUniqueVecExtras { items: right_items, capacity_hint: n - cut, leaked: 0 };
+    return EcsUniqueVecSplitResult { left: left, right: right };
+}
+
+fn ecs_uve_drain_clamped(v: EcsUniqueVecExtras, start: i64, stop: i64) -> EcsUniqueVecDrainResult {
+    let n = ecs_uve_len(v);
+    let kept: Vec<i64> = Vec::new();
+    let removed_count: i64 = 0;
+    let first_removed: i64 = -1;
+    let removed_sum: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        if i >= start {
+            if i < stop {
+                if removed_count == 0 { first_removed = v.items[i]; };
+                removed_count = removed_count + 1;
+                removed_sum = removed_sum + v.items[i];
+            };
+        };
+        if i < start { kept.push(v.items[i]); };
+        if i >= stop { kept.push(v.items[i]); };
+        i = i + 1;
+    }
+    v.items = kept;
+    return EcsUniqueVecDrainResult { vec: v, removed_count: removed_count, first_removed: first_removed, removed_sum: removed_sum };
+}
+
+fn ecs_uve_drain(v: EcsUniqueVecExtras, start: i64, end: i64) -> EcsUniqueVecDrainResult {
+    let n = ecs_uve_len(v);
+    if start < 0 { return EcsUniqueVecDrainResult { vec: v, removed_count: 0, first_removed: -1, removed_sum: 0 }; };
+    if end < start { return EcsUniqueVecDrainResult { vec: v, removed_count: 0, first_removed: -1, removed_sum: 0 }; };
+    if start > n { return EcsUniqueVecDrainResult { vec: v, removed_count: 0, first_removed: -1, removed_sum: 0 }; };
+    if end >= n { return ecs_uve_drain_clamped(v, start, n); };
+    return ecs_uve_drain_clamped(v, start, end);
+}
+
+fn ecs_uve_splice_clamped(v: EcsUniqueVecExtras, start: i64, stop: i64, replacement: Vec<i64>) -> EcsUniqueVecSpliceResult {
+    let n = ecs_uve_len(v);
+    let out_items: Vec<i64> = Vec::new();
+    let removed_count: i64 = 0;
+    let first_removed: i64 = -1;
+    let inserted_count: i64 = len(replacement) as i64;
+    let i: i64 = 0;
+    while i < n {
+        if i == start {
+            let r: i64 = 0;
+            while r < inserted_count {
+                out_items.push(replacement[r]);
+                r = r + 1;
+            }
+        };
+        if i >= start {
+            if i < stop {
+                if removed_count == 0 { first_removed = v.items[i]; };
+                removed_count = removed_count + 1;
+            };
+        };
+        if i < start { out_items.push(v.items[i]); };
+        if i >= stop { out_items.push(v.items[i]); };
+        i = i + 1;
+    }
+    if start == n {
+        let r2: i64 = 0;
+        while r2 < inserted_count {
+            out_items.push(replacement[r2]);
+            r2 = r2 + 1;
+        }
+    };
+    v.items = out_items;
+    if ecs_uve_len(v) > v.capacity_hint { v.capacity_hint = ecs_uve_len(v); };
+    return EcsUniqueVecSpliceResult { vec: v, removed_count: removed_count, first_removed: first_removed, inserted_count: inserted_count };
+}
+
+fn ecs_uve_splice(v: EcsUniqueVecExtras, start: i64, end: i64, replacement: Vec<i64>) -> EcsUniqueVecSpliceResult {
+    let n = ecs_uve_len(v);
+    if start < 0 { return EcsUniqueVecSpliceResult { vec: v, removed_count: 0, first_removed: -1, inserted_count: 0 }; };
+    if end < start { return EcsUniqueVecSpliceResult { vec: v, removed_count: 0, first_removed: -1, inserted_count: 0 }; };
+    if start > n { return EcsUniqueVecSpliceResult { vec: v, removed_count: 0, first_removed: -1, inserted_count: 0 }; };
+    if end >= n { return ecs_uve_splice_clamped(v, start, n, replacement); };
+    return ecs_uve_splice_clamped(v, start, end, replacement);
+}
+
+fn ecs_uve_resize_with_sequence(v: EcsUniqueVecExtras, new_len: i64, first_new_entity: i64) -> EcsUniqueVecExtras {
+    if new_len < 0 { return v; };
+    let current = ecs_uve_len(v);
+    if new_len <= current {
+        let kept: Vec<i64> = Vec::new();
+        let i: i64 = 0;
+        while i < new_len {
+            kept.push(v.items[i]);
+            i = i + 1;
+        }
+        v.items = kept;
+        return v;
+    };
+    let next = first_new_entity;
+    while ecs_uve_len(v) < new_len {
+        v.items.push(next);
+        next = next + 1;
+    }
+    if ecs_uve_len(v) > v.capacity_hint { v.capacity_hint = ecs_uve_len(v); };
+    return v;
+}
+
+fn ecs_uve_leak(v: EcsUniqueVecExtras) -> EcsUniqueVecExtras {
+    v.leaked = 1;
+    return v;
+}
+
+fn ecs_uve_is_leaked(v: EcsUniqueVecExtras) -> bool { return v.leaked == 1; }

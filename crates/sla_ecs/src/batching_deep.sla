@@ -1,0 +1,152 @@
+// Deepened Bevy ECS batching surface.
+// Mirrors src/batching.rs: BatchingStrategy limits range, fixed(), min/max,
+// batches_per_thread assert >0, calc_batch_size empty-range short-circuit,
+// thread_count>0 assert, div_ceil + clamp.
+// Shallow lib/batching.sla retained.
+
+// Error codes for invalid configuration / runtime asserts
+const ECS_BS_OK: i32 = 0;
+const ECS_BS_ERR_ZERO_BPT: i32 = 1;
+const ECS_BS_ERR_ZERO_THREADS: i32 = 2;
+
+// Use large positive as usize::MAX stand-in (avoid negative top-level const)
+const ECS_BS_USIZE_MAX: i64 = 2147483647; // stand-in for usize::MAX (avoid LEB overflow on default backend)
+
+struct EcsBatchingStrategyDeep {
+    min_batch: i64,
+    max_batch: i64, // exclusive end in Bevy Range; we store inclusive max for clamp
+    // Bevy uses Range { start, end } with end exclusive. We keep:
+    // batch_size_limits_start / batch_size_limits_end (end exclusive)
+    range_start: i64,
+    range_end: i64,
+    batches_per_thread: i64,
+    last_error: i32,
+}
+
+fn ecs_bs_deep_new() -> EcsBatchingStrategyDeep {
+    return EcsBatchingStrategyDeep {
+        min_batch: 1,
+        max_batch: ECS_BS_USIZE_MAX,
+        range_start: 1,
+        range_end: ECS_BS_USIZE_MAX, // Bevy 1..usize::MAX — empty check uses is_empty on range
+        // Note: in Rust, 1..usize::MAX is NOT empty. Empty when start >= end.
+        batches_per_thread: 1,
+        last_error: ECS_BS_OK,
+    };
+}
+
+fn ecs_bs_deep_default() -> EcsBatchingStrategyDeep {
+    return ecs_bs_deep_new();
+}
+
+// fixed: batch_size..batch_size  — EMPTY range in Rust! Bevy returns start on empty.
+// Wait: fixed uses batch_size..batch_size which IS empty (start==end).
+// calc_batch_size: if limits.is_empty() { return start; }
+fn ecs_bs_deep_fixed(batch_size: i64) -> EcsBatchingStrategyDeep {
+    return EcsBatchingStrategyDeep {
+        min_batch: batch_size,
+        max_batch: batch_size,
+        range_start: batch_size,
+        range_end: batch_size, // empty range
+        batches_per_thread: 1,
+        last_error: ECS_BS_OK,
+    };
+}
+
+fn ecs_bs_deep_min_batch_size(bs: EcsBatchingStrategyDeep, batch_size: i64) -> EcsBatchingStrategyDeep {
+    bs.range_start = batch_size;
+    bs.min_batch = batch_size;
+    return bs;
+}
+
+fn ecs_bs_deep_max_batch_size(bs: EcsBatchingStrategyDeep, batch_size: i64) -> EcsBatchingStrategyDeep {
+    // Bevy sets range.end = batch_size (exclusive end used as clamp max in practice
+    // via clamp(start, end) — wait, clamp uses end as max inclusive in Rust clamp?
+    // batch_size.clamp(start, end) requires start <= end and clamps to [start, end] INCLUSIVE.
+    // But fixed has start==end so empty range short-circuits before clamp.
+    // For non-empty, end is exclusive in Range but clamp's max is inclusive of end value
+    // when they set max_batch_size(end). Looking at Bevy:
+    //   batch_size_limits: 1..usize::MAX
+    //   clamp(start, end) with end=usize::MAX
+    // For max_batch_size(n): end = n, clamp(start, n) inclusive max n.
+    bs.range_end = batch_size;
+    bs.max_batch = batch_size;
+    return bs;
+}
+
+fn ecs_bs_deep_batches_per_thread(bs: EcsBatchingStrategyDeep, bpt: i64) -> EcsBatchingStrategyDeep {
+    if bpt <= 0 {
+        bs.last_error = ECS_BS_ERR_ZERO_BPT;
+        return bs;
+    };
+    bs.batches_per_thread = bpt;
+    bs.last_error = ECS_BS_OK;
+    return bs;
+}
+
+fn ecs_bs_deep_range_is_empty(bs: EcsBatchingStrategyDeep) -> bool {
+    return bs.range_start >= bs.range_end;
+}
+
+fn ecs_bs_deep_div_ceil(a: i64, b: i64) -> i64 {
+    if b <= 0 { return a; };
+    let q = a / b;
+    if a % b != 0 { q = q + 1; };
+    return q;
+}
+
+fn ecs_bs_deep_clamp(val: i64, lo: i64, hi: i64) -> i64 {
+    if val < lo { return lo; };
+    if val > hi { return hi; };
+    return val;
+}
+
+// calc_batch_size(max_items, thread_count)
+// Bevy takes max_items as FnOnce — we pass the count directly.
+fn ecs_bs_deep_calc_batch_size(
+    bs: EcsBatchingStrategyDeep,
+    max_items: i64,
+    thread_count: i64
+) -> (EcsBatchingStrategyDeep, i64) {
+    if ecs_bs_deep_range_is_empty(bs) {
+        bs.last_error = ECS_BS_OK;
+        return (bs, bs.range_start);
+    };
+    if thread_count <= 0 {
+        bs.last_error = ECS_BS_ERR_ZERO_THREADS;
+        return (bs, 0);
+    };
+    let batches = thread_count * bs.batches_per_thread;
+    let batch_size = ecs_bs_deep_div_ceil(max_items, batches);
+    // clamp to [start, end] inclusive as Bevy's clamp(start, end)
+    let clamped = ecs_bs_deep_clamp(batch_size, bs.range_start, bs.range_end);
+    bs.last_error = ECS_BS_OK;
+    return (bs, clamped);
+}
+
+fn ecs_bs_deep_min(bs: EcsBatchingStrategyDeep) -> i64 { return bs.range_start; }
+fn ecs_bs_deep_max(bs: EcsBatchingStrategyDeep) -> i64 { return bs.range_end; }
+fn ecs_bs_deep_bpt(bs: EcsBatchingStrategyDeep) -> i64 { return bs.batches_per_thread; }
+fn ecs_bs_deep_last_error(bs: EcsBatchingStrategyDeep) -> i32 { return bs.last_error; }
+
+// Convenience: number of batches produced for a given item count
+fn ecs_bs_deep_num_batches(batch_size: i64, max_items: i64) -> i64 {
+    if batch_size <= 0 { return 0; };
+    return ecs_bs_deep_div_ceil(max_items, batch_size);
+}
+
+// Split plan: returns batch_size and count of full batches (for tests)
+fn ecs_bs_deep_plan(
+    bs: EcsBatchingStrategyDeep,
+    max_items: i64,
+    thread_count: i64
+) -> (EcsBatchingStrategyDeep, i64, i64) {
+    let r = ecs_bs_deep_calc_batch_size(bs, max_items, thread_count);
+    bs = r.0;
+    let batch_size = r.1;
+    if batch_size <= 0 {
+        return (bs, 0, 0);
+    };
+    let n = ecs_bs_deep_num_batches(batch_size, max_items);
+    return (bs, batch_size, n);
+}

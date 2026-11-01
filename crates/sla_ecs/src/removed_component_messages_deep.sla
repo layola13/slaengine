@@ -1,0 +1,333 @@
+// Deepened Bevy ECS RemovedComponentMessages + RemovedComponents reader.
+// Mirrors src/lifecycle.rs:
+//   RemovedComponentMessages { SparseSet<ComponentId, Messages<RemovedComponentEntity>> }
+//   write / update / get / iter
+//   RemovedComponentReader + RemovedComponents { read / read_with_id / len / is_empty / clear }
+// Each bucket is a Messages dual-buffer (A oldest, B current) with capacity 4 entities per sequence.
+// Fixed: 4 component buckets. Shallow lib/removed_component_messages.sla retained.
+
+// One Messages-like dual buffer for a component's removals
+struct EcsRcmBucketDeep {
+    component_id: i32,
+    message_count: i64,
+    a_start: i64,
+    a0: i32, a1: i32, a2: i32, a3: i32, a_len: i32,
+    b_start: i64,
+    b0: i32, b1: i32, b2: i32, b3: i32, b_len: i32,
+}
+
+fn ecs_rcmd_bucket_empty(component_id: i32) -> EcsRcmBucketDeep {
+    return EcsRcmBucketDeep {
+        component_id: component_id, message_count: 0,
+        a_start: 0, a0: 0, a1: 0, a2: 0, a3: 0, a_len: 0,
+        b_start: 0, b0: 0, b1: 0, b2: 0, b3: 0, b_len: 0,
+    };
+}
+
+fn ecs_rcmd_bucket_len(b: EcsRcmBucketDeep) -> i64 {
+    return (b.a_len as i64) + (b.b_len as i64);
+}
+
+fn ecs_rcmd_bucket_rebuild(
+    component_id: i32, message_count: i64,
+    a_start: i64, a0: i32, a1: i32, a2: i32, a3: i32, a_len: i32,
+    b_start: i64, b0: i32, b1: i32, b2: i32, b3: i32, b_len: i32
+) -> EcsRcmBucketDeep {
+    return EcsRcmBucketDeep {
+        component_id: component_id, message_count: message_count,
+        a_start: a_start, a0: a0, a1: a1, a2: a2, a3: a3, a_len: a_len,
+        b_start: b_start, b0: b0, b1: b1, b2: b2, b3: b3, b_len: b_len,
+    };
+}
+
+fn ecs_rcmd_bucket_write(b: EcsRcmBucketDeep, entity: i32) -> EcsRcmBucketDeep {
+    let bl = b.b_len;
+    if bl >= 4 {
+        return ecs_rcmd_bucket_rebuild(
+            b.component_id, b.message_count + 1,
+            b.a_start, b.a0, b.a1, b.a2, b.a3, b.a_len,
+            b.b_start, b.b0, b.b1, b.b2, b.b3, b.b_len
+        );
+    };
+    let b0 = b.b0; let b1 = b.b1; let b2 = b.b2; let b3 = b.b3;
+    if bl == 0 { b0 = entity; };
+    if bl == 1 { b1 = entity; };
+    if bl == 2 { b2 = entity; };
+    if bl == 3 { b3 = entity; };
+    return ecs_rcmd_bucket_rebuild(
+        b.component_id, b.message_count + 1,
+        b.a_start, b.a0, b.a1, b.a2, b.a3, b.a_len,
+        b.b_start, b0, b1, b2, b3, bl + 1
+    );
+}
+
+// update: swap A/B, clear B, B.start = message_count
+fn ecs_rcmd_bucket_update(b: EcsRcmBucketDeep) -> EcsRcmBucketDeep {
+    return ecs_rcmd_bucket_rebuild(
+        b.component_id, b.message_count,
+        b.b_start, b.b0, b.b1, b.b2, b.b3, b.b_len,
+        b.message_count, 0, 0, 0, 0, 0
+    );
+}
+
+fn ecs_rcmd_bucket_entity_at(b: EcsRcmBucketDeep, idx: i32) -> i32 {
+    // flatten A then B
+    if idx < b.a_len {
+        if idx == 0 { return b.a0; };
+        if idx == 1 { return b.a1; };
+        if idx == 2 { return b.a2; };
+        if idx == 3 { return b.a3; };
+        return 0;
+    };
+    let j = idx - b.a_len;
+    if j == 0 { return b.b0; };
+    if j == 1 { return b.b1; };
+    if j == 2 { return b.b2; };
+    if j == 3 { return b.b3; };
+    return 0;
+}
+
+// Storage: up to 4 buckets
+struct EcsRcmDeep {
+    n: i32,
+    b0: EcsRcmBucketDeep,
+    b1: EcsRcmBucketDeep,
+    b2: EcsRcmBucketDeep,
+    b3: EcsRcmBucketDeep,
+}
+
+fn ecs_rcmd_new() -> EcsRcmDeep {
+    let empty = ecs_rcmd_bucket_empty(-1);
+    return EcsRcmDeep { n: 0, b0: empty, b1: empty, b2: empty, b3: empty };
+}
+
+fn ecs_rcmd_buckets(s: EcsRcmDeep) -> i32 { return s.n; }
+
+fn ecs_rcmd_find(s: EcsRcmDeep, component_id: i32) -> i32 {
+    if s.n >= 1 {
+        if s.b0.component_id == component_id { return 0; };
+    };
+    if s.n >= 2 {
+        if s.b1.component_id == component_id { return 1; };
+    };
+    if s.n >= 3 {
+        if s.b2.component_id == component_id { return 2; };
+    };
+    if s.n >= 4 {
+        if s.b3.component_id == component_id { return 3; };
+    };
+    return -1;
+}
+
+fn ecs_rcmd_get_bucket(s: EcsRcmDeep, idx: i32) -> EcsRcmBucketDeep {
+    if idx == 0 { return s.b0; };
+    if idx == 1 { return s.b1; };
+    if idx == 2 { return s.b2; };
+    if idx == 3 { return s.b3; };
+    return ecs_rcmd_bucket_empty(-1);
+}
+
+fn ecs_rcmd_set_bucket(s: EcsRcmDeep, idx: i32, b: EcsRcmBucketDeep) -> EcsRcmDeep {
+    if idx == 0 {
+        return EcsRcmDeep { n: s.n, b0: b, b1: s.b1, b2: s.b2, b3: s.b3 };
+    };
+    if idx == 1 {
+        return EcsRcmDeep { n: s.n, b0: s.b0, b1: b, b2: s.b2, b3: s.b3 };
+    };
+    if idx == 2 {
+        return EcsRcmDeep { n: s.n, b0: s.b0, b1: s.b1, b2: b, b3: s.b3 };
+    };
+    if idx == 3 {
+        return EcsRcmDeep { n: s.n, b0: s.b0, b1: s.b1, b2: s.b2, b3: b };
+    };
+    return s;
+}
+
+fn ecs_rcmd_write(s: EcsRcmDeep, component_id: i32, entity: i32) -> EcsRcmDeep {
+    let idx = ecs_rcmd_find(s, component_id);
+    if idx >= 0 {
+        let b = ecs_rcmd_get_bucket(s, idx);
+        let b2 = ecs_rcmd_bucket_write(b, entity);
+        return ecs_rcmd_set_bucket(s, idx, b2);
+    };
+    if s.n >= 4 { return s; };
+    let bnew = ecs_rcmd_bucket_write(ecs_rcmd_bucket_empty(component_id), entity);
+    let n2 = s.n + 1;
+    if s.n == 0 {
+        return EcsRcmDeep { n: n2, b0: bnew, b1: s.b1, b2: s.b2, b3: s.b3 };
+    };
+    if s.n == 1 {
+        return EcsRcmDeep { n: n2, b0: s.b0, b1: bnew, b2: s.b2, b3: s.b3 };
+    };
+    if s.n == 2 {
+        return EcsRcmDeep { n: n2, b0: s.b0, b1: s.b1, b2: bnew, b3: s.b3 };
+    };
+    return EcsRcmDeep { n: n2, b0: s.b0, b1: s.b1, b2: s.b2, b3: bnew };
+}
+
+// update all buckets
+fn ecs_rcmd_update(s: EcsRcmDeep) -> EcsRcmDeep {
+    let n = s.n;
+    let b0 = s.b0; let b1 = s.b1; let b2 = s.b2; let b3 = s.b3;
+    if n >= 1 { b0 = ecs_rcmd_bucket_update(b0); };
+    if n >= 2 { b1 = ecs_rcmd_bucket_update(b1); };
+    if n >= 3 { b2 = ecs_rcmd_bucket_update(b2); };
+    if n >= 4 { b3 = ecs_rcmd_bucket_update(b3); };
+    return EcsRcmDeep { n: n, b0: b0, b1: b1, b2: b2, b3: b3 };
+}
+
+struct EcsRcmdGet {
+    has: bool,
+    count: i64,
+    first_entity: i32,
+    message_count: i64,
+}
+
+fn ecs_rcmd_get_has(r: EcsRcmdGet) -> bool { return r.has; }
+fn ecs_rcmd_get_count(r: EcsRcmdGet) -> i64 { return r.count; }
+fn ecs_rcmd_get_first_entity(r: EcsRcmdGet) -> i32 { return r.first_entity; }
+fn ecs_rcmd_get_message_count(r: EcsRcmdGet) -> i64 { return r.message_count; }
+
+fn ecs_rcmd_get(s: EcsRcmDeep, component_id: i32) -> EcsRcmdGet {
+    let idx = ecs_rcmd_find(s, component_id);
+    if idx < 0 {
+        return EcsRcmdGet { has: false, count: 0, first_entity: -1, message_count: 0 };
+    };
+    let b = ecs_rcmd_get_bucket(s, idx);
+    let count = ecs_rcmd_bucket_len(b);
+    let first = -1;
+    if count > 0 {
+        first = ecs_rcmd_bucket_entity_at(b, 0);
+    };
+    return EcsRcmdGet {
+        has: true, count: count, first_entity: first, message_count: b.message_count,
+    };
+}
+
+struct EcsRcmdPair {
+    component_id: i32,
+    count: i64,
+}
+
+fn ecs_rcmd_pair_id(p: EcsRcmdPair) -> i32 { return p.component_id; }
+fn ecs_rcmd_pair_count(p: EcsRcmdPair) -> i64 { return p.count; }
+
+fn ecs_rcmd_iter_count(s: EcsRcmDeep) -> i32 { return s.n; }
+
+fn ecs_rcmd_iter_pair(s: EcsRcmDeep, idx: i32) -> EcsRcmdPair {
+    if idx < 0 {
+        return EcsRcmdPair { component_id: -1, count: 0 };
+    };
+    if idx >= s.n {
+        return EcsRcmdPair { component_id: -1, count: 0 };
+    };
+    let b = ecs_rcmd_get_bucket(s, idx);
+    return EcsRcmdPair { component_id: b.component_id, count: ecs_rcmd_bucket_len(b) };
+}
+
+// RemovedComponents reader: Local cursor over one component's Messages
+struct EcsRcmdReaderDeep {
+    component_id: i32,
+    last_message_count: i64,
+}
+
+fn ecs_rcmd_reader_new(component_id: i32) -> EcsRcmdReaderDeep {
+    return EcsRcmdReaderDeep { component_id: component_id, last_message_count: 0 };
+}
+
+fn ecs_rcmd_reader_last(r: EcsRcmdReaderDeep) -> i64 { return r.last_message_count; }
+
+// unread len = min(message_count - last, stored_len)
+fn ecs_rcmd_reader_len(r: EcsRcmdReaderDeep, s: EcsRcmDeep) -> i64 {
+    let idx = ecs_rcmd_find(s, r.component_id);
+    if idx < 0 { return 0; };
+    let b = ecs_rcmd_get_bucket(s, idx);
+    if b.message_count <= r.last_message_count { return 0; };
+    let unread = b.message_count - r.last_message_count;
+    let stored = ecs_rcmd_bucket_len(b);
+    if unread < stored { return unread; };
+    return stored;
+}
+
+fn ecs_rcmd_reader_is_empty(r: EcsRcmdReaderDeep, s: EcsRcmDeep) -> bool {
+    if ecs_rcmd_reader_len(r, s) == 0 { return true; };
+    return false;
+}
+
+// clear: jump cursor to message_count
+fn ecs_rcmd_reader_clear(r: EcsRcmdReaderDeep, s: EcsRcmDeep) -> EcsRcmdReaderDeep {
+    let idx = ecs_rcmd_find(s, r.component_id);
+    if idx < 0 {
+        return EcsRcmdReaderDeep { component_id: r.component_id, last_message_count: r.last_message_count };
+    };
+    let b = ecs_rcmd_get_bucket(s, idx);
+    return EcsRcmdReaderDeep { component_id: r.component_id, last_message_count: b.message_count };
+}
+
+// read next entity; advances cursor by 1 if available
+struct EcsRcmdReadResult {
+    reader: EcsRcmdReaderDeep,
+    has: bool,
+    entity: i32,
+    id: i64,
+}
+
+fn ecs_rcmd_read_reader(r: EcsRcmdReadResult) -> EcsRcmdReaderDeep { return r.reader; }
+fn ecs_rcmd_read_has(r: EcsRcmdReadResult) -> bool { return r.has; }
+fn ecs_rcmd_read_entity(r: EcsRcmdReadResult) -> i32 { return r.entity; }
+fn ecs_rcmd_read_id(r: EcsRcmdReadResult) -> i64 { return r.id; }
+
+fn ecs_rcmd_reader_read(r: EcsRcmdReaderDeep, s: EcsRcmDeep) -> EcsRcmdReadResult {
+    let idx = ecs_rcmd_find(s, r.component_id);
+    if idx < 0 {
+        return EcsRcmdReadResult { reader: r, has: false, entity: -1, id: -1 };
+    };
+    let b = ecs_rcmd_get_bucket(s, idx);
+    let last = r.last_message_count;
+    // clamp if messages dropped
+    let oldest = b.a_start;
+    let last2 = last;
+    if last2 < oldest { last2 = oldest; };
+    if last2 >= b.message_count {
+        let r2 = EcsRcmdReaderDeep { component_id: r.component_id, last_message_count: last2 };
+        return EcsRcmdReadResult { reader: r2, has: false, entity: -1, id: -1 };
+    };
+    // map last2 to storage index
+    let entity = 0;
+    let found = false;
+    if last2 < b.b_start {
+        let ai = last2 - b.a_start;
+        if ai >= 0 {
+            if ai < (b.a_len as i64) {
+                entity = ecs_rcmd_bucket_entity_at(b, ai as i32);
+                found = true;
+            };
+        };
+    };
+    if found != true {
+        let bi = last2 - b.b_start;
+        if bi >= 0 {
+            if bi < (b.b_len as i64) {
+                let flat = b.a_len + (bi as i32);
+                entity = ecs_rcmd_bucket_entity_at(b, flat);
+                found = true;
+            };
+        };
+    };
+    if found != true {
+        let r3 = EcsRcmdReaderDeep { component_id: r.component_id, last_message_count: b.message_count };
+        return EcsRcmdReadResult { reader: r3, has: false, entity: -1, id: -1 };
+    };
+    let r4 = EcsRcmdReaderDeep { component_id: r.component_id, last_message_count: last2 + 1 };
+    return EcsRcmdReadResult { reader: r4, has: true, entity: entity, id: last2 };
+}
+
+fn ecs_rcmd_reader_read_with_id(r: EcsRcmdReaderDeep, s: EcsRcmDeep) -> EcsRcmdReadResult {
+    return ecs_rcmd_reader_read(r, s);
+}
+
+// double-update drops old A contents for a bucket
+fn ecs_rcmd_bucket_oldest(b: EcsRcmBucketDeep) -> i64 { return b.a_start; }
+fn ecs_rcmd_bucket_message_count(b: EcsRcmBucketDeep) -> i64 { return b.message_count; }
+fn ecs_rcmd_bucket_a_len(b: EcsRcmBucketDeep) -> i32 { return b.a_len; }
+fn ecs_rcmd_bucket_b_len(b: EcsRcmBucketDeep) -> i32 { return b.b_len; }

@@ -1,0 +1,186 @@
+// Deepened Bevy ECS FilteredResourcesBuilder / MutBuilder.
+// Mirrors src/world/filtered_resource.rs builders:
+//   add_read / add_write by id, add_read_all / add_write_all
+//   access bits + build markers
+// Fixed capacity: component/resource ids 0..30 bitset. Shallow retained.
+
+struct EcsFrbAccessDeep {
+    read_bits: i64,
+    write_bits: i64,
+    read_all: bool,
+    write_all: bool,
+}
+
+fn ecs_frb_access_new() -> EcsFrbAccessDeep {
+    return EcsFrbAccessDeep { read_bits: 0, write_bits: 0, read_all: false, write_all: false };
+}
+
+fn ecs_frb_bit(id: i32) -> i64 {
+    if id < 0 { return 0; };
+    if id > 30 { return 0; };
+    let b: i64 = 1;
+    let i: i32 = 0;
+    while i < id {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ecs_frb_bits_or(bits: i64, bit: i64) -> i64 {
+    if bit == 0 { return bits; };
+    let t = bits / bit;
+    let rem = t - ((t / 2) * 2);
+    if rem == 1 { return bits; };
+    return bits + bit;
+}
+
+fn ecs_frb_bits_has(bits: i64, bit: i64) -> bool {
+    if bit == 0 { return false; };
+    let t = bits / bit;
+    let rem = t - ((t / 2) * 2);
+    return rem == 1;
+}
+
+fn ecs_frb_access_can_read(a: EcsFrbAccessDeep, id: i32) -> bool {
+    if a.read_all { return true; };
+    if a.write_all { return true; };
+    let bit = ecs_frb_bit(id);
+    if ecs_frb_bits_has(a.read_bits, bit) { return true; };
+    if ecs_frb_bits_has(a.write_bits, bit) { return true; };
+    return false;
+}
+
+fn ecs_frb_access_can_write(a: EcsFrbAccessDeep, id: i32) -> bool {
+    if a.write_all { return true; };
+    return ecs_frb_bits_has(a.write_bits, ecs_frb_bit(id));
+}
+
+// read-only builder
+struct EcsFrbDeep {
+    world_id: i32,
+    access: EcsFrbAccessDeep,
+    built: bool,
+}
+
+fn ecs_frb_deep_new(world_id: i32) -> EcsFrbDeep {
+    return EcsFrbDeep { world_id: world_id, access: ecs_frb_access_new(), built: false };
+}
+
+fn ecs_frb_deep_world(b: EcsFrbDeep) -> i32 { return b.world_id; }
+fn ecs_frb_deep_built(b: EcsFrbDeep) -> bool { return b.built; }
+fn ecs_frb_deep_read_all(b: EcsFrbDeep) -> bool { return b.access.read_all; }
+fn ecs_frb_deep_write_all(b: EcsFrbDeep) -> bool { return b.access.write_all; }
+fn ecs_frb_deep_read_bits(b: EcsFrbDeep) -> i64 { return b.access.read_bits; }
+fn ecs_frb_deep_write_bits(b: EcsFrbDeep) -> i64 { return b.access.write_bits; }
+
+fn ecs_frb_deep_rebuild(world_id: i32, access: EcsFrbAccessDeep, built: bool) -> EcsFrbDeep {
+    return EcsFrbDeep { world_id: world_id, access: access, built: built };
+}
+
+fn ecs_frb_deep_add_read_by_id(b: EcsFrbDeep, id: i32) -> EcsFrbDeep {
+    let a = b.access;
+    let a2 = EcsFrbAccessDeep {
+        read_bits: ecs_frb_bits_or(a.read_bits, ecs_frb_bit(id)),
+        write_bits: a.write_bits,
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+    return ecs_frb_deep_rebuild(b.world_id, a2, false);
+}
+
+fn ecs_frb_deep_add_read_all(b: EcsFrbDeep) -> EcsFrbDeep {
+    let a = b.access;
+    let a2 = EcsFrbAccessDeep {
+        read_bits: a.read_bits, write_bits: a.write_bits, read_all: true, write_all: a.write_all,
+    };
+    return ecs_frb_deep_rebuild(b.world_id, a2, false);
+}
+
+fn ecs_frb_deep_build(b: EcsFrbDeep) -> EcsFrbDeep {
+    return ecs_frb_deep_rebuild(b.world_id, b.access, true);
+}
+
+fn ecs_frb_deep_can_read(b: EcsFrbDeep, id: i32) -> bool {
+    return ecs_frb_access_can_read(b.access, id);
+}
+
+// mut builder
+struct EcsFrbmDeep {
+    world_id: i32,
+    access: EcsFrbAccessDeep,
+    built: bool,
+}
+
+fn ecs_frbm_deep_new(world_id: i32) -> EcsFrbmDeep {
+    return EcsFrbmDeep { world_id: world_id, access: ecs_frb_access_new(), built: false };
+}
+
+fn ecs_frbm_deep_world(b: EcsFrbmDeep) -> i32 { return b.world_id; }
+fn ecs_frbm_deep_built(b: EcsFrbmDeep) -> bool { return b.built; }
+fn ecs_frbm_deep_read_all(b: EcsFrbmDeep) -> bool { return b.access.read_all; }
+fn ecs_frbm_deep_write_all(b: EcsFrbmDeep) -> bool { return b.access.write_all; }
+
+fn ecs_frbm_deep_rebuild(world_id: i32, access: EcsFrbAccessDeep, built: bool) -> EcsFrbmDeep {
+    return EcsFrbmDeep { world_id: world_id, access: access, built: built };
+}
+
+fn ecs_frbm_deep_add_read_by_id(b: EcsFrbmDeep, id: i32) -> EcsFrbmDeep {
+    let a = b.access;
+    let a2 = EcsFrbAccessDeep {
+        read_bits: ecs_frb_bits_or(a.read_bits, ecs_frb_bit(id)),
+        write_bits: a.write_bits,
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+    return ecs_frbm_deep_rebuild(b.world_id, a2, false);
+}
+
+fn ecs_frbm_deep_add_write_by_id(b: EcsFrbmDeep, id: i32) -> EcsFrbmDeep {
+    let a = b.access;
+    let bit = ecs_frb_bit(id);
+    let a2 = EcsFrbAccessDeep {
+        read_bits: ecs_frb_bits_or(a.read_bits, bit),
+        write_bits: ecs_frb_bits_or(a.write_bits, bit),
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+    return ecs_frbm_deep_rebuild(b.world_id, a2, false);
+}
+
+fn ecs_frbm_deep_add_read_all(b: EcsFrbmDeep) -> EcsFrbmDeep {
+    let a = b.access;
+    let a2 = EcsFrbAccessDeep {
+        read_bits: a.read_bits, write_bits: a.write_bits, read_all: true, write_all: a.write_all,
+    };
+    return ecs_frbm_deep_rebuild(b.world_id, a2, false);
+}
+
+fn ecs_frbm_deep_add_write_all(b: EcsFrbmDeep) -> EcsFrbmDeep {
+    let a = b.access;
+    let a2 = EcsFrbAccessDeep {
+        read_bits: a.read_bits, write_bits: a.write_bits, read_all: true, write_all: true,
+    };
+    return ecs_frbm_deep_rebuild(b.world_id, a2, false);
+}
+
+fn ecs_frbm_deep_build(b: EcsFrbmDeep) -> EcsFrbmDeep {
+    return ecs_frbm_deep_rebuild(b.world_id, b.access, true);
+}
+
+fn ecs_frbm_deep_can_read(b: EcsFrbmDeep, id: i32) -> bool {
+    return ecs_frb_access_can_read(b.access, id);
+}
+
+fn ecs_frbm_deep_can_write(b: EcsFrbmDeep, id: i32) -> bool {
+    return ecs_frb_access_can_write(b.access, id);
+}
+
+// as_readonly from mut builder
+fn ecs_frbm_deep_as_readonly(b: EcsFrbmDeep) -> EcsFrbDeep {
+    let a = b.access;
+    let a2 = EcsFrbAccessDeep {
+        read_bits: a.read_bits, write_bits: 0, read_all: a.read_all, write_all: false,
+    };
+    return ecs_frb_deep_rebuild(b.world_id, a2, b.built);
+}

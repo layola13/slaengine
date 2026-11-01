@@ -1,0 +1,708 @@
+// Deepened Bevy ECS DeferredWorld residual surface.
+// Mirrors src/world/deferred_world.rs extras not fully fixed-slot in deferred_world_deep:
+//   get_entity_mut / entity_mut (WorldEntityFetch single + multi alias check)
+//   get_mut / get_mut_by_id
+//   query handle allocation
+//   get_resource_mut_by_id / resource_mut
+//   get_non_send_mut_by_id / non_send_resource_mut (thread check)
+//   change_tick / world_id / reborrow
+// Fixed capacity: 4 entities x 2 component slots, 2 send resources, 2 non-send.
+// Shallow lib/deferred_world_extras.sla retained.
+
+const ECS_DWX_D_OK: i32 = 0;
+const ECS_DWX_D_NOT_SPAWNED: i32 = 1;
+const ECS_DWX_D_ALIASED: i32 = 2;
+
+struct EcsDwxDeep {
+    world_id: i32,
+    call_thread_id: i32,
+    change_tick: i32,
+    // entities 0..3
+    e0: bool, e0c0: i32, e0v0: i32, e0c1: i32, e0v1: i32, e0n: i32,
+    e1: bool, e1c0: i32, e1v0: i32, e1c1: i32, e1v1: i32, e1n: i32,
+    e2: bool, e2c0: i32, e2v0: i32, e2c1: i32, e2v1: i32, e2n: i32,
+    e3: bool, e3c0: i32, e3v0: i32, e3c1: i32, e3v1: i32, e3n: i32,
+    next_entity: i32,
+    // send resources
+    r0: i32, rv0: i32,
+    r1: i32, rv1: i32,
+    rlen: i32,
+    // non-send resources
+    ns0: i32, nsv0: i32, nst0: i32,
+    ns1: i32, nsv1: i32, nst1: i32,
+    nslen: i32,
+    next_query_handle: i32,
+    // exclusive entity mut borrow flag (simple single-borrow model)
+    mut_borrowed: bool,
+    mut_entity: i32,
+}
+
+fn ecs_dwx_deep_new(world_id: i32, call_thread_id: i32) -> EcsDwxDeep {
+    return EcsDwxDeep {
+        world_id: world_id, call_thread_id: call_thread_id, change_tick: 0,
+        e0: false, e0c0: -1, e0v0: 0, e0c1: -1, e0v1: 0, e0n: 0,
+        e1: false, e1c0: -1, e1v0: 0, e1c1: -1, e1v1: 0, e1n: 0,
+        e2: false, e2c0: -1, e2v0: 0, e2c1: -1, e2v1: 0, e2n: 0,
+        e3: false, e3c0: -1, e3v0: 0, e3c1: -1, e3v1: 0, e3n: 0,
+        next_entity: 0,
+        r0: -1, rv0: 0, r1: -1, rv1: 0, rlen: 0,
+        ns0: -1, nsv0: 0, nst0: 0, ns1: -1, nsv1: 0, nst1: 0, nslen: 0,
+        next_query_handle: 1, mut_borrowed: false, mut_entity: -1,
+    };
+}
+
+fn ecs_dwx_deep_world_id(d: EcsDwxDeep) -> i32 { return d.world_id; }
+fn ecs_dwx_deep_call_thread(d: EcsDwxDeep) -> i32 { return d.call_thread_id; }
+fn ecs_dwx_deep_change_tick(d: EcsDwxDeep) -> i32 { return d.change_tick; }
+fn ecs_dwx_deep_next_entity(d: EcsDwxDeep) -> i32 { return d.next_entity; }
+fn ecs_dwx_deep_rlen(d: EcsDwxDeep) -> i32 { return d.rlen; }
+fn ecs_dwx_deep_nslen(d: EcsDwxDeep) -> i32 { return d.nslen; }
+fn ecs_dwx_deep_mut_borrowed(d: EcsDwxDeep) -> bool { return d.mut_borrowed; }
+
+fn ecs_dwx_deep_rebuild(
+    world_id: i32, call_thread_id: i32, change_tick: i32,
+    e0: bool, e0c0: i32, e0v0: i32, e0c1: i32, e0v1: i32, e0n: i32,
+    e1: bool, e1c0: i32, e1v0: i32, e1c1: i32, e1v1: i32, e1n: i32,
+    e2: bool, e2c0: i32, e2v0: i32, e2c1: i32, e2v1: i32, e2n: i32,
+    e3: bool, e3c0: i32, e3v0: i32, e3c1: i32, e3v1: i32, e3n: i32,
+    next_entity: i32,
+    r0: i32, rv0: i32, r1: i32, rv1: i32, rlen: i32,
+    ns0: i32, nsv0: i32, nst0: i32, ns1: i32, nsv1: i32, nst1: i32, nslen: i32,
+    next_query_handle: i32, mut_borrowed: bool, mut_entity: i32
+) -> EcsDwxDeep {
+    return EcsDwxDeep {
+        world_id: world_id, call_thread_id: call_thread_id, change_tick: change_tick,
+        e0: e0, e0c0: e0c0, e0v0: e0v0, e0c1: e0c1, e0v1: e0v1, e0n: e0n,
+        e1: e1, e1c0: e1c0, e1v0: e1v0, e1c1: e1c1, e1v1: e1v1, e1n: e1n,
+        e2: e2, e2c0: e2c0, e2v0: e2v0, e2c1: e2c1, e2v1: e2v1, e2n: e2n,
+        e3: e3, e3c0: e3c0, e3v0: e3v0, e3c1: e3c1, e3v1: e3v1, e3n: e3n,
+        next_entity: next_entity,
+        r0: r0, rv0: rv0, r1: r1, rv1: rv1, rlen: rlen,
+        ns0: ns0, nsv0: nsv0, nst0: nst0, ns1: ns1, nsv1: nsv1, nst1: nst1, nslen: nslen,
+        next_query_handle: next_query_handle, mut_borrowed: mut_borrowed, mut_entity: mut_entity,
+    };
+}
+
+fn ecs_dwx_deep_copy(d: EcsDwxDeep) -> EcsDwxDeep {
+    return ecs_dwx_deep_rebuild(
+        d.world_id, d.call_thread_id, d.change_tick,
+        d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+        d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+        d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+        d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+        d.next_entity,
+        d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+        d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+        d.next_query_handle, d.mut_borrowed, d.mut_entity
+    );
+}
+
+fn ecs_dwx_deep_reborrow(d: EcsDwxDeep) -> EcsDwxDeep {
+    return ecs_dwx_deep_copy(d);
+}
+
+fn ecs_dwx_deep_bump_tick(d: EcsDwxDeep) -> EcsDwxDeep {
+    return ecs_dwx_deep_rebuild(
+        d.world_id, d.call_thread_id, d.change_tick + 1,
+        d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+        d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+        d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+        d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+        d.next_entity,
+        d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+        d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+        d.next_query_handle, d.mut_borrowed, d.mut_entity
+    );
+}
+
+fn ecs_dwx_deep_is_spawned(d: EcsDwxDeep, entity: i32) -> bool {
+    if entity == 0 { return d.e0; };
+    if entity == 1 { return d.e1; };
+    if entity == 2 { return d.e2; };
+    if entity == 3 { return d.e3; };
+    return false;
+}
+
+// spawn entity with primary component id 1 = value
+fn ecs_dwx_deep_spawn(d: EcsDwxDeep, value: i32) -> EcsDwxDeep {
+    let idx = d.next_entity;
+    if idx >= 4 { return d; };
+    if idx == 0 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            true, 1, value, -1, 0, 1,
+            d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+            d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            1, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+            d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    if idx == 1 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+            true, 1, value, -1, 0, 1,
+            d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            2, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+            d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    if idx == 2 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+            d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+            true, 1, value, -1, 0, 1,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            3, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+            d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    return ecs_dwx_deep_rebuild(
+        d.world_id, d.call_thread_id, d.change_tick,
+        d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+        d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+        d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+        true, 1, value, -1, 0, 1,
+        4, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+        d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+        d.next_query_handle, d.mut_borrowed, d.mut_entity
+    );
+}
+
+// insert component on entity (capacity 2)
+fn ecs_dwx_deep_insert_comp(d: EcsDwxDeep, entity: i32, cid: i32, value: i32) -> EcsDwxDeep {
+    if ecs_dwx_deep_is_spawned(d, entity) != true { return d; };
+    // entity 0
+    if entity == 0 {
+        if d.e0n >= 1 {
+            if d.e0c0 == cid {
+                return ecs_dwx_deep_rebuild(
+                    d.world_id, d.call_thread_id, d.change_tick,
+                    d.e0, d.e0c0, value, d.e0c1, d.e0v1, d.e0n,
+                    d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                    d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                    d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                    d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                    d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                    d.next_query_handle, d.mut_borrowed, d.mut_entity
+                );
+            };
+        };
+        if d.e0n >= 2 {
+            if d.e0c1 == cid {
+                return ecs_dwx_deep_rebuild(
+                    d.world_id, d.call_thread_id, d.change_tick,
+                    d.e0, d.e0c0, d.e0v0, d.e0c1, value, d.e0n,
+                    d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                    d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                    d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                    d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                    d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                    d.next_query_handle, d.mut_borrowed, d.mut_entity
+                );
+            };
+        };
+        if d.e0n == 0 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                true, cid, value, -1, 0, 1,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        if d.e0n == 1 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                true, d.e0c0, d.e0v0, cid, value, 2,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        return d;
+    };
+    if entity == 1 {
+        if d.e1n >= 1 {
+            if d.e1c0 == cid {
+                return ecs_dwx_deep_rebuild(
+                    d.world_id, d.call_thread_id, d.change_tick,
+                    d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                    d.e1, d.e1c0, value, d.e1c1, d.e1v1, d.e1n,
+                    d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                    d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                    d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                    d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                    d.next_query_handle, d.mut_borrowed, d.mut_entity
+                );
+            };
+        };
+        if d.e1n >= 2 {
+            if d.e1c1 == cid {
+                return ecs_dwx_deep_rebuild(
+                    d.world_id, d.call_thread_id, d.change_tick,
+                    d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                    d.e1, d.e1c0, d.e1v0, d.e1c1, value, d.e1n,
+                    d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                    d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                    d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                    d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                    d.next_query_handle, d.mut_borrowed, d.mut_entity
+                );
+            };
+        };
+        if d.e1n == 0 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                true, cid, value, -1, 0, 1,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        if d.e1n == 1 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                true, d.e1c0, d.e1v0, cid, value, 2,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        return d;
+    };
+    if entity == 2 {
+        if d.e2n >= 1 {
+            if d.e2c0 == cid {
+                return ecs_dwx_deep_rebuild(
+                    d.world_id, d.call_thread_id, d.change_tick,
+                    d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                    d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                    d.e2, d.e2c0, value, d.e2c1, d.e2v1, d.e2n,
+                    d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                    d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                    d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                    d.next_query_handle, d.mut_borrowed, d.mut_entity
+                );
+            };
+        };
+        if d.e2n == 0 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                true, cid, value, -1, 0, 1,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        if d.e2n == 1 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                true, d.e2c0, d.e2v0, cid, value, 2,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        return d;
+    };
+    if entity == 3 {
+        if d.e3n >= 1 {
+            if d.e3c0 == cid {
+                return ecs_dwx_deep_rebuild(
+                    d.world_id, d.call_thread_id, d.change_tick,
+                    d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                    d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                    d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                    d.e3, d.e3c0, value, d.e3c1, d.e3v1, d.e3n,
+                    d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                    d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                    d.next_query_handle, d.mut_borrowed, d.mut_entity
+                );
+            };
+        };
+        if d.e3n == 0 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                true, cid, value, -1, 0, 1,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+        if d.e3n == 1 {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                true, d.e3c0, d.e3v0, cid, value, 2,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+    };
+    return d;
+}
+
+struct EcsDwxGetDeep {
+    ok: bool,
+    err: i32,
+    entity: i32,
+    value: i32,
+}
+
+fn ecs_dwx_get_ok(r: EcsDwxGetDeep) -> bool { return r.ok; }
+fn ecs_dwx_get_err(r: EcsDwxGetDeep) -> i32 { return r.err; }
+fn ecs_dwx_get_entity(r: EcsDwxGetDeep) -> i32 { return r.entity; }
+fn ecs_dwx_get_value(r: EcsDwxGetDeep) -> i32 { return r.value; }
+
+fn ecs_dwx_deep_primary_value(d: EcsDwxDeep, entity: i32) -> i32 {
+    if entity == 0 { return d.e0v0; };
+    if entity == 1 { return d.e1v0; };
+    if entity == 2 { return d.e2v0; };
+    if entity == 3 { return d.e3v0; };
+    return 0;
+}
+
+fn ecs_dwx_deep_comp_value(d: EcsDwxDeep, entity: i32, cid: i32) -> EcsDwxGetDeep {
+    if ecs_dwx_deep_is_spawned(d, entity) != true {
+        return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_NOT_SPAWNED, entity: entity, value: 0 };
+    };
+    if entity == 0 {
+        if d.e0n >= 1 {
+            if d.e0c0 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e0v0 }; };
+        };
+        if d.e0n >= 2 {
+            if d.e0c1 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e0v1 }; };
+        };
+    };
+    if entity == 1 {
+        if d.e1n >= 1 {
+            if d.e1c0 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e1v0 }; };
+        };
+        if d.e1n >= 2 {
+            if d.e1c1 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e1v1 }; };
+        };
+    };
+    if entity == 2 {
+        if d.e2n >= 1 {
+            if d.e2c0 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e2v0 }; };
+        };
+        if d.e2n >= 2 {
+            if d.e2c1 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e2v1 }; };
+        };
+    };
+    if entity == 3 {
+        if d.e3n >= 1 {
+            if d.e3c0 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e3v0 }; };
+        };
+        if d.e3n >= 2 {
+            if d.e3c1 == cid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: entity, value: d.e3v1 }; };
+        };
+    };
+    return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_OK, entity: entity, value: 0 };
+}
+
+// get_entity_mut single
+fn ecs_dwx_deep_get_entity_mut(d: EcsDwxDeep, entity: i32) -> EcsDwxGetDeep {
+    if ecs_dwx_deep_is_spawned(d, entity) != true {
+        return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_NOT_SPAWNED, entity: entity, value: 0 };
+    };
+    return EcsDwxGetDeep {
+        ok: true, err: ECS_DWX_D_OK, entity: entity, value: ecs_dwx_deep_primary_value(d, entity),
+    };
+}
+
+// multi entity mut: alias check
+fn ecs_dwx_deep_get_entity_mut_many(d: EcsDwxDeep, e0: i32, e1: i32, n: i32) -> EcsDwxGetDeep {
+    if n >= 2 {
+        if e0 == e1 {
+            return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_ALIASED, entity: e0, value: 0 };
+        };
+    };
+    if n >= 1 {
+        if ecs_dwx_deep_is_spawned(d, e0) != true {
+            return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_NOT_SPAWNED, entity: e0, value: 0 };
+        };
+    };
+    if n >= 2 {
+        if ecs_dwx_deep_is_spawned(d, e1) != true {
+            return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_NOT_SPAWNED, entity: e1, value: 0 };
+        };
+    };
+    return EcsDwxGetDeep {
+        ok: true, err: ECS_DWX_D_OK, entity: e0, value: ecs_dwx_deep_primary_value(d, e0),
+    };
+}
+
+fn ecs_dwx_deep_get_mut(d: EcsDwxDeep, entity: i32, cid: i32) -> EcsDwxGetDeep {
+    return ecs_dwx_deep_comp_value(d, entity, cid);
+}
+
+fn ecs_dwx_deep_get_mut_by_id(d: EcsDwxDeep, entity: i32, cid: i32) -> EcsDwxGetDeep {
+    return ecs_dwx_deep_get_mut(d, entity, cid);
+}
+
+// apply set after get_mut
+struct EcsDwxSetDeep {
+    world: EcsDwxDeep,
+    ok: bool,
+}
+
+fn ecs_dwx_set_world(r: EcsDwxSetDeep) -> EcsDwxDeep { return r.world; }
+fn ecs_dwx_set_ok(r: EcsDwxSetDeep) -> bool { return r.ok; }
+
+fn ecs_dwx_deep_set_mut(d: EcsDwxDeep, entity: i32, cid: i32, value: i32) -> EcsDwxSetDeep {
+    let g = ecs_dwx_deep_get_mut(d, entity, cid);
+    if g.ok != true {
+        return EcsDwxSetDeep { world: d, ok: false };
+    };
+    return EcsDwxSetDeep { world: ecs_dwx_deep_insert_comp(d, entity, cid, value), ok: true };
+}
+
+// query: allocate handle, return updated world + handle
+struct EcsDwxQueryDeep {
+    world: EcsDwxDeep,
+    handle: i32,
+    world_id: i32,
+}
+
+fn ecs_dwx_query_world(r: EcsDwxQueryDeep) -> EcsDwxDeep { return r.world; }
+fn ecs_dwx_query_handle_id(r: EcsDwxQueryDeep) -> i32 { return r.handle; }
+fn ecs_dwx_query_world_id(r: EcsDwxQueryDeep) -> i32 { return r.world_id; }
+
+fn ecs_dwx_deep_query(d: EcsDwxDeep) -> EcsDwxQueryDeep {
+    let h = d.next_query_handle;
+    let d2 = ecs_dwx_deep_rebuild(
+        d.world_id, d.call_thread_id, d.change_tick,
+        d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+        d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+        d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+        d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+        d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+        d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+        h + 1, d.mut_borrowed, d.mut_entity
+    );
+    return EcsDwxQueryDeep { world: d2, handle: h, world_id: d.world_id };
+}
+
+// resources
+fn ecs_dwx_deep_resource_insert(d: EcsDwxDeep, rid: i32, value: i32) -> EcsDwxDeep {
+    if d.rlen >= 1 {
+        if d.r0 == rid {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, value, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+    };
+    if d.rlen >= 2 {
+        if d.r1 == rid {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, value, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+    };
+    if d.rlen == 0 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+            d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+            d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            d.next_entity, rid, value, d.r1, d.rv1, 1,
+            d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    if d.rlen == 1 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+            d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+            d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            d.next_entity, d.r0, d.rv0, rid, value, 2,
+            d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    return d;
+}
+
+fn ecs_dwx_deep_get_resource_mut_by_id(d: EcsDwxDeep, rid: i32) -> EcsDwxGetDeep {
+    if d.rlen >= 1 {
+        if d.r0 == rid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: -1, value: d.rv0 }; };
+    };
+    if d.rlen >= 2 {
+        if d.r1 == rid { return EcsDwxGetDeep { ok: true, err: ECS_DWX_D_OK, entity: -1, value: d.rv1 }; };
+    };
+    return EcsDwxGetDeep { ok: false, err: ECS_DWX_D_OK, entity: -1, value: 0 };
+}
+
+// non-send
+fn ecs_dwx_deep_insert_non_send(d: EcsDwxDeep, rid: i32, value: i32, thread_id: i32) -> EcsDwxDeep {
+    if d.nslen >= 1 {
+        if d.ns0 == rid {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, value, thread_id, d.ns1, d.nsv1, d.nst1, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+    };
+    if d.nslen >= 2 {
+        if d.ns1 == rid {
+            return ecs_dwx_deep_rebuild(
+                d.world_id, d.call_thread_id, d.change_tick,
+                d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+                d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+                d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+                d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+                d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+                d.ns0, d.nsv0, d.nst0, d.ns1, value, thread_id, d.nslen,
+                d.next_query_handle, d.mut_borrowed, d.mut_entity
+            );
+        };
+    };
+    if d.nslen == 0 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+            d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+            d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+            rid, value, thread_id, d.ns1, d.nsv1, d.nst1, 1,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    if d.nslen == 1 {
+        return ecs_dwx_deep_rebuild(
+            d.world_id, d.call_thread_id, d.change_tick,
+            d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+            d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+            d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+            d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+            d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+            d.ns0, d.nsv0, d.nst0, rid, value, thread_id, 2,
+            d.next_query_handle, d.mut_borrowed, d.mut_entity
+        );
+    };
+    return d;
+}
+
+struct EcsDwxNsGetDeep {
+    ok: bool,
+    value: i32,
+    thread_ok: bool,
+}
+
+fn ecs_dwx_ns_ok(r: EcsDwxNsGetDeep) -> bool { return r.ok; }
+fn ecs_dwx_ns_value(r: EcsDwxNsGetDeep) -> i32 { return r.value; }
+fn ecs_dwx_ns_thread_ok(r: EcsDwxNsGetDeep) -> bool { return r.thread_ok; }
+
+fn ecs_dwx_deep_get_non_send_mut_by_id(d: EcsDwxDeep, rid: i32) -> EcsDwxNsGetDeep {
+    if d.nslen >= 1 {
+        if d.ns0 == rid {
+            let tok = false;
+            if d.nst0 == d.call_thread_id { tok = true; };
+            return EcsDwxNsGetDeep { ok: true, value: d.nsv0, thread_ok: tok };
+        };
+    };
+    if d.nslen >= 2 {
+        if d.ns1 == rid {
+            let tok = false;
+            if d.nst1 == d.call_thread_id { tok = true; };
+            return EcsDwxNsGetDeep { ok: true, value: d.nsv1, thread_ok: tok };
+        };
+    };
+    return EcsDwxNsGetDeep { ok: false, value: 0, thread_ok: false };
+}
+
+fn ecs_dwx_deep_non_send_resource_mut(d: EcsDwxDeep, rid: i32) -> EcsDwxNsGetDeep {
+    // panic-path if absent modeled as ok=false
+    return ecs_dwx_deep_get_non_send_mut_by_id(d, rid);
+}
+
+// exclusive mut borrow markers for entity_mut
+fn ecs_dwx_deep_entity_mut_begin(d: EcsDwxDeep, entity: i32) -> EcsDwxSetDeep {
+    let g = ecs_dwx_deep_get_entity_mut(d, entity);
+    if g.ok != true {
+        return EcsDwxSetDeep { world: d, ok: false };
+    };
+    if d.mut_borrowed {
+        return EcsDwxSetDeep { world: d, ok: false };
+    };
+    let d2 = ecs_dwx_deep_rebuild(
+        d.world_id, d.call_thread_id, d.change_tick,
+        d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+        d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+        d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+        d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+        d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+        d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+        d.next_query_handle, true, entity
+    );
+    return EcsDwxSetDeep { world: d2, ok: true };
+}
+
+fn ecs_dwx_deep_entity_mut_end(d: EcsDwxDeep) -> EcsDwxDeep {
+    return ecs_dwx_deep_rebuild(
+        d.world_id, d.call_thread_id, d.change_tick,
+        d.e0, d.e0c0, d.e0v0, d.e0c1, d.e0v1, d.e0n,
+        d.e1, d.e1c0, d.e1v0, d.e1c1, d.e1v1, d.e1n,
+        d.e2, d.e2c0, d.e2v0, d.e2c1, d.e2v1, d.e2n,
+        d.e3, d.e3c0, d.e3v0, d.e3c1, d.e3v1, d.e3n,
+        d.next_entity, d.r0, d.rv0, d.r1, d.rv1, d.rlen,
+        d.ns0, d.nsv0, d.nst0, d.ns1, d.nsv1, d.nst1, d.nslen,
+        d.next_query_handle, false, -1
+    );
+}

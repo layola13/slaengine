@@ -1,0 +1,215 @@
+// Bevy ECS related-methods insert/replace-with-difference gaps.
+//
+// Mirrors src/relationship/related_methods.rs pub fns:
+//   insert_related<R>(index, related)               — reorders the existing related list by inserting the
+//     new entities starting at `index` (OrderedRelationshipSourceCollection mechanics; duplicates in
+//     `related` take their last index; out-of-bounds clamps).
+//   replace_related<R>(related)                       — replaces the whole related-collection with a
+//     de-duplicated `related`; if empty, detaches the whole relationship-target (mirrors
+//     remove::<R::RelationshipTarget>); if no existing target, behaves as add_related.
+//   replace_related_with_difference<R>(entities_to_unrelate, entities_to_relate, newly_related_entities)
+//     — computes the final related-collection by removing entities_to_unrelate from the existing set,
+//     adding entities_to_relate with newly_related_entities inserted as new edges (sliding over the
+//     invariant that newly_related is disjoint from unrelate and a subset of relate).
+//
+// Model: EcsReplaceInsert holds (related) Vec<i64> plus the final resultant set returned via result
+// struct for replace_with_difference. `<R: Relationship>` generic collapses to relationship_id: i32.
+// insert_related preserves the longest-known list and replaces selected slots; the precise
+// `place_most_recent` mirror is applied as "if entity was in slot k already and the new index matches,
+// move it to the new index; otherwise append at end".
+
+// === Result struct for replace_with_difference (single-field accessors) ===
+struct RelatedDiffResult {
+    final_count: i32,
+    first_final: i64,
+}
+
+fn ecs_rel_diff_count(r: RelatedDiffResult) -> i32 {
+    return r.final_count;
+}
+
+fn ecs_rel_diff_first(r: RelatedDiffResult) -> i64 {
+    return r.first_final;
+}
+
+// === Model ===
+struct EcsReplaceInsert {
+    related: Vec<i64>,
+    has_target: i32,
+}
+
+fn ecs_ri_new() -> EcsReplaceInsert {
+    let r = EcsReplaceInsert { related: Vec::new(), has_target: 0 };
+    return r;
+}
+
+fn ecs_ri_with_existing(related: Vec<i64>) -> EcsReplaceInsert {
+    let m: i32 = len(related) as i32;
+    let flag: i32 = 0;
+    if m > 0 { flag = 1; };
+    let r = EcsReplaceInsert { related: related, has_target: flag };
+    return r;
+}
+
+fn ecs_ri_related_count(r: EcsReplaceInsert) -> i32 {
+    return len(r.related) as i32;
+}
+
+fn ecs_ri_related_at(r: EcsReplaceInsert, idx: i32) -> i64 {
+    let n: i32 = len(r.related) as i32;
+    if idx < 0 || idx >= n { return -1; };
+    return r.related[idx];
+}
+
+fn ecs_ri_has_target(r: EcsReplaceInsert) -> bool {
+    return r.has_target == 1;
+}
+
+// internal: remove entity from r.related, shifting trailing slots (sla Vecs lack remove_at).
+fn _ecs_ri_remove_at(r: EcsReplaceInsert, idx: i32) -> EcsReplaceInsert {
+    let n: i32 = len(r.related) as i32;
+    if idx < 0 || idx >= n { return r; };
+    let kept = Vec::new();
+    let i: i32 = 0;
+    while i < n - 1 {
+        let src: i32 = i;
+        if i >= idx { src = i + 1; };
+        kept.push(r.related[src]);
+        i = i + 1;
+    }
+    r.related = kept;
+    return r;
+}
+// internal: find related-list index of entity, or -1.
+fn _ecs_ri_index_of(r: EcsReplaceInsert, entity: i64) -> i32 {
+    let n: i32 = len(r.related) as i32;
+    let i: i32 = 0;
+    while i < n { if r.related[i] == entity { return i; }; i = i + 1; }
+    return -1;
+}
+
+// internal: clamp-insert entity at place_idx (out-of-bounds clamps; mid-list rebuilds).
+fn _ecs_ri_insert_at(r: EcsReplaceInsert, entity: i64, place_idx: i32) -> EcsReplaceInsert {
+    let new_n: i32 = len(r.related) as i32;
+    let clamped: i32 = place_idx;
+    if clamped > new_n { clamped = new_n; };
+    if clamped < 0 { clamped = 0; };
+    if clamped >= new_n {
+        r.related.push(entity);
+        return r;
+    };
+    let rebuilt = Vec::new();
+    let i: i32 = 0;
+    while i < clamped { rebuilt.push(r.related[i]); i = i + 1; }
+    rebuilt.push(entity);
+    let j: i32 = clamped;
+    while j < new_n { rebuilt.push(r.related[j]); j = j + 1; }
+    r.related = rebuilt;
+    return r;
+}
+
+// insert_related(relationship_id, index, related): mirrors Bevy's reordering.
+// Per-entity: if already in list, remove from existing slot then insert back at (index + offset);
+// otherwise insert at (index + offset).
+fn ecs_ri_insert_related(r: EcsReplaceInsert, relationship_id: i32, start_index: i32, related: Vec<i64>) -> EcsReplaceInsert {
+    let _ = relationship_id;
+    let related_n: i32 = len(related) as i32;
+    if related_n == 0 { return r; };
+    r.has_target = 1;
+    let offset: i32 = 0;
+    while offset < related_n {
+        let entity = related[offset];
+        let target_idx: i32 = start_index + offset;
+        let existing_idx = _ecs_ri_index_of(r, entity);
+        if existing_idx >= 0 {
+            // remove from existing slot and re-insert at target
+            let removed = _ecs_ri_remove_at(r, existing_idx);
+            r = _ecs_ri_insert_at(removed, entity, target_idx);
+        } else {
+            r = _ecs_ri_insert_at(r, entity, target_idx);
+        };
+        offset = offset + 1;
+    }
+    return r;
+}
+
+// replace_related(relationship_id, related): replaces whole set with de-duplicated related.
+// Bevy: if related is empty, remove::<R::RelationshipTarget>; if no existing target, add_related.
+fn ecs_ri_replace_related(r: EcsReplaceInsert, relationship_id: i32, related: Vec<i64>) -> EcsReplaceInsert {
+    let _ = relationship_id;
+    let n: i32 = len(related) as i32;
+    if n == 0 {
+        let empty = Vec::new();
+        r.related = empty;
+        r.has_target = 0;
+        return r;
+    };
+    // de-dup while preserving first-occurrence order
+    let deduped = Vec::new();
+    let i: i32 = 0;
+    while i < n {
+        let e = related[i];
+        let already: bool = false;
+        let k: i32 = 0;
+        let dn: i32 = len(deduped) as i32;
+        while k < dn {
+            if deduped[k] == e { already = true; };
+            k = k + 1;
+        }
+        if !already {
+            deduped.push(e);
+        };
+        i = i + 1;
+    }
+    r.related = deduped;
+    r.has_target = 1;
+    return r;
+}
+
+// internal: vec-contains predicate.
+fn _ecs_ri_vec_contains(list: Vec<i64>, entity: i64) -> bool {
+    let n: i32 = len(list) as i32;
+    let i: i32 = 0;
+    while i < n { if list[i] == entity { return true; }; i = i + 1; }
+    return false;
+}
+
+// replace_related_with_difference(unrelate, relate, newly_related):
+// Final related = (existing \ unrelate) ∪ relate with newly_related treated as "new insertions".
+// We mirror Bevy's invariant by UNIONing relate into the kept-set (since Bevy accepts newly_related ⊂ relate),
+// ignoring any unrelate entry in the final kept-set.
+fn ecs_ri_replace_related_with_difference(r: EcsReplaceInsert, relationship_id: i32, unrelate: Vec<i64>, relate: Vec<i64>, newly_related: Vec<i64>) -> (EcsReplaceInsert, RelatedDiffResult) {
+    let _ = relationship_id;
+    let _ = newly_related;
+    // start from existing
+    let existing = r.related;
+    let mut_set = Vec::new();
+    // copy existing entries NOT in unrelate, deduped
+    let existing_n: i32 = len(existing) as i32;
+    let i: i32 = 0;
+    while i < existing_n {
+        let e = existing[i];
+        let in_unrelate = _ecs_ri_vec_contains(unrelate, e);
+        if !in_unrelate {
+            let already = _ecs_ri_vec_contains(mut_set, e);
+            if !already { mut_set.push(e); };
+        };
+        i = i + 1;
+    }
+    // then UNION-in relate entries, deduped
+    let relate_n: i32 = len(relate) as i32;
+    let j: i32 = 0;
+    while j < relate_n {
+        let e = relate[j];
+        let already = _ecs_ri_vec_contains(mut_set, e);
+        if !already { mut_set.push(e); };
+        j = j + 1;
+    }
+    r.related = mut_set;
+    r.has_target = 1;
+    let cnt: i32 = len(r.related) as i32;
+    let first: i64 = -1;
+    if cnt > 0 { first = r.related[0]; };
+    let res = RelatedDiffResult { final_count: cnt, first_final: first };
+    return (r, res);
+}

@@ -1,0 +1,388 @@
+// Deepened Bevy ECS Messages buffer.
+// Mirrors src/message/messages.rs:
+//   Messages { messages_a, messages_b, message_count }
+//   MessageSequence { start_message_count, messages }
+//   write / write_batch / write_default / Extend
+//   get_cursor / get_cursor_current
+//   update / update_drain
+//   clear / drain / len / is_empty
+//   oldest_message_count / get_message / sequence
+//   iter_current_update_messages
+//   WriteBatchIds { last_count, message_count }
+// Fixed capacity: 8 slots per sequence. Shallow lib/messages_buffer.sla retained.
+
+struct EcsMsgBufDeep {
+    message_count: i64,
+    a_start: i64,
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    a4: i64, a5: i64, a6: i64, a7: i64,
+    a_len: i32,
+    b_start: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+    b4: i64, b5: i64, b6: i64, b7: i64,
+    b_len: i32,
+}
+
+fn ecs_msgbuf_deep_new() -> EcsMsgBufDeep {
+    return EcsMsgBufDeep {
+        message_count: 0,
+        a_start: 0,
+        a0: 0, a1: 0, a2: 0, a3: 0,
+        a4: 0, a5: 0, a6: 0, a7: 0,
+        a_len: 0,
+        b_start: 0,
+        b0: 0, b1: 0, b2: 0, b3: 0,
+        b4: 0, b5: 0, b6: 0, b7: 0,
+        b_len: 0,
+    };
+}
+
+fn ecs_msgbuf_deep_message_count(m: EcsMsgBufDeep) -> i64 { return m.message_count; }
+fn ecs_msgbuf_deep_a_len(m: EcsMsgBufDeep) -> i32 { return m.a_len; }
+fn ecs_msgbuf_deep_b_len(m: EcsMsgBufDeep) -> i32 { return m.b_len; }
+fn ecs_msgbuf_deep_a_start(m: EcsMsgBufDeep) -> i64 { return m.a_start; }
+fn ecs_msgbuf_deep_b_start(m: EcsMsgBufDeep) -> i64 { return m.b_start; }
+
+// Bevy: oldest_message_count = messages_a.start_message_count
+fn ecs_msgbuf_deep_oldest_message_count(m: EcsMsgBufDeep) -> i64 { return m.a_start; }
+
+// Bevy: len = a.len + b.len
+fn ecs_msgbuf_deep_len(m: EcsMsgBufDeep) -> i64 {
+    return (m.a_len as i64) + (m.b_len as i64);
+}
+
+fn ecs_msgbuf_deep_is_empty(m: EcsMsgBufDeep) -> bool {
+    if ecs_msgbuf_deep_len(m) == 0 { return true; };
+    return false;
+}
+
+fn ecs_msgbuf_deep_a_get(m: EcsMsgBufDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.a0; };
+    if idx == 1 { return m.a1; };
+    if idx == 2 { return m.a2; };
+    if idx == 3 { return m.a3; };
+    if idx == 4 { return m.a4; };
+    if idx == 5 { return m.a5; };
+    if idx == 6 { return m.a6; };
+    if idx == 7 { return m.a7; };
+    return 0;
+}
+
+fn ecs_msgbuf_deep_b_get(m: EcsMsgBufDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.b0; };
+    if idx == 1 { return m.b1; };
+    if idx == 2 { return m.b2; };
+    if idx == 3 { return m.b3; };
+    if idx == 4 { return m.b4; };
+    if idx == 5 { return m.b5; };
+    if idx == 6 { return m.b6; };
+    if idx == 7 { return m.b7; };
+    return 0;
+}
+
+fn ecs_msgbuf_deep_rebuild(
+    message_count: i64,
+    a_start: i64,
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    a4: i64, a5: i64, a6: i64, a7: i64,
+    a_len: i32,
+    b_start: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+    b4: i64, b5: i64, b6: i64, b7: i64,
+    b_len: i32
+) -> EcsMsgBufDeep {
+    return EcsMsgBufDeep {
+        message_count: message_count,
+        a_start: a_start,
+        a0: a0, a1: a1, a2: a2, a3: a3,
+        a4: a4, a5: a5, a6: a6, a7: a7,
+        a_len: a_len,
+        b_start: b_start,
+        b0: b0, b1: b1, b2: b2, b3: b3,
+        b4: b4, b5: b5, b6: b6, b7: b7,
+        b_len: b_len,
+    };
+}
+
+fn ecs_msgbuf_deep_b_set(m: EcsMsgBufDeep, idx: i32, v: i64) -> EcsMsgBufDeep {
+    let b0 = m.b0; let b1 = m.b1; let b2 = m.b2; let b3 = m.b3;
+    let b4 = m.b4; let b5 = m.b5; let b6 = m.b6; let b7 = m.b7;
+    if idx == 0 { b0 = v; };
+    if idx == 1 { b1 = v; };
+    if idx == 2 { b2 = v; };
+    if idx == 3 { b3 = v; };
+    if idx == 4 { b4 = v; };
+    if idx == 5 { b5 = v; };
+    if idx == 6 { b6 = v; };
+    if idx == 7 { b7 = v; };
+    return ecs_msgbuf_deep_rebuild(
+        m.message_count,
+        m.a_start, m.a0, m.a1, m.a2, m.a3, m.a4, m.a5, m.a6, m.a7, m.a_len,
+        m.b_start, b0, b1, b2, b3, b4, b5, b6, b7, m.b_len
+    );
+}
+
+// write into B (current), MessageId.id = message_count before increment
+struct EcsMsgBufWriteResult {
+    messages: EcsMsgBufDeep,
+    id: i64,
+}
+
+fn ecs_msgbuf_deep_write_result_messages(r: EcsMsgBufWriteResult) -> EcsMsgBufDeep { return r.messages; }
+fn ecs_msgbuf_deep_write_result_id(r: EcsMsgBufWriteResult) -> i64 { return r.id; }
+
+fn ecs_msgbuf_deep_write(m: EcsMsgBufDeep, value: i64) -> EcsMsgBufWriteResult {
+    let id = m.message_count;
+    let b_len = m.b_len;
+    if b_len >= 8 {
+        // capacity full: still bump count (id reserved) but drop payload
+        let m2 = ecs_msgbuf_deep_rebuild(
+            m.message_count + 1,
+            m.a_start, m.a0, m.a1, m.a2, m.a3, m.a4, m.a5, m.a6, m.a7, m.a_len,
+            m.b_start, m.b0, m.b1, m.b2, m.b3, m.b4, m.b5, m.b6, m.b7, m.b_len
+        );
+        return EcsMsgBufWriteResult { messages: m2, id: id };
+    };
+    let m1 = ecs_msgbuf_deep_b_set(m, b_len, value);
+    let m2 = ecs_msgbuf_deep_rebuild(
+        m1.message_count + 1,
+        m1.a_start, m1.a0, m1.a1, m1.a2, m1.a3, m1.a4, m1.a5, m1.a6, m1.a7, m1.a_len,
+        m1.b_start, m1.b0, m1.b1, m1.b2, m1.b3, m1.b4, m1.b5, m1.b6, m1.b7, b_len + 1
+    );
+    return EcsMsgBufWriteResult { messages: m2, id: id };
+}
+
+fn ecs_msgbuf_deep_write_default(m: EcsMsgBufDeep) -> EcsMsgBufWriteResult {
+    return ecs_msgbuf_deep_write(m, 0);
+}
+
+// WriteBatchIds model
+struct EcsMsgBufBatchIds {
+    last_count: i64,
+    message_count: i64,
+}
+
+fn ecs_msgbuf_deep_batch_ids_new(last_count: i64, message_count: i64) -> EcsMsgBufBatchIds {
+    return EcsMsgBufBatchIds { last_count: last_count, message_count: message_count };
+}
+fn ecs_msgbuf_deep_batch_ids_len(b: EcsMsgBufBatchIds) -> i64 {
+    if b.message_count <= b.last_count { return 0; };
+    return b.message_count - b.last_count;
+}
+fn ecs_msgbuf_deep_batch_ids_next(b: EcsMsgBufBatchIds) -> (EcsMsgBufBatchIds, bool, i64) {
+    if b.last_count >= b.message_count {
+        return (b, false, 0);
+    };
+    let id = b.last_count;
+    let b2 = EcsMsgBufBatchIds { last_count: b.last_count + 1, message_count: b.message_count };
+    return (b2, true, id);
+}
+
+struct EcsMsgBufBatchResult {
+    messages: EcsMsgBufDeep,
+    last_count: i64,
+    message_count: i64,
+}
+
+fn ecs_msgbuf_deep_batch_result_messages(r: EcsMsgBufBatchResult) -> EcsMsgBufDeep { return r.messages; }
+fn ecs_msgbuf_deep_batch_result_last(r: EcsMsgBufBatchResult) -> i64 { return r.last_count; }
+fn ecs_msgbuf_deep_batch_result_count(r: EcsMsgBufBatchResult) -> i64 { return r.message_count; }
+fn ecs_msgbuf_deep_batch_result_ids(r: EcsMsgBufBatchResult) -> EcsMsgBufBatchIds {
+    return EcsMsgBufBatchIds { last_count: r.last_count, message_count: r.message_count };
+}
+
+// write_batch of up to 4 values (unrolled; avoids while + rebinding)
+fn ecs_msgbuf_deep_write_batch4(
+    m: EcsMsgBufDeep,
+    v0: i64, v1: i64, v2: i64, v3: i64,
+    n: i32
+) -> EcsMsgBufBatchResult {
+    let last = m.message_count;
+    let cur0 = m;
+    if n <= 0 {
+        return EcsMsgBufBatchResult {
+            messages: cur0,
+            last_count: last,
+            message_count: cur0.message_count,
+        };
+    };
+    let wr0 = ecs_msgbuf_deep_write(cur0, v0);
+    let cur1 = ecs_msgbuf_deep_write_result_messages(wr0);
+    if n == 1 {
+        return EcsMsgBufBatchResult {
+            messages: cur1,
+            last_count: last,
+            message_count: cur1.message_count,
+        };
+    };
+    let wr1 = ecs_msgbuf_deep_write(cur1, v1);
+    let cur2 = ecs_msgbuf_deep_write_result_messages(wr1);
+    if n == 2 {
+        return EcsMsgBufBatchResult {
+            messages: cur2,
+            last_count: last,
+            message_count: cur2.message_count,
+        };
+    };
+    let wr2 = ecs_msgbuf_deep_write(cur2, v2);
+    let cur3 = ecs_msgbuf_deep_write_result_messages(wr2);
+    if n == 3 {
+        return EcsMsgBufBatchResult {
+            messages: cur3,
+            last_count: last,
+            message_count: cur3.message_count,
+        };
+    };
+    let wr3 = ecs_msgbuf_deep_write(cur3, v3);
+    let cur4 = ecs_msgbuf_deep_write_result_messages(wr3);
+    return EcsMsgBufBatchResult {
+        messages: cur4,
+        last_count: last,
+        message_count: cur4.message_count,
+    };
+}
+
+// get_cursor: MessageCursor default (last_message_count = 0) — includes all
+struct EcsMsgBufCursorDeep {
+    last_message_count: i64,
+}
+
+fn ecs_msgbuf_deep_get_cursor(m: EcsMsgBufDeep) -> EcsMsgBufCursorDeep {
+    let _ = m.message_count;
+    return EcsMsgBufCursorDeep { last_message_count: 0 };
+}
+
+// get_cursor_current: ignore messages already in buffers (start at message_count)
+fn ecs_msgbuf_deep_get_cursor_current(m: EcsMsgBufDeep) -> EcsMsgBufCursorDeep {
+    return EcsMsgBufCursorDeep { last_message_count: m.message_count };
+}
+
+fn ecs_msgbuf_deep_cursor_last(c: EcsMsgBufCursorDeep) -> i64 { return c.last_message_count; }
+
+// cursor unread len: min(message_count - last, messages.len()) saturating
+fn ecs_msgbuf_deep_cursor_len(c: EcsMsgBufCursorDeep, m: EcsMsgBufDeep) -> i64 {
+    let total = m.message_count;
+    let last = c.last_message_count;
+    if total <= last { return 0; };
+    let unread = total - last;
+    let stored = ecs_msgbuf_deep_len(m);
+    if unread < stored { return unread; };
+    return stored;
+}
+
+// update: swap A/B, clear B, B.start = message_count
+fn ecs_msgbuf_deep_update(m: EcsMsgBufDeep) -> EcsMsgBufDeep {
+    // A becomes previous B
+    // B is cleared with start = message_count
+    return ecs_msgbuf_deep_rebuild(
+        m.message_count,
+        m.b_start,
+        m.b0, m.b1, m.b2, m.b3, m.b4, m.b5, m.b6, m.b7, m.b_len,
+        m.message_count,
+        0, 0, 0, 0, 0, 0, 0, 0, 0
+    );
+}
+
+// update_drain: same swap, returns drained count (old A len) + sum of drained values
+struct EcsMsgBufDrainResult {
+    messages: EcsMsgBufDeep,
+    drained_count: i64,
+    drained_sum: i64,
+}
+
+fn ecs_msgbuf_deep_drain_result_messages(r: EcsMsgBufDrainResult) -> EcsMsgBufDeep { return r.messages; }
+fn ecs_msgbuf_deep_drain_result_count(r: EcsMsgBufDrainResult) -> i64 { return r.drained_count; }
+fn ecs_msgbuf_deep_drain_result_sum(r: EcsMsgBufDrainResult) -> i64 { return r.drained_sum; }
+
+fn ecs_msgbuf_deep_update_drain(m: EcsMsgBufDeep) -> EcsMsgBufDrainResult {
+    // drained = old A (before swap, A is oldest)
+    let count = m.a_len as i64;
+    let sum = m.a0 + m.a1 + m.a2 + m.a3 + m.a4 + m.a5 + m.a6 + m.a7;
+    // only sum first a_len slots conceptually; zeroed slots are 0 so sum is fine
+    let m2 = ecs_msgbuf_deep_update(m);
+    return EcsMsgBufDrainResult {
+        messages: m2,
+        drained_count: count,
+        drained_sum: sum,
+    };
+}
+
+// clear: reset starts to message_count, clear both sequences
+fn ecs_msgbuf_deep_clear(m: EcsMsgBufDeep) -> EcsMsgBufDeep {
+    return ecs_msgbuf_deep_rebuild(
+        m.message_count,
+        m.message_count,
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
+        m.message_count,
+        0, 0, 0, 0, 0, 0, 0, 0, 0
+    );
+}
+
+// drain: reset starts, clear both, return drained count of all stored
+fn ecs_msgbuf_deep_drain(m: EcsMsgBufDeep) -> EcsMsgBufDrainResult {
+    let count = ecs_msgbuf_deep_len(m);
+    let sum_a = m.a0 + m.a1 + m.a2 + m.a3 + m.a4 + m.a5 + m.a6 + m.a7;
+    let sum_b = m.b0 + m.b1 + m.b2 + m.b3 + m.b4 + m.b5 + m.b6 + m.b7;
+    let m2 = ecs_msgbuf_deep_clear(m);
+    return EcsMsgBufDrainResult {
+        messages: m2,
+        drained_count: count,
+        drained_sum: sum_a + sum_b,
+    };
+}
+
+// iter_current_update_messages: count = b_len (newer buffer only)
+fn ecs_msgbuf_deep_iter_current_count(m: EcsMsgBufDeep) -> i64 {
+    return m.b_len as i64;
+}
+
+fn ecs_msgbuf_deep_iter_current_at(m: EcsMsgBufDeep, idx: i32) -> i64 {
+    return ecs_msgbuf_deep_b_get(m, idx);
+}
+
+// get_message(id) -> Option (found, value, id)
+struct EcsMsgBufGetResult {
+    found: bool,
+    value: i64,
+    id: i64,
+}
+
+fn ecs_msgbuf_deep_get_result_found(r: EcsMsgBufGetResult) -> bool { return r.found; }
+fn ecs_msgbuf_deep_get_result_value(r: EcsMsgBufGetResult) -> i64 { return r.value; }
+fn ecs_msgbuf_deep_get_result_id(r: EcsMsgBufGetResult) -> i64 { return r.id; }
+
+fn ecs_msgbuf_deep_get_message(m: EcsMsgBufDeep, id: i64) -> EcsMsgBufGetResult {
+    let oldest = m.a_start;
+    if id < oldest {
+        return EcsMsgBufGetResult { found: false, value: 0, id: id };
+    };
+    // sequence: if id < b_start then A else B
+    if id < m.b_start {
+        let index = id - m.a_start;
+        if index < 0 {
+            return EcsMsgBufGetResult { found: false, value: 0, id: id };
+        };
+        if index >= (m.a_len as i64) {
+            return EcsMsgBufGetResult { found: false, value: 0, id: id };
+        };
+        let v = ecs_msgbuf_deep_a_get(m, index as i32);
+        return EcsMsgBufGetResult { found: true, value: v, id: id };
+    };
+    let index_b = id - m.b_start;
+    if index_b < 0 {
+        return EcsMsgBufGetResult { found: false, value: 0, id: id };
+    };
+    if index_b >= (m.b_len as i64) {
+        return EcsMsgBufGetResult { found: false, value: 0, id: id };
+    };
+    let vb = ecs_msgbuf_deep_b_get(m, index_b as i32);
+    return EcsMsgBufGetResult { found: true, value: vb, id: id };
+}
+
+// invariant: a_start + a_len == b_start (after update)
+fn ecs_msgbuf_deep_invariant_ok(m: EcsMsgBufDeep) -> bool {
+    if m.a_start + (m.a_len as i64) == m.b_start {
+        return true;
+    };
+    return false;
+}

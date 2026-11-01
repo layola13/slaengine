@@ -1,0 +1,267 @@
+// Deepened Bevy ECS change_detection tick surface.
+// Mirrors src/change_detection/tick.rs + constants from mod.rs:
+//   CHECK_TICK_THRESHOLD / MAX_CHANGE_AGE
+//   Tick { get/set/is_newer_than/relative_to/check_tick }
+//   CheckChangeTicks { present_tick }
+//   ComponentTicks { is_added/is_changed/new/set_changed }
+//   ComponentTicksMut { set_added/set_changed/set_both/as_ref }
+// Tick values modeled as i64 in u32 range with wrapping_sub modulo 2^32.
+// Shallow lib/change_detection.sla retained.
+
+// u32 modulus as i64
+const ECS_CDT_U32_MOD: i64 = 4294967296;
+// CHECK_TICK_THRESHOLD = 518_400_000
+const ECS_CDT_CHECK_TICK_THRESHOLD: i64 = 518400000;
+// MAX_CHANGE_AGE = u32::MAX - (2 * CHECK_TICK_THRESHOLD - 1) = 3_258_167_296
+const ECS_CDT_MAX_CHANGE_AGE: i64 = 3258167296;
+// Tick::MAX == MAX_CHANGE_AGE
+const ECS_CDT_TICK_MAX: i64 = 3258167296;
+
+fn ecs_cdt_check_tick_threshold() -> i64 { return ECS_CDT_CHECK_TICK_THRESHOLD; }
+fn ecs_cdt_max_change_age() -> i64 { return ECS_CDT_MAX_CHANGE_AGE; }
+fn ecs_cdt_tick_max_value() -> i64 { return ECS_CDT_TICK_MAX; }
+fn ecs_cdt_u32_mod() -> i64 { return ECS_CDT_U32_MOD; }
+
+// Normalize into [0, 2^32)
+fn ecs_cdt_wrap_u32(x: i64) -> i64 {
+    let m = ECS_CDT_U32_MOD;
+    let r = x % m;
+    if r < 0 {
+        return r + m;
+    };
+    return r;
+}
+
+// wrapping_sub for u32-modeled ticks
+fn ecs_cdt_wrapping_sub(a: i64, b: i64) -> i64 {
+    return ecs_cdt_wrap_u32(a - b);
+}
+
+fn ecs_cdt_min_i64(a: i64, b: i64) -> i64 {
+    if a < b { return a; };
+    return b;
+}
+
+// === Tick ===
+struct EcsCdtTickDeep {
+    tick: i64,
+}
+
+fn ecs_cdt_tick_new(tick: i64) -> EcsCdtTickDeep {
+    return EcsCdtTickDeep { tick: ecs_cdt_wrap_u32(tick) };
+}
+
+fn ecs_cdt_tick_max() -> EcsCdtTickDeep {
+    return EcsCdtTickDeep { tick: ECS_CDT_TICK_MAX };
+}
+
+fn ecs_cdt_tick_get(t: EcsCdtTickDeep) -> i64 { return t.tick; }
+
+fn ecs_cdt_tick_set(t: EcsCdtTickDeep, tick: i64) -> EcsCdtTickDeep {
+    t.tick = ecs_cdt_wrap_u32(tick);
+    return t;
+}
+
+fn ecs_cdt_tick_eq(a: EcsCdtTickDeep, b: EcsCdtTickDeep) -> bool {
+    return a.tick == b.tick;
+}
+
+// relative_to: self.wrapping_sub(other)
+fn ecs_cdt_tick_relative_to(self_tick: EcsCdtTickDeep, other: EcsCdtTickDeep) -> EcsCdtTickDeep {
+    return EcsCdtTickDeep { tick: ecs_cdt_wrapping_sub(self_tick.tick, other.tick) };
+}
+
+// is_newer_than(self, last_run, this_run):
+//   min(this_run.rel(self), MAX) < min(this_run.rel(last_run), MAX)  i.e. ticks_since_system > ticks_since_insert
+fn ecs_cdt_tick_is_newer_than(self_tick: EcsCdtTickDeep, last_run: EcsCdtTickDeep, this_run: EcsCdtTickDeep) -> bool {
+    let since_insert = ecs_cdt_tick_relative_to(this_run, self_tick).tick;
+    let since_system = ecs_cdt_tick_relative_to(this_run, last_run).tick;
+    let a = ecs_cdt_min_i64(since_insert, ECS_CDT_MAX_CHANGE_AGE);
+    let b = ecs_cdt_min_i64(since_system, ECS_CDT_MAX_CHANGE_AGE);
+    return b > a;
+}
+
+// === CheckChangeTicks ===
+struct EcsCdtCheckDeep {
+    present: i64,
+}
+
+fn ecs_cdt_check_new(present: i64) -> EcsCdtCheckDeep {
+    return EcsCdtCheckDeep { present: ecs_cdt_wrap_u32(present) };
+}
+
+fn ecs_cdt_check_from_tick(t: EcsCdtTickDeep) -> EcsCdtCheckDeep {
+    return EcsCdtCheckDeep { present: t.tick };
+}
+
+fn ecs_cdt_check_present_tick(c: EcsCdtCheckDeep) -> EcsCdtTickDeep {
+    return EcsCdtTickDeep { tick: c.present };
+}
+
+fn ecs_cdt_check_present(c: EcsCdtCheckDeep) -> i64 { return c.present; }
+
+// check_tick: if age > MAX, wrap self to present.relative_to(MAX); return whether wrapped
+fn ecs_cdt_tick_check_tick(t: EcsCdtTickDeep, check: EcsCdtCheckDeep) -> (EcsCdtTickDeep, bool) {
+    let present = EcsCdtTickDeep { tick: check.present };
+    let age = ecs_cdt_tick_relative_to(present, t).tick;
+    if age > ECS_CDT_TICK_MAX {
+        // *self = present.relative_to(Tick::MAX)
+        let max_tick = EcsCdtTickDeep { tick: ECS_CDT_TICK_MAX };
+        let wrapped = ecs_cdt_tick_relative_to(present, max_tick);
+        return (wrapped, true);
+    };
+    return (t, false);
+}
+
+// === ComponentTicks ===
+struct EcsCdtComponentTicksDeep {
+    added: i64,
+    changed: i64,
+}
+
+fn ecs_cdt_ct_new(change_tick: i64) -> EcsCdtComponentTicksDeep {
+    let t = ecs_cdt_wrap_u32(change_tick);
+    return EcsCdtComponentTicksDeep { added: t, changed: t };
+}
+
+fn ecs_cdt_ct_from_parts(added: i64, changed: i64) -> EcsCdtComponentTicksDeep {
+    return EcsCdtComponentTicksDeep {
+        added: ecs_cdt_wrap_u32(added),
+        changed: ecs_cdt_wrap_u32(changed),
+    };
+}
+
+fn ecs_cdt_ct_added(ct: EcsCdtComponentTicksDeep) -> i64 { return ct.added; }
+fn ecs_cdt_ct_changed(ct: EcsCdtComponentTicksDeep) -> i64 { return ct.changed; }
+
+fn ecs_cdt_ct_added_tick(ct: EcsCdtComponentTicksDeep) -> EcsCdtTickDeep {
+    return EcsCdtTickDeep { tick: ct.added };
+}
+fn ecs_cdt_ct_changed_tick(ct: EcsCdtComponentTicksDeep) -> EcsCdtTickDeep {
+    return EcsCdtTickDeep { tick: ct.changed };
+}
+
+fn ecs_cdt_ct_is_added(ct: EcsCdtComponentTicksDeep, last_run: i64, this_run: i64) -> bool {
+    let self_t = EcsCdtTickDeep { tick: ct.added };
+    let lr = EcsCdtTickDeep { tick: ecs_cdt_wrap_u32(last_run) };
+    let tr = EcsCdtTickDeep { tick: ecs_cdt_wrap_u32(this_run) };
+    return ecs_cdt_tick_is_newer_than(self_t, lr, tr);
+}
+
+fn ecs_cdt_ct_is_changed(ct: EcsCdtComponentTicksDeep, last_run: i64, this_run: i64) -> bool {
+    let self_t = EcsCdtTickDeep { tick: ct.changed };
+    let lr = EcsCdtTickDeep { tick: ecs_cdt_wrap_u32(last_run) };
+    let tr = EcsCdtTickDeep { tick: ecs_cdt_wrap_u32(this_run) };
+    return ecs_cdt_tick_is_newer_than(self_t, lr, tr);
+}
+
+fn ecs_cdt_ct_set_changed(ct: EcsCdtComponentTicksDeep, change_tick: i64) -> EcsCdtComponentTicksDeep {
+    ct.changed = ecs_cdt_wrap_u32(change_tick);
+    return ct;
+}
+
+fn ecs_cdt_ct_set_added(ct: EcsCdtComponentTicksDeep, change_tick: i64) -> EcsCdtComponentTicksDeep {
+    ct.added = ecs_cdt_wrap_u32(change_tick);
+    return ct;
+}
+
+// === ComponentTicksMut (owned model of mut view) ===
+// Bevy: set_added / set_changed / set_both; as_ref → ComponentTicks
+struct EcsCdtComponentTicksMutDeep {
+    added: i64,
+    changed: i64,
+    caller: i64,
+    has_caller: bool,
+}
+
+fn ecs_cdt_ctm_new(added: i64, changed: i64) -> EcsCdtComponentTicksMutDeep {
+    return EcsCdtComponentTicksMutDeep {
+        added: ecs_cdt_wrap_u32(added),
+        changed: ecs_cdt_wrap_u32(changed),
+        caller: 0,
+        has_caller: false,
+    };
+}
+
+fn ecs_cdt_ctm_from_ct(ct: EcsCdtComponentTicksDeep) -> EcsCdtComponentTicksMutDeep {
+    return EcsCdtComponentTicksMutDeep {
+        added: ct.added,
+        changed: ct.changed,
+        caller: 0,
+        has_caller: false,
+    };
+}
+
+fn ecs_cdt_ctm_added(m: EcsCdtComponentTicksMutDeep) -> i64 { return m.added; }
+fn ecs_cdt_ctm_changed(m: EcsCdtComponentTicksMutDeep) -> i64 { return m.changed; }
+fn ecs_cdt_ctm_has_caller(m: EcsCdtComponentTicksMutDeep) -> bool { return m.has_caller; }
+fn ecs_cdt_ctm_caller(m: EcsCdtComponentTicksMutDeep) -> i64 { return m.caller; }
+
+fn ecs_cdt_ctm_set_added(m: EcsCdtComponentTicksMutDeep, tick: i64, caller: i64, has_caller: bool) -> EcsCdtComponentTicksMutDeep {
+    m.added = ecs_cdt_wrap_u32(tick);
+    m.caller = caller;
+    m.has_caller = has_caller;
+    return m;
+}
+
+fn ecs_cdt_ctm_set_changed(m: EcsCdtComponentTicksMutDeep, tick: i64, caller: i64, has_caller: bool) -> EcsCdtComponentTicksMutDeep {
+    m.changed = ecs_cdt_wrap_u32(tick);
+    m.caller = caller;
+    m.has_caller = has_caller;
+    return m;
+}
+
+fn ecs_cdt_ctm_set_both(m: EcsCdtComponentTicksMutDeep, tick: i64, caller: i64, has_caller: bool) -> EcsCdtComponentTicksMutDeep {
+    let t = ecs_cdt_wrap_u32(tick);
+    m.added = t;
+    m.changed = t;
+    m.caller = caller;
+    m.has_caller = has_caller;
+    return m;
+}
+
+fn ecs_cdt_ctm_as_ref(m: EcsCdtComponentTicksMutDeep) -> EcsCdtComponentTicksDeep {
+    return EcsCdtComponentTicksDeep { added: m.added, changed: m.changed };
+}
+
+// Apply check_tick to both added/changed fields of ComponentTicks
+fn ecs_cdt_ct_check_ticks(ct: EcsCdtComponentTicksDeep, present: i64) -> (EcsCdtComponentTicksDeep, bool, bool) {
+    let check = ecs_cdt_check_new(present);
+    let a = ecs_cdt_tick_check_tick(EcsCdtTickDeep { tick: ct.added }, check);
+    let c = ecs_cdt_tick_check_tick(EcsCdtTickDeep { tick: ct.changed }, check);
+    ct.added = a.0.tick;
+    ct.changed = c.0.tick;
+    return (ct, a.1, c.1);
+}
+
+// World-style change tick counter helper
+struct EcsCdtWorldTicksDeep {
+    change_tick: i64,
+}
+
+fn ecs_cdt_world_new(start: i64) -> EcsCdtWorldTicksDeep {
+    return EcsCdtWorldTicksDeep { change_tick: ecs_cdt_wrap_u32(start) };
+}
+
+fn ecs_cdt_world_change_tick(w: EcsCdtWorldTicksDeep) -> i64 { return w.change_tick; }
+
+fn ecs_cdt_world_increment(w: EcsCdtWorldTicksDeep) -> EcsCdtWorldTicksDeep {
+    w.change_tick = ecs_cdt_wrap_u32(w.change_tick + 1);
+    return w;
+}
+
+fn ecs_cdt_world_add(w: EcsCdtWorldTicksDeep, delta: i64) -> EcsCdtWorldTicksDeep {
+    w.change_tick = ecs_cdt_wrap_u32(w.change_tick + delta);
+    return w;
+}
+
+// Scenario helper from Bevy change_expiration test spirit:
+// component changed at insert_tick; system last_run; this_run advances.
+// After MAX_CHANGE_AGE without check, is_changed clamps equal → false when both ages == MAX.
+fn ecs_cdt_both_at_max_is_changed(last_run_age: i64, change_age: i64) -> bool {
+    // Simulate: this_run = T, last_run = T - last_run_age, changed = T - change_age
+    // with ages already clamped conceptually
+    let a = ecs_cdt_min_i64(change_age, ECS_CDT_MAX_CHANGE_AGE);
+    let b = ecs_cdt_min_i64(last_run_age, ECS_CDT_MAX_CHANGE_AGE);
+    return b > a;
+}

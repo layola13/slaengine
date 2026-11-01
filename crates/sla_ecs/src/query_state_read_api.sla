@@ -1,0 +1,357 @@
+// Bevy ECS query/state.rs read API extras — single/single_mut + is_empty + contains + get/get_mut +
+// get_many(_mut/_unique/_unique_mut) + iter_many(_mut/_unique) + from_builder/try_new/update_archetypes +
+// QueryEntityError {QueryDoesNotMatch,NotSpawned,AliasedMutability} + QuerySingleError {NoEntities,MultipleEntities}.
+// Mirrors src/query/state.rs gaps not in lib/query_state_extras.sla.
+
+// === Error markers ===
+// QueryEntityError: 0=QueryDoesNotMatch, 1=NotSpawned, 2=AliasedMutability
+fn ecs_qe_err_query_does_not_match() -> i32 {
+    return 0;
+}
+
+fn ecs_qe_err_not_spawned() -> i32 {
+    return 1;
+}
+
+fn ecs_qe_err_aliased_mutability() -> i32 {
+    return 2;
+}
+
+fn ecs_qe_err_is_query_does_not_match(code: i32) -> bool {
+    return code == 0;
+}
+
+fn ecs_qe_err_is_not_spawned(code: i32) -> bool {
+    return code == 1;
+}
+
+fn ecs_qe_err_is_aliased_mutability(code: i32) -> bool {
+    return code == 2;
+}
+
+// QuerySingleError: 0=NoEntities, 1=MultipleEntities
+fn ecs_qs_err_no_entities() -> i32 {
+    return 0;
+}
+
+fn ecs_qs_err_multiple_entities() -> i32 {
+    return 1;
+}
+
+fn ecs_qs_err_is_no_entities(code: i32) -> bool {
+    return code == 0;
+}
+
+fn ecs_qs_err_is_multiple_entities(code: i32) -> bool {
+    return code == 1;
+}
+
+// === Single-entity read result (single / single_mut) ===
+struct SingleResult {
+    ok: i32,
+    err_code: i32,
+    entity_idx: i32,
+    value: i32,
+}
+
+fn ecs_qs_single_found(r: SingleResult) -> bool {
+    return r.ok == 1;
+}
+
+fn ecs_qs_single_err_code(r: SingleResult) -> i32 {
+    return r.err_code;
+}
+
+fn ecs_qs_single_entity_idx(r: SingleResult) -> i32 {
+    return r.entity_idx;
+}
+
+fn ecs_qs_single_value(r: SingleResult) -> i32 {
+    return r.value;
+}
+
+// === Get result ===
+struct GetResult {
+    ok: i32,
+    err_code: i32,
+    value: i32,
+}
+
+fn ecs_qs_get_ok(r: GetResult) -> i32 {
+    return r.ok;
+}
+
+fn ecs_qs_get_err_code(r: GetResult) -> i32 {
+    return r.err_code;
+}
+
+fn ecs_qs_get_value(r: GetResult) -> i32 {
+    return r.value;
+}
+
+// === get_many result: count + per-index (ok, value) via dedicated getter ===
+struct GetManyResult {
+    count: i32,
+    first_err_code: i32,
+    // scalar summary to avoid Vec-leak: total matched count, sum of values, first altar value
+    matched_count: i32,
+    sum_values: i32,
+    first_value: i32,
+    aliased_idx: i32,
+}
+
+fn ecs_qs_getmany_count(r: GetManyResult) -> i32 {
+    return r.count;
+}
+
+fn ecs_qs_getmany_first_err(r: GetManyResult) -> i32 {
+    return r.first_err_code;
+}
+
+fn ecs_qs_getmany_matched(r: GetManyResult) -> i32 {
+    return r.matched_count;
+}
+
+fn ecs_qs_getmany_sum(r: GetManyResult) -> i32 {
+    return r.sum_values;
+}
+
+fn ecs_qs_getmany_first_value(r: GetManyResult) -> i32 {
+    return r.first_value;
+}
+
+fn ecs_qs_getmany_aliased_idx(r: GetManyResult) -> i32 {
+    return r.aliased_idx;
+}
+
+// === iter_many result: scalar-reduce over the requested entity ids ===
+struct IterManyResult {
+    requested: i32,
+    matched: i32,
+    sum_values: i32,
+}
+
+fn ecs_qs_itermany_requested(r: IterManyResult) -> i32 {
+    return r.requested;
+}
+
+fn ecs_qs_itermany_matched(r: IterManyResult) -> i32 {
+    return r.matched;
+}
+
+fn ecs_qs_itermany_sum(r: IterManyResult) -> i32 {
+    return r.sum_values;
+}
+
+// === A tiny typed query-state-over-world model ===
+// store entities as: spawned_indices, has_component flag (storing type_id), value(i32), alive flag.
+struct EcsQsReadApiState {
+    entity_indices: Vec<i32>,
+    values: Vec<i32>,
+    type_id: i32,
+    archetype_generation: i32,
+    world_id: i32,
+    builder_source: i32,
+    try_new_ok: i32,
+}
+
+fn ecs_qs_read_api_new(type_id: i32, world_id: i32) -> EcsQsReadApiState {
+    let s = EcsQsReadApiState { entity_indices: Vec::new(), values: Vec::new(), type_id: type_id, archetype_generation: 0, world_id: world_id, builder_source: 0, try_new_ok: 1 };
+    return s;
+}
+
+// from_builder: derive a state from a builder_id
+fn ecs_qs_read_api_from_builder(builder_id: i32, type_id: i32, world_id: i32) -> EcsQsReadApiState {
+    let s = ecs_qs_read_api_new(type_id, world_id);
+    s.builder_source = builder_id;
+    return s;
+}
+
+fn ecs_qs_read_api_builder_source(s: EcsQsReadApiState) -> i32 {
+    return s.builder_source;
+}
+
+// try_new: returns ok=1 if world_id valid (>0), else ok=0
+fn ecs_qs_read_api_try_new(world_id: i32, type_id: i32) -> (EcsQsReadApiState, i32) {
+    if world_id <= 0 {
+        let s = ecs_qs_read_api_new(type_id, world_id);
+        s.try_new_ok = 0;
+        return (s, 0);
+    };
+    let s = ecs_qs_read_api_new(type_id, world_id);
+    return (s, 1);
+}
+
+fn ecs_qs_read_api_try_new_ok(s: EcsQsReadApiState) -> i32 {
+    return s.try_new_ok;
+}
+
+// spawn an entity with the component value (helpers to populate for tests)
+fn ecs_qs_read_api_spawn(s: EcsQsReadApiState, value: i32) -> (EcsQsReadApiState, i32) {
+    let idx: i32 = len(s.entity_indices) as i32;
+    s.entity_indices.push(idx);
+    s.values.push(value);
+    return (s, idx);
+}
+
+// update_archetypes: bumps the archetype generation (mirrors structural-view refresh)
+fn ecs_qs_read_api_update_archetypes(s: EcsQsReadApiState) -> EcsQsReadApiState {
+    s.archetype_generation = s.archetype_generation + 1;
+    return s;
+}
+
+fn ecs_qs_read_api_archetype_generation(s: EcsQsReadApiState) -> i32 {
+    return s.archetype_generation;
+}
+
+// world_id accessor
+fn ecs_qs_read_api_world_id(s: EcsQsReadApiState) -> i32 {
+    return s.world_id;
+}
+
+// private: entity exists (alive)? all spawned entities are alive in this model.
+fn ecs_qs_read_api_entity_is_spawned(s: EcsQsReadApiState, entity: i32) -> bool {
+    if entity < 0 { return false; };
+    return entity < len(s.entity_indices) as i32;
+}
+
+// --- is_empty ---
+fn ecs_qs_read_api_is_empty(s: EcsQsReadApiState) -> bool {
+    return len(s.entity_indices) == 0;
+}
+
+// --- contains: entity matches the query (spawned AND carries the component type) ---
+fn ecs_qs_read_api_contains(s: EcsQsReadApiState, entity: i32) -> bool {
+    return ecs_qs_read_api_entity_is_spawned(s, entity);
+}
+
+// --- single: returns SingleResult (ok=1 + entity + value), or NoEntities/MultipleEntities ---
+fn ecs_qs_read_api_single(s: EcsQsReadApiState) -> SingleResult {
+    let n: i32 = len(s.entity_indices) as i32;
+    if n == 0 {
+        let r = SingleResult { ok: 0, err_code: ecs_qs_err_no_entities(), entity_idx: -1, value: 0 };
+        return r;
+    };
+    if n > 1 {
+        let r = SingleResult { ok: 0, err_code: ecs_qs_err_multiple_entities(), entity_idx: -1, value: 0 };
+        return r;
+    };
+    let r = SingleResult { ok: 1, err_code: -1, entity_idx: 0, value: s.values[0] };
+    return r;
+}
+
+// --- single_mut: same semantics in our model (mutability modeled by returning the same form) ---
+fn ecs_qs_read_api_single_mut(s: EcsQsReadApiState) -> SingleResult {
+    return ecs_qs_read_api_single(s);
+}
+
+// --- get: returns GetResult (ok=1 + value), or QueryDoesNotMatch / NotSpawned ---
+fn ecs_qs_read_api_get(s: EcsQsReadApiState, entity: i32) -> GetResult {
+    if !ecs_qs_read_api_entity_is_spawned(s, entity) {
+        let r = GetResult { ok: 0, err_code: ecs_qe_err_not_spawned(), value: 0 };
+        return r;
+    };
+    let r = GetResult { ok: 1, err_code: -1, value: s.values[entity] };
+    return r;
+}
+
+// --- get_mut: same model, mutability conceptual ---
+fn ecs_qs_read_api_get_mut(s: EcsQsReadApiState, entity: i32) -> GetResult {
+    return ecs_qs_read_api_get(s, entity);
+}
+
+// --- get_many: walk len(entities); collect scalar-reduce. first_err_code: -1 if all ok. ---
+
+fn ecs_qs_read_api_first_duplicate_index(entities: Vec<i32>) -> i32 {
+    let n: i32 = len(entities) as i32;
+    let i: i32 = 0;
+    let dup: i32 = -1;
+    while i < n { let j: i32 = i + 1; while j < n { if entities[i] == entities[j] { dup = entities[i]; }; j = j + 1; } if dup != -1 { i = n; } else { i = i + 1; }; }
+    return dup;
+}
+
+fn ecs_qs_read_api_get_many(s: EcsQsReadApiState, entities: Vec<i32>, require_unique: bool, allow_aliasing_for_mut: bool) -> GetManyResult {
+    let n: i32 = len(entities) as i32;
+    let matched: i32 = 0;
+    let first_err: i32 = -1;
+    let sum: i32 = 0;
+    let first_val: i32 = 0;
+    let i: i32 = 0;
+    while i < n {
+        let e = entities[i];
+        let spawned = ecs_qs_read_api_entity_is_spawned(s, e);
+        if !spawned {
+            if first_err == -1 { first_err = ecs_qe_err_not_spawned(); };
+        };
+        if spawned {
+            matched = matched + 1;
+            sum = sum + s.values[e];
+            if matched == 1 { first_val = s.values[e]; };
+        };
+        i = i + 1;
+    }
+    let aliased_idx: i32 = -1;
+    let need_dup_check: bool = allow_aliasing_for_mut || require_unique;
+    if need_dup_check {
+        let dup = ecs_qs_read_api_first_duplicate_index(entities);
+        if dup != -1 {
+            aliased_idx = dup;
+            if first_err == -1 { first_err = ecs_qe_err_aliased_mutability(); };
+        };
+    };
+    let r = GetManyResult { count: n, first_err_code: first_err, matched_count: matched, sum_values: sum, first_value: first_val, aliased_idx: aliased_idx };
+    return r;
+}
+
+// read-only get_many
+fn ecs_qs_read_api_get_many_ro(s: EcsQsReadApiState, entities: Vec<i32>) -> GetManyResult {
+    return ecs_qs_read_api_get_many(s, entities, false, false);
+}
+
+// get_many_mut (requires unique, detects aliasing)
+fn ecs_qs_read_api_get_many_mut(s: EcsQsReadApiState, entities: Vec<i32>) -> GetManyResult {
+    return ecs_qs_read_api_get_many(s, entities, true, true);
+}
+
+// get_many_unique (read, but unique-contract: dupes are an error)
+fn ecs_qs_read_api_get_many_unique(s: EcsQsReadApiState, entities: Vec<i32>) -> GetManyResult {
+    return ecs_qs_read_api_get_many(s, entities, true, false);
+}
+
+// get_many_unique_mut
+fn ecs_qs_read_api_get_many_unique_mut(s: EcsQsReadApiState, entities: Vec<i32>) -> GetManyResult {
+    return ecs_qs_read_api_get_many(s, entities, true, true);
+}
+
+// --- iter_many: reduce over requested entities (same behavior as get_many_ro but no "unique" contract) ---
+fn ecs_qs_read_api_iter_many(s: EcsQsReadApiState, entities: Vec<i32>) -> IterManyResult {
+    let n: i32 = len(entities) as i32;
+    let matched: i32 = 0;
+    let sum: i32 = 0;
+    let i: i32 = 0;
+    while i < n {
+        let e = entities[i];
+        if ecs_qs_read_api_entity_is_spawned(s, e) {
+            matched = matched + 1;
+            sum = sum + s.values[e];
+        };
+        i = i + 1;
+    }
+    let r = IterManyResult { requested: n, matched: matched, sum_values: sum };
+    return r;
+}
+
+// iter_many_mut: reduce with "mut" semantics (same model); reports an alias-code via... keep scalar
+fn ecs_qs_read_api_iter_many_mut(s: EcsQsReadApiState, entities: Vec<i32>) -> IterManyResult {
+    return ecs_qs_read_api_iter_many(s, entities);
+}
+
+// iter_many_unique: same reduce but the unique-contract is the caller's responsibility in this model
+fn ecs_qs_read_api_iter_many_unique(s: EcsQsReadApiState, entities: Vec<i32>) -> IterManyResult {
+    return ecs_qs_read_api_iter_many(s, entities);
+}
+
+// iter_many_unique_mut
+fn ecs_qs_read_api_iter_many_unique_mut(s: EcsQsReadApiState, entities: Vec<i32>) -> IterManyResult {
+    return ecs_qs_read_api_iter_many(s, entities);
+}

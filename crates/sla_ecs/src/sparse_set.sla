@@ -1,0 +1,181 @@
+// Bevy ECS storage::sparse_set (src/storage/sparse_set.rs): SparseSet + ComponentSparseSet.
+// A sparse-set map (index -> value) + component sparse set (entity -> component data + ticks).
+
+// === SparseSet<I, V> ===
+struct EcsSparseSet {
+    dense: Vec<i64>,      // dense values
+    dense_indices: Vec<i64>, // parallel: the index (key) for each dense slot
+    sparse: Vec<i64>,     // sparse[index] = position in dense, or -1
+    capacity: i64,
+}
+
+fn ecs_sparse_set_new() -> EcsSparseSet {
+    return EcsSparseSet { dense: Vec::new(), dense_indices: Vec::new(), sparse: Vec::new(), capacity: 0 };
+}
+
+// ensure sparse array can hold `index`
+fn ecs_sparse_set_ensure_capacity(s: EcsSparseSet, index: i64) -> EcsSparseSet {
+    if index < s.capacity { return s; };
+    let i = s.capacity;
+    while i <= index {
+        s.sparse.push(-1);
+        i = i + 1;
+    }
+    s.capacity = index + 1;
+    return s;
+}
+
+fn ecs_sparse_set_insert(s: EcsSparseSet, index: i64, value: i64) -> EcsSparseSet {
+    s = ecs_sparse_set_ensure_capacity(s, index);
+    let pos = s.sparse[index];
+    if pos >= 0 {
+        s.dense[pos] = value;
+        return s;
+    };
+    let new_pos = len(s.dense) as i64;
+    s.dense.push(value);
+    s.dense_indices.push(index);
+    s.sparse[index] = new_pos;
+    return s;
+}
+
+fn ecs_sparse_set_contains(s: EcsSparseSet, index: i64) -> bool {
+    if index >= s.capacity { return false; };
+    return s.sparse[index] >= 0;
+}
+
+fn ecs_sparse_set_get(s: EcsSparseSet, index: i64) -> (bool, i64) {
+    if index >= s.capacity { return (false, 0); };
+    let pos = s.sparse[index];
+    if pos < 0 { return (false, 0); };
+    return (true, s.dense[pos]);
+}
+
+// remove: swap-remove
+fn ecs_sparse_set_remove(s: EcsSparseSet, index: i64) -> (EcsSparseSet, bool) {
+    if index >= s.capacity { return (s, false); };
+    let pos = s.sparse[index];
+    if pos < 0 { return (s, false); };
+    let last_pos = len(s.dense) as i64 - 1;
+    if pos != last_pos {
+        // swap with last
+        s.dense[pos] = s.dense[last_pos];
+        s.dense_indices[pos] = s.dense_indices[last_pos];
+        s.sparse[s.dense_indices[pos]] = pos;
+    };
+    s.dense.pop();
+    s.dense_indices.pop();
+    s.sparse[index] = -1;
+    return (s, true);
+}
+
+fn ecs_sparse_set_len(s: EcsSparseSet) -> i64 { return len(s.dense) as i64; }
+
+fn ecs_sparse_set_is_empty(s: EcsSparseSet) -> bool { return len(s.dense) as i64 == 0; }
+
+fn ecs_sparse_set_clear(s: EcsSparseSet) -> EcsSparseSet {
+    s.dense = Vec::new();
+    s.dense_indices = Vec::new();
+    let i: i64 = 0;
+    while i < s.capacity {
+        s.sparse[i] = -1;
+        i = i + 1;
+    }
+    return s;
+}
+
+// === ComponentSparseSet ===
+// entity -> (component value, added_tick, changed_tick)
+struct EcsComponentSparseSet {
+    entities: Vec<i64>,
+    values: Vec<i64>,
+    added_ticks: Vec<i32>,
+    changed_ticks: Vec<i32>,
+}
+
+fn ecs_component_sparse_set_new() -> EcsComponentSparseSet {
+    return EcsComponentSparseSet { entities: Vec::new(), values: Vec::new(), added_ticks: Vec::new(), changed_ticks: Vec::new() };
+}
+
+fn ecs_component_sparse_set_insert(c: EcsComponentSparseSet, entity: i64, value: i64, tick: i32) -> EcsComponentSparseSet {
+    let i: i64 = 0;
+    let n: i64 = len(c.entities) as i64;
+    while i < n {
+        if c.entities[i] == entity {
+            c.values[i] = value;
+            c.changed_ticks[i] = tick;
+            return c;
+        };
+        i = i + 1;
+    }
+    c.entities.push(entity);
+    c.values.push(value);
+    c.added_ticks.push(tick);
+    c.changed_ticks.push(tick);
+    return c;
+}
+
+fn ecs_component_sparse_set_contains(c: EcsComponentSparseSet, entity: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(c.entities) as i64;
+    while i < n {
+        if c.entities[i] == entity { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_component_sparse_set_get(c: EcsComponentSparseSet, entity: i64) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(c.entities) as i64;
+    while i < n {
+        if c.entities[i] == entity { return (true, c.values[i]); };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+// get_with_ticks: returns (found, value, added_tick, changed_tick)
+fn ecs_component_sparse_set_get_with_ticks(c: EcsComponentSparseSet, entity: i64) -> (bool, i64, i32, i32) {
+    let i: i64 = 0;
+    let n: i64 = len(c.entities) as i64;
+    while i < n {
+        if c.entities[i] == entity { return (true, c.values[i], c.added_ticks[i], c.changed_ticks[i]); };
+        i = i + 1;
+    }
+    return (false, 0, 0, 0);
+}
+
+fn ecs_component_sparse_set_remove(c: EcsComponentSparseSet, entity: i64) -> (EcsComponentSparseSet, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(c.entities) as i64;
+    while i < n {
+        if c.entities[i] == entity {
+            let last = n - 1;
+            if i != last {
+                c.entities[i] = c.entities[last];
+                c.values[i] = c.values[last];
+                c.added_ticks[i] = c.added_ticks[last];
+                c.changed_ticks[i] = c.changed_ticks[last];
+            };
+            c.entities.pop();
+            c.values.pop();
+            c.added_ticks.pop();
+            c.changed_ticks.pop();
+            return (c, true);
+        };
+        i = i + 1;
+    }
+    return (c, false);
+}
+
+fn ecs_component_sparse_set_len(c: EcsComponentSparseSet) -> i64 { return len(c.entities) as i64; }
+fn ecs_component_sparse_set_is_empty(c: EcsComponentSparseSet) -> bool { return len(c.entities) as i64 == 0; }
+
+fn ecs_component_sparse_set_clear(c: EcsComponentSparseSet) -> EcsComponentSparseSet {
+    c.entities = Vec::new();
+    c.values = Vec::new();
+    c.added_ticks = Vec::new();
+    c.changed_ticks = Vec::new();
+    return c;
+}

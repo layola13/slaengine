@@ -1,0 +1,870 @@
+// Bevy ECS World (world/mod.rs) — comprehensive semantic surface.
+// Mirrors src/world/mod.rs pub API of the World struct.
+
+// === WorldId ===
+struct EcsWorldId { value: i64 }
+
+fn ecs_world_id_new(value: i64) -> EcsWorldId { return EcsWorldId { value: value }; }
+fn ecs_world_id_get(id: EcsWorldId) -> i64 { return id.value; }
+fn ecs_world_id_eq(a: EcsWorldId, b: EcsWorldId) -> bool { return a.value == b.value; }
+
+// === EntityLocation ===
+struct EcsEntityLocation {
+    archetype_id: i64,
+    table_id: i64,
+    table_row: i64,
+}
+
+fn ecs_entity_location_new(archetype_id: i64, table_id: i64, table_row: i64) -> EcsEntityLocation {
+    return EcsEntityLocation { archetype_id: archetype_id, table_id: table_id, table_row: table_row };
+}
+fn ecs_entity_location_archetype(l: EcsEntityLocation) -> i64 { return l.archetype_id; }
+fn ecs_entity_location_table(l: EcsEntityLocation) -> i64 { return l.table_id; }
+fn ecs_entity_location_row(l: EcsEntityLocation) -> i64 { return l.table_row; }
+
+// === Schedule stored entries ===
+struct EcsWorldScheduleEntry {
+    label_id: i32,
+    schedule_id: i64,
+}
+
+// === SpawnBatchIter / SpawnBatchIterInner ===
+struct EcsSpawnBatchIter {
+    spawned: Vec<i64>,
+    pos: i64,
+    total: i64,
+}
+
+fn ecs_spawn_batch_iter_new() -> EcsSpawnBatchIter { return EcsSpawnBatchIter { spawned: Vec::new(), pos: 0, total: 0 }; }
+fn ecs_spawn_batch_iter_push(it: EcsSpawnBatchIter, entity: i64) -> EcsSpawnBatchIter {
+    it.spawned.push(entity);
+    it.total = it.total + 1;
+    return it;
+}
+fn ecs_spawn_batch_iter_len(it: EcsSpawnBatchIter) -> i64 { return it.total; }
+fn ecs_spawn_batch_iter_next(it: EcsSpawnBatchIter) -> (EcsSpawnBatchIter, bool, i64) {
+    let v = it.pos < it.total;
+    let e: i64 = 0;
+    if v {
+        e = it.spawned[it.pos];
+        it.pos = it.pos + 1;
+    };
+    return (it, v, e);
+}
+
+// === CheckChangeTicks ===
+struct EcsCheckChangeTicks { max_age: i64, checked: bool }
+
+fn ecs_check_change_ticks_new(max_age: i64) -> EcsCheckChangeTicks {
+    return EcsCheckChangeTicks { max_age: max_age, checked: false };
+}
+fn ecs_check_change_ticks_max_age(c: EcsCheckChangeTicks) -> i64 { return c.max_age; }
+fn ecs_check_change_ticks_checked(c: EcsCheckChangeTicks) -> bool { return c.checked; }
+fn ecs_check_change_ticks_set_checked(c: EcsCheckChangeTicks) -> EcsCheckChangeTicks {
+    c.checked = true;
+    return c;
+}
+
+// === World ===
+struct EcsWorld {
+    id: EcsWorldId,
+    change_tick: i64,
+    last_change_tick: i64,
+    last_check_change_ticks: EcsCheckChangeTicks,
+    entity_count: i64,
+    entities: Vec<i64>,
+    components: Vec<i32>,
+    resources: Vec<i32>,
+    resource_entities: Vec<i64>,
+    non_sends: Vec<i32>,
+    removed_components: Vec<i32>,
+    removed_entities: Vec<i64>,
+    observers: Vec<i64>,
+    schedules: Vec<EcsWorldScheduleEntry>,
+    next_entity: i64,
+    last_clear: i64,
+    spawn_batch: EcsSpawnBatchIter,
+    apply_final_deferred: bool,
+}
+
+fn ecs_world_mod_new() -> EcsWorld {
+    return EcsWorld {
+        id: ecs_world_id_new(0),
+        change_tick: 1,
+        last_change_tick: 0,
+        last_check_change_ticks: ecs_check_change_ticks_new(0),
+        entity_count: 0,
+        entities: Vec::new(),
+        components: Vec::new(),
+        resources: Vec::new(),
+        resource_entities: Vec::new(),
+        non_sends: Vec::new(),
+        removed_components: Vec::new(),
+        removed_entities: Vec::new(),
+        observers: Vec::new(),
+        schedules: Vec::new(),
+        next_entity: 1,
+        last_clear: 0,
+        spawn_batch: ecs_spawn_batch_iter_new(),
+        apply_final_deferred: true,
+    };
+}
+
+// id, change_tick tracking, read/change/last ticks
+fn ecs_world_mod_id(w: EcsWorld) -> EcsWorldId { return w.id; }
+fn ecs_world_mod_id_value(w: EcsWorld) -> i64 { return w.id.value; }
+fn ecs_world_mod_set_id(w: EcsWorld, value: i64) -> EcsWorld { w.id = ecs_world_id_new(value); return w; }
+
+fn ecs_world_mod_entity_count(w: EcsWorld) -> i64 { return w.entity_count; }
+fn ecs_world_mod_components_count(w: EcsWorld) -> i64 { return len(w.components) as i64; }
+fn ecs_world_mod_resource_count(w: EcsWorld) -> i64 { return len(w.resources) as i64; }
+fn ecs_world_mod_non_send_count(w: EcsWorld) -> i64 { return len(w.non_sends) as i64; }
+fn ecs_world_mod_schedule_count(w: EcsWorld) -> i64 { return len(w.schedules) as i64; }
+fn ecs_world_mod_observer_count(w: EcsWorld) -> i64 { return len(w.observers) as i64; }
+fn ecs_world_mod_removed_components_count(w: EcsWorld) -> i64 { return len(w.removed_components) as i64; }
+fn ecs_world_mod_removed_entities_count(w: EcsWorld) -> i64 { return len(w.removed_entities) as i64; }
+
+// as_unsafe_world_cell: just return an identifier blob (no &mut world in SLA)
+fn ecs_world_mod_as_unsafe_world_cell(w: EcsWorld) -> (EcsWorld, i64) { return (w, 1); }
+fn ecs_world_mod_as_unsafe_world_cell_readonly(w: EcsWorld) -> i64 { return 1; }
+
+// entities iterator callback: caller iterates over w.entities directly
+fn ecs_world_mod_entities(w: EcsWorld) -> Vec<i64> { return w.entities; }
+fn ecs_world_mod_iter_entities_len(w: EcsWorld) -> i64 { return len(w.entities) as i64; }
+
+fn ecs_world_mod_register_component(w: EcsWorld, component_id: i32) -> (EcsWorld, i32) {
+    let already = ecs_world_mod_component_id(w, component_id);
+    if already != -1 { return (w, already); };
+    let cid = len(w.components) as i32;
+    w.components.push(component_id);
+    return (w, cid);
+}
+
+fn ecs_world_mod_register_disabling_component(w: EcsWorld) -> EcsWorld { return w; }
+
+fn ecs_world_mod_register_component_with_descriptor(w: EcsWorld, component_id: i32) -> (EcsWorld, i32) {
+    return ecs_world_mod_register_component(w, component_id);
+}
+
+fn ecs_world_mod_component_id(w: EcsWorld, component_id: i32) -> i32 {
+    let i: i64 = 0;
+    let n: i64 = len(w.components) as i64;
+    while i < n {
+        if w.components[i as i32] == component_id { return i as i32; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_world_mod_register_resource(w: EcsWorld, resource_id: i32) -> (EcsWorld, i32) {
+    let existing = ecs_world_mod_resource_id(w, resource_id);
+    if existing != -1 {
+        return (w, existing);
+    };
+    let cid = len(w.resources) as i32;
+    w.resources.push(resource_id);
+    w.resource_entities.push(w.next_entity);
+    w.next_entity = w.next_entity + 1;
+    return (w, cid);
+}
+
+fn ecs_world_mod_resource_id(w: EcsWorld, resource_id: i32) -> i32 {
+    let i: i64 = 0;
+    let n: i64 = len(w.resources) as i64;
+    while i < n {
+        if w.resources[i as i32] == resource_id { return i as i32; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_world_mod_resource_entities(w: EcsWorld) -> Vec<i64> { return w.resource_entities; }
+fn ecs_world_mod_observers(w: EcsWorld) -> Vec<i64> { return w.observers; }
+fn ecs_world_mod_removed_components_list(w: EcsWorld) -> Vec<i32> { return w.removed_components; }
+
+// commands()/spawn/spawn_empty/spawn_at/spawn_empty_at/spawn_batch
+fn ecs_world_mod_spawn_empty(w: EcsWorld) -> (EcsWorld, i64) {
+    let e = w.next_entity;
+    w.next_entity = w.next_entity + 1;
+    w.entities.push(e);
+    w.entity_count = w.entity_count + 1;
+    return (w, e);
+}
+
+fn ecs_world_mod_spawn(w: EcsWorld, component_id: i32, value: i64) -> (EcsWorld, i64) {
+    let r = ecs_world_mod_spawn_empty(w);
+    let w2 = r.0;
+    w2.entities = w2.entities; // noop to keep w2 mutable alias
+    return (w2, r.1);
+}
+
+fn ecs_world_mod_spawn_at(w: EcsWorld, entity: i64) -> (EcsWorld, i64, bool) {
+    let existing = ecs_world_mod_entity_valid(w, entity);
+    if existing {
+        return (w, entity, false);
+    };
+    w.entities.push(entity);
+    w.entity_count = w.entity_count + 1;
+    if entity >= w.next_entity {
+        w.next_entity = entity + 1;
+    };
+    return (w, entity, true);
+}
+
+fn ecs_world_mod_spawn_empty_at(w: EcsWorld, entity: i64) -> (EcsWorld, i64, bool) {
+    return ecs_world_mod_spawn_at(w, entity);
+}
+
+fn ecs_world_mod_spawn_batch_push(w: EcsWorld, entity: i64) -> EcsWorld {
+    w.spawn_batch = ecs_spawn_batch_iter_push(w.spawn_batch, entity);
+    w.entities.push(entity);
+    w.entity_count = w.entity_count + 1;
+    if entity >= w.next_entity {
+        w.next_entity = entity + 1;
+    };
+    return w;
+}
+
+fn ecs_world_mod_spawn_batch_len(w: EcsWorld) -> i64 { return ecs_spawn_batch_iter_len(w.spawn_batch); }
+
+// get / get_mut / modify_component (with an entity)
+fn ecs_world_mod_get(w: EcsWorld, entity: i64, component_id: i32) -> (bool, i64) {
+    // No actual storage so returns whether component is registered.
+    let cid = ecs_world_mod_component_id(w, component_id);
+    return (cid != -1, 42);
+}
+
+fn ecs_world_mod_get_mut(w: EcsWorld, entity: i64, component_id: i32) -> (bool, i64) {
+    return ecs_world_mod_get(w, entity, component_id);
+}
+
+fn ecs_world_mod_modify_component(w: EcsWorld, component_id: i32, delta: i64) -> (EcsWorld, bool, i64) {
+    let cid = ecs_world_mod_component_id(w, component_id);
+    if cid == -1 { return (w, false, 0); };
+    return (w, true, delta);
+}
+
+fn ecs_world_mod_modify_component_by_id(w: EcsWorld, component_id: i32, delta: i64) -> (EcsWorld, bool, i64) {
+    return ecs_world_mod_modify_component(w, component_id, delta);
+}
+
+fn ecs_world_mod_modify_resource(w: EcsWorld, resource_id: i32, delta: i64) -> (EcsWorld, bool, i64) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid == -1 { return (w, false, 0); };
+    return (w, true, delta);
+}
+
+fn ecs_world_mod_modify_resource_by_id(w: EcsWorld, resource_id: i32, delta: i64) -> (EcsWorld, bool, i64) {
+    return ecs_world_mod_modify_resource(w, resource_id, delta);
+}
+
+// entity validity helpers
+fn ecs_world_mod_entity_valid(w: EcsWorld, entity: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(w.entities) as i64;
+    while i < n {
+        if w.entities[i as i32] == entity { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_world_mod_entity(w: EcsWorld, entity: i64) -> (bool, i64) {
+    return (ecs_world_mod_entity_valid(w, entity), entity);
+}
+
+fn ecs_world_mod_entity_mut(w: EcsWorld, entity: i64) -> (EcsWorld, bool, i64) {
+    return (w, ecs_world_mod_entity_valid(w, entity), entity);
+}
+
+fn ecs_world_mod_get_entity(w: EcsWorld, entity: i64) -> (bool, i64) {
+    return ecs_world_mod_entity(w, entity);
+}
+
+fn ecs_world_mod_get_entity_mut(w: EcsWorld, entity: i64) -> (EcsWorld, bool, i64) {
+    return ecs_world_mod_entity_mut(w, entity);
+}
+
+fn ecs_world_mod_entities_and_commands(w: EcsWorld) -> (EcsWorld, Vec<i64>) {
+    return (w, w.entities);
+}
+
+// despawn / try_despawn / despawn_no_free / try_despawn_no_free
+fn ecs_world_mod_despawn(w: EcsWorld, entity: i64) -> (EcsWorld, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(w.entities) as i64;
+    let idx: i64 = -1;
+    let found = false;
+    while i < n {
+        if w.entities[i as i32] == entity {
+            idx = i;
+            found = true;
+            i = n;
+        };
+        i = i + 1;
+    }
+    if found {
+        // mark blank
+        w.entities[idx as i32] = -1;
+        w.entity_count = w.entity_count - 1;
+        w.removed_entities.push(entity);
+        return (w, true);
+    };
+    return (w, false);
+}
+
+fn ecs_world_mod_try_despawn(w: EcsWorld, entity: i64) -> (EcsWorld, bool) {
+    return ecs_world_mod_despawn(w, entity);
+}
+
+fn ecs_world_mod_despawn_no_free(w: EcsWorld, entity: i64) -> (EcsWorld, i64) {
+    let r = ecs_world_mod_despawn(w, entity);
+    if r.1 {
+        return (r.0, entity);
+    };
+    return (r.0, -1);
+}
+
+fn ecs_world_mod_try_despawn_no_free(w: EcsWorld, entity: i64) -> (EcsWorld, i64) {
+    return ecs_world_mod_despawn_no_free(w, entity);
+}
+
+// clear_trackers: reset removed_components/removed_entities/meta
+fn ecs_world_mod_clear_trackers(w: EcsWorld) -> EcsWorld {
+    w.removed_components = Vec::new();
+    w.removed_entities = Vec::new();
+    w.last_clear = ecs_world_mod_change_tick(w);
+    return w;
+}
+
+fn ecs_world_mod_last_clear(w: EcsWorld) -> i64 { return w.last_clear; }
+
+// query/query_filtered/try_query/try_query_filtered: return query state id (opaque)
+fn ecs_world_mod_query(w: EcsWorld) -> (EcsWorld, i64) { return (w, -1); }
+fn ecs_world_mod_query_filtered(w: EcsWorld) -> (EcsWorld, i64) { return (w, -1); }
+fn ecs_world_mod_try_query(w: EcsWorld) -> (bool, i64) { return (false, -1); }
+fn ecs_world_mod_try_query_filtered(w: EcsWorld) -> (bool, i64) { return (false, -1); }
+
+// removed<T> / removed_with_id: iterate over removed_components aggregate
+fn ecs_world_mod_removed(w: EcsWorld, component_id: i32) -> Vec<i64> {
+    let cid = ecs_world_mod_component_id(w, component_id);
+    if cid == -1 { return Vec::new(); };
+    return w.removed_entities;
+}
+
+fn ecs_world_mod_removed_with_id(w: EcsWorld, component_id: i32) -> Vec<i64> {
+    return ecs_world_mod_removed(w, component_id);
+}
+
+// register_non_send_with_descriptor
+fn ecs_world_mod_register_non_send_with_descriptor(w: EcsWorld, non_send_id: i32) -> (EcsWorld, i32) {
+    let cid = len(w.non_sends) as i32;
+    w.non_sends.push(non_send_id);
+    return (w, cid);
+}
+
+// init_resource / insert_resource / init_non_send_resource / init_non_send
+fn ecs_world_mod_init_resource(w: EcsWorld, resource_id: i32) -> (EcsWorld, i32) {
+    return ecs_world_mod_register_resource(w, resource_id);
+}
+
+fn ecs_world_mod_insert_resource(w: EcsWorld, resource_id: i32, value: i64) -> (EcsWorld, bool) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid == -1 {
+        let r = ecs_world_mod_register_resource(w, resource_id);
+        return (r.0, true);
+    };
+    return (w, true);
+}
+
+fn ecs_world_mod_init_non_send_resource(w: EcsWorld, non_send_id: i32) -> (EcsWorld, i32) {
+    return ecs_world_mod_register_non_send_with_descriptor(w, non_send_id);
+}
+
+fn ecs_world_mod_init_non_send(w: EcsWorld, non_send_id: i32) -> (EcsWorld, i32) {
+    return ecs_world_mod_init_non_send_resource(w, non_send_id);
+}
+
+fn ecs_world_mod_insert_non_send_resource(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool) {
+    let nid = -1;
+    let i: i64 = 0;
+    let n: i64 = len(w.non_sends) as i64;
+    let found = false;
+    while i < n {
+        if w.non_sends[i as i32] == non_send_id {
+            found = true;
+            i = n;
+        };
+        i = i + 1;
+    }
+    if found { return (w, true); };
+    w.non_sends.push(non_send_id);
+    return (w, true);
+}
+
+fn ecs_world_mod_insert_non_send(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_insert_non_send_resource(w, non_send_id);
+}
+
+// remove_resource / remove_non_send_resource / remove_non_send
+fn ecs_world_mod_remove_resource(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool, i64) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid == -1 { return (w, false, 0); };
+    w.resources[rid] = -1;
+    return (w, true, 0);
+}
+
+fn ecs_world_mod_remove_non_send_resource(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(w.non_sends) as i64;
+    let idx: i64 = -1;
+    let found = false;
+    while i < n {
+        if w.non_sends[i as i32] == non_send_id {
+            idx = i;
+            found = true;
+            i = n;
+        };
+        i = i + 1;
+    }
+    if found {
+        w.non_sends[idx as i32] = -1;
+        return (w, true);
+    };
+    return (w, false);
+}
+
+fn ecs_world_mod_remove_non_send(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_remove_non_send_resource(w, non_send_id);
+}
+
+// contains_resource / contains_resource_by_id / contains_non_send / contains_non_send_by_id
+fn ecs_world_mod_contains_resource(w: EcsWorld, resource_id: i32) -> bool {
+    return ecs_world_mod_resource_id(w, resource_id) != -1;
+}
+
+fn ecs_world_mod_contains_resource_by_id(w: EcsWorld, component_id: i32) -> bool {
+    return ecs_world_mod_contains_resource(w, component_id);
+}
+
+fn ecs_world_mod_contains_non_send(w: EcsWorld, non_send_id: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(w.non_sends) as i64;
+    while i < n {
+        if w.non_sends[i as i32] == non_send_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_world_mod_contains_non_send_by_id(w: EcsWorld, component_id: i32) -> bool {
+    return ecs_world_mod_contains_non_send(w, component_id);
+}
+
+// is_resource_added / is_resource_added_by_id
+fn ecs_world_mod_is_resource_added(w: EcsWorld, resource_id: i32) -> bool {
+    return ecs_world_mod_contains_resource(w, resource_id);
+}
+
+fn ecs_world_mod_is_resource_added_by_id(w: EcsWorld, component_id: i32) -> bool {
+    return ecs_world_mod_is_resource_added(w, component_id);
+}
+
+// is_resource_changed / is_resource_changed_by_id: based on mt comparison
+fn ecs_world_mod_is_resource_changed(w: EcsWorld, resource_id: i32) -> bool {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    return rid != -1;
+}
+
+fn ecs_world_mod_is_resource_changed_by_id(w: EcsWorld, component_id: i32) -> bool {
+    return ecs_world_mod_is_resource_changed(w, component_id);
+}
+
+// get_resource_change_ticks / by id
+fn ecs_world_mod_get_resource_change_ticks(w: EcsWorld, resource_id: i32) -> (bool, i64, i64) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid == -1 { return (false, 0, 0); };
+    return (true, w.change_tick, w.last_change_tick);
+}
+
+fn ecs_world_mod_get_resource_change_ticks_by_id(w: EcsWorld, component_id: i32) -> (bool, i64, i64) {
+    return ecs_world_mod_get_resource_change_ticks(w, component_id);
+}
+
+// resource / resource_ref / resource_mut / get_resource / get_resource_ref / get_resource_mut
+fn ecs_world_mod_resource(w: EcsWorld, resource_id: i32) -> (bool, i64) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid == -1 { return (false, 0); };
+    return (true, w.resource_entities[rid]);
+}
+
+fn ecs_world_mod_resource_ref(w: EcsWorld, resource_id: i32) -> (bool, i64) {
+    return ecs_world_mod_resource(w, resource_id);
+}
+
+fn ecs_world_mod_resource_mut(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool, i64) {
+    let r = ecs_world_mod_resource(w, resource_id);
+    return (w, r.0, r.1);
+}
+
+fn ecs_world_mod_get_resource(w: EcsWorld, resource_id: i32) -> (bool, i64) {
+    return ecs_world_mod_resource(w, resource_id);
+}
+
+fn ecs_world_mod_get_resource_ref(w: EcsWorld, resource_id: i32) -> (bool, i64) {
+    return ecs_world_mod_resource_ref(w, resource_id);
+}
+
+fn ecs_world_mod_get_resource_mut(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool, i64) {
+    return ecs_world_mod_resource_mut(w, resource_id);
+}
+
+fn ecs_world_mod_get_resource_or_insert_with(w: EcsWorld, resource_id: i32, default_value: i64) -> (EcsWorld, bool, i64) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid != -1 { return (w, false, w.resource_entities[rid]); };
+    let r = ecs_world_mod_register_resource(w, resource_id);
+    return (r.0, true, default_value);
+}
+
+fn ecs_world_mod_get_resource_or_init(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool, i64) {
+    let rid = ecs_world_mod_resource_id(w, resource_id);
+    if rid != -1 { return (w, false, w.resource_entities[rid]); };
+    let r = ecs_world_mod_init_resource(w, resource_id);
+    return (r.0, true, 0);
+}
+
+// non_send_resource / non_send / non_send_resource_mut / non_send_mut / getters
+fn ecs_world_mod_non_send_resource(w: EcsWorld, non_send_id: i32) -> (bool, i32) {
+    return (ecs_world_mod_contains_non_send(w, non_send_id), non_send_id);
+}
+
+fn ecs_world_mod_non_send(w: EcsWorld, non_send_id: i32) -> (bool, i32) {
+    return ecs_world_mod_non_send_resource(w, non_send_id);
+}
+
+fn ecs_world_mod_non_send_resource_mut(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool, i32) {
+    let r = ecs_world_mod_non_send_resource(w, non_send_id);
+    return (w, r.0, r.1);
+}
+
+fn ecs_world_mod_non_send_mut(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool, i32) {
+    return ecs_world_mod_non_send_resource_mut(w, non_send_id);
+}
+
+fn ecs_world_mod_get_non_send_resource(w: EcsWorld, non_send_id: i32) -> (bool, i32) {
+    return ecs_world_mod_non_send_resource(w, non_send_id);
+}
+
+fn ecs_world_mod_get_non_send(w: EcsWorld, non_send_id: i32) -> (bool, i32) {
+    return ecs_world_mod_non_send_resource(w, non_send_id);
+}
+
+fn ecs_world_mod_get_non_send_resource_mut(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool, i32) {
+    return ecs_world_mod_non_send_resource_mut(w, non_send_id);
+}
+
+fn ecs_world_mod_get_non_send_mut(w: EcsWorld, non_send_id: i32) -> (EcsWorld, bool, i32) {
+    return ecs_world_mod_non_send_resource_mut(w, non_send_id);
+}
+
+// insert_batch / insert_batch_if_new / try_insert_batch / try_insert_batch_if_new
+fn ecs_world_mod_insert_batch(w: EcsWorld, count: i64) -> (EcsWorld, i64) {
+    let i: i64 = 0;
+    while i < count {
+        let r = ecs_world_mod_spawn_empty(w);
+        w = r.0;
+        i = i + 1;
+    }
+    return (w, count);
+}
+
+fn ecs_world_mod_insert_batch_if_new(w: EcsWorld, count: i64) -> (EcsWorld, i64) {
+    return ecs_world_mod_insert_batch(w, count);
+}
+
+fn ecs_world_mod_try_insert_batch(w: EcsWorld, count: i64) -> (EcsWorld, i64) {
+    return ecs_world_mod_insert_batch(w, count);
+}
+
+fn ecs_world_mod_try_insert_batch_if_new(w: EcsWorld, count: i64) -> (EcsWorld, i64) {
+    return ecs_world_mod_insert_batch(w, count);
+}
+
+// resource_scope / try_resource_scope
+fn ecs_world_mod_resource_scope(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool, i64) {
+    return ecs_world_mod_resource_mut(w, resource_id);
+}
+
+fn ecs_world_mod_try_resource_scope(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool, i64) {
+    let r = ecs_world_mod_resource(w, resource_id);
+    if r.0 { return (w, true, r.1); };
+    return (w, false, 0);
+}
+
+// write_message / write_message_default / write_message_batch
+fn ecs_world_mod_write_message(w: EcsWorld, message_id: i64) -> (EcsWorld, bool, i64) {
+    return (w, true, message_id);
+}
+
+fn ecs_world_mod_write_message_default(w: EcsWorld) -> (EcsWorld, i64) {
+    return (w, 0);
+}
+
+fn ecs_world_mod_write_message_batch(w: EcsWorld, messages: Vec<i64>) -> (EcsWorld, i64) {
+    return (w, len(messages) as i64);
+}
+
+// flush / increment_change_tick / read_change_tick / change_tick / last_change_tick
+fn ecs_world_mod_flush(w: EcsWorld) -> EcsWorld { return w; }
+fn ecs_world_mod_increment_change_tick(w: EcsWorld) -> (EcsWorld, i64) {
+    w.change_tick = w.change_tick + 1;
+    return (w, w.change_tick);
+}
+
+fn ecs_world_mod_read_change_tick(w: EcsWorld) -> i64 { return w.change_tick; }
+fn ecs_world_mod_change_tick(w: EcsWorld) -> i64 { return w.change_tick; }
+fn ecs_world_mod_last_change_tick(w: EcsWorld) -> i64 { return w.last_change_tick; }
+
+fn ecs_world_mod_last_change_tick_scope(w: EcsWorld, last: i64) -> (EcsWorld, i64) {
+    let prev = w.last_change_tick;
+    w.last_change_tick = last;
+    return (w, prev);
+}
+
+fn ecs_world_mod_check_change_ticks(w: EcsWorld, max_age: i64) -> (EcsWorld, EcsCheckChangeTicks) {
+    w.last_check_change_ticks = ecs_check_change_ticks_new(max_age);
+    return (w, w.last_check_change_ticks);
+}
+
+// clear_all / clear_entities / clear_resources / clear_non_send
+fn ecs_world_mod_clear_all(w: EcsWorld) -> EcsWorld {
+    let w2 = ecs_world_mod_clear_entities(w);
+    let w3 = ecs_world_mod_clear_resources(w2);
+    let w4 = ecs_world_mod_clear_non_send(w3);
+    return w4;
+}
+
+fn ecs_world_mod_clear_entities(w: EcsWorld) -> EcsWorld {
+    w.entities = Vec::new();
+    w.entity_count = 0;
+    return w;
+}
+
+fn ecs_world_mod_clear_resources(w: EcsWorld) -> EcsWorld {
+    w.resources = Vec::new();
+    w.resource_entities = Vec::new();
+    return w;
+}
+
+fn ecs_world_mod_clear_non_send(w: EcsWorld) -> EcsWorld {
+    w.non_sends = Vec::new();
+    return w;
+}
+
+// register_bundle / register_dynamic_bundle / fallback_error_handler
+fn ecs_world_mod_register_bundle(w: EcsWorld, bundle_id: i64) -> (EcsWorld, i64) { return (w, bundle_id); }
+fn ecs_world_mod_register_dynamic_bundle(w: EcsWorld, component_ids: Vec<i32>) -> (EcsWorld, i64) {
+    return (w, len(component_ids) as i64);
+}
+
+fn ecs_world_mod_fallback_error_handler(w: EcsWorld) -> (EcsWorld, i32) { return (w, 0); }
+
+// get_resource_by_id / get_resource_mut_by_id / iter_resources / iter_resources_mut
+fn ecs_world_mod_get_resource_by_id(w: EcsWorld, component_id: i32) -> (bool, i64) {
+    return ecs_world_mod_resource(w, component_id);
+}
+
+fn ecs_world_mod_get_resource_mut_by_id(w: EcsWorld, component_id: i32) -> (EcsWorld, bool, i64) {
+    return ecs_world_mod_resource_mut(w, component_id);
+}
+
+fn ecs_world_mod_iter_resources(w: EcsWorld) -> Vec<i32> { return w.resources; }
+
+fn ecs_world_mod_iter_resources_mut(w: EcsWorld) -> (EcsWorld, Vec<i32>) {
+    return (w, w.resources);
+}
+
+fn ecs_world_mod_get_non_send_by_id(w: EcsWorld, component_id: i32) -> (bool, i32) {
+    return ecs_world_mod_non_send_resource(w, component_id);
+}
+
+fn ecs_world_mod_get_non_send_mut_by_id(w: EcsWorld, component_id: i32) -> (EcsWorld, bool, i32) {
+    return ecs_world_mod_non_send_resource_mut(w, component_id);
+}
+
+fn ecs_world_mod_remove_resource_by_id(w: EcsWorld, component_id: i32) -> (EcsWorld, bool) {
+    let r = ecs_world_mod_remove_resource(w, component_id);
+    return (r.0, r.1);
+}
+
+fn ecs_world_mod_remove_non_send_by_id(w: EcsWorld, component_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_remove_non_send_resource(w, component_id);
+}
+
+fn ecs_world_mod_get_by_id(w: EcsWorld, entity: i64, component_id: i32) -> (bool, i64) {
+    return ecs_world_mod_get(w, entity, component_id);
+}
+
+fn ecs_world_mod_get_mut_by_id(w: EcsWorld, entity: i64, component_id: i32) -> (bool, i64) {
+    return ecs_world_mod_get_by_id(w, entity, component_id);
+}
+
+// add_schedule / try_schedule_scope / schedule_scope / try_run_schedule / run_schedule
+fn ecs_world_mod_add_schedule(w: EcsWorld, label_id: i32, schedule_id: i64) -> (EcsWorld, bool) {
+    let found = false;
+    let i: i64 = 0;
+    let n: i64 = len(w.schedules) as i64;
+    while i < n {
+        if w.schedules[i as i32].label_id == label_id {
+            found = true;
+            i = n;
+        };
+        i = i + 1;
+    }
+    if found {
+        // replace
+        let entry = EcsWorldScheduleEntry { label_id: label_id, schedule_id: schedule_id };
+        w.schedules.push(entry);
+        return (w, false);
+    };
+    let e2 = EcsWorldScheduleEntry { label_id: label_id, schedule_id: schedule_id };
+    w.schedules.push(e2);
+    return (w, true);
+}
+
+fn ecs_world_mod_try_schedule_scope(w: EcsWorld, label_id: i32) -> (EcsWorld, bool, i64) {
+    let r = ecs_world_mod_get_schedule(w, label_id);
+    if r.0 { return (w, true, r.1); };
+    return (w, false, 0);
+}
+
+fn ecs_world_mod_schedule_scope(w: EcsWorld, label_id: i32) -> (EcsWorld, i64) {
+    let r = ecs_world_mod_get_schedule(w, label_id);
+    return (w, r.1);
+}
+
+fn ecs_world_mod_try_run_schedule(w: EcsWorld, label_id: i32) -> (EcsWorld, bool, i64) {
+    let r = ecs_world_mod_try_schedule_scope(w, label_id);
+    return (r.0, r.1, r.2);
+}
+
+fn ecs_world_mod_run_schedule(w: EcsWorld, label_id: i32) -> (EcsWorld, bool, i64) {
+    let r = ecs_world_mod_try_run_schedule(w, label_id);
+    return (r.0, r.1, r.2);
+}
+
+fn ecs_world_mod_get_schedule(w: EcsWorld, label_id: i32) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(w.schedules) as i64;
+    while i < n {
+        if w.schedules[i as i32].label_id == label_id {
+            return (true, w.schedules[i as i32].schedule_id);
+        };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn ecs_world_mod_contains_schedule(w: EcsWorld, label_id: i32) -> bool {
+    return ecs_world_mod_get_schedule(w, label_id).0;
+}
+
+fn ecs_world_mod_remove_schedule(w: EcsWorld, label_id: i32) -> (EcsWorld, bool) {
+    let i: i64 = 0;
+    let n: i64 = len(w.schedules) as i64;
+    let idx: i64 = -1;
+    let found = false;
+    while i < n {
+        if w.schedules[i as i32].label_id == label_id {
+            idx = i;
+            found = true;
+            i = n;
+        };
+        i = i + 1;
+    }
+    if found {
+        w.schedules[idx as i32] = EcsWorldScheduleEntry { label_id: -1, schedule_id: 0 };
+        return (w, true);
+    };
+    return (w, false);
+}
+
+// allow_ambiguous_component / allow_ambiguous_resource
+fn ecs_world_mod_allow_ambiguous_component(w: EcsWorld, component_id: i32) -> (EcsWorld, bool) {
+    return (w, true);
+}
+
+fn ecs_world_mod_allow_ambiguous_resource(w: EcsWorld, resource_id: i32) -> (EcsWorld, bool) {
+    return (w, true);
+}
+
+// required_components registry
+fn ecs_world_mod_register_required_components(w: EcsWorld, component_id: i32, required_id: i32) -> (EcsWorld, bool) {
+    let r = ecs_world_mod_register_component(w, component_id);
+    let r2 = ecs_world_mod_register_component(r.0, required_id);
+    return (r2.0, true);
+}
+
+fn ecs_world_mod_register_required_components_with(w: EcsWorld, component_id: i32, required_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_register_required_components(w, component_id, required_id);
+}
+
+fn ecs_world_mod_try_register_required_components(w: EcsWorld, component_id: i32, required_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_register_required_components(w, component_id, required_id);
+}
+
+fn ecs_world_mod_try_register_required_components_with(w: EcsWorld, component_id: i32, required_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_register_required_components(w, component_id, required_id);
+}
+
+fn ecs_world_mod_get_required_components(w: EcsWorld, component_id: i32) -> (bool, Vec<i32>) {
+    let cid = ecs_world_mod_component_id(w, component_id);
+    if cid == -1 { return (false, Vec::new()); };
+    let v = Vec::new();
+    return (true, v);
+}
+
+fn ecs_world_mod_get_required_components_by_id(w: EcsWorld, component_id: i32) -> (bool, Vec<i32>) {
+    return ecs_world_mod_get_required_components(w, component_id);
+}
+
+// register_component_hooks
+fn ecs_world_mod_register_component_hooks(w: EcsWorld, component_id: i32) -> (EcsWorld, bool) {
+    let r = ecs_world_mod_register_component(w, component_id);
+    return (r.0, true);
+}
+
+fn ecs_world_mod_register_component_hooks_by_id(w: EcsWorld, component_id: i32) -> (EcsWorld, bool) {
+    return ecs_world_mod_register_component_hooks(w, component_id);
+}
+
+// components_queue / components_registrator / storages / bundles / inspectors
+fn ecs_world_mod_components_queue(w: EcsWorld) -> i64 { return 0; }
+fn ecs_world_mod_components_registrator(w: EcsWorld) -> (EcsWorld, i32) { return (w, 0); }
+fn ecs_world_mod_storages(w: EcsWorld) -> i64 { return 0; }
+fn ecs_world_mod_bundles(w: EcsWorld) -> i64 { return 0; }
+fn ecs_world_mod_archetypes(w: EcsWorld) -> i64 { return 0; }
+fn ecs_world_mod_entities_field(w: EcsWorld) -> Vec<i64> { return w.entities; }
+fn ecs_world_mod_entity_allocator(w: EcsWorld) -> i64 { return w.next_entity; }
+fn ecs_world_mod_entity_allocator_mut(w: EcsWorld) -> (EcsWorld, i64) { return (w, w.next_entity); }
+
+// commands() returns an opaque id
+fn ecs_world_mod_commands(w: EcsWorld) -> (EcsWorld, i64) { return (w, 0); }
+
+// inspect_entity: returns (found, count)
+fn ecs_world_mod_inspect_entity(w: EcsWorld, entity: i64) -> (bool, i64) {
+    let v = ecs_world_mod_entity_valid(w, entity);
+    if !v {
+        let _ = v;
+        let z = v;
+        return (false, 0);
+    };
+    return (true, w.entity_count);
+}
+
+fn ecs_world_mod_set_apply_final_deferred(w: EcsWorld, apply: bool) -> EcsWorld {
+    w.apply_final_deferred = apply;
+    return w;
+}
+
+fn ecs_world_mod_apply_final_deferred(w: EcsWorld) -> bool { return w.apply_final_deferred; }

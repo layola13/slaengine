@@ -1,0 +1,364 @@
+// Deepened Bevy ECS system::function_system surface.
+// Mirrors src/system/function_system.rs SystemMeta flags (irreversible NON_SEND),
+// FunctionSystem Option state + world_id mismatch, IntoResult, clone de-init,
+// with_name, SystemState cache/get/apply. Flattened for SLA stability.
+// Shallow lib/function_system.sla and extras keep basic constructors.
+
+// === SystemStateFlags bits (Bevy) ===
+const ECS_FSF_EMPTY: i32 = 0;
+const ECS_FSF_NON_SEND: i32 = 1;
+const ECS_FSF_DEFERRED: i32 = 2;
+const ECS_FSF_EXCLUSIVE: i32 = 4;
+// initialized is tracked separately on FunctionSystem via has_state
+
+// === SystemMeta (flattened) ===
+struct EcsSystemMetaDeep {
+    name_id: i64,
+    flags: i32,
+    last_run: i64,
+}
+
+fn ecs_system_meta_deep_new(name_id: i64) -> EcsSystemMetaDeep {
+    return EcsSystemMetaDeep { name_id: name_id, flags: ECS_FSF_EMPTY, last_run: 0 };
+}
+
+fn ecs_system_meta_deep_name(m: EcsSystemMetaDeep) -> i64 { return m.name_id; }
+fn ecs_system_meta_deep_flags(m: EcsSystemMetaDeep) -> i32 { return m.flags; }
+fn ecs_system_meta_deep_last_run(m: EcsSystemMetaDeep) -> i64 { return m.last_run; }
+
+fn ecs_system_meta_deep_set_name(m: EcsSystemMetaDeep, new_name: i64) -> EcsSystemMetaDeep {
+    m.name_id = new_name;
+    return m;
+}
+
+fn ecs_system_meta_deep_set_last_run(m: EcsSystemMetaDeep, tick: i64) -> EcsSystemMetaDeep {
+    m.last_run = tick;
+    return m;
+}
+
+fn ecs_system_meta_deep_is_send(m: EcsSystemMetaDeep) -> bool {
+    return (m.flags & ECS_FSF_NON_SEND) == 0;
+}
+
+// set_non_send is irreversible
+fn ecs_system_meta_deep_set_non_send(m: EcsSystemMetaDeep) -> EcsSystemMetaDeep {
+    m.flags = m.flags | ECS_FSF_NON_SEND;
+    return m;
+}
+
+fn ecs_system_meta_deep_has_deferred(m: EcsSystemMetaDeep) -> bool {
+    return (m.flags & ECS_FSF_DEFERRED) != 0;
+}
+
+fn ecs_system_meta_deep_set_has_deferred(m: EcsSystemMetaDeep) -> EcsSystemMetaDeep {
+    m.flags = m.flags | ECS_FSF_DEFERRED;
+    return m;
+}
+
+fn ecs_system_meta_deep_is_exclusive(m: EcsSystemMetaDeep) -> bool {
+    return (m.flags & ECS_FSF_EXCLUSIVE) != 0;
+}
+
+fn ecs_system_meta_deep_set_exclusive(m: EcsSystemMetaDeep) -> EcsSystemMetaDeep {
+    m.flags = m.flags | ECS_FSF_EXCLUSIVE;
+    return m;
+}
+
+// === IntoResult ===
+// plain T -> Ok(T)
+// Result Ok -> Ok
+// Result Err(RunSystemError) -> Err
+// Result Err(BevyError) modeled as Failed code
+// Never -> diverges (modeled as Failed special)
+const ECS_INTO_OK: i32 = 0;
+const ECS_INTO_ERR: i32 = 1;
+
+struct EcsIntoResult {
+    kind: i32,
+    value: i64,
+    err_code: i64,
+}
+
+fn ecs_into_result_ok(value: i64) -> EcsIntoResult {
+    return EcsIntoResult { kind: ECS_INTO_OK, value: value, err_code: 0 };
+}
+
+fn ecs_into_result_err(err_code: i64) -> EcsIntoResult {
+    return EcsIntoResult { kind: ECS_INTO_ERR, value: 0, err_code: err_code };
+}
+
+fn ecs_into_result_is_ok(r: EcsIntoResult) -> bool { return r.kind == ECS_INTO_OK; }
+fn ecs_into_result_value(r: EcsIntoResult) -> i64 { return r.value; }
+fn ecs_into_result_err_code(r: EcsIntoResult) -> i64 { return r.err_code; }
+
+// From plain value
+fn ecs_into_result_from_plain(value: i64) -> EcsIntoResult {
+    return ecs_into_result_ok(value);
+}
+
+// From Result-like (ok_flag, value, err_code)
+fn ecs_into_result_from_result(ok_flag: bool, value: i64, err_code: i64) -> EcsIntoResult {
+    if ok_flag { return ecs_into_result_ok(value); };
+    return ecs_into_result_err(err_code);
+}
+
+// From BevyError Result: Ok(self?) maps BevyError to RunSystemError Failed
+fn ecs_into_result_from_bevy_error(ok_flag: bool, value: i64, bevy_err: i64) -> EcsIntoResult {
+    if ok_flag { return ecs_into_result_ok(value); };
+    // map to failed
+    return ecs_into_result_err(bevy_err);
+}
+
+// === FunctionSystem (flattened) ===
+// state: has_state + param_state_id + world_id
+// ERROR_UNINITIALIZED if !has_state on run
+// world_id mismatch error if world != state.world_id
+struct EcsFunctionSystemDeep {
+    name_id: i64,
+    flags: i32,
+    last_run: i64,
+    has_state: bool,
+    param_state_id: i64,
+    world_id: i64,
+    run_count: i64,
+    last_output: i64,
+    last_error: i32,
+    // last_error: 0=ok, 1=uninitialized, 2=world_mismatch, 3=param_validation, 4=into_result_err
+    last_err_code: i64,
+}
+
+const ECS_FS_ERR_OK: i32 = 0;
+const ECS_FS_ERR_UNINITIALIZED: i32 = 1;
+const ECS_FS_ERR_WORLD_MISMATCH: i32 = 2;
+const ECS_FS_ERR_PARAM: i32 = 3;
+const ECS_FS_ERR_INTO_RESULT: i32 = 4;
+
+fn ecs_function_system_deep_new(name_id: i64) -> EcsFunctionSystemDeep {
+    return EcsFunctionSystemDeep {
+        name_id: name_id,
+        flags: ECS_FSF_EMPTY,
+        last_run: 0,
+        has_state: false,
+        param_state_id: 0,
+        world_id: 0,
+        run_count: 0,
+        last_output: 0,
+        last_error: ECS_FS_ERR_OK,
+        last_err_code: 0,
+    };
+}
+
+// IntoSystem for F: FunctionSystem::new(func, SystemMeta::new::<F>(), None)
+fn ecs_function_system_deep_from_func(name_id: i64) -> EcsFunctionSystemDeep {
+    return ecs_function_system_deep_new(name_id);
+}
+
+fn ecs_function_system_deep_name(s: EcsFunctionSystemDeep) -> i64 { return s.name_id; }
+fn ecs_function_system_deep_flags(s: EcsFunctionSystemDeep) -> i32 { return s.flags; }
+fn ecs_function_system_deep_has_state(s: EcsFunctionSystemDeep) -> bool { return s.has_state; }
+fn ecs_function_system_deep_world_id(s: EcsFunctionSystemDeep) -> i64 { return s.world_id; }
+fn ecs_function_system_deep_run_count(s: EcsFunctionSystemDeep) -> i64 { return s.run_count; }
+fn ecs_function_system_deep_last_output(s: EcsFunctionSystemDeep) -> i64 { return s.last_output; }
+fn ecs_function_system_deep_last_error(s: EcsFunctionSystemDeep) -> i32 { return s.last_error; }
+fn ecs_function_system_deep_last_err_code(s: EcsFunctionSystemDeep) -> i64 { return s.last_err_code; }
+fn ecs_function_system_deep_last_run(s: EcsFunctionSystemDeep) -> i64 { return s.last_run; }
+
+// with_name
+fn ecs_function_system_deep_with_name(s: EcsFunctionSystemDeep, new_name: i64) -> EcsFunctionSystemDeep {
+    s.name_id = new_name;
+    return s;
+}
+
+// initialize: builds param state for world
+fn ecs_function_system_deep_initialize(s: EcsFunctionSystemDeep, world_id: i64, param_state_id: i64) -> EcsFunctionSystemDeep {
+    s.has_state = true;
+    s.world_id = world_id;
+    s.param_state_id = param_state_id;
+    s.last_error = ECS_FS_ERR_OK;
+    return s;
+}
+
+// clone de-initializes (state = None, fresh SystemMeta name from type — we keep name_id, clear state)
+fn ecs_function_system_deep_clone(s: EcsFunctionSystemDeep) -> EcsFunctionSystemDeep {
+    return EcsFunctionSystemDeep {
+        name_id: s.name_id,
+        flags: ECS_FSF_EMPTY,
+        last_run: 0,
+        has_state: false,
+        param_state_id: 0,
+        world_id: 0,
+        run_count: 0,
+        last_output: 0,
+        last_error: ECS_FS_ERR_OK,
+        last_err_code: 0,
+    };
+}
+
+// set_non_send / set_has_deferred / set_exclusive on system meta flags
+fn ecs_function_system_deep_set_non_send(s: EcsFunctionSystemDeep) -> EcsFunctionSystemDeep {
+    s.flags = s.flags | ECS_FSF_NON_SEND;
+    return s;
+}
+
+fn ecs_function_system_deep_is_send(s: EcsFunctionSystemDeep) -> bool {
+    return (s.flags & ECS_FSF_NON_SEND) == 0;
+}
+
+fn ecs_function_system_deep_set_has_deferred(s: EcsFunctionSystemDeep) -> EcsFunctionSystemDeep {
+    s.flags = s.flags | ECS_FSF_DEFERRED;
+    return s;
+}
+
+fn ecs_function_system_deep_has_deferred(s: EcsFunctionSystemDeep) -> bool {
+    return (s.flags & ECS_FSF_DEFERRED) != 0;
+}
+
+fn ecs_function_system_deep_set_exclusive(s: EcsFunctionSystemDeep) -> EcsFunctionSystemDeep {
+    s.flags = s.flags | ECS_FSF_EXCLUSIVE;
+    return s;
+}
+
+// run_unsafe:
+// - if !has_state => UNINITIALIZED
+// - if world_id mismatch => WORLD_MISMATCH
+// - if param_ok false => PARAM
+// - else run, set last_run=change_tick, into_result
+fn ecs_function_system_deep_run_unsafe(
+    s: EcsFunctionSystemDeep,
+    world_id: i64,
+    change_tick: i64,
+    param_ok: bool,
+    param_err_code: i64,
+    plain_out: i64,
+    out_is_result: bool,
+    out_ok: bool,
+    out_err_code: i64
+) -> EcsFunctionSystemDeep {
+    if s.has_state != true {
+        s.last_error = ECS_FS_ERR_UNINITIALIZED;
+        s.last_err_code = 0;
+        return s;
+    };
+    if s.world_id != world_id {
+        s.last_error = ECS_FS_ERR_WORLD_MISMATCH;
+        s.last_err_code = 0;
+        return s;
+    };
+    if param_ok != true {
+        s.last_error = ECS_FS_ERR_PARAM;
+        s.last_err_code = param_err_code;
+        return s;
+    };
+    // produce IntoResult
+    let ir = ecs_into_result_ok(plain_out);
+    if out_is_result {
+        ir = ecs_into_result_from_result(out_ok, plain_out, out_err_code);
+    };
+    s.last_run = change_tick;
+    s.run_count = s.run_count + 1;
+    if ecs_into_result_is_ok(ir) {
+        s.last_output = ecs_into_result_value(ir);
+        s.last_error = ECS_FS_ERR_OK;
+        s.last_err_code = 0;
+    } else {
+        s.last_error = ECS_FS_ERR_INTO_RESULT;
+        s.last_err_code = ecs_into_result_err_code(ir);
+    };
+    return s;
+}
+
+// Convenience run with plain output
+fn ecs_function_system_deep_run_plain(
+    s: EcsFunctionSystemDeep,
+    world_id: i64,
+    change_tick: i64,
+    output: i64
+) -> EcsFunctionSystemDeep {
+    return ecs_function_system_deep_run_unsafe(s, world_id, change_tick, true, 0, output, false, true, 0);
+}
+
+// === SystemState<Param> (standalone exclusive-world helper) ===
+// Cached state for SystemParam; must reuse for Local/Changed/MessageReader correctness.
+struct EcsSystemStateDeepFs {
+    param_id: i64,
+    world_id: i64,
+    initialized: bool,
+    last_run: i64,
+    cached_value: i64,
+    applied: bool,
+}
+
+fn ecs_system_state_deep_fs_new(param_id: i64, world_id: i64) -> EcsSystemStateDeepFs {
+    return EcsSystemStateDeepFs {
+        param_id: param_id,
+        world_id: world_id,
+        initialized: true,
+        last_run: 0,
+        cached_value: 0,
+        applied: false,
+    };
+}
+
+fn ecs_system_state_deep_fs_param_id(s: EcsSystemStateDeepFs) -> i64 { return s.param_id; }
+fn ecs_system_state_deep_fs_world_id(s: EcsSystemStateDeepFs) -> i64 { return s.world_id; }
+fn ecs_system_state_deep_fs_initialized(s: EcsSystemStateDeepFs) -> bool { return s.initialized; }
+fn ecs_system_state_deep_fs_cached_value(s: EcsSystemStateDeepFs) -> i64 { return s.cached_value; }
+fn ecs_system_state_deep_fs_applied(s: EcsSystemStateDeepFs) -> bool { return s.applied; }
+
+fn ecs_system_state_deep_fs_matches_world(s: EcsSystemStateDeepFs, world_id: i64) -> bool {
+    return s.world_id == world_id;
+}
+
+// get_mut: update cached value for world (returns error if world mismatch)
+fn ecs_system_state_deep_fs_get_mut(s: EcsSystemStateDeepFs, world_id: i64, value: i64) -> EcsSystemStateDeepFs {
+    if s.world_id != world_id {
+        // leave unchanged; caller checks matches_world
+        return s;
+    };
+    s.cached_value = value;
+    s.applied = false;
+    return s;
+}
+
+fn ecs_system_state_deep_fs_get(s: EcsSystemStateDeepFs, world_id: i64) -> (bool, i64) {
+    if s.world_id != world_id { return (false, 0); };
+    return (true, s.cached_value);
+}
+
+// apply: apply deferred commands from state
+fn ecs_system_state_deep_fs_apply(s: EcsSystemStateDeepFs) -> EcsSystemStateDeepFs {
+    s.applied = true;
+    return s;
+}
+
+// from_builder: SystemState::from_builder(world, builder)
+fn ecs_system_state_deep_fs_from_builder(param_id: i64, world_id: i64) -> EcsSystemStateDeepFs {
+    return ecs_system_state_deep_fs_new(param_id, world_id);
+}
+
+// build_system from SystemState
+fn ecs_system_state_deep_fs_build_system(s: EcsSystemStateDeepFs, name_id: i64) -> EcsFunctionSystemDeep {
+    let fs = ecs_function_system_deep_new(name_id);
+    return ecs_function_system_deep_initialize(fs, s.world_id, s.param_id);
+}
+
+// IsFunctionSystem marker presence
+fn ecs_is_function_system_marker() -> i32 {
+    return 1;
+}
+
+// HasSystemInput marker
+fn ecs_has_system_input_marker() -> i32 {
+    return 1;
+}
+
+// meta flags proxy from FunctionSystem
+fn ecs_function_system_deep_meta_is_send(s: EcsFunctionSystemDeep) -> bool {
+    return ecs_function_system_deep_is_send(s);
+}
+
+// set_last_run / get_last_run via meta surface on system
+fn ecs_function_system_deep_set_last_run(s: EcsFunctionSystemDeep, tick: i64) -> EcsFunctionSystemDeep {
+    s.last_run = tick;
+    return s;
+}

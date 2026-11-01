@@ -1,0 +1,272 @@
+// Bevy ECS schedule graph: DirectedGraph + DAG + toposort.
+// Mirrors src/schedule/graph/graph_map.rs + dag.rs + tarjan_scc.rs.
+
+// === Graph edge ===
+struct EcsGraphEdge { from: i32, to: i32 }
+
+fn ecs_graph_edge_new(from: i32, to: i32) -> EcsGraphEdge { return EcsGraphEdge { from: from, to: to }; }
+
+// === DirectedGraph (graph_map.rs) ===
+struct EcsDiGraph {
+    nodes: Vec<i32>,
+    edges: Vec<EcsGraphEdge>,
+}
+
+fn ecs_digraph_new() -> EcsDiGraph {
+    return EcsDiGraph { nodes: Vec::new(), edges: Vec::new() };
+}
+
+fn ecs_digraph_with_capacity(_nodes: i64, _edges: i64) -> EcsDiGraph {
+    return ecs_digraph_new();
+}
+
+fn ecs_digraph_vec_contains(v: Vec<i32>, x: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(v) as i64;
+    while i < cnt { if v[i] == x { return true; }; i = i + 1; }
+    return false;
+}
+
+fn ecs_digraph_vec_remove(v: Vec<i32>, x: i32) -> Vec<i32> {
+    let i: i64 = 0;
+    let cnt = len(v) as i64;
+    while i < cnt { if v[i] == x { v[i] = v[cnt - 1]; v.pop(); return v; }; i = i + 1; }
+    return v;
+}
+
+fn ecs_digraph_add_node(g: EcsDiGraph, n: i32) -> EcsDiGraph {
+    if ecs_digraph_vec_contains(g.nodes, n) != true { g.nodes.push(n); };
+    return g;
+}
+
+fn ecs_digraph_remove_node(g: EcsDiGraph, n: i32) -> EcsDiGraph {
+    g.nodes = ecs_digraph_vec_remove(g.nodes, n);
+    return g;
+}
+
+fn ecs_digraph_contains_node(g: EcsDiGraph, n: i32) -> bool {
+    return ecs_digraph_vec_contains(g.nodes, n);
+}
+
+fn ecs_digraph_node_count(g: EcsDiGraph) -> i64 { return len(g.nodes) as i64; }
+fn ecs_digraph_edge_count(g: EcsDiGraph) -> i64 { return len(g.edges) as i64; }
+
+fn ecs_digraph_add_edge(g: EcsDiGraph, a: i32, b: i32) -> EcsDiGraph {
+    g = ecs_digraph_add_node(g, a);
+    g = ecs_digraph_add_node(g, b);
+    g.edges.push(EcsGraphEdge { from: a, to: b });
+    return g;
+}
+
+fn ecs_digraph_contains_edge(g: EcsDiGraph, a: i32, b: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(g.edges) as i64;
+    while i < cnt { if g.edges[i].from == a && g.edges[i].to == b { return true; }; i = i + 1; }
+    return false;
+}
+
+fn ecs_digraph_remove_edge(g: EcsDiGraph, a: i32, b: i32) -> (bool, EcsDiGraph) {
+    let i: i64 = 0;
+    let cnt = len(g.edges) as i64;
+    while i < cnt {
+        if g.edges[i].from == a && g.edges[i].to == b {
+            g.edges[i] = g.edges[cnt - 1];
+            g.edges.pop();
+            return (true, g);
+        };
+        i = i + 1;
+    }
+    return (false, g);
+}
+
+fn ecs_digraph_neighbors(g: EcsDiGraph, a: i32) -> Vec<i32> {
+    let result: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(g.edges) as i64;
+    while i < cnt {
+        if g.edges[i].from == a {
+            if ecs_digraph_vec_contains(result, g.edges[i].to) != true { result.push(g.edges[i].to); };
+        };
+        i = i + 1;
+    }
+    return result;
+}
+
+// Kahn's BFS toposort with cycle detection
+fn ecs_digraph_toposort(g: EcsDiGraph) -> (bool, Vec<i32>) {
+    let n = len(g.nodes) as i64;
+    if n == 0 { return (true, Vec::new()); };
+    // Build in-degree map
+    let in_degree: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < n { in_degree.push(0); i = i + 1; }
+    // Count edges into each node
+    let j: i64 = 0;
+    let ecnt = len(g.edges) as i64;
+    while j < ecnt {
+        let target = g.edges[j].to;
+        let k: i64 = 0;
+        while k < n {
+            if g.nodes[k] == target { in_degree[k] = in_degree[k] + 1; k = n; };
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    // BFS: start with zero in-degree nodes
+    let queue: Vec<i32> = Vec::new();
+    let result: Vec<i32> = Vec::new();
+    let m: i64 = 0;
+    while m < n {
+        if in_degree[m] == 0 { queue.push(g.nodes[m]); };
+        m = m + 1;
+    }
+    return ecs_digraph_toposort_bfs(g, in_degree, queue, result, 0);
+}
+
+fn ecs_digraph_toposort_bfs(g: EcsDiGraph, in_degree: Vec<i32>, queue: Vec<i32>, result: Vec<i32>, qi: i64) -> (bool, Vec<i32>) {
+    if qi >= (len(queue) as i64) {
+        if len(result) == len(g.nodes) { return (true, result); };
+        return (false, result);
+    };
+    let node = queue[qi];
+    result.push(node);
+    // Decrement in-degree of neighbors
+    let neighbors = ecs_digraph_neighbors(g, node);
+    let i: i64 = 0;
+    let ncnt = len(neighbors) as i64;
+    while i < ncnt {
+        let target = neighbors[i];
+        let k: i64 = 0;
+        let n = len(g.nodes) as i64;
+        while k < n {
+            if g.nodes[k] == target {
+                in_degree[k] = in_degree[k] - 1;
+                if in_degree[k] == 0 { queue.push(target); };
+                k = n;
+            };
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return ecs_digraph_toposort_bfs(g, in_degree, queue, result, qi + 1);
+}
+
+// === DAG (dag.rs): wraps DiGraph with cached toposort ===
+struct EcsDag {
+    graph: EcsDiGraph,
+    is_dirty: bool,
+    cached_toposort: Vec<i32>,
+    has_cached: bool,
+}
+
+fn ecs_dag_new() -> EcsDag {
+    return EcsDag { graph: ecs_digraph_new(), is_dirty: false, cached_toposort: Vec::new(), has_cached: false };
+}
+
+fn ecs_dag_add_node(d: EcsDag, n: i32) -> EcsDag {
+    d.graph = ecs_digraph_add_node(d.graph, n);
+    d.is_dirty = true;
+    return d;
+}
+
+fn ecs_dag_add_edge(d: EcsDag, a: i32, b: i32) -> EcsDag {
+    d.graph = ecs_digraph_add_edge(d.graph, a, b);
+    d.is_dirty = true;
+    return d;
+}
+
+fn ecs_dag_is_dirty(d: EcsDag) -> bool { return d.is_dirty; }
+fn ecs_dag_is_toposorted(d: EcsDag) -> bool { return d.is_dirty != true && d.has_cached; }
+
+fn ecs_dag_toposort(d: EcsDag) -> (bool, EcsDag) {
+    let r = ecs_digraph_toposort(d.graph);
+    d.cached_toposort = r.1;
+    d.has_cached = true;
+    d.is_dirty = false;
+    return (r.0, d);
+}
+
+fn ecs_dag_get_toposort(d: EcsDag) -> Vec<i32> {
+    if d.has_cached { return d.cached_toposort; };
+    return Vec::new();
+}
+
+fn ecs_dag_node_count(d: EcsDag) -> i64 { return ecs_digraph_node_count(d.graph); }
+fn ecs_dag_edge_count(d: EcsDag) -> i64 { return ecs_digraph_edge_count(d.graph); }
+fn ecs_dag_contains_edge(d: EcsDag, a: i32, b: i32) -> bool { return ecs_digraph_contains_edge(d.graph, a, b); }
+
+// === Tarjan SCC (tarjan_scc.rs) ===
+struct EcsTarjanState {
+    index: i32,
+    indices: Vec<i32>,
+    lowlinks: Vec<i32>,
+    on_stack: Vec<bool>,
+    stack: Vec<i32>,
+    node_count: i32,
+}
+
+fn ecs_tarjan_state_new(node_count: i32) -> EcsTarjanState {
+    let indices: Vec<i32> = Vec::new();
+    let lowlinks: Vec<i32> = Vec::new();
+    let on_stack: Vec<bool> = Vec::new();
+    let i: i32 = 0;
+    while i < node_count { indices.push(-1); lowlinks.push(-1); on_stack.push(false); i = i + 1; }
+    return EcsTarjanState { index: 0, indices: indices, lowlinks: lowlinks, on_stack: on_stack, stack: Vec::new(), node_count: node_count };
+}
+
+fn ecs_tarjan_compute(node_count: i32, edges: Vec<EcsGraphEdge>) -> Vec<Vec<i32>> {
+    let state = ecs_tarjan_state_new(node_count);
+    let r = ecs_tarjan_next(node_count, edges, state, Vec::new(), 0);
+    return r.1;
+}
+
+fn ecs_tarjan_strongconnect(nc: i32, edges: Vec<EcsGraphEdge>, state: EcsTarjanState, sccs: Vec<Vec<i32>>, v: i32) -> (EcsTarjanState, Vec<Vec<i32>>) {
+    state.indices[v] = state.index;
+    state.lowlinks[v] = state.index;
+    state.index = state.index + 1;
+    state.stack.push(v);
+    state.on_stack[v] = true;
+    let r1 = ecs_tarjan_succ(nc, edges, state, sccs, v, 0);
+    let s2 = r1.0;
+    let sccs2 = r1.1;
+    if s2.lowlinks[v] == s2.indices[v] {
+        return ecs_tarjan_pop_scc(nc, s2, sccs2, Vec::new(), v);
+    };
+    return ecs_tarjan_next(nc, edges, s2, sccs2, v + 1);
+}
+
+fn ecs_tarjan_succ(nc: i32, edges: Vec<EcsGraphEdge>, state: EcsTarjanState, sccs: Vec<Vec<i32>>, v: i32, ei: i64) -> (EcsTarjanState, Vec<Vec<i32>>) {
+    if ei >= (len(edges) as i64) { return (state, sccs); };
+    let edge = edges[ei];
+    if edge.from != v { return ecs_tarjan_succ(nc, edges, state, sccs, v, ei + 1); };
+    let w = edge.to;
+    if state.indices[w] == -1 {
+        let r = ecs_tarjan_strongconnect(nc, edges, state, sccs, w);
+        let s2 = r.0;
+        let sccs2 = r.1;
+        if s2.lowlinks[w] < s2.lowlinks[v] { s2.lowlinks[v] = s2.lowlinks[w]; };
+        return ecs_tarjan_succ(nc, edges, s2, sccs2, v, ei + 1);
+    };
+    if state.on_stack[w] {
+        if state.indices[w] < state.lowlinks[v] { state.lowlinks[v] = state.indices[w]; };
+    };
+    return ecs_tarjan_succ(nc, edges, state, sccs, v, ei + 1);
+}
+
+fn ecs_tarjan_pop_scc(nc: i32, state: EcsTarjanState, sccs: Vec<Vec<i32>>, scc: Vec<i32>, root: i32) -> (EcsTarjanState, Vec<Vec<i32>>) {
+    let w = state.stack[len(state.stack) - 1];
+    state.stack.pop();
+    state.on_stack[w] = false;
+    scc.push(w);
+    if w != root { return ecs_tarjan_pop_scc(nc, state, sccs, scc, root); };
+    sccs.push(scc);
+    return ecs_tarjan_next(nc, Vec::new(), state, sccs, root + 1);
+}
+
+fn ecs_tarjan_next(nc: i32, edges: Vec<EcsGraphEdge>, state: EcsTarjanState, sccs: Vec<Vec<i32>>, v: i32) -> (EcsTarjanState, Vec<Vec<i32>>) {
+    if v >= nc { return (state, sccs); };
+    if state.indices[v] != -1 { return ecs_tarjan_next(nc, edges, state, sccs, v + 1); };
+    return ecs_tarjan_strongconnect(nc, edges, state, sccs, v);
+}
+
+fn ecs_tarjan_scc_count(sccs: Vec<Vec<i32>>) -> i64 { return len(sccs) as i64; }

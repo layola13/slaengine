@@ -1,0 +1,174 @@
+// Sequential schedule for TableValueWorld<T, R, M>.
+// Systems execute over the archetype table-row storage path.
+@import "commands_table_value.sla"
+
+struct TableValueSystemAccess {
+    read_components: Vec<i32>,
+    write_components: Vec<i32>,
+    reads_resource: bool,
+    writes_resource: bool,
+    reads_messages: bool,
+    writes_messages: bool,
+}
+
+struct TableValueSystem<T, R, M> {
+    run: fn(TableValueWorld<T, R, M>) -> TableValueWorld<T, R, M>,
+    access: TableValueSystemAccess,
+}
+
+struct TableValueSchedule<T, R, M> {
+    systems: Vec<TableValueSystem<T, R, M>>,
+    conflict_count: i32,
+}
+
+fn table_value_system_access_none() -> TableValueSystemAccess {
+    let read_components: Vec<i32> = Vec::new();
+    let write_components: Vec<i32> = Vec::new();
+    return TableValueSystemAccess { read_components: read_components, write_components: write_components, reads_resource: false, writes_resource: false, reads_messages: false, writes_messages: false };
+}
+
+fn table_value_access_read_component(access: TableValueSystemAccess, component_id: i32) -> TableValueSystemAccess { access.read_components.push(component_id); return access; }
+fn table_value_access_write_component(access: TableValueSystemAccess, component_id: i32) -> TableValueSystemAccess { access.write_components.push(component_id); return access; }
+fn table_value_access_read_resource(access: TableValueSystemAccess) -> TableValueSystemAccess { access.reads_resource = true; return access; }
+fn table_value_access_write_resource(access: TableValueSystemAccess) -> TableValueSystemAccess { access.writes_resource = true; return access; }
+fn table_value_access_read_messages(access: TableValueSystemAccess) -> TableValueSystemAccess { access.reads_messages = true; return access; }
+fn table_value_access_write_messages(access: TableValueSystemAccess) -> TableValueSystemAccess { access.writes_messages = true; return access; }
+
+fn table_value_component_list_has(values: Vec<i32>, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(values) as i64;
+    while i < cnt {
+        if values[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn table_value_access_component_conflicts(left: TableValueSystemAccess, right: TableValueSystemAccess) -> bool {
+    let i: i64 = 0;
+    let left_writes = len(left.write_components) as i64;
+    while i < left_writes {
+        let component_id = left.write_components[i];
+        if table_value_component_list_has(right.read_components, component_id) { return true; };
+        if table_value_component_list_has(right.write_components, component_id) { return true; };
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let right_writes = len(right.write_components) as i64;
+    while j < right_writes {
+        let component_id = right.write_components[j];
+        if table_value_component_list_has(left.read_components, component_id) { return true; };
+        if table_value_component_list_has(left.write_components, component_id) { return true; };
+        j = j + 1;
+    }
+    return false;
+}
+
+fn table_value_access_conflicts(left: TableValueSystemAccess, right: TableValueSystemAccess) -> bool {
+    if table_value_access_component_conflicts(left, right) { return true; };
+    if left.writes_resource { if right.reads_resource { return true; }; if right.writes_resource { return true; }; };
+    if right.writes_resource { if left.reads_resource { return true; }; if left.writes_resource { return true; }; };
+    if left.writes_messages { if right.reads_messages { return true; }; if right.writes_messages { return true; }; };
+    if right.writes_messages { if left.reads_messages { return true; }; if left.writes_messages { return true; }; };
+    return false;
+}
+
+fn table_value_system_new<T, R, M>(run: fn(TableValueWorld<T, R, M>) -> TableValueWorld<T, R, M>, access: TableValueSystemAccess) -> TableValueSystem<T, R, M> {
+    return TableValueSystem<T, R, M> { run: run, access: access };
+}
+
+fn table_value_schedule_default<T, R, M>() -> TableValueSchedule<T, R, M> {
+    let systems: Vec<TableValueSystem<T, R, M>> = Vec::new();
+    return TableValueSchedule<T, R, M> { systems: systems, conflict_count: 0 };
+}
+
+fn table_value_schedule_add_systems<T, R, M>(schedule: TableValueSchedule<T, R, M>, system: TableValueSystem<T, R, M>) -> TableValueSchedule<T, R, M> {
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        if table_value_access_conflicts(schedule.systems[i].access, system.access) { schedule.conflict_count = schedule.conflict_count + 1; };
+        i = i + 1;
+    }
+    schedule.systems.push(system);
+    return schedule;
+}
+
+fn table_value_schedule_conflict_count<T, R, M>(schedule: TableValueSchedule<T, R, M>) -> i32 { return schedule.conflict_count; }
+
+fn table_value_schedule_run<T, R, M>(schedule: TableValueSchedule<T, R, M>, world: TableValueWorld<T, R, M>) -> TableValueWorld<T, R, M> {
+    world = table_value_world_increment_tick<T, R, M>(world);
+    let i: i64 = 0;
+    let cnt = len(schedule.systems) as i64;
+    while i < cnt {
+        let system = schedule.systems[i];
+        let run = system.run;
+        world = run(world);
+        i = i + 1;
+    }
+    return world;
+}
+
+struct TableScheduleData { amount: i32 }
+struct TableScheduleTime { tick: i32 }
+struct TableScheduleEvent { amount: i32 }
+
+fn table_schedule_time_default() -> TableScheduleTime { return TableScheduleTime { tick: 0 }; }
+fn table_schedule_event_default() -> TableScheduleEvent { return TableScheduleEvent { amount: 0 }; }
+
+fn table_schedule_world_new() -> TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent> {
+    return table_value_world_new<TableScheduleData, TableScheduleTime, TableScheduleEvent>(table_schedule_time_default(), table_schedule_event_default());
+}
+
+fn table_schedule_move_system(world: TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent>) -> TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent> {
+    let q = table_value_world_query_pair_mut_first<TableScheduleData, TableScheduleTime, TableScheduleEvent>(world, 1, 2);
+    let i: i64 = 0;
+    let cnt = len(q.items) as i64;
+    while i < cnt {
+        let item = q.items[i];
+        world = table_value_world_pair_write_first<TableScheduleData, TableScheduleTime, TableScheduleEvent>(world, item, TableScheduleData { amount: item.first.value.amount + item.second.amount });
+        i = i + 1;
+    }
+    return world;
+}
+
+fn table_schedule_resource_system(world: TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent>) -> TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent> {
+    return table_value_world_insert_resource<TableScheduleData, TableScheduleTime, TableScheduleEvent>(world, TableScheduleTime { tick: world.registry.change_tick });
+}
+
+fn table_schedule_message_system(world: TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent>) -> TableValueWorld<TableScheduleData, TableScheduleTime, TableScheduleEvent> {
+    return table_value_world_write_message<TableScheduleData, TableScheduleTime, TableScheduleEvent>(world, TableScheduleEvent { amount: 9 });
+}
+
+@test "table value schedule runs systems in order"() {
+    let w0 = table_schedule_world_new();
+    let (w1, position) = table_value_world_register_table<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w0);
+    let (w2, velocity) = table_value_world_register_table<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w1);
+    let (w3, entity) = table_value_world_spawn<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w2);
+    let w4 = table_value_world_insert<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w3, entity, position.id, TableScheduleData { amount: 3 });
+    let w5 = table_value_world_insert<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w4, entity, velocity.id, TableScheduleData { amount: 4 });
+    let group_before = table_value_world_entity_archetype_id<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w5, entity);
+    let move_access = table_value_access_read_component(table_value_access_write_component(table_value_system_access_none(), position.id), velocity.id);
+    let resource_access = table_value_access_write_resource(table_value_system_access_none());
+    let message_access = table_value_access_write_messages(table_value_system_access_none());
+    let s0 = table_value_schedule_default<TableScheduleData, TableScheduleTime, TableScheduleEvent>();
+    let s1 = table_value_schedule_add_systems<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s0, table_value_system_new<TableScheduleData, TableScheduleTime, TableScheduleEvent>(table_schedule_move_system, move_access));
+    let s2 = table_value_schedule_add_systems<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s1, table_value_system_new<TableScheduleData, TableScheduleTime, TableScheduleEvent>(table_schedule_resource_system, resource_access));
+    let s3 = table_value_schedule_add_systems<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s2, table_value_system_new<TableScheduleData, TableScheduleTime, TableScheduleEvent>(table_schedule_message_system, message_access));
+    let w6 = table_value_schedule_run<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s3, w5);
+    if table_value_world_entity_archetype_id<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w6, entity) != group_before { panic(11300); };
+    if table_value_world_get<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w6, entity, position.id).amount != 7 { panic(11301); };
+    if table_value_world_get_resource<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w6).tick != 2 { panic(11302); };
+    let event = table_value_world_read_message<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w6, message_reader_new(), table_schedule_event_default());
+    if event.value.amount != 9 { panic(11303); };
+}
+
+@test "table value schedule records component id conflicts"() {
+    let w0 = table_schedule_world_new();
+    let (w1, position) = table_value_world_register_table<TableScheduleData, TableScheduleTime, TableScheduleEvent>(w0);
+    let read_access = table_value_access_read_component(table_value_system_access_none(), position.id);
+    let write_access = table_value_access_write_component(table_value_system_access_none(), position.id);
+    let s0 = table_value_schedule_default<TableScheduleData, TableScheduleTime, TableScheduleEvent>();
+    let s1 = table_value_schedule_add_systems<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s0, table_value_system_new<TableScheduleData, TableScheduleTime, TableScheduleEvent>(table_schedule_resource_system, read_access));
+    let s2 = table_value_schedule_add_systems<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s1, table_value_system_new<TableScheduleData, TableScheduleTime, TableScheduleEvent>(table_schedule_move_system, write_access));
+    if table_value_schedule_conflict_count<TableScheduleData, TableScheduleTime, TableScheduleEvent>(s2) != 1 { panic(11310); };
+}

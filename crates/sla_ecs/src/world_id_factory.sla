@@ -1,0 +1,104 @@
+// Bevy ECS WorldId::new() static factory + Option/monotonic semantics — mirrors
+// src/world/identifier.rs.
+//
+//   pub struct WorldId(usize);
+//   static MAX_WORLD_ID: AtomicUsize = AtomicUsize::new(0);
+//   impl WorldId {
+//       pub fn new() -> Option<Self> {
+//           MAX_WORLD_ID.fetch_update(...).map(WorldId).ok()
+//       }
+//   }
+//   impl SparseSetIndex for WorldId {
+//       fn sparse_set_index(&self) -> usize { self.0 }
+//       fn get_sparse_set_index(value: usize) -> Self { Self(value) }
+//   }
+//
+// The existing lib/world_mod.sla models EcsWorldId { value } with an explicit value (the caller
+// provides the id). This gap module models the *static* identity-minting path: a global counter
+// that yields strictly-increasing unique ids and returns None once it overflows a sentinel cap,
+// matching Bevy's "unique across time — id of a dropped WorldId still cannot be reused" + the
+// `Option` return on exhaustion. We carry the counter in the struct itself (no SLA global state),
+// so the test threads the counter binding through calls as a builder.
+
+struct EcsWorldIdFactory {
+    next_id: i64,
+    cap: i64,           // the exhaustion sentinel — None when next_id >= cap
+    exhausted: bool,
+}
+
+// new() default cap mirrors a far-from-overflow bound (MAX_WORLD_ID ~ usize::MAX). Use a large
+// but finite cap so the exhaustion path is testable.
+fn ecs_world_id_factory_new() -> EcsWorldIdFactory {
+    return EcsWorldIdFactory { next_id: 0, cap: 1000000000, exhausted: false };
+}
+
+fn ecs_world_id_factory_with_cap(cap: i64) -> EcsWorldIdFactory {
+    return EcsWorldIdFactory { next_id: 0, cap: cap, exhausted: false };
+}
+
+fn ecs_world_id_factory_next_id(f: EcsWorldIdFactory) -> i64 {
+    return f.next_id;
+}
+
+fn ecs_world_id_factory_is_exhausted(f: EcsWorldIdFactory) -> bool {
+    return f.exhausted;
+}
+
+// Result struct for the Option<Self> return (single-field accessor — avoids scalar-tuple corruption).
+struct WorldIdNewResult {
+    factory: EcsWorldIdFactory,
+    has_id: i32,      // 0 => None (exhaustion), 1 => Some
+    id_value: i64,    // the minted id when has_id == 1
+}
+
+fn ecs_widr_factory(r: WorldIdNewResult) -> EcsWorldIdFactory {
+    return r.factory;
+}
+
+fn ecs_widr_has(r: WorldIdNewResult) -> i32 {
+    return r.has_id;
+}
+
+fn ecs_widr_value(r: WorldIdNewResult) -> i64 {
+    return r.id_value;
+}
+
+// WorldId::new() — fetch-add the counter (uniqueness across time) OR mark None when exhausted.
+// Once exhausted, stays exhausted (Bevy atomic won't rollback on overflow — but our cap path
+// flips exhausted once exceeded; subsequent calls keep returning None).
+fn ecs_world_id_new(f: EcsWorldIdFactory) -> WorldIdNewResult {
+    if f.exhausted || f.next_id >= f.cap {
+        f.exhausted = true;
+        return WorldIdNewResult { factory: f, has_id: 0, id_value: (0 - 1) };
+    };
+    let v = f.next_id;
+    f.next_id = v + 1;
+    return WorldIdNewResult { factory: f, has_id: 1, id_value: v };
+}
+
+// === SparseSetIndex impl ===
+struct EcsWorldId {
+    value: i64,
+}
+
+fn ecs_world_id_embedded_new(value: i64) -> EcsWorldId {
+    return EcsWorldId { value: value };
+}
+
+fn ecs_world_id_embedded_value(id: EcsWorldId) -> i64 {
+    return id.value;
+}
+
+// SparseSetIndex::sparse_set_index -> usize  == the wrapped usize.
+fn ecs_world_id_sparse_set_index(id: EcsWorldId) -> i64 {
+    return id.value;
+}
+
+// SparseSetIndex::get_sparse_set_index(value) -> Self  == Self(value).
+fn ecs_world_id_get_sparse_set_index(value: i64) -> EcsWorldId {
+    return EcsWorldId { value: value };
+}
+
+fn ecs_world_id_embedded_eq(a: EcsWorldId, b: EcsWorldId) -> bool {
+    return a.value == b.value;
+}

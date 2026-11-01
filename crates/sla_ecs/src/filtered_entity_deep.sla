@@ -1,0 +1,461 @@
+// Deepened Bevy ECS FilteredEntityRef / FilteredEntityMut / UnsafeFilteredEntityMut.
+// Mirrors src/world/entity_access/filtered.rs:
+//   Access-gated get / get_ref / get_mut / get_by_id / get_change_ticks
+//   contains / contains_id / contains_type_id (storage, not access-gated)
+//   try_into_all (Ref needs read_all; Mut needs read_all + write_all)
+//   reborrow / into_readonly / as_readonly
+//   into_mut / set via write access
+//   UnsafeFilteredEntityMut new_readonly / into_mut
+//   PartialEq / Ord by entity id
+// Fixed capacity: 4 component slots. Shallow lib/filtered_entity.sla retained.
+
+const ECS_FE_ERR_OK: i32 = 0;
+const ECS_FE_ERR_MISSING_READ_ALL: i32 = 1;
+const ECS_FE_ERR_MISSING_WRITE_ALL: i32 = 2;
+
+// Access: bitmasks for component ids 0..31 + all flags
+struct EcsFeAccessDeep {
+    read_bits: i64,
+    write_bits: i64,
+    read_all: bool,
+    write_all: bool,
+}
+
+fn ecs_fe_access_deep_new() -> EcsFeAccessDeep {
+    return EcsFeAccessDeep {
+        read_bits: 0, write_bits: 0, read_all: false, write_all: false,
+    };
+}
+
+fn ecs_fe_access_deep_read_bits(a: EcsFeAccessDeep) -> i64 { return a.read_bits; }
+fn ecs_fe_access_deep_write_bits(a: EcsFeAccessDeep) -> i64 { return a.write_bits; }
+fn ecs_fe_access_deep_has_read_all(a: EcsFeAccessDeep) -> bool { return a.read_all; }
+fn ecs_fe_access_deep_has_write_all(a: EcsFeAccessDeep) -> bool { return a.write_all; }
+
+fn ecs_fe_access_deep_set_read_all(a: EcsFeAccessDeep) -> EcsFeAccessDeep {
+    return EcsFeAccessDeep {
+        read_bits: a.read_bits, write_bits: a.write_bits, read_all: true, write_all: a.write_all,
+    };
+}
+
+fn ecs_fe_access_deep_set_write_all(a: EcsFeAccessDeep) -> EcsFeAccessDeep {
+    return EcsFeAccessDeep {
+        read_bits: a.read_bits, write_bits: a.write_bits, read_all: a.read_all, write_all: true,
+    };
+}
+
+fn ecs_fe_bit_for(id: i32) -> i64 {
+    if id < 0 { return 0; };
+    if id > 30 { return 0; };
+    let b: i64 = 1;
+    let i: i32 = 0;
+    while i < id {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+// OR-style: if bit already set keep else add bit
+fn ecs_fe_bits_or(bits: i64, bit: i64) -> i64 {
+    if bit == 0 { return bits; };
+    let has = (bits / bit) % 2;
+    if has == 1 { return bits; };
+    return bits + bit;
+}
+
+fn ecs_fe_access_deep_add_read(a: EcsFeAccessDeep, id: i32) -> EcsFeAccessDeep {
+    let bit = ecs_fe_bit_for(id);
+    return EcsFeAccessDeep {
+        read_bits: ecs_fe_bits_or(a.read_bits, bit),
+        write_bits: a.write_bits,
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+}
+
+fn ecs_fe_access_deep_add_write(a: EcsFeAccessDeep, id: i32) -> EcsFeAccessDeep {
+    let bit = ecs_fe_bit_for(id);
+    // write implies read in Bevy Access typically when added via FilteredAccess; model both
+    return EcsFeAccessDeep {
+        read_bits: ecs_fe_bits_or(a.read_bits, bit),
+        write_bits: ecs_fe_bits_or(a.write_bits, bit),
+        read_all: a.read_all,
+        write_all: a.write_all,
+    };
+}
+
+fn ecs_fe_access_deep_has_read(a: EcsFeAccessDeep, id: i32) -> bool {
+    if a.read_all { return true; };
+    let bit = ecs_fe_bit_for(id);
+    if bit == 0 { return false; };
+    if (a.read_bits / bit) % 2 == 1 { return true; };
+    // write also grants read for get on Mut path
+    if (a.write_bits / bit) % 2 == 1 { return true; };
+    return false;
+}
+
+fn ecs_fe_access_deep_has_write(a: EcsFeAccessDeep, id: i32) -> bool {
+    if a.write_all { return true; };
+    let bit = ecs_fe_bit_for(id);
+    if bit == 0 { return false; };
+    if (a.write_bits / bit) % 2 == 1 { return true; };
+    return false;
+}
+
+// Entity storage: fixed 4 component slots + meta
+struct EcsFeEntityDeep {
+    entity: i64,
+    archetype_id: i64,
+    location_row: i64,
+    spawned_by: i64,
+    spawn_tick: i64,
+    // slots
+    c0: i32, v0: i64, t0: i64,
+    c1: i32, v1: i64, t1: i64,
+    c2: i32, v2: i64, t2: i64,
+    c3: i32, v3: i64, t3: i64,
+    len: i32,
+}
+
+fn ecs_fe_entity_deep_new(entity: i64) -> EcsFeEntityDeep {
+    return EcsFeEntityDeep {
+        entity: entity, archetype_id: 0, location_row: 0, spawned_by: 0, spawn_tick: 0,
+        c0: -1, v0: 0, t0: 0,
+        c1: -1, v1: 0, t1: 0,
+        c2: -1, v2: 0, t2: 0,
+        c3: -1, v3: 0, t3: 0,
+        len: 0,
+    };
+}
+
+fn ecs_fe_entity_deep_id(e: EcsFeEntityDeep) -> i64 { return e.entity; }
+fn ecs_fe_entity_deep_archetype(e: EcsFeEntityDeep) -> i64 { return e.archetype_id; }
+fn ecs_fe_entity_deep_location_row(e: EcsFeEntityDeep) -> i64 { return e.location_row; }
+fn ecs_fe_entity_deep_spawned_by(e: EcsFeEntityDeep) -> i64 { return e.spawned_by; }
+fn ecs_fe_entity_deep_spawn_tick(e: EcsFeEntityDeep) -> i64 { return e.spawn_tick; }
+fn ecs_fe_entity_deep_len(e: EcsFeEntityDeep) -> i32 { return e.len; }
+
+fn ecs_fe_entity_deep_with_meta(
+    e: EcsFeEntityDeep,
+    archetype_id: i64,
+    location_row: i64,
+    spawned_by: i64,
+    spawn_tick: i64
+) -> EcsFeEntityDeep {
+    return EcsFeEntityDeep {
+        entity: e.entity, archetype_id: archetype_id, location_row: location_row,
+        spawned_by: spawned_by, spawn_tick: spawn_tick,
+        c0: e.c0, v0: e.v0, t0: e.t0,
+        c1: e.c1, v1: e.v1, t1: e.t1,
+        c2: e.c2, v2: e.v2, t2: e.t2,
+        c3: e.c3, v3: e.v3, t3: e.t3,
+        len: e.len,
+    };
+}
+
+fn ecs_fe_entity_deep_rebuild(
+    entity: i64, archetype_id: i64, location_row: i64, spawned_by: i64, spawn_tick: i64,
+    c0: i32, v0: i64, t0: i64,
+    c1: i32, v1: i64, t1: i64,
+    c2: i32, v2: i64, t2: i64,
+    c3: i32, v3: i64, t3: i64,
+    len: i32
+) -> EcsFeEntityDeep {
+    return EcsFeEntityDeep {
+        entity: entity, archetype_id: archetype_id, location_row: location_row,
+        spawned_by: spawned_by, spawn_tick: spawn_tick,
+        c0: c0, v0: v0, t0: t0,
+        c1: c1, v1: v1, t1: t1,
+        c2: c2, v2: v2, t2: t2,
+        c3: c3, v3: v3, t3: t3,
+        len: len,
+    };
+}
+
+fn ecs_fe_entity_deep_insert(e: EcsFeEntityDeep, component_id: i32, value: i64, tick: i64) -> EcsFeEntityDeep {
+    // update existing
+    if e.len >= 1 {
+        if e.c0 == component_id {
+            return ecs_fe_entity_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+                e.c0, value, tick, e.c1, e.v1, e.t1, e.c2, e.v2, e.t2, e.c3, e.v3, e.t3, e.len
+            );
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == component_id {
+            return ecs_fe_entity_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+                e.c0, e.v0, e.t0, e.c1, value, tick, e.c2, e.v2, e.t2, e.c3, e.v3, e.t3, e.len
+            );
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == component_id {
+            return ecs_fe_entity_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+                e.c0, e.v0, e.t0, e.c1, e.v1, e.t1, e.c2, value, tick, e.c3, e.v3, e.t3, e.len
+            );
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == component_id {
+            return ecs_fe_entity_deep_rebuild(
+                e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+                e.c0, e.v0, e.t0, e.c1, e.v1, e.t1, e.c2, e.v2, e.t2, e.c3, value, tick, e.len
+            );
+        };
+    };
+    // append
+    if e.len == 0 {
+        return ecs_fe_entity_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+            component_id, value, tick, e.c1, e.v1, e.t1, e.c2, e.v2, e.t2, e.c3, e.v3, e.t3, 1
+        );
+    };
+    if e.len == 1 {
+        return ecs_fe_entity_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+            e.c0, e.v0, e.t0, component_id, value, tick, e.c2, e.v2, e.t2, e.c3, e.v3, e.t3, 2
+        );
+    };
+    if e.len == 2 {
+        return ecs_fe_entity_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+            e.c0, e.v0, e.t0, e.c1, e.v1, e.t1, component_id, value, tick, e.c3, e.v3, e.t3, 3
+        );
+    };
+    if e.len == 3 {
+        return ecs_fe_entity_deep_rebuild(
+            e.entity, e.archetype_id, e.location_row, e.spawned_by, e.spawn_tick,
+            e.c0, e.v0, e.t0, e.c1, e.v1, e.t1, e.c2, e.v2, e.t2, component_id, value, tick, 4
+        );
+    };
+    return e;
+}
+
+struct EcsFeCompGet {
+    found: bool,
+    value: i64,
+    tick: i64,
+}
+
+fn ecs_fe_comp_get_found(r: EcsFeCompGet) -> bool { return r.found; }
+fn ecs_fe_comp_get_value(r: EcsFeCompGet) -> i64 { return r.value; }
+fn ecs_fe_comp_get_tick(r: EcsFeCompGet) -> i64 { return r.tick; }
+
+fn ecs_fe_entity_deep_get(e: EcsFeEntityDeep, component_id: i32) -> EcsFeCompGet {
+    if e.len >= 1 {
+        if e.c0 == component_id {
+            return EcsFeCompGet { found: true, value: e.v0, tick: e.t0 };
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == component_id {
+            return EcsFeCompGet { found: true, value: e.v1, tick: e.t1 };
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == component_id {
+            return EcsFeCompGet { found: true, value: e.v2, tick: e.t2 };
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == component_id {
+            return EcsFeCompGet { found: true, value: e.v3, tick: e.t3 };
+        };
+    };
+    return EcsFeCompGet { found: false, value: 0, tick: 0 };
+}
+
+fn ecs_fe_entity_deep_contains(e: EcsFeEntityDeep, component_id: i32) -> bool {
+    let g = ecs_fe_entity_deep_get(e, component_id);
+    return ecs_fe_comp_get_found(g);
+}
+
+// FilteredEntityRef
+struct EcsFeRefDeep {
+    entity: EcsFeEntityDeep,
+    access: EcsFeAccessDeep,
+}
+
+fn ecs_fe_ref_deep_new(entity: EcsFeEntityDeep, access: EcsFeAccessDeep) -> EcsFeRefDeep {
+    return EcsFeRefDeep { entity: entity, access: access };
+}
+
+fn ecs_fe_ref_deep_id(f: EcsFeRefDeep) -> i64 { return ecs_fe_entity_deep_id(f.entity); }
+fn ecs_fe_ref_deep_archetype(f: EcsFeRefDeep) -> i64 { return ecs_fe_entity_deep_archetype(f.entity); }
+fn ecs_fe_ref_deep_location_row(f: EcsFeRefDeep) -> i64 { return ecs_fe_entity_deep_location_row(f.entity); }
+fn ecs_fe_ref_deep_spawned_by(f: EcsFeRefDeep) -> i64 { return ecs_fe_entity_deep_spawned_by(f.entity); }
+fn ecs_fe_ref_deep_spawn_tick(f: EcsFeRefDeep) -> i64 { return ecs_fe_entity_deep_spawn_tick(f.entity); }
+fn ecs_fe_ref_deep_access_read_bits(f: EcsFeRefDeep) -> i64 { return ecs_fe_access_deep_read_bits(f.access); }
+
+// contains ignores access
+fn ecs_fe_ref_deep_contains(f: EcsFeRefDeep, component_id: i32) -> bool {
+    return ecs_fe_entity_deep_contains(f.entity, component_id);
+}
+fn ecs_fe_ref_deep_contains_id(f: EcsFeRefDeep, component_id: i32) -> bool {
+    return ecs_fe_ref_deep_contains(f, component_id);
+}
+fn ecs_fe_ref_deep_contains_type_id(f: EcsFeRefDeep, type_id: i32) -> bool {
+    return ecs_fe_ref_deep_contains(f, type_id);
+}
+
+fn ecs_fe_ref_deep_get(f: EcsFeRefDeep, component_id: i32) -> EcsFeCompGet {
+    if ecs_fe_access_deep_has_read(f.access, component_id) != true {
+        return EcsFeCompGet { found: false, value: 0, tick: 0 };
+    };
+    return ecs_fe_entity_deep_get(f.entity, component_id);
+}
+
+fn ecs_fe_ref_deep_get_ref(f: EcsFeRefDeep, component_id: i32) -> EcsFeCompGet {
+    return ecs_fe_ref_deep_get(f, component_id);
+}
+
+fn ecs_fe_ref_deep_get_by_id(f: EcsFeRefDeep, component_id: i32) -> EcsFeCompGet {
+    return ecs_fe_ref_deep_get(f, component_id);
+}
+
+fn ecs_fe_ref_deep_get_change_ticks(f: EcsFeRefDeep, component_id: i32) -> EcsFeCompGet {
+    return ecs_fe_ref_deep_get(f, component_id);
+}
+
+// try_into_all for Ref: needs read_all
+struct EcsFeTryAll {
+    ok: bool,
+    err: i32,
+}
+
+fn ecs_fe_try_all_ok(r: EcsFeTryAll) -> bool { return r.ok; }
+fn ecs_fe_try_all_err(r: EcsFeTryAll) -> i32 { return r.err; }
+
+fn ecs_fe_ref_deep_try_into_all(f: EcsFeRefDeep) -> EcsFeTryAll {
+    if ecs_fe_access_deep_has_read_all(f.access) != true {
+        return EcsFeTryAll { ok: false, err: ECS_FE_ERR_MISSING_READ_ALL };
+    };
+    return EcsFeTryAll { ok: true, err: ECS_FE_ERR_OK };
+}
+
+fn ecs_fe_ref_deep_eq(a: EcsFeRefDeep, b: EcsFeRefDeep) -> bool {
+    if ecs_fe_ref_deep_id(a) == ecs_fe_ref_deep_id(b) { return true; };
+    return false;
+}
+
+fn ecs_fe_ref_deep_cmp(a: EcsFeRefDeep, b: EcsFeRefDeep) -> i32 {
+    let aid = ecs_fe_ref_deep_id(a);
+    let bid = ecs_fe_ref_deep_id(b);
+    if aid < bid { return -1; };
+    if aid > bid { return 1; };
+    return 0;
+}
+
+// FilteredEntityMut
+struct EcsFeMutDeep {
+    entity: EcsFeEntityDeep,
+    access: EcsFeAccessDeep,
+}
+
+fn ecs_fe_mut_deep_new(entity: EcsFeEntityDeep, access: EcsFeAccessDeep) -> EcsFeMutDeep {
+    return EcsFeMutDeep { entity: entity, access: access };
+}
+
+fn ecs_fe_mut_deep_id(f: EcsFeMutDeep) -> i64 { return ecs_fe_entity_deep_id(f.entity); }
+fn ecs_fe_mut_deep_archetype(f: EcsFeMutDeep) -> i64 { return ecs_fe_entity_deep_archetype(f.entity); }
+fn ecs_fe_mut_deep_contains(f: EcsFeMutDeep, component_id: i32) -> bool {
+    return ecs_fe_entity_deep_contains(f.entity, component_id);
+}
+
+fn ecs_fe_mut_deep_get(f: EcsFeMutDeep, component_id: i32) -> EcsFeCompGet {
+    if ecs_fe_access_deep_has_read(f.access, component_id) != true {
+        return EcsFeCompGet { found: false, value: 0, tick: 0 };
+    };
+    return ecs_fe_entity_deep_get(f.entity, component_id);
+}
+
+// get_mut: requires write; returns current value if present
+fn ecs_fe_mut_deep_get_mut(f: EcsFeMutDeep, component_id: i32) -> EcsFeCompGet {
+    if ecs_fe_access_deep_has_write(f.access, component_id) != true {
+        return EcsFeCompGet { found: false, value: 0, tick: 0 };
+    };
+    return ecs_fe_entity_deep_get(f.entity, component_id);
+}
+
+// set via write access: updates value + tick
+struct EcsFeMutSetResult {
+    view: EcsFeMutDeep,
+    ok: bool,
+}
+
+fn ecs_fe_mut_set_view(r: EcsFeMutSetResult) -> EcsFeMutDeep { return r.view; }
+fn ecs_fe_mut_set_ok(r: EcsFeMutSetResult) -> bool { return r.ok; }
+
+fn ecs_fe_mut_deep_set(f: EcsFeMutDeep, component_id: i32, value: i64, tick: i64) -> EcsFeMutSetResult {
+    if ecs_fe_access_deep_has_write(f.access, component_id) != true {
+        return EcsFeMutSetResult { view: f, ok: false };
+    };
+    if ecs_fe_entity_deep_contains(f.entity, component_id) != true {
+        return EcsFeMutSetResult { view: f, ok: false };
+    };
+    let e2 = ecs_fe_entity_deep_insert(f.entity, component_id, value, tick);
+    let f2 = EcsFeMutDeep { entity: e2, access: f.access };
+    return EcsFeMutSetResult { view: f2, ok: true };
+}
+
+fn ecs_fe_mut_deep_reborrow(f: EcsFeMutDeep) -> EcsFeMutDeep {
+    return EcsFeMutDeep { entity: f.entity, access: f.access };
+}
+
+fn ecs_fe_mut_deep_into_readonly(f: EcsFeMutDeep) -> EcsFeRefDeep {
+    return EcsFeRefDeep { entity: f.entity, access: f.access };
+}
+
+fn ecs_fe_mut_deep_as_readonly(f: EcsFeMutDeep) -> EcsFeRefDeep {
+    return ecs_fe_mut_deep_into_readonly(f);
+}
+
+fn ecs_fe_mut_deep_try_into_all(f: EcsFeMutDeep) -> EcsFeTryAll {
+    if ecs_fe_access_deep_has_read_all(f.access) != true {
+        return EcsFeTryAll { ok: false, err: ECS_FE_ERR_MISSING_READ_ALL };
+    };
+    if ecs_fe_access_deep_has_write_all(f.access) != true {
+        return EcsFeTryAll { ok: false, err: ECS_FE_ERR_MISSING_WRITE_ALL };
+    };
+    return EcsFeTryAll { ok: true, err: ECS_FE_ERR_OK };
+}
+
+fn ecs_fe_mut_deep_eq(a: EcsFeMutDeep, b: EcsFeMutDeep) -> bool {
+    if ecs_fe_mut_deep_id(a) == ecs_fe_mut_deep_id(b) { return true; };
+    return false;
+}
+
+fn ecs_fe_mut_deep_cmp(a: EcsFeMutDeep, b: EcsFeMutDeep) -> i32 {
+    let aid = ecs_fe_mut_deep_id(a);
+    let bid = ecs_fe_mut_deep_id(b);
+    if aid < bid { return -1; };
+    if aid > bid { return 1; };
+    return 0;
+}
+
+// UnsafeFilteredEntityMut
+struct EcsFeUnsafeMutDeep {
+    entity: EcsFeEntityDeep,
+    access: EcsFeAccessDeep,
+}
+
+fn ecs_fe_unsafe_mut_deep_new_readonly(f: EcsFeMutDeep) -> EcsFeUnsafeMutDeep {
+    return EcsFeUnsafeMutDeep { entity: f.entity, access: f.access };
+}
+
+fn ecs_fe_unsafe_mut_deep_into_mut(u: EcsFeUnsafeMutDeep) -> EcsFeMutDeep {
+    return EcsFeMutDeep { entity: u.entity, access: u.access };
+}
+
+fn ecs_fe_unsafe_mut_deep_id(u: EcsFeUnsafeMutDeep) -> i64 {
+    return ecs_fe_entity_deep_id(u.entity);
+}
+
+// into_mut typed: consume mut view, require write + present
+fn ecs_fe_mut_deep_into_mut(f: EcsFeMutDeep, component_id: i32) -> EcsFeCompGet {
+    return ecs_fe_mut_deep_get_mut(f, component_id);
+}

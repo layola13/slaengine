@@ -1,0 +1,232 @@
+// Deepened Bevy ECS archetype::Archetype + ArchetypeFlags.
+// Components tracked in fixed capacity-4 slots with storage type inline.
+// Shallow lib/archetype_info.sla retained.
+
+const ECS_AIF_ON_ADD_HOOK: i32 = 1;
+const ECS_AIF_ON_INSERT_HOOK: i32 = 2;
+const ECS_AIF_ON_DISCARD_HOOK: i32 = 4;
+const ECS_AIF_ON_REMOVE_HOOK: i32 = 8;
+const ECS_AIF_ON_DESPAWN_HOOK: i32 = 16;
+const ECS_AIF_ON_ADD_OBSERVER: i32 = 32;
+const ECS_AIF_ON_INSERT_OBSERVER: i32 = 64;
+const ECS_AIF_ON_DISCARD_OBSERVER: i32 = 128;
+const ECS_AIF_ON_REMOVE_OBSERVER: i32 = 256;
+const ECS_AIF_ON_DESPAWN_OBSERVER: i32 = 512;
+const ECS_AIF_STORAGE_TABLE: i32 = 0;
+const ECS_AIF_STORAGE_SPARSE: i32 = 1;
+
+struct EcsArchInfoDeep {
+    id: i32,
+    table_id: i32,
+    flags: i32,
+    // component_id + storage_type slots
+    c0: i32, c1: i32, c2: i32, c3: i32,
+    s0: i32, s1: i32, s2: i32, s3: i32,
+    comp_len: i32,
+    table_comp_count: i32,
+    sparse_comp_count: i32,
+    entity_count: i32,
+    generation: i32,
+    edges_present: bool,
+}
+
+fn ecs_ainf_new(id: i32, table_id: i32, generation: i32) -> EcsArchInfoDeep {
+    return EcsArchInfoDeep {
+        id: id, table_id: table_id, flags: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, s0: 0, s1: 0, s2: 0, s3: 0, comp_len: 0,
+        table_comp_count: 0, sparse_comp_count: 0, entity_count: 0,
+        generation: generation, edges_present: false,
+    };
+}
+
+fn ecs_ainf_rebuild(
+    id: i32, table_id: i32, flags: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32,
+    s0: i32, s1: i32, s2: i32, s3: i32,
+    comp_len: i32, table_comp_count: i32, sparse_comp_count: i32,
+    entity_count: i32, generation: i32, edges_present: bool
+) -> EcsArchInfoDeep {
+    return EcsArchInfoDeep {
+        id: id, table_id: table_id, flags: flags,
+        c0: c0, c1: c1, c2: c2, c3: c3,
+        s0: s0, s1: s1, s2: s2, s3: s3,
+        comp_len: comp_len, table_comp_count: table_comp_count, sparse_comp_count: sparse_comp_count,
+        entity_count: entity_count, generation: generation, edges_present: edges_present,
+    };
+}
+
+fn ecs_ainf_add_table_component(a: EcsArchInfoDeep, component_id: i32) -> EcsArchInfoDeep {
+    let ln = a.comp_len;
+    if ln >= 4 { return a; };
+    let c0 = a.c0; let c1 = a.c1; let c2 = a.c2; let c3 = a.c3;
+    if ln == 0 { c0 = component_id; };
+    if ln == 1 { c1 = component_id; };
+    if ln == 2 { c2 = component_id; };
+    if ln == 3 { c3 = component_id; };
+    return ecs_ainf_rebuild(
+        a.id, a.table_id, a.flags,
+        c0, c1, c2, c3,
+        a.s0, a.s1, a.s2, a.s3,
+        ln + 1, a.table_comp_count + 1, a.sparse_comp_count,
+        a.entity_count, a.generation, a.edges_present
+    );
+    // s value missing: need to set storage type for new slot
+}
+
+// Provide a full add that also writes storage_type to the slot sX.
+fn ecs_ainf_add_component(a: EcsArchInfoDeep, component_id: i32, storage_type: i32) -> EcsArchInfoDeep {
+    let ln = a.comp_len;
+    if ln >= 4 { return a; };
+    let c0 = a.c0; let c1 = a.c1; let c2 = a.c2; let c3 = a.c3;
+    let s0 = a.s0; let s1 = a.s1; let s2 = a.s2; let s3 = a.s3;
+    let tcc = a.table_comp_count;
+    let scc = a.sparse_comp_count;
+    if ln == 0 {
+        c0 = component_id; s0 = storage_type;
+        if storage_type == ECS_AIF_STORAGE_TABLE {
+            return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 1, tcc + 1, scc, a.entity_count, a.generation, a.edges_present);
+        };
+        return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 1, tcc, scc + 1, a.entity_count, a.generation, a.edges_present);
+    };
+    if ln == 1 {
+        c1 = component_id; s1 = storage_type;
+        if storage_type == ECS_AIF_STORAGE_TABLE {
+            return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 2, tcc + 1, scc, a.entity_count, a.generation, a.edges_present);
+        };
+        return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 2, tcc, scc + 1, a.entity_count, a.generation, a.edges_present);
+    };
+    if ln == 2 {
+        c2 = component_id; s2 = storage_type;
+        if storage_type == ECS_AIF_STORAGE_TABLE {
+            return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 3, tcc + 1, scc, a.entity_count, a.generation, a.edges_present);
+        };
+        return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 3, tcc, scc + 1, a.entity_count, a.generation, a.edges_present);
+    };
+    if ln == 3 {
+        c3 = component_id; s3 = storage_type;
+        if storage_type == ECS_AIF_STORAGE_TABLE {
+            return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 4, tcc + 1, scc, a.entity_count, a.generation, a.edges_present);
+        };
+        return ecs_ainf_rebuild(a.id, a.table_id, a.flags, c0, c1, c2, c3, s0, s1, s2, s3, 4, tcc, scc + 1, a.entity_count, a.generation, a.edges_present);
+    };
+    return a;
+}
+
+fn ecs_ainf_add_table_component_full(a: EcsArchInfoDeep, component_id: i32) -> EcsArchInfoDeep {
+    return ecs_ainf_add_component(a, component_id, ECS_AIF_STORAGE_TABLE);
+}
+fn ecs_ainf_add_sparse_component_full(a: EcsArchInfoDeep, component_id: i32) -> EcsArchInfoDeep {
+    return ecs_ainf_add_component(a, component_id, ECS_AIF_STORAGE_SPARSE);
+}
+
+fn ecs_ainf_id(a: EcsArchInfoDeep) -> i32 { return a.id; }
+fn ecs_ainf_table_id(a: EcsArchInfoDeep) -> i32 { return a.table_id; }
+fn ecs_ainf_flags(a: EcsArchInfoDeep) -> i32 { return a.flags; }
+fn ecs_ainf_generation(a: EcsArchInfoDeep) -> i32 { return a.generation; }
+fn ecs_ainf_component_count(a: EcsArchInfoDeep) -> i32 { return a.comp_len; }
+fn ecs_ainf_table_components_count(a: EcsArchInfoDeep) -> i32 { return a.table_comp_count; }
+fn ecs_ainf_sparse_components_count(a: EcsArchInfoDeep) -> i32 { return a.sparse_comp_count; }
+fn ecs_ainf_len(a: EcsArchInfoDeep) -> i32 { return a.entity_count; }
+fn ecs_ainf_is_empty(a: EcsArchInfoDeep) -> bool { return a.entity_count == 0; }
+fn ecs_ainf_edges(a: EcsArchInfoDeep) -> bool { return a.edges_present; }
+
+fn ecs_ainf_add_entity(a: EcsArchInfoDeep) -> EcsArchInfoDeep {
+    return ecs_ainf_rebuild(
+        a.id, a.table_id, a.flags, a.c0, a.c1, a.c2, a.c3,
+        a.s0, a.s1, a.s2, a.s3, a.comp_len, a.table_comp_count, a.sparse_comp_count,
+        a.entity_count + 1, a.generation, a.edges_present
+    );
+}
+fn ecs_ainf_remove_entity(a: EcsArchInfoDeep) -> EcsArchInfoDeep {
+    let c = a.entity_count;
+    if c <= 0 { return a; };
+    return ecs_ainf_rebuild(
+        a.id, a.table_id, a.flags, a.c0, a.c1, a.c2, a.c3,
+        a.s0, a.s1, a.s2, a.s3, a.comp_len, a.table_comp_count, a.sparse_comp_count,
+        c - 1, a.generation, a.edges_present
+    );
+}
+
+fn ecs_ainf_set_edges(a: EcsArchInfoDeep) -> EcsArchInfoDeep {
+    return ecs_ainf_rebuild(
+        a.id, a.table_id, a.flags, a.c0, a.c1, a.c2, a.c3,
+        a.s0, a.s1, a.s2, a.s3, a.comp_len, a.table_comp_count, a.sparse_comp_count,
+        a.entity_count, a.generation, true
+    );
+}
+
+fn ecs_ainf_set_flag(a: EcsArchInfoDeep, mask: i32) -> EcsArchInfoDeep {
+    return ecs_ainf_rebuild(
+        a.id, a.table_id, a.flags + mask, a.c0, a.c1, a.c2, a.c3,
+        a.s0, a.s1, a.s2, a.s3, a.comp_len, a.table_comp_count, a.sparse_comp_count,
+        a.entity_count, a.generation, a.edges_present
+    );
+}
+
+fn ecs_ainf_set_add_hook(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_ADD_HOOK); }
+fn ecs_ainf_set_insert_hook(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_INSERT_HOOK); }
+fn ecs_ainf_set_discard_hook(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_DISCARD_HOOK); }
+fn ecs_ainf_set_remove_hook(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_REMOVE_HOOK); }
+fn ecs_ainf_set_despawn_hook(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_DESPAWN_HOOK); }
+fn ecs_ainf_set_add_observer(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_ADD_OBSERVER); }
+fn ecs_ainf_set_insert_observer(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_INSERT_OBSERVER); }
+fn ecs_ainf_set_discard_observer(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_DISCARD_OBSERVER); }
+fn ecs_ainf_set_remove_observer(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_REMOVE_OBSERVER); }
+fn ecs_ainf_set_despawn_observer(a: EcsArchInfoDeep) -> EcsArchInfoDeep { return ecs_ainf_set_flag(a, ECS_AIF_ON_DESPAWN_OBSERVER); }
+
+fn ecs_ainf_has_flag(a: EcsArchInfoDeep, mask: i32) -> bool {
+    let q = a.flags / mask;
+    let rem = q - (q / 2) * 2;
+    return rem != 0;
+}
+
+fn ecs_ainf_has_add_hook(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_ADD_HOOK); }
+fn ecs_ainf_has_insert_hook(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_INSERT_HOOK); }
+fn ecs_ainf_has_discard_hook(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_DISCARD_HOOK); }
+fn ecs_ainf_has_remove_hook(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_REMOVE_HOOK); }
+fn ecs_ainf_has_despawn_hook(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_DESPAWN_HOOK); }
+fn ecs_ainf_has_add_observer(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_ADD_OBSERVER); }
+fn ecs_ainf_has_insert_observer(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_INSERT_OBSERVER); }
+fn ecs_ainf_has_discard_observer(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_DISCARD_OBSERVER); }
+fn ecs_ainf_has_remove_observer(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_REMOVE_OBSERVER); }
+fn ecs_ainf_has_despawn_observer(a: EcsArchInfoDeep) -> bool { return ecs_ainf_has_flag(a, ECS_AIF_ON_DESPAWN_OBSERVER); }
+
+fn ecs_ainf_contains(a: EcsArchInfoDeep, component_id: i32) -> bool {
+    if a.comp_len >= 1 { if a.c0 == component_id { return true; }; };
+    if a.comp_len >= 2 { if a.c1 == component_id { return true; }; };
+    if a.comp_len >= 3 { if a.c2 == component_id { return true; }; };
+    if a.comp_len >= 4 { if a.c3 == component_id { return true; }; };
+    return false;
+}
+
+struct EcsAinfStorageDeep { found: bool, storage_type: i32 }
+fn ecs_ainf_storage_found(s: EcsAinfStorageDeep) -> bool { return s.found; }
+fn ecs_ainf_storage_type(s: EcsAinfStorageDeep) -> i32 { return s.storage_type; }
+
+fn ecs_ainf_get_storage_type(a: EcsArchInfoDeep, component_id: i32) -> EcsAinfStorageDeep {
+    if a.comp_len >= 1 { if a.c0 == component_id { return EcsAinfStorageDeep { found: true, storage_type: a.s0 }; }; };
+    if a.comp_len >= 2 { if a.c1 == component_id { return EcsAinfStorageDeep { found: true, storage_type: a.s1 }; }; };
+    if a.comp_len >= 3 { if a.c2 == component_id { return EcsAinfStorageDeep { found: true, storage_type: a.s2 }; }; };
+    if a.comp_len >= 4 { if a.c3 == component_id { return EcsAinfStorageDeep { found: true, storage_type: a.s3 }; }; };
+    return EcsAinfStorageDeep { found: false, storage_type: 0 };
+}
+
+fn ecs_ainf_component_at(a: EcsArchInfoDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.c0; };
+    if idx == 1 { return a.c1; };
+    if idx == 2 { return a.c2; };
+    if idx == 3 { return a.c3; };
+    return -1;
+}
+
+fn ecs_ainf_storage_at(a: EcsArchInfoDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.s0; };
+    if idx == 1 { return a.s1; };
+    if idx == 2 { return a.s2; };
+    if idx == 3 { return a.s3; };
+    return -1;
+}
+
+fn ecs_ainf_entity_table_row(a: EcsArchInfoDeep, archetype_row: i32) -> i32 {
+    return archetype_row;
+}

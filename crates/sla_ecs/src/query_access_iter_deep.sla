@@ -1,0 +1,406 @@
+// Deepened Bevy ECS query access_iter surface.
+// Mirrors src/query/access_iter.rs:
+//   EcsAccessLevel { Read(id), Write(id), ReadAll, WriteAll }
+//   EcsAccessType { Component(level), Access(borrowed), Empty }
+//   is_compatible / AccessConflictError
+//   has_conflicts_small (pairwise, USE_FILTER_THRESHOLD=4)
+//   has_conflicts_large (bloom-ish filter then exact)
+//   QueryAccessError { ComponentNotRegistered, EntityDoesNotMatch, NoConflict path }
+// Fixed access list capacity: 8. Shallow lib/query_access_iter.sla retained.
+
+const ECS_QAI_LEVEL_READ: i32 = 0;
+const ECS_QAI_LEVEL_WRITE: i32 = 1;
+const ECS_QAI_LEVEL_READ_ALL: i32 = 2;
+const ECS_QAI_LEVEL_WRITE_ALL: i32 = 3;
+
+const ECS_QAI_TYPE_EMPTY: i32 = 0;
+const ECS_QAI_TYPE_COMPONENT: i32 = 1;
+const ECS_QAI_TYPE_ACCESS: i32 = 2;
+
+const ECS_QAI_USE_FILTER_THRESHOLD: i32 = 4;
+
+const ECS_QAI_ERR_OK: i32 = 0;
+const ECS_QAI_ERR_COMPONENT_NOT_REGISTERED: i32 = 1;
+const ECS_QAI_ERR_ENTITY_DOES_NOT_MATCH: i32 = 2;
+const ECS_QAI_ERR_CONFLICT: i32 = 3;
+
+// EcsAccessLevel
+struct EcsQaiLevelDeep {
+    kind: i32,
+    component_id: i32,
+}
+
+fn ecs_qai_level_read(id: i32) -> EcsQaiLevelDeep {
+    return EcsQaiLevelDeep { kind: ECS_QAI_LEVEL_READ, component_id: id };
+}
+fn ecs_qai_level_write(id: i32) -> EcsQaiLevelDeep {
+    return EcsQaiLevelDeep { kind: ECS_QAI_LEVEL_WRITE, component_id: id };
+}
+fn ecs_qai_level_read_all() -> EcsQaiLevelDeep {
+    return EcsQaiLevelDeep { kind: ECS_QAI_LEVEL_READ_ALL, component_id: -1 };
+}
+fn ecs_qai_level_write_all() -> EcsQaiLevelDeep {
+    return EcsQaiLevelDeep { kind: ECS_QAI_LEVEL_WRITE_ALL, component_id: -1 };
+}
+fn ecs_qai_level_kind(l: EcsQaiLevelDeep) -> i32 { return l.kind; }
+fn ecs_qai_level_id(l: EcsQaiLevelDeep) -> i32 { return l.component_id; }
+
+// EcsAccessType (Component / Empty / Access-borrowed simplified)
+// For Access borrowed: read_bits/write_bits + read_all/write_all
+struct EcsQaiTypeDeep {
+    variant: i32,
+    level_kind: i32,
+    component_id: i32,
+    read_bits: i64,
+    write_bits: i64,
+    read_all: bool,
+    write_all: bool,
+}
+
+fn ecs_qai_type_empty() -> EcsQaiTypeDeep {
+    return EcsQaiTypeDeep {
+        variant: ECS_QAI_TYPE_EMPTY, level_kind: 0, component_id: -1,
+        read_bits: 0, write_bits: 0, read_all: false, write_all: false,
+    };
+}
+
+fn ecs_qai_type_component(level: EcsQaiLevelDeep) -> EcsQaiTypeDeep {
+    return EcsQaiTypeDeep {
+        variant: ECS_QAI_TYPE_COMPONENT, level_kind: level.kind, component_id: level.component_id,
+        read_bits: 0, write_bits: 0, read_all: false, write_all: false,
+    };
+}
+
+fn ecs_qai_type_access(read_bits: i64, write_bits: i64, read_all: bool, write_all: bool) -> EcsQaiTypeDeep {
+    return EcsQaiTypeDeep {
+        variant: ECS_QAI_TYPE_ACCESS, level_kind: 0, component_id: -1,
+        read_bits: read_bits, write_bits: write_bits, read_all: read_all, write_all: write_all,
+    };
+}
+
+fn ecs_qai_type_variant(t: EcsQaiTypeDeep) -> i32 { return t.variant; }
+fn ecs_qai_type_level_kind(t: EcsQaiTypeDeep) -> i32 { return t.level_kind; }
+fn ecs_qai_type_component_id(t: EcsQaiTypeDeep) -> i32 { return t.component_id; }
+
+fn ecs_qai_bit_for(id: i32) -> i64 {
+    if id < 0 { return 0; };
+    if id > 30 { return 0; };
+    let b: i64 = 1;
+    let i: i32 = 0;
+    while i < id {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ecs_qai_bits_has(bits: i64, id: i32) -> bool {
+    let bit = ecs_qai_bit_for(id);
+    if bit == 0 { return false; };
+    if (bits / bit) % 2 == 1 { return true; };
+    return false;
+}
+
+// is_compatible result
+struct EcsQaiCompat {
+    ok: bool,
+    // conflict pair snapshot when not ok
+    a_variant: i32,
+    a_level: i32,
+    a_id: i32,
+    b_variant: i32,
+    b_level: i32,
+    b_id: i32,
+}
+
+fn ecs_qai_compat_ok(c: EcsQaiCompat) -> bool { return c.ok; }
+fn ecs_qai_compat_a_level(c: EcsQaiCompat) -> i32 { return c.a_level; }
+fn ecs_qai_compat_b_level(c: EcsQaiCompat) -> i32 { return c.b_level; }
+fn ecs_qai_compat_a_id(c: EcsQaiCompat) -> i32 { return c.a_id; }
+fn ecs_qai_compat_b_id(c: EcsQaiCompat) -> i32 { return c.b_id; }
+
+fn ecs_qai_compat_true() -> EcsQaiCompat {
+    return EcsQaiCompat {
+        ok: true, a_variant: 0, a_level: 0, a_id: -1, b_variant: 0, b_level: 0, b_id: -1,
+    };
+}
+
+fn ecs_qai_compat_false(a: EcsQaiTypeDeep, b: EcsQaiTypeDeep) -> EcsQaiCompat {
+    return EcsQaiCompat {
+        ok: false,
+        a_variant: a.variant, a_level: a.level_kind, a_id: a.component_id,
+        b_variant: b.variant, b_level: b.level_kind, b_id: b.component_id,
+    };
+}
+
+// Component vs Component compatibility (Bevy match arms)
+fn ecs_qai_component_levels_compatible(a_kind: i32, a_id: i32, b_kind: i32, b_id: i32) -> bool {
+    // WriteAll conflicts with any Component
+    if a_kind == ECS_QAI_LEVEL_WRITE_ALL { return false; };
+    if b_kind == ECS_QAI_LEVEL_WRITE_ALL { return false; };
+    // ReadAll conflicts with Write(id)
+    if a_kind == ECS_QAI_LEVEL_READ_ALL {
+        if b_kind == ECS_QAI_LEVEL_WRITE { return false; };
+        return true;
+    };
+    if b_kind == ECS_QAI_LEVEL_READ_ALL {
+        if a_kind == ECS_QAI_LEVEL_WRITE { return false; };
+        return true;
+    };
+    // same id: Read+Read ok; any Write conflicts
+    if a_id == b_id {
+        if a_kind == ECS_QAI_LEVEL_WRITE { return false; };
+        if b_kind == ECS_QAI_LEVEL_WRITE { return false; };
+        return true;
+    };
+    return true;
+}
+
+// Access borrowed vs Component
+fn ecs_qai_access_vs_component(access: EcsQaiTypeDeep, level_kind: i32, component_id: i32) -> bool {
+    if access.write_all { return false; };
+    if level_kind == ECS_QAI_LEVEL_WRITE_ALL { return false; };
+    if level_kind == ECS_QAI_LEVEL_READ_ALL {
+        // ReadAll conflicts if access has any write
+        if access.write_all { return false; };
+        if access.write_bits != 0 { return false; };
+        return true;
+    };
+    if level_kind == ECS_QAI_LEVEL_WRITE {
+        // write conflicts with access read or write of same id, or read_all
+        if access.read_all { return false; };
+        if ecs_qai_bits_has(access.read_bits, component_id) { return false; };
+        if ecs_qai_bits_has(access.write_bits, component_id) { return false; };
+        return true;
+    };
+    // Read(id): conflicts with access write of id or write_all
+    if ecs_qai_bits_has(access.write_bits, component_id) { return false; };
+    return true;
+}
+
+// Access vs Access: conflict if write_all either side, or overlapping write/read
+fn ecs_qai_access_vs_access(a: EcsQaiTypeDeep, b: EcsQaiTypeDeep) -> bool {
+    if a.write_all { return false; };
+    if b.write_all { return false; };
+    if a.read_all {
+        if b.write_bits != 0 { return false; };
+    };
+    if b.read_all {
+        if a.write_bits != 0 { return false; };
+    };
+    // simplified: conflict if any shared bit in a.write & b.read/write or reverse
+    // check ids 0..8
+    let id: i32 = 0;
+    while id < 8 {
+        let aw = ecs_qai_bits_has(a.write_bits, id);
+        let ar = ecs_qai_bits_has(a.read_bits, id);
+        let bw = ecs_qai_bits_has(b.write_bits, id);
+        let br = ecs_qai_bits_has(b.read_bits, id);
+        if aw {
+            if bw { return false; };
+            if br { return false; };
+            if b.read_all { return false; };
+        };
+        if bw {
+            if ar { return false; };
+            if a.read_all { return false; };
+        };
+        id = id + 1;
+    }
+    return true;
+}
+
+fn ecs_qai_is_compatible(a: EcsQaiTypeDeep, b: EcsQaiTypeDeep) -> EcsQaiCompat {
+    // Empty compatible with all
+    if a.variant == ECS_QAI_TYPE_EMPTY { return ecs_qai_compat_true(); };
+    if b.variant == ECS_QAI_TYPE_EMPTY { return ecs_qai_compat_true(); };
+    if a.variant == ECS_QAI_TYPE_COMPONENT {
+        if b.variant == ECS_QAI_TYPE_COMPONENT {
+            if ecs_qai_component_levels_compatible(a.level_kind, a.component_id, b.level_kind, b.component_id) {
+                return ecs_qai_compat_true();
+            };
+            return ecs_qai_compat_false(a, b);
+        };
+        if b.variant == ECS_QAI_TYPE_ACCESS {
+            if ecs_qai_access_vs_component(b, a.level_kind, a.component_id) {
+                return ecs_qai_compat_true();
+            };
+            return ecs_qai_compat_false(a, b);
+        };
+    };
+    if a.variant == ECS_QAI_TYPE_ACCESS {
+        if b.variant == ECS_QAI_TYPE_COMPONENT {
+            if ecs_qai_access_vs_component(a, b.level_kind, b.component_id) {
+                return ecs_qai_compat_true();
+            };
+            return ecs_qai_compat_false(a, b);
+        };
+        if b.variant == ECS_QAI_TYPE_ACCESS {
+            if ecs_qai_access_vs_access(a, b) {
+                return ecs_qai_compat_true();
+            };
+            return ecs_qai_compat_false(a, b);
+        };
+    };
+    return ecs_qai_compat_true();
+}
+
+// Access list for has_conflicts (up to 8 component-level accesses)
+struct EcsQaiListDeep {
+    n: i32,
+    // each slot: level_kind + component_id (component accesses only for small/large helpers)
+    k0: i32, i0: i32,
+    k1: i32, i1: i32,
+    k2: i32, i2: i32,
+    k3: i32, i3: i32,
+    k4: i32, i4: i32,
+    k5: i32, i5: i32,
+    k6: i32, i6: i32,
+    k7: i32, i7: i32,
+    registered: bool,
+}
+
+fn ecs_qai_list_new() -> EcsQaiListDeep {
+    return EcsQaiListDeep {
+        n: 0,
+        k0: 0, i0: -1, k1: 0, i1: -1, k2: 0, i2: -1, k3: 0, i3: -1,
+        k4: 0, i4: -1, k5: 0, i5: -1, k6: 0, i6: -1, k7: 0, i7: -1,
+        registered: true,
+    };
+}
+
+fn ecs_qai_list_unregistered() -> EcsQaiListDeep {
+    let l = ecs_qai_list_new();
+    return EcsQaiListDeep {
+        n: 0,
+        k0: 0, i0: -1, k1: 0, i1: -1, k2: 0, i2: -1, k3: 0, i3: -1,
+        k4: 0, i4: -1, k5: 0, i5: -1, k6: 0, i6: -1, k7: 0, i7: -1,
+        registered: false,
+    };
+}
+
+fn ecs_qai_list_len(l: EcsQaiListDeep) -> i32 { return l.n; }
+fn ecs_qai_list_registered(l: EcsQaiListDeep) -> bool { return l.registered; }
+
+fn ecs_qai_list_rebuild(
+    n: i32,
+    k0: i32, i0: i32, k1: i32, i1: i32, k2: i32, i2: i32, k3: i32, i3: i32,
+    k4: i32, i4: i32, k5: i32, i5: i32, k6: i32, i6: i32, k7: i32, i7: i32,
+    registered: bool
+) -> EcsQaiListDeep {
+    return EcsQaiListDeep {
+        n: n,
+        k0: k0, i0: i0, k1: k1, i1: i1, k2: k2, i2: i2, k3: k3, i3: i3,
+        k4: k4, i4: i4, k5: k5, i5: i5, k6: k6, i6: i6, k7: k7, i7: i7,
+        registered: registered,
+    };
+}
+
+fn ecs_qai_list_push(l: EcsQaiListDeep, level_kind: i32, component_id: i32) -> EcsQaiListDeep {
+    if l.n >= 8 { return l; };
+    if l.n == 0 {
+        return ecs_qai_list_rebuild(1, level_kind, component_id, l.k1, l.i1, l.k2, l.i2, l.k3, l.i3, l.k4, l.i4, l.k5, l.i5, l.k6, l.i6, l.k7, l.i7, l.registered);
+    };
+    if l.n == 1 {
+        return ecs_qai_list_rebuild(2, l.k0, l.i0, level_kind, component_id, l.k2, l.i2, l.k3, l.i3, l.k4, l.i4, l.k5, l.i5, l.k6, l.i6, l.k7, l.i7, l.registered);
+    };
+    if l.n == 2 {
+        return ecs_qai_list_rebuild(3, l.k0, l.i0, l.k1, l.i1, level_kind, component_id, l.k3, l.i3, l.k4, l.i4, l.k5, l.i5, l.k6, l.i6, l.k7, l.i7, l.registered);
+    };
+    if l.n == 3 {
+        return ecs_qai_list_rebuild(4, l.k0, l.i0, l.k1, l.i1, l.k2, l.i2, level_kind, component_id, l.k4, l.i4, l.k5, l.i5, l.k6, l.i6, l.k7, l.i7, l.registered);
+    };
+    if l.n == 4 {
+        return ecs_qai_list_rebuild(5, l.k0, l.i0, l.k1, l.i1, l.k2, l.i2, l.k3, l.i3, level_kind, component_id, l.k5, l.i5, l.k6, l.i6, l.k7, l.i7, l.registered);
+    };
+    if l.n == 5 {
+        return ecs_qai_list_rebuild(6, l.k0, l.i0, l.k1, l.i1, l.k2, l.i2, l.k3, l.i3, l.k4, l.i4, level_kind, component_id, l.k6, l.i6, l.k7, l.i7, l.registered);
+    };
+    if l.n == 6 {
+        return ecs_qai_list_rebuild(7, l.k0, l.i0, l.k1, l.i1, l.k2, l.i2, l.k3, l.i3, l.k4, l.i4, l.k5, l.i5, level_kind, component_id, l.k7, l.i7, l.registered);
+    };
+    return ecs_qai_list_rebuild(8, l.k0, l.i0, l.k1, l.i1, l.k2, l.i2, l.k3, l.i3, l.k4, l.i4, l.k5, l.i5, l.k6, l.i6, level_kind, component_id, l.registered);
+}
+
+fn ecs_qai_list_at(l: EcsQaiListDeep, idx: i32) -> EcsQaiTypeDeep {
+    if idx == 0 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k0, component_id: l.i0 }); };
+    if idx == 1 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k1, component_id: l.i1 }); };
+    if idx == 2 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k2, component_id: l.i2 }); };
+    if idx == 3 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k3, component_id: l.i3 }); };
+    if idx == 4 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k4, component_id: l.i4 }); };
+    if idx == 5 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k5, component_id: l.i5 }); };
+    if idx == 6 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k6, component_id: l.i6 }); };
+    if idx == 7 { return ecs_qai_type_component(EcsQaiLevelDeep { kind: l.k7, component_id: l.i7 }); };
+    return ecs_qai_type_empty();
+}
+
+// has_conflicts_small: pairwise all i < j
+struct EcsQaiConflictResult {
+    ok: bool,
+    err: i32,
+    a_idx: i32,
+    b_idx: i32,
+    component_id: i32,
+}
+
+fn ecs_qai_conflict_ok(r: EcsQaiConflictResult) -> bool { return r.ok; }
+fn ecs_qai_conflict_err(r: EcsQaiConflictResult) -> i32 { return r.err; }
+fn ecs_qai_conflict_a_idx(r: EcsQaiConflictResult) -> i32 { return r.a_idx; }
+fn ecs_qai_conflict_b_idx(r: EcsQaiConflictResult) -> i32 { return r.b_idx; }
+fn ecs_qai_conflict_component_id(r: EcsQaiConflictResult) -> i32 { return r.component_id; }
+
+fn ecs_qai_has_conflicts_small(l: EcsQaiListDeep) -> EcsQaiConflictResult {
+    let n = l.n;
+    let i: i32 = 0;
+    while i < n {
+        let j: i32 = 0;
+        while j < i {
+            let a = ecs_qai_list_at(l, i);
+            let b = ecs_qai_list_at(l, j);
+            let c = ecs_qai_is_compatible(a, b);
+            if ecs_qai_compat_ok(c) != true {
+                let cid = a.component_id;
+                return EcsQaiConflictResult {
+                    ok: false, err: ECS_QAI_ERR_CONFLICT, a_idx: i, b_idx: j, component_id: cid,
+                };
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return EcsQaiConflictResult {
+        ok: true, err: ECS_QAI_ERR_OK, a_idx: -1, b_idx: -1, component_id: -1,
+    };
+}
+
+// has_conflicts_large: model bloom as "duplicate component id seen" then exact check
+// (simplified: always exact pairwise for correctness of deep model)
+fn ecs_qai_has_conflicts_large(l: EcsQaiListDeep) -> EcsQaiConflictResult {
+    return ecs_qai_has_conflicts_small(l);
+}
+
+// has_conflicts: unregistered => ComponentNotRegistered; size <= threshold => small else large
+fn ecs_qai_has_conflicts(l: EcsQaiListDeep) -> EcsQaiConflictResult {
+    if l.registered != true {
+        return EcsQaiConflictResult {
+            ok: false, err: ECS_QAI_ERR_COMPONENT_NOT_REGISTERED, a_idx: -1, b_idx: -1, component_id: -1,
+        };
+    };
+    if l.n <= ECS_QAI_USE_FILTER_THRESHOLD {
+        return ecs_qai_has_conflicts_small(l);
+    };
+    return ecs_qai_has_conflicts_large(l);
+}
+
+fn ecs_qai_uses_small_path(l: EcsQaiListDeep) -> bool {
+    if l.n <= ECS_QAI_USE_FILTER_THRESHOLD { return true; };
+    return false;
+}
+
+// QueryAccessError helpers for entity match path
+fn ecs_qai_entity_match_error(matches: bool) -> i32 {
+    if matches { return ECS_QAI_ERR_OK; };
+    return ECS_QAI_ERR_ENTITY_DOES_NOT_MATCH;
+}
+
+fn ecs_qai_threshold() -> i32 { return ECS_QAI_USE_FILTER_THRESHOLD; }

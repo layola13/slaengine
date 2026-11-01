@@ -1,0 +1,147 @@
+// Bevy edge_executor drop/lifetime accounting over explicit i32 tasks.
+//
+// The vendored edge_executor tests cover subtle ownership cases around
+// dropping or leaking the executor and then awaiting or dropping finished
+// tasks. This module models those observable cases without implementing Rust
+// futures, pinning, or destructors.
+@import "task_edge_executor.sla"
+
+struct EcsEdgeExecutorDropStateI32 {
+    executor: EcsEdgeExecutorI32,
+    executor_dropped: bool,
+    executor_leaked: bool,
+    awaited_ids: Vec<i64>,
+    dropped_task_ids: Vec<i64>,
+    payload_drop_count: i64,
+    pending_leak_count: i64,
+}
+
+struct EcsEdgeExecutorAwaitResultI32 {
+    state: EcsEdgeExecutorDropStateI32,
+    ready: bool,
+    value: i32,
+}
+
+fn ecs_edge_executor_drop_state_i32(executor: EcsEdgeExecutorI32) -> EcsEdgeExecutorDropStateI32 {
+    let awaited_ids: Vec<i64> = Vec::new();
+    let dropped_task_ids: Vec<i64> = Vec::new();
+    return EcsEdgeExecutorDropStateI32 { executor: executor, executor_dropped: false, executor_leaked: false, awaited_ids: awaited_ids, dropped_task_ids: dropped_task_ids, payload_drop_count: 0, pending_leak_count: 0 };
+}
+
+fn ecs_edge_executor_drop_completed_without_slot_i32(executor: EcsEdgeExecutorI32, skip_slot: i64) -> EcsEdgeExecutorI32 {
+    let ids: Vec<i64> = Vec::new();
+    let values: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let n = len(executor.completed_ids) as i64;
+    while i < n {
+        if i != skip_slot {
+            ids.push(executor.completed_ids[i]);
+            values.push(executor.completed_values[i]);
+        };
+        i = i + 1;
+    }
+    executor.completed_ids = ids;
+    executor.completed_values = values;
+    return executor;
+}
+
+fn ecs_edge_executor_drop_state_drop_executor_i32(state: EcsEdgeExecutorDropStateI32) -> EcsEdgeExecutorDropStateI32 {
+    state.executor_dropped = true;
+    return state;
+}
+
+fn ecs_edge_executor_drop_state_leak_executor_i32(state: EcsEdgeExecutorDropStateI32) -> EcsEdgeExecutorDropStateI32 {
+    state.executor_leaked = true;
+    state.pending_leak_count = ecs_edge_executor_scheduled_count_i32(state.executor);
+    return state;
+}
+
+fn ecs_edge_executor_drop_state_await_task_i32(state: EcsEdgeExecutorDropStateI32, handle: EcsTaskHandleI32) -> EcsEdgeExecutorAwaitResultI32 {
+    if state.executor_leaked {
+        return EcsEdgeExecutorAwaitResultI32 { state: state, ready: false, value: 0 };
+    };
+    let slot = ecs_edge_executor_task_completed_slot_i32(state.executor, handle);
+    if slot < 0 {
+        return EcsEdgeExecutorAwaitResultI32 { state: state, ready: false, value: 0 };
+    };
+    let value = state.executor.completed_values[slot];
+    state.executor = ecs_edge_executor_drop_completed_without_slot_i32(state.executor, slot);
+    state.awaited_ids.push(handle.task_id);
+    return EcsEdgeExecutorAwaitResultI32 { state: state, ready: true, value: value };
+}
+
+fn ecs_edge_executor_drop_state_drop_task_i32(state: EcsEdgeExecutorDropStateI32, handle: EcsTaskHandleI32) -> EcsEdgeExecutorDropStateI32 {
+    state.dropped_task_ids.push(handle.task_id);
+    let slot = ecs_edge_executor_task_completed_slot_i32(state.executor, handle);
+    if slot >= 0 {
+        state.executor = ecs_edge_executor_drop_completed_without_slot_i32(state.executor, slot);
+        state.payload_drop_count = state.payload_drop_count + 1;
+    };
+    return state;
+}
+
+@test "edge executor leaked executor leaks pending task payload"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 10, 2);
+    let tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    if tick.completed { panic(32510); };
+    let state0 = ecs_edge_executor_drop_state_i32(tick.executor);
+    let leaked = ecs_edge_executor_drop_state_leak_executor_i32(state0);
+    if leaked.executor_leaked != true { panic(32511); };
+    if leaked.pending_leak_count != 1 { panic(32512); };
+    if leaked.payload_drop_count != 0 { panic(32513); };
+    let awaited = ecs_edge_executor_drop_state_await_task_i32(leaked, spawn.handle);
+    if awaited.ready { panic(32514); };
+    if awaited.state.payload_drop_count != 0 { panic(32515); };
+}
+
+@test "edge executor finished task can be awaited after executor drop"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 22, 1);
+    let tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    if tick.completed != true { panic(32520); };
+    let state0 = ecs_edge_executor_drop_state_i32(tick.executor);
+    let dropped_executor = ecs_edge_executor_drop_state_drop_executor_i32(state0);
+    let awaited = ecs_edge_executor_drop_state_await_task_i32(dropped_executor, spawn.handle);
+    if awaited.ready != true { panic(32521); };
+    if awaited.value != 22 { panic(32522); };
+    if awaited.state.payload_drop_count != 0 { panic(32523); };
+    if ecs_edge_executor_completed_count_i32(awaited.state.executor) != 0 { panic(32524); };
+}
+
+@test "edge executor drop then drop finished task drops payload once"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 33, 1);
+    let tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    let state0 = ecs_edge_executor_drop_state_i32(tick.executor);
+    let dropped_executor = ecs_edge_executor_drop_state_drop_executor_i32(state0);
+    if dropped_executor.payload_drop_count != 0 { panic(32530); };
+    let dropped_task = ecs_edge_executor_drop_state_drop_task_i32(dropped_executor, spawn.handle);
+    if dropped_task.payload_drop_count != 1 { panic(32531); };
+    if ecs_edge_executor_completed_count_i32(dropped_task.executor) != 0 { panic(32532); };
+    let dropped_again = ecs_edge_executor_drop_state_drop_task_i32(dropped_task, spawn.handle);
+    if dropped_again.payload_drop_count != 1 { panic(32533); };
+}
+
+@test "edge executor drop finished task before executor drops payload once"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 44, 1);
+    let tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    let state0 = ecs_edge_executor_drop_state_i32(tick.executor);
+    let dropped_task = ecs_edge_executor_drop_state_drop_task_i32(state0, spawn.handle);
+    if dropped_task.payload_drop_count != 1 { panic(32540); };
+    let dropped_executor = ecs_edge_executor_drop_state_drop_executor_i32(dropped_task);
+    if dropped_executor.payload_drop_count != 1 { panic(32541); };
+    if dropped_executor.executor_dropped != true { panic(32542); };
+}
+
+@test "edge executor awaiting finished task consumes result before task drop"() {
+    let executor = ecs_edge_executor_i32_new(4);
+    let spawn = ecs_edge_executor_spawn_i32(executor, 55, 1);
+    let tick = ecs_edge_executor_try_tick_i32(spawn.executor);
+    let state0 = ecs_edge_executor_drop_state_i32(tick.executor);
+    let awaited = ecs_edge_executor_drop_state_await_task_i32(state0, spawn.handle);
+    if awaited.ready != true { panic(32550); };
+    let dropped_task = ecs_edge_executor_drop_state_drop_task_i32(awaited.state, spawn.handle);
+    if dropped_task.payload_drop_count != 0 { panic(32551); };
+}

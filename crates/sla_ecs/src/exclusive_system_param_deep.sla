@@ -1,0 +1,293 @@
+// Deepened Bevy ECS ExclusiveSystemParam surface.
+// Mirrors src/system/exclusive_system_param.rs:
+//   ExclusiveSystemParam { State, Item, init, get_param }
+//   impls: &mut QueryState, &mut SystemState, Local<T>, PhantomData, tuples 0..N
+//   ExclusiveSystemParamItem alias
+// World-mutable exclusive systems: params after &mut World.
+// Shallow lib/exclusive_system_param.sla retained.
+
+// === Param kinds ===
+const ECS_ESP_KIND_QUERY_STATE: i32 = 0;
+const ECS_ESP_KIND_SYSTEM_STATE: i32 = 1;
+const ECS_ESP_KIND_LOCAL: i32 = 2;
+const ECS_ESP_KIND_PHANTOM: i32 = 3;
+const ECS_ESP_KIND_SYSTEM_NAME: i32 = 4;
+const ECS_ESP_KIND_TUPLE: i32 = 5;
+
+// Validation error codes
+const ECS_ESP_OK: i32 = 0;
+const ECS_ESP_ERR_VALIDATION: i32 = 1;
+
+// === World / SystemMeta stand-ins ===
+struct EcsEspWorldDeep {
+    resource_value: i64, // Res stand-in for Local FromWorld / system side effects
+    query_match_count: i64,
+    tick: i64,
+    init_count: i64,
+}
+
+fn ecs_esp_world_new() -> EcsEspWorldDeep {
+    return EcsEspWorldDeep {
+        resource_value: 0,
+        query_match_count: 0,
+        tick: 0,
+        init_count: 0,
+    };
+}
+
+fn ecs_esp_world_resource(w: EcsEspWorldDeep) -> i64 { return w.resource_value; }
+fn ecs_esp_world_set_resource(w: EcsEspWorldDeep, v: i64) -> EcsEspWorldDeep {
+    w.resource_value = v;
+    return w;
+}
+fn ecs_esp_world_bump_resource(w: EcsEspWorldDeep) -> EcsEspWorldDeep {
+    w.resource_value = w.resource_value + 1;
+    return w;
+}
+fn ecs_esp_world_init_count(w: EcsEspWorldDeep) -> i64 { return w.init_count; }
+
+struct EcsEspSystemMetaDeep {
+    name_id: i64,
+    last_run: i64,
+}
+
+fn ecs_esp_meta_new(name_id: i64) -> EcsEspSystemMetaDeep {
+    return EcsEspSystemMetaDeep { name_id: name_id, last_run: 0 };
+}
+
+fn ecs_esp_meta_name(m: EcsEspSystemMetaDeep) -> i64 { return m.name_id; }
+
+// === QueryState exclusive param (&mut QueryState) ===
+struct EcsEspQueryStateDeep {
+    // cached match count snapshot from world at init; can re-run
+    match_count: i64,
+    run_count: i64,
+    initialized: bool,
+}
+
+fn ecs_esp_query_state_init(w: EcsEspWorldDeep) -> (EcsEspWorldDeep, EcsEspQueryStateDeep) {
+    w.init_count = w.init_count + 1;
+    let s = EcsEspQueryStateDeep {
+        match_count: w.query_match_count,
+        run_count: 0,
+        initialized: true,
+    };
+    return (w, s);
+}
+
+fn ecs_esp_query_state_get(s: EcsEspQueryStateDeep) -> (bool, EcsEspQueryStateDeep) {
+    // Item = &mut QueryState — return ok + state
+    if s.initialized != true {
+        return (false, s);
+    };
+    return (true, s);
+}
+
+fn ecs_esp_query_state_run(s: EcsEspQueryStateDeep, w: EcsEspWorldDeep) -> (EcsEspQueryStateDeep, i64) {
+    // re-read world match count
+    s.match_count = w.query_match_count;
+    s.run_count = s.run_count + 1;
+    return (s, s.match_count);
+}
+
+fn ecs_esp_query_state_match_count(s: EcsEspQueryStateDeep) -> i64 { return s.match_count; }
+fn ecs_esp_query_state_run_count(s: EcsEspQueryStateDeep) -> i64 { return s.run_count; }
+
+// === SystemState exclusive param (&mut SystemState<P>) ===
+struct EcsEspSystemStateDeep {
+    param_kind: i32,
+    cached_value: i64,
+    initialized: bool,
+    get_count: i64,
+}
+
+fn ecs_esp_system_state_init(w: EcsEspWorldDeep, param_kind: i32) -> (EcsEspWorldDeep, EcsEspSystemStateDeep) {
+    w.init_count = w.init_count + 1;
+    let s = EcsEspSystemStateDeep {
+        param_kind: param_kind,
+        cached_value: w.resource_value,
+        initialized: true,
+        get_count: 0,
+    };
+    return (w, s);
+}
+
+fn ecs_esp_system_state_get(s: EcsEspSystemStateDeep) -> (bool, EcsEspSystemStateDeep) {
+    if s.initialized != true { return (false, s); };
+    s.get_count = s.get_count + 1;
+    return (true, s);
+}
+
+fn ecs_esp_system_state_value(s: EcsEspSystemStateDeep) -> i64 { return s.cached_value; }
+fn ecs_esp_system_state_get_count(s: EcsEspSystemStateDeep) -> i64 { return s.get_count; }
+
+// === Local<T> exclusive param ===
+// State = SyncCell<T>; Item = Local holding T
+struct EcsEspLocalDeep {
+    value: i64,
+    initialized: bool,
+}
+
+fn ecs_esp_local_init(w: EcsEspWorldDeep) -> (EcsEspWorldDeep, EcsEspLocalDeep) {
+    // FromWorld: default from world.resource_value
+    w.init_count = w.init_count + 1;
+    let s = EcsEspLocalDeep {
+        value: w.resource_value,
+        initialized: true,
+    };
+    return (w, s);
+}
+
+fn ecs_esp_local_get(s: EcsEspLocalDeep) -> (bool, EcsEspLocalDeep) {
+    if s.initialized != true { return (false, s); };
+    return (true, s);
+}
+
+fn ecs_esp_local_value(s: EcsEspLocalDeep) -> i64 { return s.value; }
+
+fn ecs_esp_local_set(s: EcsEspLocalDeep, v: i64) -> EcsEspLocalDeep {
+    s.value = v;
+    return s;
+}
+
+fn ecs_esp_local_bump(s: EcsEspLocalDeep) -> EcsEspLocalDeep {
+    s.value = s.value + 1;
+    return s;
+}
+
+// === PhantomData ===
+struct EcsEspPhantomDeep {
+    marker: i32, // type stand-in
+}
+
+fn ecs_esp_phantom_init(_w: EcsEspWorldDeep) -> EcsEspPhantomDeep {
+    return EcsEspPhantomDeep { marker: 0 };
+}
+
+fn ecs_esp_phantom_get(s: EcsEspPhantomDeep) -> (bool, EcsEspPhantomDeep) {
+    return (true, s);
+}
+
+// === SystemName as ExclusiveSystemParam (also in system_name.rs) ===
+struct EcsEspSystemNameDeep {
+    name_id: i64,
+}
+
+fn ecs_esp_system_name_init(_w: EcsEspWorldDeep, m: EcsEspSystemMetaDeep) -> EcsEspSystemNameDeep {
+    // State empty; name comes from meta at get_param
+    return EcsEspSystemNameDeep { name_id: 0 };
+}
+
+fn ecs_esp_system_name_get(
+    _s: EcsEspSystemNameDeep,
+    m: EcsEspSystemMetaDeep
+) -> (bool, EcsEspSystemNameDeep) {
+    return (true, EcsEspSystemNameDeep { name_id: m.name_id });
+}
+
+fn ecs_esp_system_name_id(s: EcsEspSystemNameDeep) -> i64 { return s.name_id; }
+
+// === Tuple composition (up to 3 for tests) ===
+struct EcsEspTuple2Deep {
+    a_kind: i32,
+    b_kind: i32,
+    // Local + QueryState state embedded
+    local: EcsEspLocalDeep,
+    query: EcsEspQueryStateDeep,
+}
+
+fn ecs_esp_tuple2_local_query_init(w: EcsEspWorldDeep) -> (EcsEspWorldDeep, EcsEspTuple2Deep) {
+    let l = ecs_esp_local_init(w);
+    w = l.0;
+    let q = ecs_esp_query_state_init(w);
+    w = q.0;
+    let t = EcsEspTuple2Deep {
+        a_kind: ECS_ESP_KIND_LOCAL,
+        b_kind: ECS_ESP_KIND_QUERY_STATE,
+        local: l.1,
+        query: q.1,
+    };
+    return (w, t);
+}
+
+fn ecs_esp_tuple2_get(t: EcsEspTuple2Deep) -> (bool, EcsEspTuple2Deep) {
+    let la = ecs_esp_local_get(t.local);
+    if la.0 != true { return (false, t); };
+    t.local = la.1;
+    let qa = ecs_esp_query_state_get(t.query);
+    if qa.0 != true { return (false, t); };
+    t.query = qa.1;
+    return (true, t);
+}
+
+fn ecs_esp_tuple2_local(t: EcsEspTuple2Deep) -> EcsEspLocalDeep { return t.local; }
+fn ecs_esp_tuple2_query(t: EcsEspTuple2Deep) -> EcsEspQueryStateDeep { return t.query; }
+
+fn ecs_esp_tuple2_set_local(t: EcsEspTuple2Deep, local: EcsEspLocalDeep) -> EcsEspTuple2Deep {
+    t.local = local;
+    return t;
+}
+
+// empty tuple ()
+fn ecs_esp_unit_init(_w: EcsEspWorldDeep) -> i32 {
+    return 0; // State = ()
+}
+
+fn ecs_esp_unit_get(_state: i32) -> bool {
+    return true;
+}
+
+// === Exclusive system runner ===
+// Models: fn my_system(world: &mut World, mut local: Local<u32>, _phantom: PhantomData)
+// Bevy test: assert resource == local; local+=1; resource+=1
+struct EcsEspExclusiveSystemDeep {
+    local: EcsEspLocalDeep,
+    phantom: EcsEspPhantomDeep,
+    run_count: i64,
+    last_error: i32,
+}
+
+fn ecs_esp_system_init(w: EcsEspWorldDeep, _m: EcsEspSystemMetaDeep) -> (EcsEspWorldDeep, EcsEspExclusiveSystemDeep) {
+    let l = ecs_esp_local_init(w);
+    w = l.0;
+    let p = ecs_esp_phantom_init(w);
+    let s = EcsEspExclusiveSystemDeep {
+        local: l.1,
+        phantom: p,
+        run_count: 0,
+        last_error: ECS_ESP_OK,
+    };
+    return (w, s);
+}
+
+fn ecs_esp_system_run(
+    w: EcsEspWorldDeep,
+    s: EcsEspExclusiveSystemDeep
+) -> (EcsEspWorldDeep, EcsEspExclusiveSystemDeep, bool) {
+    // assert resource == local at start
+    if w.resource_value != s.local.value {
+        s.last_error = ECS_ESP_ERR_VALIDATION;
+        return (w, s, false);
+    };
+    s.local = ecs_esp_local_bump(s.local);
+    w = ecs_esp_world_bump_resource(w);
+    s.run_count = s.run_count + 1;
+    s.last_error = ECS_ESP_OK;
+    return (w, s, true);
+}
+
+fn ecs_esp_system_run_count(s: EcsEspExclusiveSystemDeep) -> i64 { return s.run_count; }
+fn ecs_esp_system_local_value(s: EcsEspExclusiveSystemDeep) -> i64 { return s.local.value; }
+fn ecs_esp_system_last_error(s: EcsEspExclusiveSystemDeep) -> i32 { return s.last_error; }
+
+// Generic get_param Result helper
+fn ecs_esp_ok() -> i32 { return ECS_ESP_OK; }
+fn ecs_esp_err_validation() -> i32 { return ECS_ESP_ERR_VALIDATION; }
+
+// Kind tags
+fn ecs_esp_kind_local() -> i32 { return ECS_ESP_KIND_LOCAL; }
+fn ecs_esp_kind_query_state() -> i32 { return ECS_ESP_KIND_QUERY_STATE; }
+fn ecs_esp_kind_system_state() -> i32 { return ECS_ESP_KIND_SYSTEM_STATE; }
+fn ecs_esp_kind_phantom() -> i32 { return ECS_ESP_KIND_PHANTOM; }
+fn ecs_esp_kind_system_name() -> i32 { return ECS_ESP_KIND_SYSTEM_NAME; }
+fn ecs_esp_kind_tuple() -> i32 { return ECS_ESP_KIND_TUPLE; }

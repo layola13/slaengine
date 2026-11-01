@@ -1,0 +1,577 @@
+// Deepened Bevy ECS EntityCommands conditional / try surface.
+// Mirrors src/system/commands/mod.rs EntityCommands:
+//   insert / insert_if / insert_if_new / insert_if_new_and
+//   try_insert / try_insert_if / try_insert_if_new / try_insert_if_new_and
+//   remove / remove_if / try_remove / try_remove_if
+//   retain / clear / try_despawn
+//   InsertMode::Replace vs Keep; queue_handled vs queue_silenced
+// Fixed capacity: 4 component slots + 8 command log slots.
+// Shallow lib/entity_commands_conditional.sla retained.
+
+const ECS_ECC_OK: i32 = 0;
+const ECS_ECC_ERR_ENTITY_NOT_FOUND: i32 = 1;
+
+const ECS_ECC_OP_INSERT: i32 = 0;
+const ECS_ECC_OP_INSERT_IF: i32 = 1;
+const ECS_ECC_OP_INSERT_IF_NEW: i32 = 2;
+const ECS_ECC_OP_INSERT_IF_NEW_AND: i32 = 3;
+const ECS_ECC_OP_TRY_INSERT: i32 = 4;
+const ECS_ECC_OP_TRY_INSERT_IF: i32 = 5;
+const ECS_ECC_OP_TRY_INSERT_IF_NEW: i32 = 6;
+const ECS_ECC_OP_TRY_INSERT_IF_NEW_AND: i32 = 7;
+const ECS_ECC_OP_REMOVE: i32 = 8;
+const ECS_ECC_OP_REMOVE_IF: i32 = 9;
+const ECS_ECC_OP_TRY_REMOVE: i32 = 10;
+const ECS_ECC_OP_TRY_REMOVE_IF: i32 = 11;
+const ECS_ECC_OP_RETAIN: i32 = 12;
+const ECS_ECC_OP_CLEAR: i32 = 13;
+const ECS_ECC_OP_TRY_DESPAWN: i32 = 14;
+const ECS_ECC_OP_INSERT_IF_NEQ: i32 = 15;
+
+fn ecs_ecc_ok() -> i32 { return ECS_ECC_OK; }
+fn ecs_ecc_err_entity_not_found() -> i32 { return ECS_ECC_ERR_ENTITY_NOT_FOUND; }
+
+struct EcsEccDeep {
+    entity: i64,
+    spawned: bool,
+    c0: i32, v0: i64,
+    c1: i32, v1: i64,
+    c2: i32, v2: i64,
+    c3: i32, v3: i64,
+    len: i32,
+    // command log kinds
+    l0: i32, l1: i32, l2: i32, l3: i32,
+    l4: i32, l5: i32, l6: i32, l7: i32,
+    log_len: i32,
+    // non-try missing-entity warnings/errors
+    error_count: i64,
+    last_error: i32,
+    // silenced try ops that skipped because entity missing
+    silenced_count: i64,
+}
+
+fn ecs_ecc_deep_new(entity: i64) -> EcsEccDeep {
+    return EcsEccDeep {
+        entity: entity, spawned: true,
+        c0: -1, v0: 0, c1: -1, v1: 0, c2: -1, v2: 0, c3: -1, v3: 0, len: 0,
+        l0: -1, l1: -1, l2: -1, l3: -1, l4: -1, l5: -1, l6: -1, l7: -1, log_len: 0,
+        error_count: 0, last_error: 0, silenced_count: 0,
+    };
+}
+
+fn ecs_ecc_deep_new_despawned(entity: i64) -> EcsEccDeep {
+    return EcsEccDeep {
+        entity: entity, spawned: false,
+        c0: -1, v0: 0, c1: -1, v1: 0, c2: -1, v2: 0, c3: -1, v3: 0, len: 0,
+        l0: -1, l1: -1, l2: -1, l3: -1, l4: -1, l5: -1, l6: -1, l7: -1, log_len: 0,
+        error_count: 0, last_error: 0, silenced_count: 0,
+    };
+}
+
+fn ecs_ecc_deep_id(c: EcsEccDeep) -> i64 { return c.entity; }
+fn ecs_ecc_deep_is_spawned(c: EcsEccDeep) -> bool { return c.spawned; }
+fn ecs_ecc_deep_len(c: EcsEccDeep) -> i32 { return c.len; }
+fn ecs_ecc_deep_log_len(c: EcsEccDeep) -> i32 { return c.log_len; }
+fn ecs_ecc_deep_error_count(c: EcsEccDeep) -> i64 { return c.error_count; }
+fn ecs_ecc_deep_last_error(c: EcsEccDeep) -> i32 { return c.last_error; }
+fn ecs_ecc_deep_silenced_count(c: EcsEccDeep) -> i64 { return c.silenced_count; }
+
+fn ecs_ecc_deep_rebuild(
+    entity: i64, spawned: bool,
+    c0: i32, v0: i64, c1: i32, v1: i64, c2: i32, v2: i64, c3: i32, v3: i64, len: i32,
+    l0: i32, l1: i32, l2: i32, l3: i32, l4: i32, l5: i32, l6: i32, l7: i32, log_len: i32,
+    error_count: i64, last_error: i32, silenced_count: i64
+) -> EcsEccDeep {
+    return EcsEccDeep {
+        entity: entity, spawned: spawned,
+        c0: c0, v0: v0, c1: c1, v1: v1, c2: c2, v2: v2, c3: c3, v3: v3, len: len,
+        l0: l0, l1: l1, l2: l2, l3: l3, l4: l4, l5: l5, l6: l6, l7: l7, log_len: log_len,
+        error_count: error_count, last_error: last_error, silenced_count: silenced_count,
+    };
+}
+
+fn ecs_ecc_deep_push_log(c: EcsEccDeep, kind: i32) -> EcsEccDeep {
+    if c.log_len == 0 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            kind, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, 1,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 1 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, kind, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, 2,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 2 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, c.l1, kind, c.l3, c.l4, c.l5, c.l6, c.l7, 3,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 3 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, c.l1, c.l2, kind, c.l4, c.l5, c.l6, c.l7, 4,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 4 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, c.l1, c.l2, c.l3, kind, c.l5, c.l6, c.l7, 5,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 5 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, c.l1, c.l2, c.l3, c.l4, kind, c.l6, c.l7, 6,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 6 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, kind, c.l7, 7,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.log_len == 7 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+            c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, kind, 8,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    return c;
+}
+
+fn ecs_ecc_deep_log_at(c: EcsEccDeep, idx: i32) -> i32 {
+    if idx == 0 { return c.l0; };
+    if idx == 1 { return c.l1; };
+    if idx == 2 { return c.l2; };
+    if idx == 3 { return c.l3; };
+    if idx == 4 { return c.l4; };
+    if idx == 5 { return c.l5; };
+    if idx == 6 { return c.l6; };
+    if idx == 7 { return c.l7; };
+    return -1;
+}
+
+fn ecs_ecc_deep_contains(c: EcsEccDeep, cid: i32) -> bool {
+    if c.len >= 1 {
+        if c.c0 == cid { return true; };
+    };
+    if c.len >= 2 {
+        if c.c1 == cid { return true; };
+    };
+    if c.len >= 3 {
+        if c.c2 == cid { return true; };
+    };
+    if c.len >= 4 {
+        if c.c3 == cid { return true; };
+    };
+    return false;
+}
+
+struct EcsEccGet {
+    found: bool,
+    value: i64,
+}
+
+fn ecs_ecc_get_found(g: EcsEccGet) -> bool { return g.found; }
+fn ecs_ecc_get_value(g: EcsEccGet) -> i64 { return g.value; }
+
+fn ecs_ecc_deep_get(c: EcsEccDeep, cid: i32) -> EcsEccGet {
+    if c.len >= 1 {
+        if c.c0 == cid { return EcsEccGet { found: true, value: c.v0 }; };
+    };
+    if c.len >= 2 {
+        if c.c1 == cid { return EcsEccGet { found: true, value: c.v1 }; };
+    };
+    if c.len >= 3 {
+        if c.c2 == cid { return EcsEccGet { found: true, value: c.v2 }; };
+    };
+    if c.len >= 4 {
+        if c.c3 == cid { return EcsEccGet { found: true, value: c.v3 }; };
+    };
+    return EcsEccGet { found: false, value: 0 };
+}
+
+// InsertMode::Replace — overwrite if present, else append
+fn ecs_ecc_deep_insert_replace(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccDeep {
+    if c.len >= 1 {
+        if c.c0 == cid {
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, value, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len >= 2 {
+        if c.c1 == cid {
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, c.v0, c.c1, value, c.c2, c.v2, c.c3, c.v3, c.len,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len >= 3 {
+        if c.c2 == cid {
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, value, c.c3, c.v3, c.len,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len >= 4 {
+        if c.c3 == cid {
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, value, c.len,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len == 0 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, cid, value, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, 1,
+            c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.len == 1 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, cid, value, c.c2, c.v2, c.c3, c.v3, 2,
+            c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.len == 2 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, cid, value, c.c3, c.v3, 3,
+            c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    if c.len == 3 {
+        return ecs_ecc_deep_rebuild(
+            c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, cid, value, 4,
+            c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+            c.error_count, c.last_error, c.silenced_count
+        );
+    };
+    return c;
+}
+
+// InsertMode::Keep — only insert if absent
+fn ecs_ecc_deep_insert_keep(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccDeep {
+    if ecs_ecc_deep_contains(c, cid) {
+        return c;
+    };
+    return ecs_ecc_deep_insert_replace(c, cid, value);
+}
+
+fn ecs_ecc_deep_note_missing_handled(c: EcsEccDeep) -> EcsEccDeep {
+    return ecs_ecc_deep_rebuild(
+        c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+        c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+        c.error_count + 1, ECS_ECC_ERR_ENTITY_NOT_FOUND, c.silenced_count
+    );
+}
+
+fn ecs_ecc_deep_note_missing_silenced(c: EcsEccDeep) -> EcsEccDeep {
+    return ecs_ecc_deep_rebuild(
+        c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+        c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+        c.error_count, c.last_error, c.silenced_count + 1
+    );
+}
+
+// insert (Replace, handled warn on missing)
+fn ecs_ecc_deep_insert(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_INSERT);
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_insert_replace(c2, cid, value);
+}
+
+fn ecs_ecc_deep_insert_if(c: EcsEccDeep, cid: i32, value: i64, condition: bool) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_INSERT_IF);
+    if condition != true { return c2; };
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_insert_replace(c2, cid, value);
+}
+
+fn ecs_ecc_deep_insert_if_new(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_INSERT_IF_NEW);
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_insert_keep(c2, cid, value);
+}
+
+fn ecs_ecc_deep_insert_if_new_and(c: EcsEccDeep, cid: i32, value: i64, condition: bool) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_INSERT_IF_NEW_AND);
+    if condition != true { return c2; };
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_insert_keep(c2, cid, value);
+}
+
+// insert_if_neq: overwrite only if missing or value differs
+fn ecs_ecc_deep_insert_if_neq(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_INSERT_IF_NEQ);
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    let g = ecs_ecc_deep_get(c2, cid);
+    if g.found {
+        if g.value == value { return c2; };
+    };
+    return ecs_ecc_deep_insert_replace(c2, cid, value);
+}
+
+// try_* — queue_silenced: missing entity ignored
+struct EcsEccTryResult {
+    cmd: EcsEccDeep,
+    code: i32,
+}
+
+fn ecs_ecc_try_cmd(r: EcsEccTryResult) -> EcsEccDeep { return r.cmd; }
+fn ecs_ecc_try_code(r: EcsEccTryResult) -> i32 { return r.code; }
+
+fn ecs_ecc_deep_try_insert(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_INSERT);
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_insert_replace(c2, cid, value);
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+fn ecs_ecc_deep_try_insert_if(c: EcsEccDeep, cid: i32, value: i64, condition: bool) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_INSERT_IF);
+    if condition != true {
+        return EcsEccTryResult { cmd: c2, code: ECS_ECC_OK };
+    };
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_insert_replace(c2, cid, value);
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+fn ecs_ecc_deep_try_insert_if_new(c: EcsEccDeep, cid: i32, value: i64) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_INSERT_IF_NEW);
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_insert_keep(c2, cid, value);
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+fn ecs_ecc_deep_try_insert_if_new_and(c: EcsEccDeep, cid: i32, value: i64, condition: bool) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_INSERT_IF_NEW_AND);
+    if condition != true {
+        return EcsEccTryResult { cmd: c2, code: ECS_ECC_OK };
+    };
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_insert_keep(c2, cid, value);
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+// remove swap-remove
+fn ecs_ecc_deep_remove_raw(c: EcsEccDeep, cid: i32) -> EcsEccDeep {
+    if c.len >= 1 {
+        if c.c0 == cid {
+            if c.len == 1 {
+                return ecs_ecc_deep_rebuild(
+                    c.entity, c.spawned, -1, 0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, 0,
+                    c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                    c.error_count, c.last_error, c.silenced_count
+                );
+            };
+            if c.len == 2 {
+                return ecs_ecc_deep_rebuild(
+                    c.entity, c.spawned, c.c1, c.v1, -1, 0, c.c2, c.v2, c.c3, c.v3, 1,
+                    c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                    c.error_count, c.last_error, c.silenced_count
+                );
+            };
+            if c.len == 3 {
+                return ecs_ecc_deep_rebuild(
+                    c.entity, c.spawned, c.c2, c.v2, c.c1, c.v1, -1, 0, c.c3, c.v3, 2,
+                    c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                    c.error_count, c.last_error, c.silenced_count
+                );
+            };
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c3, c.v3, c.c1, c.v1, c.c2, c.v2, -1, 0, 3,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len >= 2 {
+        if c.c1 == cid {
+            if c.len == 2 {
+                return ecs_ecc_deep_rebuild(
+                    c.entity, c.spawned, c.c0, c.v0, -1, 0, c.c2, c.v2, c.c3, c.v3, 1,
+                    c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                    c.error_count, c.last_error, c.silenced_count
+                );
+            };
+            if c.len == 3 {
+                return ecs_ecc_deep_rebuild(
+                    c.entity, c.spawned, c.c0, c.v0, c.c2, c.v2, -1, 0, c.c3, c.v3, 2,
+                    c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                    c.error_count, c.last_error, c.silenced_count
+                );
+            };
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, c.v0, c.c3, c.v3, c.c2, c.v2, -1, 0, 3,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len >= 3 {
+        if c.c2 == cid {
+            if c.len == 3 {
+                return ecs_ecc_deep_rebuild(
+                    c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, -1, 0, c.c3, c.v3, 2,
+                    c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                    c.error_count, c.last_error, c.silenced_count
+                );
+            };
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c3, c.v3, -1, 0, 3,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    if c.len >= 4 {
+        if c.c3 == cid {
+            return ecs_ecc_deep_rebuild(
+                c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, -1, 0, 3,
+                c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+                c.error_count, c.last_error, c.silenced_count
+            );
+        };
+    };
+    return c;
+}
+
+fn ecs_ecc_deep_remove(c: EcsEccDeep, cid: i32) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_REMOVE);
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_remove_raw(c2, cid);
+}
+
+fn ecs_ecc_deep_remove_if(c: EcsEccDeep, cid: i32, condition: bool) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_REMOVE_IF);
+    if condition != true { return c2; };
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_remove_raw(c2, cid);
+}
+
+fn ecs_ecc_deep_try_remove(c: EcsEccDeep, cid: i32) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_REMOVE);
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_remove_raw(c2, cid);
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+fn ecs_ecc_deep_try_remove_if(c: EcsEccDeep, cid: i32, condition: bool) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_REMOVE_IF);
+    if condition != true {
+        return EcsEccTryResult { cmd: c2, code: ECS_ECC_OK };
+    };
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_remove_raw(c2, cid);
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+// retain keep_cid only
+fn ecs_ecc_deep_retain(c: EcsEccDeep, keep_cid: i32) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_RETAIN);
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    let g = ecs_ecc_deep_get(c2, keep_cid);
+    if g.found != true {
+        return ecs_ecc_deep_rebuild(
+            c2.entity, c2.spawned, -1, 0, -1, 0, -1, 0, -1, 0, 0,
+            c2.l0, c2.l1, c2.l2, c2.l3, c2.l4, c2.l5, c2.l6, c2.l7, c2.log_len,
+            c2.error_count, c2.last_error, c2.silenced_count
+        );
+    };
+    return ecs_ecc_deep_rebuild(
+        c2.entity, c2.spawned, keep_cid, g.value, -1, 0, -1, 0, -1, 0, 1,
+        c2.l0, c2.l1, c2.l2, c2.l3, c2.l4, c2.l5, c2.l6, c2.l7, c2.log_len,
+        c2.error_count, c2.last_error, c2.silenced_count
+    );
+}
+
+fn ecs_ecc_deep_clear(c: EcsEccDeep) -> EcsEccDeep {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_CLEAR);
+    if c2.spawned != true {
+        return ecs_ecc_deep_note_missing_handled(c2);
+    };
+    return ecs_ecc_deep_rebuild(
+        c2.entity, c2.spawned, -1, 0, -1, 0, -1, 0, -1, 0, 0,
+        c2.l0, c2.l1, c2.l2, c2.l3, c2.l4, c2.l5, c2.l6, c2.l7, c2.log_len,
+        c2.error_count, c2.last_error, c2.silenced_count
+    );
+}
+
+fn ecs_ecc_deep_try_despawn(c: EcsEccDeep) -> EcsEccTryResult {
+    let c2 = ecs_ecc_deep_push_log(c, ECS_ECC_OP_TRY_DESPAWN);
+    if c2.spawned != true {
+        let c3 = ecs_ecc_deep_note_missing_silenced(c2);
+        return EcsEccTryResult { cmd: c3, code: ECS_ECC_ERR_ENTITY_NOT_FOUND };
+    };
+    let c4 = ecs_ecc_deep_rebuild(
+        c2.entity, false, -1, 0, -1, 0, -1, 0, -1, 0, 0,
+        c2.l0, c2.l1, c2.l2, c2.l3, c2.l4, c2.l5, c2.l6, c2.l7, c2.log_len,
+        c2.error_count, c2.last_error, c2.silenced_count
+    );
+    return EcsEccTryResult { cmd: c4, code: ECS_ECC_OK };
+}
+
+fn ecs_ecc_deep_reborrow(c: EcsEccDeep) -> EcsEccDeep {
+    return ecs_ecc_deep_rebuild(
+        c.entity, c.spawned, c.c0, c.v0, c.c1, c.v1, c.c2, c.v2, c.c3, c.v3, c.len,
+        c.l0, c.l1, c.l2, c.l3, c.l4, c.l5, c.l6, c.l7, c.log_len,
+        c.error_count, c.last_error, c.silenced_count
+    );
+}

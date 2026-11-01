@@ -1,0 +1,374 @@
+// Deferred command queue for the generic relationship runtime.
+// Bevy/ECS relationship names remain library data; the compiler is not aware of them.
+@import "relationship.sla"
+
+const RELATIONSHIP_COMMAND_SET_RELATED: i32 = 1;
+const RELATIONSHIP_COMMAND_ADD_RELATED: i32 = 2;
+const RELATIONSHIP_COMMAND_INSERT_RELATED: i32 = 3;
+const RELATIONSHIP_COMMAND_REMOVE_RELATED: i32 = 4;
+const RELATIONSHIP_COMMAND_DETACH_ALL_RELATED: i32 = 5;
+const RELATIONSHIP_COMMAND_REPLACE_RELATED: i32 = 6;
+const RELATIONSHIP_COMMAND_REPLACE_RELATED_WITH_DIFFERENCE: i32 = 7;
+const RELATIONSHIP_COMMAND_DESPAWN: i32 = 8;
+const RELATIONSHIP_COMMAND_DESPAWN_RELATED: i32 = 9;
+
+struct RelationshipCommandEntityList {
+    items: Vec<Entity>,
+}
+
+struct RelationshipCommand {
+    kind: i32,
+    kind_id: i32,
+    target: Entity,
+    source: Entity,
+    index: i64,
+    related_index: i64,
+    unrelate_index: i64,
+    newly_index: i64,
+}
+
+struct RelationshipCommands {
+    items: Vec<RelationshipCommand>,
+    entity_lists: Vec<RelationshipCommandEntityList>,
+}
+
+struct RelationshipRelatedSpawnerCommands {
+    commands: RelationshipCommands,
+    kind_id: i32,
+    target: Entity,
+}
+
+fn relationship_commands_new() -> RelationshipCommands {
+    let items: Vec<RelationshipCommand> = Vec::new();
+    let entity_lists: Vec<RelationshipCommandEntityList> = Vec::new();
+    return RelationshipCommands { items: items, entity_lists: entity_lists };
+}
+
+fn relationship_command_entity_list_new(items: Vec<Entity>) -> RelationshipCommandEntityList {
+    return RelationshipCommandEntityList { items: items };
+}
+
+fn relationship_command_new(kind: i32, kind_id: i32, target: Entity, source: Entity, index: i64, related_index: i64, unrelate_index: i64, newly_index: i64) -> RelationshipCommand {
+    return RelationshipCommand { kind: kind, kind_id: kind_id, target: target, source: source, index: index, related_index: related_index, unrelate_index: unrelate_index, newly_index: newly_index };
+}
+
+fn relationship_commands_len(commands: RelationshipCommands) -> i64 { return len(commands.items) as i64; }
+fn relationship_commands_entity_list_len(commands: RelationshipCommands, list_index: i64) -> i64 { return len(commands.entity_lists[list_index].items) as i64; }
+
+fn relationship_related_spawner_commands_new(commands: RelationshipCommands, kind_id: i32, target: Entity) -> RelationshipRelatedSpawnerCommands {
+    return RelationshipRelatedSpawnerCommands { commands: commands, kind_id: kind_id, target: target };
+}
+
+fn relationship_related_spawner_commands_len(spawner: RelationshipRelatedSpawnerCommands) -> i64 {
+    return relationship_commands_len(spawner.commands);
+}
+
+fn relationship_related_spawner_commands_spawn(world: RelationshipWorld, spawner: RelationshipRelatedSpawnerCommands) -> (RelationshipWorld, RelationshipRelatedSpawnerCommands, Entity) {
+    let (next_world, next_commands, entity) = relationship_commands_spawn_related(world, spawner.commands, spawner.kind_id, spawner.target);
+    spawner.commands = next_commands;
+    return (next_world, spawner, entity);
+}
+
+fn relationship_related_spawner_commands_add_existing(spawner: RelationshipRelatedSpawnerCommands, source: Entity) -> RelationshipRelatedSpawnerCommands {
+    spawner.commands = relationship_commands_set_related(spawner.commands, spawner.kind_id, source, spawner.target);
+    return spawner;
+}
+
+fn relationship_related_spawner_commands_finish(spawner: RelationshipRelatedSpawnerCommands) -> RelationshipCommands {
+    return spawner.commands;
+}
+
+fn relationship_commands_store_entity_list(commands: RelationshipCommands, related: Vec<Entity>) -> (RelationshipCommands, i64) {
+    commands.entity_lists.push(relationship_command_entity_list_new(related));
+    return (commands, (len(commands.entity_lists) as i64) - 1);
+}
+
+fn relationship_commands_copy_entity_list(commands: RelationshipCommands, list_index: i64) -> Vec<Entity> {
+    let copied: Vec<Entity> = Vec::new();
+    let i: i64 = 0;
+    let cnt = len(commands.entity_lists[list_index].items) as i64;
+    while i < cnt {
+        let entity = commands.entity_lists[list_index].items[i];
+        copied.push(entity_new(entity.id, entity.gen));
+        i = i + 1;
+    }
+    return copied;
+}
+
+fn relationship_commands_push(commands: RelationshipCommands, command: RelationshipCommand) -> RelationshipCommands {
+    commands.items.push(command);
+    return commands;
+}
+
+fn relationship_commands_reserve_entity(world: RelationshipWorld, commands: RelationshipCommands) -> (RelationshipWorld, RelationshipCommands, Entity) {
+    let (next_world, entity) = relationship_world_spawn(world);
+    return (next_world, commands, entity);
+}
+
+fn relationship_commands_spawn_related(world: RelationshipWorld, commands: RelationshipCommands, kind_id: i32, target: Entity) -> (RelationshipWorld, RelationshipCommands, Entity) {
+    let (next_world, entity) = relationship_world_spawn(world);
+    commands = relationship_commands_set_related(commands, kind_id, entity, target);
+    return (next_world, commands, entity);
+}
+
+fn relationship_commands_set_related(commands: RelationshipCommands, kind_id: i32, source: Entity, target: Entity) -> RelationshipCommands {
+    return relationship_commands_push(commands, relationship_command_new(RELATIONSHIP_COMMAND_SET_RELATED, kind_id, target, source, 2147483647 as i64, -1, -1, -1));
+}
+
+fn relationship_commands_add_related(commands: RelationshipCommands, kind_id: i32, target: Entity, related: Vec<Entity>) -> RelationshipCommands {
+    let (next_commands, related_index) = relationship_commands_store_entity_list(commands, related);
+    return relationship_commands_push(next_commands, relationship_command_new(RELATIONSHIP_COMMAND_ADD_RELATED, kind_id, target, entity_placeholder(), 2147483647 as i64, related_index, -1, -1));
+}
+
+fn relationship_commands_insert_related(commands: RelationshipCommands, kind_id: i32, target: Entity, index: i64, related: Vec<Entity>) -> RelationshipCommands {
+    let (next_commands, related_index) = relationship_commands_store_entity_list(commands, related);
+    return relationship_commands_push(next_commands, relationship_command_new(RELATIONSHIP_COMMAND_INSERT_RELATED, kind_id, target, entity_placeholder(), index, related_index, -1, -1));
+}
+
+fn relationship_commands_remove_related(commands: RelationshipCommands, kind_id: i32, target: Entity, related: Vec<Entity>) -> RelationshipCommands {
+    let (next_commands, related_index) = relationship_commands_store_entity_list(commands, related);
+    return relationship_commands_push(next_commands, relationship_command_new(RELATIONSHIP_COMMAND_REMOVE_RELATED, kind_id, target, entity_placeholder(), 0, related_index, -1, -1));
+}
+
+fn relationship_commands_detach_all_related(commands: RelationshipCommands, kind_id: i32, target: Entity) -> RelationshipCommands {
+    return relationship_commands_push(commands, relationship_command_new(RELATIONSHIP_COMMAND_DETACH_ALL_RELATED, kind_id, target, entity_placeholder(), 0, -1, -1, -1));
+}
+
+fn relationship_commands_replace_related(commands: RelationshipCommands, kind_id: i32, target: Entity, related: Vec<Entity>) -> RelationshipCommands {
+    let (next_commands, related_index) = relationship_commands_store_entity_list(commands, related);
+    return relationship_commands_push(next_commands, relationship_command_new(RELATIONSHIP_COMMAND_REPLACE_RELATED, kind_id, target, entity_placeholder(), 0, related_index, -1, -1));
+}
+
+fn relationship_commands_replace_related_with_difference(commands: RelationshipCommands, kind_id: i32, target: Entity, entities_to_unrelate: Vec<Entity>, entities_to_relate: Vec<Entity>, newly_related_entities: Vec<Entity>) -> RelationshipCommands {
+    let (c1, unrelate_index) = relationship_commands_store_entity_list(commands, entities_to_unrelate);
+    let (c2, relate_index) = relationship_commands_store_entity_list(c1, entities_to_relate);
+    let (c3, newly_index) = relationship_commands_store_entity_list(c2, newly_related_entities);
+    return relationship_commands_push(c3, relationship_command_new(RELATIONSHIP_COMMAND_REPLACE_RELATED_WITH_DIFFERENCE, kind_id, target, entity_placeholder(), 0, relate_index, unrelate_index, newly_index));
+}
+
+fn relationship_commands_despawn(commands: RelationshipCommands, entity: Entity) -> RelationshipCommands {
+    return relationship_commands_push(commands, relationship_command_new(RELATIONSHIP_COMMAND_DESPAWN, 0, entity, entity_placeholder(), 0, -1, -1, -1));
+}
+
+fn relationship_commands_despawn_related(commands: RelationshipCommands, kind_id: i32, target: Entity) -> RelationshipCommands {
+    return relationship_commands_push(commands, relationship_command_new(RELATIONSHIP_COMMAND_DESPAWN_RELATED, kind_id, target, entity_placeholder(), 0, -1, -1, -1));
+}
+
+fn relationship_commands_apply_set(world: RelationshipWorld, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind == RELATIONSHIP_COMMAND_SET_RELATED {
+        return relationship_world_set_related_at(world, command.kind_id, command.source, command.target, command.index);
+    };
+    return world;
+}
+
+fn relationship_commands_apply_add(world: RelationshipWorld, commands: RelationshipCommands, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind != RELATIONSHIP_COMMAND_ADD_RELATED { return world; };
+    let i: i64 = 0;
+    let cnt = len(commands.entity_lists[command.related_index].items) as i64;
+    while i < cnt {
+        let source = commands.entity_lists[command.related_index].items[i];
+        world = relationship_world_set_related(world, command.kind_id, entity_new(source.id, source.gen), command.target);
+        i = i + 1;
+    }
+    return world;
+}
+
+fn relationship_commands_apply_insert(world: RelationshipWorld, commands: RelationshipCommands, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind != RELATIONSHIP_COMMAND_INSERT_RELATED { return world; };
+    let i: i64 = 0;
+    let cnt = len(commands.entity_lists[command.related_index].items) as i64;
+    while i < cnt {
+        let source = commands.entity_lists[command.related_index].items[i];
+        world = relationship_world_set_related_at(world, command.kind_id, entity_new(source.id, source.gen), command.target, command.index + i);
+        i = i + 1;
+    }
+    return world;
+}
+
+fn relationship_commands_apply_remove(world: RelationshipWorld, commands: RelationshipCommands, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind != RELATIONSHIP_COMMAND_REMOVE_RELATED { return world; };
+    let i: i64 = 0;
+    let cnt = len(commands.entity_lists[command.related_index].items) as i64;
+    while i < cnt {
+        let source = commands.entity_lists[command.related_index].items[i];
+        if relationship_world_has_related(world, command.kind_id, source) {
+            let current_target = relationship_world_related(world, command.kind_id, source);
+            if entity_eq(current_target, command.target) {
+                world = relationship_world_remove_related(world, command.kind_id, entity_new(source.id, source.gen));
+            };
+        };
+        i = i + 1;
+    }
+    return world;
+}
+
+fn relationship_commands_apply_detach_all(world: RelationshipWorld, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind == RELATIONSHIP_COMMAND_DETACH_ALL_RELATED {
+        return relationship_world_detach_all_related(world, command.kind_id, command.target);
+    };
+    return world;
+}
+
+fn relationship_commands_apply_replace(world: RelationshipWorld, commands: RelationshipCommands, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind == RELATIONSHIP_COMMAND_REPLACE_RELATED {
+        return relationship_world_replace_related(world, command.kind_id, command.target, relationship_commands_copy_entity_list(commands, command.related_index));
+    };
+    return world;
+}
+
+fn relationship_commands_apply_replace_difference(world: RelationshipWorld, commands: RelationshipCommands, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind == RELATIONSHIP_COMMAND_REPLACE_RELATED_WITH_DIFFERENCE {
+        return relationship_world_replace_related_with_difference(world, command.kind_id, command.target, relationship_commands_copy_entity_list(commands, command.unrelate_index), relationship_commands_copy_entity_list(commands, command.related_index), relationship_commands_copy_entity_list(commands, command.newly_index));
+    };
+    return world;
+}
+
+fn relationship_commands_apply_despawn(world: RelationshipWorld, command: RelationshipCommand) -> RelationshipWorld {
+    if command.kind == RELATIONSHIP_COMMAND_DESPAWN { return relationship_world_despawn(world, command.target); };
+    if command.kind == RELATIONSHIP_COMMAND_DESPAWN_RELATED { return relationship_world_despawn_related(world, command.kind_id, command.target); };
+    return world;
+}
+
+fn relationship_commands_apply(world: RelationshipWorld, commands: RelationshipCommands) -> (RelationshipWorld, RelationshipCommands) {
+    let i: i64 = 0;
+    let cnt = relationship_commands_len(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = relationship_commands_apply_set(world, command);
+        world = relationship_commands_apply_add(world, commands, command);
+        world = relationship_commands_apply_insert(world, commands, command);
+        world = relationship_commands_apply_remove(world, commands, command);
+        world = relationship_commands_apply_detach_all(world, command);
+        world = relationship_commands_apply_replace(world, commands, command);
+        world = relationship_commands_apply_replace_difference(world, commands, command);
+        world = relationship_commands_apply_despawn(world, command);
+        i = i + 1;
+    }
+    return (world, relationship_commands_new());
+}
+
+@test "relationship commands defer add insert remove replace"() {
+    let w0 = relationship_world_new();
+    let (w1, kind) = relationship_world_register_many(w0, false, false);
+    let (w2, target) = relationship_world_spawn(w1);
+    let (w3, e0) = relationship_world_spawn(w2);
+    let (w4, e1) = relationship_world_spawn(w3);
+    let (w5, e2) = relationship_world_spawn(w4);
+    let (w6, e3) = relationship_world_spawn(w5);
+    let (w7, e4) = relationship_world_spawn(w6);
+    let initial: Vec<Entity> = Vec::new();
+    initial.push(e0);
+    initial.push(e1);
+    initial.push(e2);
+    let insert: Vec<Entity> = Vec::new();
+    insert.push(e0);
+    insert.push(e3);
+    insert.push(e4);
+    insert.push(e4);
+    let c0 = relationship_commands_new();
+    let c1 = relationship_commands_add_related(c0, kind.id, target, initial);
+    let c2 = relationship_commands_insert_related(c1, kind.id, target, 1, insert);
+    if relationship_world_source_count(w7, kind.id, target) != 0 { panic(9700); };
+    let (w8, c3) = relationship_commands_apply(w7, c2);
+    if relationship_commands_len(c3) != 0 { panic(9701); };
+    if entity_eq(relationship_world_source_at(w8, kind.id, target, 0), e1) != true { panic(9702); };
+    if entity_eq(relationship_world_source_at(w8, kind.id, target, 1), e0) != true { panic(9703); };
+    if entity_eq(relationship_world_source_at(w8, kind.id, target, 2), e3) != true { panic(9704); };
+    if entity_eq(relationship_world_source_at(w8, kind.id, target, 3), e2) != true { panic(9705); };
+    if entity_eq(relationship_world_source_at(w8, kind.id, target, 4), e4) != true { panic(9706); };
+    let remove: Vec<Entity> = Vec::new();
+    remove.push(e3);
+    let c4 = relationship_commands_remove_related(c3, kind.id, target, remove);
+    let keep: Vec<Entity> = Vec::new();
+    keep.push(e2);
+    keep.push(e4);
+    let c5 = relationship_commands_replace_related(c4, kind.id, target, keep);
+    let (w9, c6) = relationship_commands_apply(w8, c5);
+    if relationship_commands_len(c6) != 0 { panic(9707); };
+    if relationship_world_has_related(w9, kind.id, e0) != false { panic(9708); };
+    if relationship_world_has_related(w9, kind.id, e1) != false { panic(9709); };
+    if relationship_world_has_related(w9, kind.id, e3) != false { panic(9710); };
+    if entity_eq(relationship_world_source_at(w9, kind.id, target, 0), e2) != true { panic(9711); };
+    if entity_eq(relationship_world_source_at(w9, kind.id, target, 1), e4) != true { panic(9712); };
+}
+
+@test "relationship commands spawn related and detach all"() {
+    let w0 = relationship_world_new();
+    let (w1, kind) = relationship_world_register_many(w0, false, false);
+    let (w2, target) = relationship_world_spawn(w1);
+    let c0 = relationship_commands_new();
+    let (w3, c1, child) = relationship_commands_spawn_related(w2, c0, kind.id, target);
+    if relationship_world_is_alive(w3, child) != true { panic(9720); };
+    if relationship_world_has_related(w3, kind.id, child) != false { panic(9721); };
+    let (w4, c2) = relationship_commands_apply(w3, c1);
+    if entity_eq(relationship_world_related(w4, kind.id, child), target) != true { panic(9722); };
+    let c3 = relationship_commands_detach_all_related(c2, kind.id, target);
+    let (w5, c4) = relationship_commands_apply(w4, c3);
+    if relationship_commands_len(c4) != 0 { panic(9723); };
+    if relationship_world_has_related(w5, kind.id, child) != false { panic(9724); };
+    if relationship_world_source_count(w5, kind.id, target) != 0 { panic(9725); };
+}
+
+@test "relationship related spawner commands batch spawned children"() {
+    let w0 = relationship_world_new();
+    let (w1, kind) = relationship_world_register_many(w0, false, false);
+    let (w2, target) = relationship_world_spawn(w1);
+    let (w3, existing) = relationship_world_spawn(w2);
+    let c0 = relationship_commands_new();
+    let s0 = relationship_related_spawner_commands_new(c0, kind.id, target);
+    let (w4, s1, first) = relationship_related_spawner_commands_spawn(w3, s0);
+    let (w5, s2, second) = relationship_related_spawner_commands_spawn(w4, s1);
+    let s3 = relationship_related_spawner_commands_add_existing(s2, existing);
+    if relationship_related_spawner_commands_len(s3) != 3 { panic(9726); };
+    if relationship_world_source_count(w5, kind.id, target) != 0 { panic(9727); };
+    let c1 = relationship_related_spawner_commands_finish(s3);
+    let (w6, c2) = relationship_commands_apply(w5, c1);
+    if relationship_commands_len(c2) != 0 { panic(9728); };
+    if relationship_world_source_count(w6, kind.id, target) != 3 { panic(9729); };
+    if entity_eq(relationship_world_related(w6, kind.id, first), target) != true { panic(9749); };
+    if entity_eq(relationship_world_related(w6, kind.id, second), target) != true { panic(9758); };
+    if entity_eq(relationship_world_related(w6, kind.id, existing), target) != true { panic(9759); };
+}
+
+@test "relationship commands difference and linked despawn"() {
+    let w0 = relationship_world_new();
+    let (w1, kind) = relationship_world_register_many(w0, true, false);
+    let (w2, target) = relationship_world_spawn(w1);
+    let (w3, child1) = relationship_world_spawn_related(w2, kind.id, target);
+    let (w4, child2) = relationship_world_spawn_related(w3, kind.id, target);
+    let (w5, child3) = relationship_world_spawn(w4);
+    let unrelate: Vec<Entity> = Vec::new();
+    unrelate.push(child1);
+    let relate: Vec<Entity> = Vec::new();
+    relate.push(child2);
+    relate.push(child3);
+    let newly: Vec<Entity> = Vec::new();
+    newly.push(child3);
+    let c0 = relationship_commands_new();
+    let c1 = relationship_commands_replace_related_with_difference(c0, kind.id, target, unrelate, relate, newly);
+    let c2 = relationship_commands_despawn(c1, target);
+    let (w6, c3) = relationship_commands_apply(w5, c2);
+    if relationship_commands_len(c3) != 0 { panic(9730); };
+    if relationship_world_is_alive(w6, target) != false { panic(9731); };
+    if relationship_world_is_alive(w6, child1) != true { panic(9732); };
+    if relationship_world_is_alive(w6, child2) != false { panic(9733); };
+    if relationship_world_is_alive(w6, child3) != false { panic(9734); };
+    if relationship_world_has_related(w6, kind.id, child1) != false { panic(9735); };
+}
+
+@test "relationship commands one to one replacement"() {
+    let w0 = relationship_world_new();
+    let (w1, kind) = relationship_world_register_one(w0, false, false);
+    let (w2, target) = relationship_world_spawn(w1);
+    let (w3, first) = relationship_world_spawn(w2);
+    let (w4, second) = relationship_world_spawn(w3);
+    let c0 = relationship_commands_new();
+    let c1 = relationship_commands_set_related(c0, kind.id, first, target);
+    let c2 = relationship_commands_set_related(c1, kind.id, second, target);
+    let (w5, c3) = relationship_commands_apply(w4, c2);
+    if relationship_commands_len(c3) != 0 { panic(9736); };
+    if relationship_world_has_related(w5, kind.id, first) != false { panic(9737); };
+    if relationship_world_has_related(w5, kind.id, second) != true { panic(9738); };
+    if relationship_world_source_count(w5, kind.id, target) != 1 { panic(9739); };
+    if entity_eq(relationship_world_source_at(w5, kind.id, target, 0), second) != true { panic(9746); };
+}

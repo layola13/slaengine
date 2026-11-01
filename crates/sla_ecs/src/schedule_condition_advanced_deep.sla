@@ -1,0 +1,174 @@
+// Deepened Bevy ECS schedule::condition advanced combinators.
+// Models condition_changed / changed_to state plus combinator evaluation and a
+// condition-set pipeline. Shallow lib/schedule_condition_advanced.sla retained.
+
+struct EcsCondStateDeep {
+    prev: i32,
+    initialized: i32,
+    calls: i32,
+}
+
+fn ecs_cond_state_new() -> EcsCondStateDeep {
+    return EcsCondStateDeep { prev: 0, initialized: 0, calls: 0 };
+}
+
+fn ecs_cond_state_prev(s: EcsCondStateDeep) -> i32 { return s.prev; }
+fn ecs_cond_state_initialized(s: EcsCondStateDeep) -> i32 { return s.initialized; }
+fn ecs_cond_state_calls(s: EcsCondStateDeep) -> i32 { return s.calls; }
+
+fn ecs_cond_state_rebuild(prev: i32, initialized: i32, calls: i32) -> EcsCondStateDeep {
+    return EcsCondStateDeep { prev: prev, initialized: initialized, calls: calls };
+}
+
+// changed: returns (result_changed, new_state). First call reports change = current.
+struct EcsCondChangedDeep { changed: i32, state: EcsCondStateDeep }
+fn ecs_cond_changed_result(c: EcsCondChangedDeep) -> i32 { return c.changed; }
+fn ecs_cond_changed_state(c: EcsCondChangedDeep) -> EcsCondStateDeep { return c.state; }
+
+fn ecs_cond_state_to_i32(b: bool) -> i32 {
+    if b { return 1; };
+    return 0;
+}
+
+fn ecs_cond_i32_to_bool(v: i32) -> bool { return v != 0; }
+
+fn ecs_cond_changed(s: EcsCondStateDeep, new_result: bool) -> EcsCondChangedDeep {
+    let cur = ecs_cond_state_to_i32(new_result);
+    let calls = s.calls + 1;
+    if s.initialized != 1 {
+        let st = ecs_cond_state_rebuild(cur, 1, calls);
+        return EcsCondChangedDeep { changed: 1, state: st };
+    };
+    let changed: i32 = 0;
+    if s.prev != cur { changed = 1; };
+    let st2 = ecs_cond_state_rebuild(cur, 1, calls);
+    return EcsCondChangedDeep { changed: changed, state: st2 };
+}
+
+// changed_to: returns true only when transitioning to the requested value.
+struct EcsCondChangedToDeep { result: i32, state: EcsCondStateDeep }
+fn ecs_cond_changed_to_result(c: EcsCondChangedToDeep) -> i32 { return c.result; }
+fn ecs_cond_changed_to_state(c: EcsCondChangedToDeep) -> EcsCondStateDeep { return c.state; }
+
+fn ecs_cond_changed_to(s: EcsCondStateDeep, to: bool, new_result: bool) -> EcsCondChangedToDeep {
+    let cur = ecs_cond_state_to_i32(new_result);
+    let target = ecs_cond_state_to_i32(to);
+    let calls = s.calls + 1;
+    let prev = 0;
+    if s.initialized == 1 { prev = s.prev; };
+    let matched: i32 = 0;
+    if prev != cur {
+        if cur == target { matched = 1; };
+    };
+    let st = ecs_cond_state_rebuild(cur, 1, calls);
+    return EcsCondChangedToDeep { result: matched, state: st };
+}
+
+// Combinator kinds (0..9)
+const ECS_COND_AND_THEN: i32 = 0;
+const ECS_COND_AND_EAGER: i32 = 1;
+const ECS_COND_OR_ELSE: i32 = 2;
+const ECS_COND_OR_EAGER: i32 = 3;
+const ECS_COND_NAND_THEN: i32 = 4;
+const ECS_COND_NAND_EAGER: i32 = 5;
+const ECS_COND_NOR_THEN: i32 = 6;
+const ECS_COND_NOR_EAGER: i32 = 7;
+const ECS_COND_XOR_THEN: i32 = 8;
+const ECS_COND_XOR_EAGER: i32 = 9;
+
+fn ecs_cond_and(a: bool, b: bool) -> bool { return a && b; }
+fn ecs_cond_or(a: bool, b: bool) -> bool { return a || b; }
+fn ecs_cond_nand(a: bool, b: bool) -> bool { return (a && b) != true; }
+fn ecs_cond_nor(a: bool, b: bool) -> bool { return (a || b) != true; }
+fn ecs_cond_xor(a: bool, b: bool) -> bool { return a != b; }
+fn ecs_cond_not(a: bool) -> bool { return a != true; }
+
+fn ecs_cond_combine(kind: i32, a: bool, b: bool) -> bool {
+    if kind == ECS_COND_AND_THEN { return ecs_cond_and(a, b); };
+    if kind == ECS_COND_AND_EAGER { return ecs_cond_and(a, b); };
+    if kind == ECS_COND_OR_ELSE { return ecs_cond_or(a, b); };
+    if kind == ECS_COND_OR_EAGER { return ecs_cond_or(a, b); };
+    if kind == ECS_COND_NAND_THEN { return ecs_cond_nand(a, b); };
+    if kind == ECS_COND_NAND_EAGER { return ecs_cond_nand(a, b); };
+    if kind == ECS_COND_NOR_THEN { return ecs_cond_nor(a, b); };
+    if kind == ECS_COND_NOR_EAGER { return ecs_cond_nor(a, b); };
+    if kind == ECS_COND_XOR_THEN { return ecs_cond_xor(a, b); };
+    if kind == ECS_COND_XOR_EAGER { return ecs_cond_xor(a, b); };
+    return false;
+}
+
+fn ecs_cond_combine_i32(kind: i32, a: i32, b: i32) -> i32 {
+    let ba = ecs_cond_i32_to_bool(a);
+    let bb = ecs_cond_i32_to_bool(b);
+    let r = ecs_cond_combine(kind, ba, bb);
+    return ecs_cond_state_to_i32(r);
+}
+
+fn ecs_cond_resource_exists_and(exists: bool, predicate_result: bool) -> bool {
+    if exists != true { return false; };
+    return predicate_result;
+}
+
+// Condition set: capacity-4 evaluated condition results plus combinators.
+struct EcsCondSetDeep {
+    r0: i32, r1: i32, r2: i32, r3: i32,
+    kind0: i32, kind1: i32, kind2: i32, kind3: i32,
+    len: i32,
+    fold_kind: i32,
+}
+
+fn ecs_cond_set_new(fold_kind: i32) -> EcsCondSetDeep {
+    return EcsCondSetDeep {
+        r0: 0, r1: 0, r2: 0, r3: 0,
+        kind0: 0, kind1: 0, kind2: 0, kind3: 0,
+        len: 0, fold_kind: fold_kind,
+    };
+}
+
+fn ecs_cond_set_rebuild(
+    r0: i32, r1: i32, r2: i32, r3: i32,
+    kind0: i32, kind1: i32, kind2: i32, kind3: i32,
+    len: i32, fold_kind: i32
+) -> EcsCondSetDeep {
+    return EcsCondSetDeep {
+        r0: r0, r1: r1, r2: r2, r3: r3,
+        kind0: kind0, kind1: kind1, kind2: kind2, kind3: kind3,
+        len: len, fold_kind: fold_kind,
+    };
+}
+
+fn ecs_cond_set_len(s: EcsCondSetDeep) -> i32 { return s.len; }
+fn ecs_cond_set_fold_kind(s: EcsCondSetDeep) -> i32 { return s.fold_kind; }
+
+fn ecs_cond_set_push(s: EcsCondSetDeep, kind: i32, result: bool) -> EcsCondSetDeep {
+    let r = ecs_cond_state_to_i32(result);
+    let r0 = s.r0; let r1 = s.r1; let r2 = s.r2; let r3 = s.r3;
+    let k0 = s.kind0; let k1 = s.kind1; let k2 = s.kind2; let k3 = s.kind3;
+    let ln = s.len; let fk = s.fold_kind;
+    if ln >= 4 { return s; };
+    if ln == 0 { return ecs_cond_set_rebuild(r, 0, 0, 0, kind, 0, 0, 0, 1, fk); };
+    if ln == 1 { return ecs_cond_set_rebuild(r0, r, 0, 0, k0, kind, 0, 0, 2, fk); };
+    if ln == 2 { return ecs_cond_set_rebuild(r0, r1, r, 0, k0, k1, kind, 0, 3, fk); };
+    if ln == 3 { return ecs_cond_set_rebuild(r0, r1, r2, r, k0, k1, k2, kind, 4, fk); };
+    return s;
+}
+
+fn ecs_cond_set_fold(s: EcsCondSetDeep) -> i32 {
+    if s.len == 0 { return 0; };
+    let acc = s.r0;
+    if s.len == 1 { return acc; };
+    let acc2 = ecs_cond_combine_i32(s.fold_kind, acc, s.r1);
+    if s.len == 2 { return acc2; };
+    let acc3 = ecs_cond_combine_i32(s.fold_kind, acc2, s.r2);
+    if s.len == 3 { return acc3; };
+    let acc4 = ecs_cond_combine_i32(s.fold_kind, acc3, s.r3);
+    return acc4;
+}
+
+fn ecs_cond_set_get(s: EcsCondSetDeep, idx: i32) -> i32 {
+    if idx == 0 { return s.r0; };
+    if idx == 1 { return s.r1; };
+    if idx == 2 { return s.r2; };
+    if idx == 3 { return s.r3; };
+    return -1;
+}

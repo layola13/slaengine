@@ -1,0 +1,1809 @@
+// Deep bed for lib/world_dynamic3.sla (Batch 391).
+// Mirrors shallow lib/world_dynamic3.sla's generically-typed DynamicWorld3<A,B,C,R,M> (Vec/
+// dyn_store-backed dynamic 3-column variant of DynamicWorld with cap-N growable entity
+// allocation) as a SELF-CONTAINED fixed-cap variant (NO `@import`) baking the entity allocator
+// + 3 component stores + per-store added/changed tick arrays + ResourceSlot + Messages queue +
+// change_tick. Shallow uses Vec growth + generics + `impl QueryIter { fn self }` method-call
+// syntax + `for pos in query { ... }` iteration; the deep replaces each Vec with `field0..15`
+// cap-16 scalar slot families (SA has no fixed-array in `_deep.sla`), replaces `impl ... { fn
+// self }` with free functions per Batch 388 #7, and tests use `while` loops (no for-in) and
+// wrapper-struct accessors per Batch 373.
+//
+// Concrete typed plugs: `EcsWD3Pos{x,y}` (A), `EcsWD3Vel{x,y}` (B), `EcsWD3Player{team}` (C),
+// `EcsWD3Time{tick}` (resource R), `EcsWD3Event{amount}` (message M). change_tick starts at 1
+// (mirrors shallow `dynamic_world3_new` which sets `change_tick: 1`). Cap is fixed at 16
+// entities (the shallow can grow via Vec::push but cap-16 here still leaves room beyond the
+// shallow's small embedded test scenarios and exercises cap-reject).
+//
+// Shallow surfaces 3 @test at panic 8101-8224 (shallow's resort-style guard panics 8101/8104/
+// 8105/8106 against non-alive/non-component, plus test asserts 8200-8224). Wrapper structs
+// (EcsWD3Spawn/EcsWD3TripleQuery/EcsWD3QueryA) replace tuple-return and Vec-return ops so
+// tests never destructure tuples (`let (w, e) = spawn`) nor use Vec members directly.
+
+const ECS_WD3_CAP: i32 = 16;
+
+// ── Entity wrapper { id, generation } (cap-16 + 32-bit gen each). ────────────────────────────
+struct EcsWD3Entity { id: i32, generation: i32 }
+fn ecs_wd3_entity_eq(a: EcsWD3Entity, b: EcsWD3Entity) -> bool {
+    if a.id != b.id { return false; };
+    if a.generation != b.generation { return false; };
+    return true;
+}
+fn ecs_wd3_entity_id(a: EcsWD3Entity) -> i32 { return a.id; }
+fn ecs_wd3_entity_gen(a: EcsWD3Entity) -> i32 { return a.generation; }
+fn ecs_wd3_entity_new(id: i32, gen: i32) -> EcsWD3Entity { return EcsWD3Entity { id: id, generation: gen }; }
+
+// ── Concrete typed plugs. ─────────────────────────────────────────────────────────────────
+struct EcsWD3Pos { x: i32, y: i32 }
+struct EcsWD3Vel { x: i32, y: i32 }
+struct EcsWD3Player { team: i32 }
+struct EcsWD3Time { tick: i32 }
+struct EcsWD3Event { amount: i32 }
+fn ecs_wd3_pos_new(x: i32, y: i32) -> EcsWD3Pos { return EcsWD3Pos { x: x, y: y }; }
+fn ecs_wd3_pos_x(p: EcsWD3Pos) -> i32 { return p.x; }
+fn ecs_wd3_pos_y(p: EcsWD3Pos) -> i32 { return p.y; }
+fn ecs_wd3_vel_new(x: i32, y: i32) -> EcsWD3Vel { return EcsWD3Vel { x: x, y: y }; }
+fn ecs_wd3_vel_x(v: EcsWD3Vel) -> i32 { return v.x; }
+fn ecs_wd3_vel_y(v: EcsWD3Vel) -> i32 { return v.y; }
+fn ecs_wd3_player_new(team: i32) -> EcsWD3Player { return EcsWD3Player { team: team }; }
+fn ecs_wd3_player_team(p: EcsWD3Player) -> i32 { return p.team; }
+fn ecs_wd3_time_new(t: i32) -> EcsWD3Time { return EcsWD3Time { tick: t }; }
+fn ecs_wd3_time_tick(t: EcsWD3Time) -> i32 { return t.tick; }
+fn ecs_wd3_event_new(a: i32) -> EcsWD3Event { return EcsWD3Event { amount: a }; }
+fn ecs_wd3_event_amount(e: EcsWD3Event) -> i32 { return e.amount; }
+
+// ── World: cap-16 entity allocator + 3 component stores (cap-16 each, slot-addressed by
+//    entity_id) + per-store added/changed tick arrays cap-16 + 1 resource slot + cap-16
+//    message queue + change_tick.
+struct EcsWD3World {
+    // Entity allocator state (flat-scalar: next_id + free_count + generations[16] + free_ids[16]
+    // + occupied[16]). Mirrors DynamicEntityAllocator free_ids + generations + occupied.
+    next_id: i32,
+    free_count: i32,
+    gen0: i32, gen1: i32, gen2: i32, gen3: i32, gen4: i32, gen5: i32, gen6: i32, gen7: i32,
+    gen8: i32, gen9: i32, gen10: i32, gen11: i32, gen12: i32, gen13: i32, gen14: i32, gen15: i32,
+    free_id0: i32, free_id1: i32, free_id2: i32, free_id3: i32, free_id4: i32, free_id5: i32, free_id6: i32, free_id7: i32,
+    free_id8: i32, free_id9: i32, free_id10: i32, free_id11: i32, free_id12: i32, free_id13: i32, free_id14: i32, free_id15: i32,
+    occ0: i32, occ1: i32, occ2: i32, occ3: i32, occ4: i32, occ5: i32, occ6: i32, occ7: i32,
+    occ8: i32, occ9: i32, occ10: i32, occ11: i32, occ12: i32, occ13: i32, occ14: i32, occ15: i32,
+    // A component store (EcsWD3Pos): count + per-slot (eid, x, y, added_t, changed_t) cap-16.
+    a_count: i32,
+    a_eid0: i32, a_eid1: i32, a_eid2: i32, a_eid3: i32, a_eid4: i32, a_eid5: i32, a_eid6: i32, a_eid7: i32,
+    a_eid8: i32, a_eid9: i32, a_eid10: i32, a_eid11: i32, a_eid12: i32, a_eid13: i32, a_eid14: i32, a_eid15: i32,
+    a_x0: i32, a_x1: i32, a_x2: i32, a_x3: i32, a_x4: i32, a_x5: i32, a_x6: i32, a_x7: i32,
+    a_x8: i32, a_x9: i32, a_x10: i32, a_x11: i32, a_x12: i32, a_x13: i32, a_x14: i32, a_x15: i32,
+    a_y0: i32, a_y1: i32, a_y2: i32, a_y3: i32, a_y4: i32, a_y5: i32, a_y6: i32, a_y7: i32,
+    a_y8: i32, a_y9: i32, a_y10: i32, a_y11: i32, a_y12: i32, a_y13: i32, a_y14: i32, a_y15: i32,
+    a_added_t0: i32, a_added_t1: i32, a_added_t2: i32, a_added_t3: i32, a_added_t4: i32, a_added_t5: i32, a_added_t6: i32, a_added_t7: i32,
+    a_added_t8: i32, a_added_t9: i32, a_added_t10: i32, a_added_t11: i32, a_added_t12: i32, a_added_t13: i32, a_added_t14: i32, a_added_t15: i32,
+    a_changed_t0: i32, a_changed_t1: i32, a_changed_t2: i32, a_changed_t3: i32, a_changed_t4: i32, a_changed_t5: i32, a_changed_t6: i32, a_changed_t7: i32,
+    a_changed_t8: i32, a_changed_t9: i32, a_changed_t10: i32, a_changed_t11: i32, a_changed_t12: i32, a_changed_t13: i32, a_changed_t14: i32, a_changed_t15: i32,
+    // B component store (EcsWD3Vel): count + per-slot (eid, x, y, added_t, changed_t) cap-16.
+    b_count: i32,
+    b_eid0: i32, b_eid1: i32, b_eid2: i32, b_eid3: i32, b_eid4: i32, b_eid5: i32, b_eid6: i32, b_eid7: i32,
+    b_eid8: i32, b_eid9: i32, b_eid10: i32, b_eid11: i32, b_eid12: i32, b_eid13: i32, b_eid14: i32, b_eid15: i32,
+    b_x0: i32, b_x1: i32, b_x2: i32, b_x3: i32, b_x4: i32, b_x5: i32, b_x6: i32, b_x7: i32,
+    b_x8: i32, b_x9: i32, b_x10: i32, b_x11: i32, b_x12: i32, b_x13: i32, b_x14: i32, b_x15: i32,
+    b_y0: i32, b_y1: i32, b_y2: i32, b_y3: i32, b_y4: i32, b_y5: i32, b_y6: i32, b_y7: i32,
+    b_y8: i32, b_y9: i32, b_y10: i32, b_y11: i32, b_y12: i32, b_y13: i32, b_y14: i32, b_y15: i32,
+    b_added_t0: i32, b_added_t1: i32, b_added_t2: i32, b_added_t3: i32, b_added_t4: i32, b_added_t5: i32, b_added_t6: i32, b_added_t7: i32,
+    b_added_t8: i32, b_added_t9: i32, b_added_t10: i32, b_added_t11: i32, b_added_t12: i32, b_added_t13: i32, b_added_t14: i32, b_added_t15: i32,
+    b_changed_t0: i32, b_changed_t1: i32, b_changed_t2: i32, b_changed_t3: i32, b_changed_t4: i32, b_changed_t5: i32, b_changed_t6: i32, b_changed_t7: i32,
+    b_changed_t8: i32, b_changed_t9: i32, b_changed_t10: i32, b_changed_t11: i32, b_changed_t12: i32, b_changed_t13: i32, b_changed_t14: i32, b_changed_t15: i32,
+    // C component store (EcsWD3Player): count + per-slot (eid, team, added_t, changed_t) cap-16.
+    c_count: i32,
+    c_eid0: i32, c_eid1: i32, c_eid2: i32, c_eid3: i32, c_eid4: i32, c_eid5: i32, c_eid6: i32, c_eid7: i32,
+    c_eid8: i32, c_eid9: i32, c_eid10: i32, c_eid11: i32, c_eid12: i32, c_eid13: i32, c_eid14: i32, c_eid15: i32,
+    c_team0: i32, c_team1: i32, c_team2: i32, c_team3: i32, c_team4: i32, c_team5: i32, c_team6: i32, c_team7: i32,
+    c_team8: i32, c_team9: i32, c_team10: i32, c_team11: i32, c_team12: i32, c_team13: i32, c_team14: i32, c_team15: i32,
+    c_added_t0: i32, c_added_t1: i32, c_added_t2: i32, c_added_t3: i32, c_added_t4: i32, c_added_t5: i32, c_added_t6: i32, c_added_t7: i32,
+    c_added_t8: i32, c_added_t9: i32, c_added_t10: i32, c_added_t11: i32, c_added_t12: i32, c_added_t13: i32, c_added_t14: i32, c_added_t15: i32,
+    c_changed_t0: i32, c_changed_t1: i32, c_changed_t2: i32, c_changed_t3: i32, c_changed_t4: i32, c_changed_t5: i32, c_changed_t6: i32, c_changed_t7: i32,
+    c_changed_t8: i32, c_changed_t9: i32, c_changed_t10: i32, c_changed_t11: i32, c_changed_t12: i32, c_changed_t13: i32, c_changed_t14: i32, c_changed_t15: i32,
+    // Resource slot (single EcsWD3Time): has-flag + tick + added_t + changed_t.
+    res_has: i32,
+    res_tick: i32,
+    res_added_t: i32,
+    res_changed_t: i32,
+    // Message slot (cap-16): tail + per-slot amount.
+    msg_tail: i32,
+    msg0: i32, msg1: i32, msg2: i32, msg3: i32, msg4: i32, msg5: i32, msg6: i32, msg7: i32,
+    msg8: i32, msg9: i32, msg10: i32, msg11: i32, msg12: i32, msg13: i32, msg14: i32, msg15: i32,
+    // Monotone change tick (starts at 1).
+    change_tick: i32,
+}
+
+fn ecs_wd3_world_new() -> EcsWD3World {
+    return EcsWD3World {
+        next_id: 1, free_count: 0,
+        gen0: 0, gen1: 0, gen2: 0, gen3: 0, gen4: 0, gen5: 0, gen6: 0, gen7: 0,
+        gen8: 0, gen9: 0, gen10: 0, gen11: 0, gen12: 0, gen13: 0, gen14: 0, gen15: 0,
+        free_id0: 0, free_id1: 0, free_id2: 0, free_id3: 0, free_id4: 0, free_id5: 0, free_id6: 0, free_id7: 0,
+        free_id8: 0, free_id9: 0, free_id10: 0, free_id11: 0, free_id12: 0, free_id13: 0, free_id14: 0, free_id15: 0,
+        occ0: 0, occ1: 0, occ2: 0, occ3: 0, occ4: 0, occ5: 0, occ6: 0, occ7: 0,
+        occ8: 0, occ9: 0, occ10: 0, occ11: 0, occ12: 0, occ13: 0, occ14: 0, occ15: 0,
+        a_count: 0,
+        a_eid0: 0, a_eid1: 0, a_eid2: 0, a_eid3: 0, a_eid4: 0, a_eid5: 0, a_eid6: 0, a_eid7: 0,
+        a_eid8: 0, a_eid9: 0, a_eid10: 0, a_eid11: 0, a_eid12: 0, a_eid13: 0, a_eid14: 0, a_eid15: 0,
+        a_x0: 0, a_x1: 0, a_x2: 0, a_x3: 0, a_x4: 0, a_x5: 0, a_x6: 0, a_x7: 0,
+        a_x8: 0, a_x9: 0, a_x10: 0, a_x11: 0, a_x12: 0, a_x13: 0, a_x14: 0, a_x15: 0,
+        a_y0: 0, a_y1: 0, a_y2: 0, a_y3: 0, a_y4: 0, a_y5: 0, a_y6: 0, a_y7: 0,
+        a_y8: 0, a_y9: 0, a_y10: 0, a_y11: 0, a_y12: 0, a_y13: 0, a_y14: 0, a_y15: 0,
+        a_added_t0: 0, a_added_t1: 0, a_added_t2: 0, a_added_t3: 0, a_added_t4: 0, a_added_t5: 0, a_added_t6: 0, a_added_t7: 0,
+        a_added_t8: 0, a_added_t9: 0, a_added_t10: 0, a_added_t11: 0, a_added_t12: 0, a_added_t13: 0, a_added_t14: 0, a_added_t15: 0,
+        a_changed_t0: 0, a_changed_t1: 0, a_changed_t2: 0, a_changed_t3: 0, a_changed_t4: 0, a_changed_t5: 0, a_changed_t6: 0, a_changed_t7: 0,
+        a_changed_t8: 0, a_changed_t9: 0, a_changed_t10: 0, a_changed_t11: 0, a_changed_t12: 0, a_changed_t13: 0, a_changed_t14: 0, a_changed_t15: 0,
+        b_count: 0,
+        b_eid0: 0, b_eid1: 0, b_eid2: 0, b_eid3: 0, b_eid4: 0, b_eid5: 0, b_eid6: 0, b_eid7: 0,
+        b_eid8: 0, b_eid9: 0, b_eid10: 0, b_eid11: 0, b_eid12: 0, b_eid13: 0, b_eid14: 0, b_eid15: 0,
+        b_x0: 0, b_x1: 0, b_x2: 0, b_x3: 0, b_x4: 0, b_x5: 0, b_x6: 0, b_x7: 0,
+        b_x8: 0, b_x9: 0, b_x10: 0, b_x11: 0, b_x12: 0, b_x13: 0, b_x14: 0, b_x15: 0,
+        b_y0: 0, b_y1: 0, b_y2: 0, b_y3: 0, b_y4: 0, b_y5: 0, b_y6: 0, b_y7: 0,
+        b_y8: 0, b_y9: 0, b_y10: 0, b_y11: 0, b_y12: 0, b_y13: 0, b_y14: 0, b_y15: 0,
+        b_added_t0: 0, b_added_t1: 0, b_added_t2: 0, b_added_t3: 0, b_added_t4: 0, b_added_t5: 0, b_added_t6: 0, b_added_t7: 0,
+        b_added_t8: 0, b_added_t9: 0, b_added_t10: 0, b_added_t11: 0, b_added_t12: 0, b_added_t13: 0, b_added_t14: 0, b_added_t15: 0,
+        b_changed_t0: 0, b_changed_t1: 0, b_changed_t2: 0, b_changed_t3: 0, b_changed_t4: 0, b_changed_t5: 0, b_changed_t6: 0, b_changed_t7: 0,
+        b_changed_t8: 0, b_changed_t9: 0, b_changed_t10: 0, b_changed_t11: 0, b_changed_t12: 0, b_changed_t13: 0, b_changed_t14: 0, b_changed_t15: 0,
+        c_count: 0,
+        c_eid0: 0, c_eid1: 0, c_eid2: 0, c_eid3: 0, c_eid4: 0, c_eid5: 0, c_eid6: 0, c_eid7: 0,
+        c_eid8: 0, c_eid9: 0, c_eid10: 0, c_eid11: 0, c_eid12: 0, c_eid13: 0, c_eid14: 0, c_eid15: 0,
+        c_team0: 0, c_team1: 0, c_team2: 0, c_team3: 0, c_team4: 0, c_team5: 0, c_team6: 0, c_team7: 0,
+        c_team8: 0, c_team9: 0, c_team10: 0, c_team11: 0, c_team12: 0, c_team13: 0, c_team14: 0, c_team15: 0,
+        c_added_t0: 0, c_added_t1: 0, c_added_t2: 0, c_added_t3: 0, c_added_t4: 0, c_added_t5: 0, c_added_t6: 0, c_added_t7: 0,
+        c_added_t8: 0, c_added_t9: 0, c_added_t10: 0, c_added_t11: 0, c_added_t12: 0, c_added_t13: 0, c_added_t14: 0, c_added_t15: 0,
+        c_changed_t0: 0, c_changed_t1: 0, c_changed_t2: 0, c_changed_t3: 0, c_changed_t4: 0, c_changed_t5: 0, c_changed_t6: 0, c_changed_t7: 0,
+        c_changed_t8: 0, c_changed_t9: 0, c_changed_t10: 0, c_changed_t11: 0, c_changed_t12: 0, c_changed_t13: 0, c_changed_t14: 0, c_changed_t15: 0,
+        res_has: 0, res_tick: 0, res_added_t: 0, res_changed_t: 0,
+        msg_tail: 0,
+        msg0: 0, msg1: 0, msg2: 0, msg3: 0, msg4: 0, msg5: 0, msg6: 0, msg7: 0,
+        msg8: 0, msg9: 0, msg10: 0, msg11: 0, msg12: 0, msg13: 0, msg14: 0, msg15: 0,
+        change_tick: 1,
+    };
+}
+
+fn ecs_wd3_world_change_tick(w: EcsWD3World) -> i32 { return w.change_tick; }
+
+fn ecs_wd3_increment_tick(w0: EcsWD3World) -> EcsWD3World {
+    w0.change_tick = w0.change_tick + 1;
+    return w0;
+}
+
+// ── Allocator slot accessors (gen, free_id, occupied). ────────────────────────────────────
+fn _ecs_wd3_gen_at(w: EcsWD3World, id: i32) -> i32 {
+    if id == 0 { return w.gen0; };
+    if id == 1 { return w.gen1; };
+    if id == 2 { return w.gen2; };
+    if id == 3 { return w.gen3; };
+    if id == 4 { return w.gen4; };
+    if id == 5 { return w.gen5; };
+    if id == 6 { return w.gen6; };
+    if id == 7 { return w.gen7; };
+    if id == 8 { return w.gen8; };
+    if id == 9 { return w.gen9; };
+    if id == 10 { return w.gen10; };
+    if id == 11 { return w.gen11; };
+    if id == 12 { return w.gen12; };
+    if id == 13 { return w.gen13; };
+    if id == 14 { return w.gen14; };
+    return w.gen15;
+}
+
+fn _ecs_wd3_set_gen(w0: EcsWD3World, id: i32, value: i32) -> EcsWD3World {
+    if id == 0 { w0.gen0 = value; return w0; };
+    if id == 1 { w0.gen1 = value; return w0; };
+    if id == 2 { w0.gen2 = value; return w0; };
+    if id == 3 { w0.gen3 = value; return w0; };
+    if id == 4 { w0.gen4 = value; return w0; };
+    if id == 5 { w0.gen5 = value; return w0; };
+    if id == 6 { w0.gen6 = value; return w0; };
+    if id == 7 { w0.gen7 = value; return w0; };
+    if id == 8 { w0.gen8 = value; return w0; };
+    if id == 9 { w0.gen9 = value; return w0; };
+    if id == 10 { w0.gen10 = value; return w0; };
+    if id == 11 { w0.gen11 = value; return w0; };
+    if id == 12 { w0.gen12 = value; return w0; };
+    if id == 13 { w0.gen13 = value; return w0; };
+    if id == 14 { w0.gen14 = value; return w0; };
+    w0.gen15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_free_id_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.free_id0; };
+    if idx == 1 { return w.free_id1; };
+    if idx == 2 { return w.free_id2; };
+    if idx == 3 { return w.free_id3; };
+    if idx == 4 { return w.free_id4; };
+    if idx == 5 { return w.free_id5; };
+    if idx == 6 { return w.free_id6; };
+    if idx == 7 { return w.free_id7; };
+    if idx == 8 { return w.free_id8; };
+    if idx == 9 { return w.free_id9; };
+    if idx == 10 { return w.free_id10; };
+    if idx == 11 { return w.free_id11; };
+    if idx == 12 { return w.free_id12; };
+    if idx == 13 { return w.free_id13; };
+    if idx == 14 { return w.free_id14; };
+    return w.free_id15;
+}
+
+fn _ecs_wd3_set_free_id(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.free_id0 = value; return w0; };
+    if idx == 1 { w0.free_id1 = value; return w0; };
+    if idx == 2 { w0.free_id2 = value; return w0; };
+    if idx == 3 { w0.free_id3 = value; return w0; };
+    if idx == 4 { w0.free_id4 = value; return w0; };
+    if idx == 5 { w0.free_id5 = value; return w0; };
+    if idx == 6 { w0.free_id6 = value; return w0; };
+    if idx == 7 { w0.free_id7 = value; return w0; };
+    if idx == 8 { w0.free_id8 = value; return w0; };
+    if idx == 9 { w0.free_id9 = value; return w0; };
+    if idx == 10 { w0.free_id10 = value; return w0; };
+    if idx == 11 { w0.free_id11 = value; return w0; };
+    if idx == 12 { w0.free_id12 = value; return w0; };
+    if idx == 13 { w0.free_id13 = value; return w0; };
+    if idx == 14 { w0.free_id14 = value; return w0; };
+    w0.free_id15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_occ_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.occ0; };
+    if idx == 1 { return w.occ1; };
+    if idx == 2 { return w.occ2; };
+    if idx == 3 { return w.occ3; };
+    if idx == 4 { return w.occ4; };
+    if idx == 5 { return w.occ5; };
+    if idx == 6 { return w.occ6; };
+    if idx == 7 { return w.occ7; };
+    if idx == 8 { return w.occ8; };
+    if idx == 9 { return w.occ9; };
+    if idx == 10 { return w.occ10; };
+    if idx == 11 { return w.occ11; };
+    if idx == 12 { return w.occ12; };
+    if idx == 13 { return w.occ13; };
+    if idx == 14 { return w.occ14; };
+    return w.occ15;
+}
+
+fn _ecs_wd3_set_occ(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.occ0 = value; return w0; };
+    if idx == 1 { w0.occ1 = value; return w0; };
+    if idx == 2 { w0.occ2 = value; return w0; };
+    if idx == 3 { w0.occ3 = value; return w0; };
+    if idx == 4 { w0.occ4 = value; return w0; };
+    if idx == 5 { w0.occ5 = value; return w0; };
+    if idx == 6 { w0.occ6 = value; return w0; };
+    if idx == 7 { w0.occ7 = value; return w0; };
+    if idx == 8 { w0.occ8 = value; return w0; };
+    if idx == 9 { w0.occ9 = value; return w0; };
+    if idx == 10 { w0.occ10 = value; return w0; };
+    if idx == 11 { w0.occ11 = value; return w0; };
+    if idx == 12 { w0.occ12 = value; return w0; };
+    if idx == 13 { w0.occ13 = value; return w0; };
+    if idx == 14 { w0.occ14 = value; return w0; };
+    w0.occ15 = value;
+    return w0;
+}
+
+
+// ── A/B/C store scalar accessors (cap-16 cascade). ────────────────────────────────────
+fn _ecs_wd3_a_eid_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.a_eid0; };
+    if idx == 1 { return w.a_eid1; };
+    if idx == 2 { return w.a_eid2; };
+    if idx == 3 { return w.a_eid3; };
+    if idx == 4 { return w.a_eid4; };
+    if idx == 5 { return w.a_eid5; };
+    if idx == 6 { return w.a_eid6; };
+    if idx == 7 { return w.a_eid7; };
+    if idx == 8 { return w.a_eid8; };
+    if idx == 9 { return w.a_eid9; };
+    if idx == 10 { return w.a_eid10; };
+    if idx == 11 { return w.a_eid11; };
+    if idx == 12 { return w.a_eid12; };
+    if idx == 13 { return w.a_eid13; };
+    if idx == 14 { return w.a_eid14; };
+    return w.a_eid15;
+}
+
+fn _ecs_wd3_a_set_eid(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.a_eid0 = value; return w0; };
+    if idx == 1 { w0.a_eid1 = value; return w0; };
+    if idx == 2 { w0.a_eid2 = value; return w0; };
+    if idx == 3 { w0.a_eid3 = value; return w0; };
+    if idx == 4 { w0.a_eid4 = value; return w0; };
+    if idx == 5 { w0.a_eid5 = value; return w0; };
+    if idx == 6 { w0.a_eid6 = value; return w0; };
+    if idx == 7 { w0.a_eid7 = value; return w0; };
+    if idx == 8 { w0.a_eid8 = value; return w0; };
+    if idx == 9 { w0.a_eid9 = value; return w0; };
+    if idx == 10 { w0.a_eid10 = value; return w0; };
+    if idx == 11 { w0.a_eid11 = value; return w0; };
+    if idx == 12 { w0.a_eid12 = value; return w0; };
+    if idx == 13 { w0.a_eid13 = value; return w0; };
+    if idx == 14 { w0.a_eid14 = value; return w0; };
+    w0.a_eid15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_a_x_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.a_x0; };
+    if idx == 1 { return w.a_x1; };
+    if idx == 2 { return w.a_x2; };
+    if idx == 3 { return w.a_x3; };
+    if idx == 4 { return w.a_x4; };
+    if idx == 5 { return w.a_x5; };
+    if idx == 6 { return w.a_x6; };
+    if idx == 7 { return w.a_x7; };
+    if idx == 8 { return w.a_x8; };
+    if idx == 9 { return w.a_x9; };
+    if idx == 10 { return w.a_x10; };
+    if idx == 11 { return w.a_x11; };
+    if idx == 12 { return w.a_x12; };
+    if idx == 13 { return w.a_x13; };
+    if idx == 14 { return w.a_x14; };
+    return w.a_x15;
+}
+
+fn _ecs_wd3_a_set_x(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.a_x0 = value; return w0; };
+    if idx == 1 { w0.a_x1 = value; return w0; };
+    if idx == 2 { w0.a_x2 = value; return w0; };
+    if idx == 3 { w0.a_x3 = value; return w0; };
+    if idx == 4 { w0.a_x4 = value; return w0; };
+    if idx == 5 { w0.a_x5 = value; return w0; };
+    if idx == 6 { w0.a_x6 = value; return w0; };
+    if idx == 7 { w0.a_x7 = value; return w0; };
+    if idx == 8 { w0.a_x8 = value; return w0; };
+    if idx == 9 { w0.a_x9 = value; return w0; };
+    if idx == 10 { w0.a_x10 = value; return w0; };
+    if idx == 11 { w0.a_x11 = value; return w0; };
+    if idx == 12 { w0.a_x12 = value; return w0; };
+    if idx == 13 { w0.a_x13 = value; return w0; };
+    if idx == 14 { w0.a_x14 = value; return w0; };
+    w0.a_x15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_a_y_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.a_y0; };
+    if idx == 1 { return w.a_y1; };
+    if idx == 2 { return w.a_y2; };
+    if idx == 3 { return w.a_y3; };
+    if idx == 4 { return w.a_y4; };
+    if idx == 5 { return w.a_y5; };
+    if idx == 6 { return w.a_y6; };
+    if idx == 7 { return w.a_y7; };
+    if idx == 8 { return w.a_y8; };
+    if idx == 9 { return w.a_y9; };
+    if idx == 10 { return w.a_y10; };
+    if idx == 11 { return w.a_y11; };
+    if idx == 12 { return w.a_y12; };
+    if idx == 13 { return w.a_y13; };
+    if idx == 14 { return w.a_y14; };
+    return w.a_y15;
+}
+
+fn _ecs_wd3_a_set_y(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.a_y0 = value; return w0; };
+    if idx == 1 { w0.a_y1 = value; return w0; };
+    if idx == 2 { w0.a_y2 = value; return w0; };
+    if idx == 3 { w0.a_y3 = value; return w0; };
+    if idx == 4 { w0.a_y4 = value; return w0; };
+    if idx == 5 { w0.a_y5 = value; return w0; };
+    if idx == 6 { w0.a_y6 = value; return w0; };
+    if idx == 7 { w0.a_y7 = value; return w0; };
+    if idx == 8 { w0.a_y8 = value; return w0; };
+    if idx == 9 { w0.a_y9 = value; return w0; };
+    if idx == 10 { w0.a_y10 = value; return w0; };
+    if idx == 11 { w0.a_y11 = value; return w0; };
+    if idx == 12 { w0.a_y12 = value; return w0; };
+    if idx == 13 { w0.a_y13 = value; return w0; };
+    if idx == 14 { w0.a_y14 = value; return w0; };
+    w0.a_y15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_a_added_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.a_added_t0; };
+    if idx == 1 { return w.a_added_t1; };
+    if idx == 2 { return w.a_added_t2; };
+    if idx == 3 { return w.a_added_t3; };
+    if idx == 4 { return w.a_added_t4; };
+    if idx == 5 { return w.a_added_t5; };
+    if idx == 6 { return w.a_added_t6; };
+    if idx == 7 { return w.a_added_t7; };
+    if idx == 8 { return w.a_added_t8; };
+    if idx == 9 { return w.a_added_t9; };
+    if idx == 10 { return w.a_added_t10; };
+    if idx == 11 { return w.a_added_t11; };
+    if idx == 12 { return w.a_added_t12; };
+    if idx == 13 { return w.a_added_t13; };
+    if idx == 14 { return w.a_added_t14; };
+    return w.a_added_t15;
+}
+
+fn _ecs_wd3_a_set_added(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.a_added_t0 = value; return w0; };
+    if idx == 1 { w0.a_added_t1 = value; return w0; };
+    if idx == 2 { w0.a_added_t2 = value; return w0; };
+    if idx == 3 { w0.a_added_t3 = value; return w0; };
+    if idx == 4 { w0.a_added_t4 = value; return w0; };
+    if idx == 5 { w0.a_added_t5 = value; return w0; };
+    if idx == 6 { w0.a_added_t6 = value; return w0; };
+    if idx == 7 { w0.a_added_t7 = value; return w0; };
+    if idx == 8 { w0.a_added_t8 = value; return w0; };
+    if idx == 9 { w0.a_added_t9 = value; return w0; };
+    if idx == 10 { w0.a_added_t10 = value; return w0; };
+    if idx == 11 { w0.a_added_t11 = value; return w0; };
+    if idx == 12 { w0.a_added_t12 = value; return w0; };
+    if idx == 13 { w0.a_added_t13 = value; return w0; };
+    if idx == 14 { w0.a_added_t14 = value; return w0; };
+    w0.a_added_t15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_a_changed_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.a_changed_t0; };
+    if idx == 1 { return w.a_changed_t1; };
+    if idx == 2 { return w.a_changed_t2; };
+    if idx == 3 { return w.a_changed_t3; };
+    if idx == 4 { return w.a_changed_t4; };
+    if idx == 5 { return w.a_changed_t5; };
+    if idx == 6 { return w.a_changed_t6; };
+    if idx == 7 { return w.a_changed_t7; };
+    if idx == 8 { return w.a_changed_t8; };
+    if idx == 9 { return w.a_changed_t9; };
+    if idx == 10 { return w.a_changed_t10; };
+    if idx == 11 { return w.a_changed_t11; };
+    if idx == 12 { return w.a_changed_t12; };
+    if idx == 13 { return w.a_changed_t13; };
+    if idx == 14 { return w.a_changed_t14; };
+    return w.a_changed_t15;
+}
+
+fn _ecs_wd3_a_set_changed(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.a_changed_t0 = value; return w0; };
+    if idx == 1 { w0.a_changed_t1 = value; return w0; };
+    if idx == 2 { w0.a_changed_t2 = value; return w0; };
+    if idx == 3 { w0.a_changed_t3 = value; return w0; };
+    if idx == 4 { w0.a_changed_t4 = value; return w0; };
+    if idx == 5 { w0.a_changed_t5 = value; return w0; };
+    if idx == 6 { w0.a_changed_t6 = value; return w0; };
+    if idx == 7 { w0.a_changed_t7 = value; return w0; };
+    if idx == 8 { w0.a_changed_t8 = value; return w0; };
+    if idx == 9 { w0.a_changed_t9 = value; return w0; };
+    if idx == 10 { w0.a_changed_t10 = value; return w0; };
+    if idx == 11 { w0.a_changed_t11 = value; return w0; };
+    if idx == 12 { w0.a_changed_t12 = value; return w0; };
+    if idx == 13 { w0.a_changed_t13 = value; return w0; };
+    if idx == 14 { w0.a_changed_t14 = value; return w0; };
+    w0.a_changed_t15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_b_eid_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.b_eid0; };
+    if idx == 1 { return w.b_eid1; };
+    if idx == 2 { return w.b_eid2; };
+    if idx == 3 { return w.b_eid3; };
+    if idx == 4 { return w.b_eid4; };
+    if idx == 5 { return w.b_eid5; };
+    if idx == 6 { return w.b_eid6; };
+    if idx == 7 { return w.b_eid7; };
+    if idx == 8 { return w.b_eid8; };
+    if idx == 9 { return w.b_eid9; };
+    if idx == 10 { return w.b_eid10; };
+    if idx == 11 { return w.b_eid11; };
+    if idx == 12 { return w.b_eid12; };
+    if idx == 13 { return w.b_eid13; };
+    if idx == 14 { return w.b_eid14; };
+    return w.b_eid15;
+}
+
+fn _ecs_wd3_b_set_eid(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.b_eid0 = value; return w0; };
+    if idx == 1 { w0.b_eid1 = value; return w0; };
+    if idx == 2 { w0.b_eid2 = value; return w0; };
+    if idx == 3 { w0.b_eid3 = value; return w0; };
+    if idx == 4 { w0.b_eid4 = value; return w0; };
+    if idx == 5 { w0.b_eid5 = value; return w0; };
+    if idx == 6 { w0.b_eid6 = value; return w0; };
+    if idx == 7 { w0.b_eid7 = value; return w0; };
+    if idx == 8 { w0.b_eid8 = value; return w0; };
+    if idx == 9 { w0.b_eid9 = value; return w0; };
+    if idx == 10 { w0.b_eid10 = value; return w0; };
+    if idx == 11 { w0.b_eid11 = value; return w0; };
+    if idx == 12 { w0.b_eid12 = value; return w0; };
+    if idx == 13 { w0.b_eid13 = value; return w0; };
+    if idx == 14 { w0.b_eid14 = value; return w0; };
+    w0.b_eid15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_b_x_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.b_x0; };
+    if idx == 1 { return w.b_x1; };
+    if idx == 2 { return w.b_x2; };
+    if idx == 3 { return w.b_x3; };
+    if idx == 4 { return w.b_x4; };
+    if idx == 5 { return w.b_x5; };
+    if idx == 6 { return w.b_x6; };
+    if idx == 7 { return w.b_x7; };
+    if idx == 8 { return w.b_x8; };
+    if idx == 9 { return w.b_x9; };
+    if idx == 10 { return w.b_x10; };
+    if idx == 11 { return w.b_x11; };
+    if idx == 12 { return w.b_x12; };
+    if idx == 13 { return w.b_x13; };
+    if idx == 14 { return w.b_x14; };
+    return w.b_x15;
+}
+
+fn _ecs_wd3_b_set_x(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.b_x0 = value; return w0; };
+    if idx == 1 { w0.b_x1 = value; return w0; };
+    if idx == 2 { w0.b_x2 = value; return w0; };
+    if idx == 3 { w0.b_x3 = value; return w0; };
+    if idx == 4 { w0.b_x4 = value; return w0; };
+    if idx == 5 { w0.b_x5 = value; return w0; };
+    if idx == 6 { w0.b_x6 = value; return w0; };
+    if idx == 7 { w0.b_x7 = value; return w0; };
+    if idx == 8 { w0.b_x8 = value; return w0; };
+    if idx == 9 { w0.b_x9 = value; return w0; };
+    if idx == 10 { w0.b_x10 = value; return w0; };
+    if idx == 11 { w0.b_x11 = value; return w0; };
+    if idx == 12 { w0.b_x12 = value; return w0; };
+    if idx == 13 { w0.b_x13 = value; return w0; };
+    if idx == 14 { w0.b_x14 = value; return w0; };
+    w0.b_x15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_b_y_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.b_y0; };
+    if idx == 1 { return w.b_y1; };
+    if idx == 2 { return w.b_y2; };
+    if idx == 3 { return w.b_y3; };
+    if idx == 4 { return w.b_y4; };
+    if idx == 5 { return w.b_y5; };
+    if idx == 6 { return w.b_y6; };
+    if idx == 7 { return w.b_y7; };
+    if idx == 8 { return w.b_y8; };
+    if idx == 9 { return w.b_y9; };
+    if idx == 10 { return w.b_y10; };
+    if idx == 11 { return w.b_y11; };
+    if idx == 12 { return w.b_y12; };
+    if idx == 13 { return w.b_y13; };
+    if idx == 14 { return w.b_y14; };
+    return w.b_y15;
+}
+
+fn _ecs_wd3_b_set_y(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.b_y0 = value; return w0; };
+    if idx == 1 { w0.b_y1 = value; return w0; };
+    if idx == 2 { w0.b_y2 = value; return w0; };
+    if idx == 3 { w0.b_y3 = value; return w0; };
+    if idx == 4 { w0.b_y4 = value; return w0; };
+    if idx == 5 { w0.b_y5 = value; return w0; };
+    if idx == 6 { w0.b_y6 = value; return w0; };
+    if idx == 7 { w0.b_y7 = value; return w0; };
+    if idx == 8 { w0.b_y8 = value; return w0; };
+    if idx == 9 { w0.b_y9 = value; return w0; };
+    if idx == 10 { w0.b_y10 = value; return w0; };
+    if idx == 11 { w0.b_y11 = value; return w0; };
+    if idx == 12 { w0.b_y12 = value; return w0; };
+    if idx == 13 { w0.b_y13 = value; return w0; };
+    if idx == 14 { w0.b_y14 = value; return w0; };
+    w0.b_y15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_b_added_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.b_added_t0; };
+    if idx == 1 { return w.b_added_t1; };
+    if idx == 2 { return w.b_added_t2; };
+    if idx == 3 { return w.b_added_t3; };
+    if idx == 4 { return w.b_added_t4; };
+    if idx == 5 { return w.b_added_t5; };
+    if idx == 6 { return w.b_added_t6; };
+    if idx == 7 { return w.b_added_t7; };
+    if idx == 8 { return w.b_added_t8; };
+    if idx == 9 { return w.b_added_t9; };
+    if idx == 10 { return w.b_added_t10; };
+    if idx == 11 { return w.b_added_t11; };
+    if idx == 12 { return w.b_added_t12; };
+    if idx == 13 { return w.b_added_t13; };
+    if idx == 14 { return w.b_added_t14; };
+    return w.b_added_t15;
+}
+
+fn _ecs_wd3_b_set_added(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.b_added_t0 = value; return w0; };
+    if idx == 1 { w0.b_added_t1 = value; return w0; };
+    if idx == 2 { w0.b_added_t2 = value; return w0; };
+    if idx == 3 { w0.b_added_t3 = value; return w0; };
+    if idx == 4 { w0.b_added_t4 = value; return w0; };
+    if idx == 5 { w0.b_added_t5 = value; return w0; };
+    if idx == 6 { w0.b_added_t6 = value; return w0; };
+    if idx == 7 { w0.b_added_t7 = value; return w0; };
+    if idx == 8 { w0.b_added_t8 = value; return w0; };
+    if idx == 9 { w0.b_added_t9 = value; return w0; };
+    if idx == 10 { w0.b_added_t10 = value; return w0; };
+    if idx == 11 { w0.b_added_t11 = value; return w0; };
+    if idx == 12 { w0.b_added_t12 = value; return w0; };
+    if idx == 13 { w0.b_added_t13 = value; return w0; };
+    if idx == 14 { w0.b_added_t14 = value; return w0; };
+    w0.b_added_t15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_b_changed_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.b_changed_t0; };
+    if idx == 1 { return w.b_changed_t1; };
+    if idx == 2 { return w.b_changed_t2; };
+    if idx == 3 { return w.b_changed_t3; };
+    if idx == 4 { return w.b_changed_t4; };
+    if idx == 5 { return w.b_changed_t5; };
+    if idx == 6 { return w.b_changed_t6; };
+    if idx == 7 { return w.b_changed_t7; };
+    if idx == 8 { return w.b_changed_t8; };
+    if idx == 9 { return w.b_changed_t9; };
+    if idx == 10 { return w.b_changed_t10; };
+    if idx == 11 { return w.b_changed_t11; };
+    if idx == 12 { return w.b_changed_t12; };
+    if idx == 13 { return w.b_changed_t13; };
+    if idx == 14 { return w.b_changed_t14; };
+    return w.b_changed_t15;
+}
+
+fn _ecs_wd3_b_set_changed(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.b_changed_t0 = value; return w0; };
+    if idx == 1 { w0.b_changed_t1 = value; return w0; };
+    if idx == 2 { w0.b_changed_t2 = value; return w0; };
+    if idx == 3 { w0.b_changed_t3 = value; return w0; };
+    if idx == 4 { w0.b_changed_t4 = value; return w0; };
+    if idx == 5 { w0.b_changed_t5 = value; return w0; };
+    if idx == 6 { w0.b_changed_t6 = value; return w0; };
+    if idx == 7 { w0.b_changed_t7 = value; return w0; };
+    if idx == 8 { w0.b_changed_t8 = value; return w0; };
+    if idx == 9 { w0.b_changed_t9 = value; return w0; };
+    if idx == 10 { w0.b_changed_t10 = value; return w0; };
+    if idx == 11 { w0.b_changed_t11 = value; return w0; };
+    if idx == 12 { w0.b_changed_t12 = value; return w0; };
+    if idx == 13 { w0.b_changed_t13 = value; return w0; };
+    if idx == 14 { w0.b_changed_t14 = value; return w0; };
+    w0.b_changed_t15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_c_eid_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.c_eid0; };
+    if idx == 1 { return w.c_eid1; };
+    if idx == 2 { return w.c_eid2; };
+    if idx == 3 { return w.c_eid3; };
+    if idx == 4 { return w.c_eid4; };
+    if idx == 5 { return w.c_eid5; };
+    if idx == 6 { return w.c_eid6; };
+    if idx == 7 { return w.c_eid7; };
+    if idx == 8 { return w.c_eid8; };
+    if idx == 9 { return w.c_eid9; };
+    if idx == 10 { return w.c_eid10; };
+    if idx == 11 { return w.c_eid11; };
+    if idx == 12 { return w.c_eid12; };
+    if idx == 13 { return w.c_eid13; };
+    if idx == 14 { return w.c_eid14; };
+    return w.c_eid15;
+}
+
+fn _ecs_wd3_c_set_eid(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.c_eid0 = value; return w0; };
+    if idx == 1 { w0.c_eid1 = value; return w0; };
+    if idx == 2 { w0.c_eid2 = value; return w0; };
+    if idx == 3 { w0.c_eid3 = value; return w0; };
+    if idx == 4 { w0.c_eid4 = value; return w0; };
+    if idx == 5 { w0.c_eid5 = value; return w0; };
+    if idx == 6 { w0.c_eid6 = value; return w0; };
+    if idx == 7 { w0.c_eid7 = value; return w0; };
+    if idx == 8 { w0.c_eid8 = value; return w0; };
+    if idx == 9 { w0.c_eid9 = value; return w0; };
+    if idx == 10 { w0.c_eid10 = value; return w0; };
+    if idx == 11 { w0.c_eid11 = value; return w0; };
+    if idx == 12 { w0.c_eid12 = value; return w0; };
+    if idx == 13 { w0.c_eid13 = value; return w0; };
+    if idx == 14 { w0.c_eid14 = value; return w0; };
+    w0.c_eid15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_c_team_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.c_team0; };
+    if idx == 1 { return w.c_team1; };
+    if idx == 2 { return w.c_team2; };
+    if idx == 3 { return w.c_team3; };
+    if idx == 4 { return w.c_team4; };
+    if idx == 5 { return w.c_team5; };
+    if idx == 6 { return w.c_team6; };
+    if idx == 7 { return w.c_team7; };
+    if idx == 8 { return w.c_team8; };
+    if idx == 9 { return w.c_team9; };
+    if idx == 10 { return w.c_team10; };
+    if idx == 11 { return w.c_team11; };
+    if idx == 12 { return w.c_team12; };
+    if idx == 13 { return w.c_team13; };
+    if idx == 14 { return w.c_team14; };
+    return w.c_team15;
+}
+
+fn _ecs_wd3_c_set_team(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.c_team0 = value; return w0; };
+    if idx == 1 { w0.c_team1 = value; return w0; };
+    if idx == 2 { w0.c_team2 = value; return w0; };
+    if idx == 3 { w0.c_team3 = value; return w0; };
+    if idx == 4 { w0.c_team4 = value; return w0; };
+    if idx == 5 { w0.c_team5 = value; return w0; };
+    if idx == 6 { w0.c_team6 = value; return w0; };
+    if idx == 7 { w0.c_team7 = value; return w0; };
+    if idx == 8 { w0.c_team8 = value; return w0; };
+    if idx == 9 { w0.c_team9 = value; return w0; };
+    if idx == 10 { w0.c_team10 = value; return w0; };
+    if idx == 11 { w0.c_team11 = value; return w0; };
+    if idx == 12 { w0.c_team12 = value; return w0; };
+    if idx == 13 { w0.c_team13 = value; return w0; };
+    if idx == 14 { w0.c_team14 = value; return w0; };
+    w0.c_team15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_c_added_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.c_added_t0; };
+    if idx == 1 { return w.c_added_t1; };
+    if idx == 2 { return w.c_added_t2; };
+    if idx == 3 { return w.c_added_t3; };
+    if idx == 4 { return w.c_added_t4; };
+    if idx == 5 { return w.c_added_t5; };
+    if idx == 6 { return w.c_added_t6; };
+    if idx == 7 { return w.c_added_t7; };
+    if idx == 8 { return w.c_added_t8; };
+    if idx == 9 { return w.c_added_t9; };
+    if idx == 10 { return w.c_added_t10; };
+    if idx == 11 { return w.c_added_t11; };
+    if idx == 12 { return w.c_added_t12; };
+    if idx == 13 { return w.c_added_t13; };
+    if idx == 14 { return w.c_added_t14; };
+    return w.c_added_t15;
+}
+
+fn _ecs_wd3_c_set_added(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.c_added_t0 = value; return w0; };
+    if idx == 1 { w0.c_added_t1 = value; return w0; };
+    if idx == 2 { w0.c_added_t2 = value; return w0; };
+    if idx == 3 { w0.c_added_t3 = value; return w0; };
+    if idx == 4 { w0.c_added_t4 = value; return w0; };
+    if idx == 5 { w0.c_added_t5 = value; return w0; };
+    if idx == 6 { w0.c_added_t6 = value; return w0; };
+    if idx == 7 { w0.c_added_t7 = value; return w0; };
+    if idx == 8 { w0.c_added_t8 = value; return w0; };
+    if idx == 9 { w0.c_added_t9 = value; return w0; };
+    if idx == 10 { w0.c_added_t10 = value; return w0; };
+    if idx == 11 { w0.c_added_t11 = value; return w0; };
+    if idx == 12 { w0.c_added_t12 = value; return w0; };
+    if idx == 13 { w0.c_added_t13 = value; return w0; };
+    if idx == 14 { w0.c_added_t14 = value; return w0; };
+    w0.c_added_t15 = value;
+    return w0;
+}
+
+fn _ecs_wd3_c_changed_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.c_changed_t0; };
+    if idx == 1 { return w.c_changed_t1; };
+    if idx == 2 { return w.c_changed_t2; };
+    if idx == 3 { return w.c_changed_t3; };
+    if idx == 4 { return w.c_changed_t4; };
+    if idx == 5 { return w.c_changed_t5; };
+    if idx == 6 { return w.c_changed_t6; };
+    if idx == 7 { return w.c_changed_t7; };
+    if idx == 8 { return w.c_changed_t8; };
+    if idx == 9 { return w.c_changed_t9; };
+    if idx == 10 { return w.c_changed_t10; };
+    if idx == 11 { return w.c_changed_t11; };
+    if idx == 12 { return w.c_changed_t12; };
+    if idx == 13 { return w.c_changed_t13; };
+    if idx == 14 { return w.c_changed_t14; };
+    return w.c_changed_t15;
+}
+
+fn _ecs_wd3_c_set_changed(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.c_changed_t0 = value; return w0; };
+    if idx == 1 { w0.c_changed_t1 = value; return w0; };
+    if idx == 2 { w0.c_changed_t2 = value; return w0; };
+    if idx == 3 { w0.c_changed_t3 = value; return w0; };
+    if idx == 4 { w0.c_changed_t4 = value; return w0; };
+    if idx == 5 { w0.c_changed_t5 = value; return w0; };
+    if idx == 6 { w0.c_changed_t6 = value; return w0; };
+    if idx == 7 { w0.c_changed_t7 = value; return w0; };
+    if idx == 8 { w0.c_changed_t8 = value; return w0; };
+    if idx == 9 { w0.c_changed_t9 = value; return w0; };
+    if idx == 10 { w0.c_changed_t10 = value; return w0; };
+    if idx == 11 { w0.c_changed_t11 = value; return w0; };
+    if idx == 12 { w0.c_changed_t12 = value; return w0; };
+    if idx == 13 { w0.c_changed_t13 = value; return w0; };
+    if idx == 14 { w0.c_changed_t14 = value; return w0; };
+    w0.c_changed_t15 = value;
+    return w0;
+}
+
+// ── Message slot scalar helpers. ────────────────────────────────────────────────────────
+fn _ecs_wd3_msg_at(w: EcsWD3World, idx: i32) -> i32 {
+    if idx == 0 { return w.msg0; };
+    if idx == 1 { return w.msg1; };
+    if idx == 2 { return w.msg2; };
+    if idx == 3 { return w.msg3; };
+    if idx == 4 { return w.msg4; };
+    if idx == 5 { return w.msg5; };
+    if idx == 6 { return w.msg6; };
+    if idx == 7 { return w.msg7; };
+    if idx == 8 { return w.msg8; };
+    if idx == 9 { return w.msg9; };
+    if idx == 10 { return w.msg10; };
+    if idx == 11 { return w.msg11; };
+    if idx == 12 { return w.msg12; };
+    if idx == 13 { return w.msg13; };
+    if idx == 14 { return w.msg14; };
+    return w.msg15;
+}
+
+fn _ecs_wd3_set_msg(w0: EcsWD3World, idx: i32, value: i32) -> EcsWD3World {
+    if idx == 0 { w0.msg0 = value; return w0; };
+    if idx == 1 { w0.msg1 = value; return w0; };
+    if idx == 2 { w0.msg2 = value; return w0; };
+    if idx == 3 { w0.msg3 = value; return w0; };
+    if idx == 4 { w0.msg4 = value; return w0; };
+    if idx == 5 { w0.msg5 = value; return w0; };
+    if idx == 6 { w0.msg6 = value; return w0; };
+    if idx == 7 { w0.msg7 = value; return w0; };
+    if idx == 8 { w0.msg8 = value; return w0; };
+    if idx == 9 { w0.msg9 = value; return w0; };
+    if idx == 10 { w0.msg10 = value; return w0; };
+    if idx == 11 { w0.msg11 = value; return w0; };
+    if idx == 12 { w0.msg12 = value; return w0; };
+    if idx == 13 { w0.msg13 = value; return w0; };
+    if idx == 14 { w0.msg14 = value; return w0; };
+    w0.msg15 = value;
+    return w0;
+}
+
+// ── Entity allocator ops. ────────────────────────────────────────────────────────────────
+fn ecs_wd3_allocator_next_id(w: EcsWD3World) -> i32 { return w.next_id; }
+fn ecs_wd3_allocator_free_count(w: EcsWD3World) -> i32 { return w.free_count; }
+
+fn _ecs_wd3_id_is_free(w: EcsWD3World, id: i32) -> bool {
+    let i: i32 = 0;
+    while i < w.free_count {
+        if _ecs_wd3_free_id_at(w, i) == id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// EcsWD3Spawn wraps (World, Entity) — replaces tuple destructuring.
+struct EcsWD3Spawn { world: EcsWD3World, entity: EcsWD3Entity }
+fn ecs_wd3_spawn_world(s: EcsWD3Spawn) -> EcsWD3World { return s.world; }
+fn ecs_wd3_spawn_entity(s: EcsWD3Spawn) -> EcsWD3Entity { return s.entity; }
+
+// ecs_wd3_alloc_entity pops a free id (decrements free_count, clears slot) or bumps next_id;
+// returns sentinel EcsWD3Entity{id:-1,generation:0} at cap (NO panic — Batch 388/389/390 #2/#3).
+fn ecs_wd3_alloc_entity(w0: EcsWD3World) -> EcsWD3Spawn {
+    if w0.free_count > 0 {
+        let next_free_count = w0.free_count - 1;
+        let id = _ecs_wd3_free_id_at(w0, next_free_count);
+        w0.free_count = next_free_count;
+        w0 = _ecs_wd3_set_free_id(w0, next_free_count, 0);
+        let gen = _ecs_wd3_gen_at(w0, id);
+        return EcsWD3Spawn { world: w0, entity: EcsWD3Entity { id: id, generation: gen } };
+    };
+    if w0.next_id >= ECS_WD3_CAP {
+        return EcsWD3Spawn { world: w0, entity: EcsWD3Entity { id: -1, generation: 0 } };
+    };
+    let id = w0.next_id;
+    w0.next_id = id + 1;
+    let gen = _ecs_wd3_gen_at(w0, id);
+    return EcsWD3Spawn { world: w0, entity: EcsWD3Entity { id: id, generation: gen } };
+}
+
+// ecs_wd3_is_alive: id in (0, 16), below next_id, not in free list, gen matches.
+fn ecs_wd3_is_alive(w: EcsWD3World, e: EcsWD3Entity) -> bool {
+    if e.id <= 0 { return false; };
+    if e.id >= ECS_WD3_CAP { return false; };
+    if e.id >= w.next_id { return false; };
+    if _ecs_wd3_id_is_free(w, e.id) { return false; };
+    return _ecs_wd3_gen_at(w, e.id) == e.generation;
+}
+
+// ecs_wd3_free_entity bumps generation of id and pushes id onto free_ids; no-op if not alive.
+fn ecs_wd3_free_entity(w0: EcsWD3World, e: EcsWD3Entity) -> EcsWD3World {
+    if ecs_wd3_is_alive(w0, e) != true { return w0; };
+    let cur_gen = _ecs_wd3_gen_at(w0, e.id);
+    w0 = _ecs_wd3_set_gen(w0, e.id, cur_gen + 1);
+    let pos = w0.free_count;
+    w0 = _ecs_wd3_set_free_id(w0, pos, e.id);
+    w0.free_count = pos + 1;
+    return w0;
+}
+
+// ecs_wd3_world_spawn is the public spawn: returns EcsWD3Spawn wrapper.
+fn ecs_wd3_world_spawn(w0: EcsWD3World) -> EcsWD3Spawn {
+    return ecs_wd3_alloc_entity(w0);
+}
+
+// ── Per-store slot lookup (linear scan of *_eid slots). Returns slot index >= 0 or -1. ──────
+fn _ecs_wd3_a_slot_of(w: EcsWD3World, eid: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.a_count {
+        if _ecs_wd3_a_eid_at(w, i) == eid { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _ecs_wd3_b_slot_of(w: EcsWD3World, eid: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.b_count {
+        if _ecs_wd3_b_eid_at(w, i) == eid { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _ecs_wd3_c_slot_of(w: EcsWD3World, eid: i32) -> i32 {
+    let i: i32 = 0;
+    while i < w.c_count {
+        if _ecs_wd3_c_eid_at(w, i) == eid { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ── World component operations: insert / write / remove / get / has. ───────────────────────
+fn ecs_wd3_insert_a(w0: EcsWD3World, e: EcsWD3Entity, x: i32, y: i32) -> EcsWD3World {
+    if ecs_wd3_is_alive(w0, e) != true { panic(8101); };
+    let slot = _ecs_wd3_a_slot_of(w0, e.id);
+    if slot >= 0 {
+        w0 = _ecs_wd3_a_set_x(w0, slot, x);
+        w0 = _ecs_wd3_a_set_y(w0, slot, y);
+        w0 = _ecs_wd3_a_set_changed(w0, slot, w0.change_tick);
+        return w0;
+    };
+    let new_slot = w0.a_count;
+    if new_slot >= ECS_WD3_CAP { panic(8101); };
+    w0 = _ecs_wd3_a_set_eid(w0, new_slot, e.id);
+    w0 = _ecs_wd3_a_set_x(w0, new_slot, x);
+    w0 = _ecs_wd3_a_set_y(w0, new_slot, y);
+    w0 = _ecs_wd3_a_set_added(w0, new_slot, w0.change_tick);
+    w0 = _ecs_wd3_a_set_changed(w0, new_slot, w0.change_tick);
+    w0.a_count = new_slot + 1;
+    return w0;
+}
+
+fn ecs_wd3_insert_b(w0: EcsWD3World, e: EcsWD3Entity, x: i32, y: i32) -> EcsWD3World {
+    if ecs_wd3_is_alive(w0, e) != true { panic(8102); };
+    let slot = _ecs_wd3_b_slot_of(w0, e.id);
+    if slot >= 0 {
+        w0 = _ecs_wd3_b_set_x(w0, slot, x);
+        w0 = _ecs_wd3_b_set_y(w0, slot, y);
+        w0 = _ecs_wd3_b_set_changed(w0, slot, w0.change_tick);
+        return w0;
+    };
+    let new_slot = w0.b_count;
+    if new_slot >= ECS_WD3_CAP { panic(8102); };
+    w0 = _ecs_wd3_b_set_eid(w0, new_slot, e.id);
+    w0 = _ecs_wd3_b_set_x(w0, new_slot, x);
+    w0 = _ecs_wd3_b_set_y(w0, new_slot, y);
+    w0 = _ecs_wd3_b_set_added(w0, new_slot, w0.change_tick);
+    w0 = _ecs_wd3_b_set_changed(w0, new_slot, w0.change_tick);
+    w0.b_count = new_slot + 1;
+    return w0;
+}
+
+fn ecs_wd3_insert_c(w0: EcsWD3World, e: EcsWD3Entity, team: i32) -> EcsWD3World {
+    if ecs_wd3_is_alive(w0, e) != true { panic(8103); };
+    let slot = _ecs_wd3_c_slot_of(w0, e.id);
+    if slot >= 0 {
+        w0 = _ecs_wd3_c_set_team(w0, slot, team);
+        w0 = _ecs_wd3_c_set_changed(w0, slot, w0.change_tick);
+        return w0;
+    };
+    let new_slot = w0.c_count;
+    if new_slot >= ECS_WD3_CAP { panic(8103); };
+    w0 = _ecs_wd3_c_set_eid(w0, new_slot, e.id);
+    w0 = _ecs_wd3_c_set_team(w0, new_slot, team);
+    w0 = _ecs_wd3_c_set_added(w0, new_slot, w0.change_tick);
+    w0 = _ecs_wd3_c_set_changed(w0, new_slot, w0.change_tick);
+    w0.c_count = new_slot + 1;
+    return w0;
+}
+
+fn ecs_wd3_has_a(w: EcsWD3World, e: EcsWD3Entity) -> bool {
+    if ecs_wd3_is_alive(w, e) != true { return false; };
+    return _ecs_wd3_a_slot_of(w, e.id) >= 0;
+}
+
+fn ecs_wd3_has_b(w: EcsWD3World, e: EcsWD3Entity) -> bool {
+    if ecs_wd3_is_alive(w, e) != true { return false; };
+    return _ecs_wd3_b_slot_of(w, e.id) >= 0;
+}
+
+fn ecs_wd3_has_c(w: EcsWD3World, e: EcsWD3Entity) -> bool {
+    if ecs_wd3_is_alive(w, e) != true { return false; };
+    return _ecs_wd3_c_slot_of(w, e.id) >= 0;
+}
+
+fn ecs_wd3_get_a(w: EcsWD3World, e: EcsWD3Entity) -> EcsWD3Pos {
+    if ecs_wd3_has_a(w, e) != true { panic(8104); };
+    let slot = _ecs_wd3_a_slot_of(w, e.id);
+    return EcsWD3Pos { x: _ecs_wd3_a_x_at(w, slot), y: _ecs_wd3_a_y_at(w, slot) };
+}
+
+fn ecs_wd3_get_c(w: EcsWD3World, e: EcsWD3Entity) -> EcsWD3Player {
+    if ecs_wd3_has_c(w, e) != true { panic(8105); };
+    let slot = _ecs_wd3_c_slot_of(w, e.id);
+    return EcsWD3Player { team: _ecs_wd3_c_team_at(w, slot) };
+}
+
+fn ecs_wd3_write_c(w0: EcsWD3World, e: EcsWD3Entity, team: i32) -> EcsWD3World {
+    if ecs_wd3_has_c(w0, e) != true { panic(8106); };
+    let slot = _ecs_wd3_c_slot_of(w0, e.id);
+    if slot < 0 { panic(8106); };
+    w0 = _ecs_wd3_c_set_team(w0, slot, team);
+    w0 = _ecs_wd3_c_set_changed(w0, slot, w0.change_tick);
+    return w0;
+}
+
+fn ecs_wd3_remove_a(w0: EcsWD3World, e: EcsWD3Entity) -> EcsWD3World {
+    let slot = _ecs_wd3_a_slot_of(w0, e.id);
+    if slot < 0 { return w0; };
+    let last = w0.a_count - 1;
+    if slot != last {
+        let last_eid = _ecs_wd3_a_eid_at(w0, last);
+        let last_x = _ecs_wd3_a_x_at(w0, last);
+        let last_y = _ecs_wd3_a_y_at(w0, last);
+        let last_added = _ecs_wd3_a_added_at(w0, last);
+        let last_changed = _ecs_wd3_a_changed_at(w0, last);
+        w0 = _ecs_wd3_a_set_eid(w0, slot, last_eid);
+        w0 = _ecs_wd3_a_set_x(w0, slot, last_x);
+        w0 = _ecs_wd3_a_set_y(w0, slot, last_y);
+        w0 = _ecs_wd3_a_set_added(w0, slot, last_added);
+        w0 = _ecs_wd3_a_set_changed(w0, slot, last_changed);
+    };
+    w0 = _ecs_wd3_a_set_eid(w0, last, 0);
+    w0 = _ecs_wd3_a_set_x(w0, last, 0);
+    w0 = _ecs_wd3_a_set_y(w0, last, 0);
+    w0 = _ecs_wd3_a_set_added(w0, last, 0);
+    w0 = _ecs_wd3_a_set_changed(w0, last, 0);
+    w0.a_count = last;
+    return w0;
+}
+
+fn ecs_wd3_remove_b(w0: EcsWD3World, e: EcsWD3Entity) -> EcsWD3World {
+    let slot = _ecs_wd3_b_slot_of(w0, e.id);
+    if slot < 0 { return w0; };
+    let last = w0.b_count - 1;
+    if slot != last {
+        let last_eid = _ecs_wd3_b_eid_at(w0, last);
+        let last_x = _ecs_wd3_b_x_at(w0, last);
+        let last_y = _ecs_wd3_b_y_at(w0, last);
+        let last_added = _ecs_wd3_b_added_at(w0, last);
+        let last_changed = _ecs_wd3_b_changed_at(w0, last);
+        w0 = _ecs_wd3_b_set_eid(w0, slot, last_eid);
+        w0 = _ecs_wd3_b_set_x(w0, slot, last_x);
+        w0 = _ecs_wd3_b_set_y(w0, slot, last_y);
+        w0 = _ecs_wd3_b_set_added(w0, slot, last_added);
+        w0 = _ecs_wd3_b_set_changed(w0, slot, last_changed);
+    };
+    w0 = _ecs_wd3_b_set_eid(w0, last, 0);
+    w0 = _ecs_wd3_b_set_x(w0, last, 0);
+    w0 = _ecs_wd3_b_set_y(w0, last, 0);
+    w0 = _ecs_wd3_b_set_added(w0, last, 0);
+    w0 = _ecs_wd3_b_set_changed(w0, last, 0);
+    w0.b_count = last;
+    return w0;
+}
+
+fn ecs_wd3_remove_c(w0: EcsWD3World, e: EcsWD3Entity) -> EcsWD3World {
+    let slot = _ecs_wd3_c_slot_of(w0, e.id);
+    if slot < 0 { return w0; };
+    let last = w0.c_count - 1;
+    if slot != last {
+        let last_eid = _ecs_wd3_c_eid_at(w0, last);
+        let last_team = _ecs_wd3_c_team_at(w0, last);
+        let last_added = _ecs_wd3_c_added_at(w0, last);
+        let last_changed = _ecs_wd3_c_changed_at(w0, last);
+        w0 = _ecs_wd3_c_set_eid(w0, slot, last_eid);
+        w0 = _ecs_wd3_c_set_team(w0, slot, last_team);
+        w0 = _ecs_wd3_c_set_added(w0, slot, last_added);
+        w0 = _ecs_wd3_c_set_changed(w0, slot, last_changed);
+    };
+    w0 = _ecs_wd3_c_set_eid(w0, last, 0);
+    w0 = _ecs_wd3_c_set_team(w0, last, 0);
+    w0 = _ecs_wd3_c_set_added(w0, last, 0);
+    w0 = _ecs_wd3_c_set_changed(w0, last, 0);
+    w0.c_count = last;
+    return w0;
+}
+
+// ecs_wd3_spawn_abc: spawn + insert_a + insert_b + insert_c. Returns EcsWD3Spawn wrapper.
+fn ecs_wd3_spawn_abc(w0: EcsWD3World, ax: i32, ay: i32, bx: i32, by: i32, team: i32) -> EcsWD3Spawn {
+    let sp = ecs_wd3_alloc_entity(w0);
+    let w1 = ecs_wd3_spawn_world(sp);
+    let e = ecs_wd3_spawn_entity(sp);
+    let w2 = ecs_wd3_insert_a(w1, e, ax, ay);
+    let w3 = ecs_wd3_insert_b(w2, e, bx, by);
+    let w4 = ecs_wd3_insert_c(w3, e, team);
+    return EcsWD3Spawn { world: w4, entity: e };
+}
+
+// ecs_wd3_despawn: remove_a + remove_b + remove_c + free_entity; no-op if not alive.
+fn ecs_wd3_despawn(w0: EcsWD3World, e: EcsWD3Entity) -> EcsWD3World {
+    if ecs_wd3_is_alive(w0, e) != true { return w0; };
+    w0 = ecs_wd3_remove_a(w0, e);
+    w0 = ecs_wd3_remove_b(w0, e);
+    w0 = ecs_wd3_remove_c(w0, e);
+    w0 = ecs_wd3_free_entity(w0, e);
+    return w0;
+}
+
+// ecs_wd3_c_added_since / c_changed_since: strict-greater-than (stamp > tick).
+fn ecs_wd3_c_added_since(w: EcsWD3World, e: EcsWD3Entity, tick: i32) -> bool {
+    let slot = _ecs_wd3_c_slot_of(w, e.id);
+    if slot < 0 { return false; };
+    return _ecs_wd3_c_added_at(w, slot) > tick;
+}
+
+fn ecs_wd3_c_changed_since(w: EcsWD3World, e: EcsWD3Entity, tick: i32) -> bool {
+    let slot = _ecs_wd3_c_slot_of(w, e.id);
+    if slot < 0 { return false; };
+    return _ecs_wd3_c_changed_at(w, slot) > tick;
+}
+
+// ── Resource slot (single EcsWD3Time plug) operations. ────────────────────────────────────
+fn ecs_wd3_insert_resource(w0: EcsWD3World, tick: i32) -> EcsWD3World {
+    w0.res_has = 1;
+    w0.res_tick = tick;
+    w0.res_added_t = w0.change_tick;
+    w0.res_changed_t = w0.change_tick;
+    return w0;
+}
+
+fn ecs_wd3_has_resource(w: EcsWD3World) -> bool { return w.res_has == 1; }
+
+fn ecs_wd3_get_resource(w: EcsWD3World) -> EcsWD3Time {
+    if w.res_has != 1 { panic(8107); };
+    return EcsWD3Time { tick: w.res_tick };
+}
+
+fn ecs_wd3_remove_resource(w0: EcsWD3World) -> EcsWD3World {
+    w0.res_has = 0;
+    return w0;
+}
+
+// ── Message queue (cap-16 EcsWD3Event plug) operations. ──────────────────────────────────
+struct EcsWD3Read { has_value: i32, amount: i32, cursor: i32 }
+fn ecs_wd3_read_has_value(r: EcsWD3Read) -> i32 { return r.has_value; }
+fn ecs_wd3_read_amount(r: EcsWD3Read) -> i32 { return r.amount; }
+fn ecs_wd3_read_cursor(r: EcsWD3Read) -> i32 { return r.cursor; }
+
+struct EcsWD3MessageReader { cursor: i32 }
+fn ecs_wd3_message_reader_new() -> EcsWD3MessageReader { return EcsWD3MessageReader { cursor: 0 }; }
+fn ecs_wd3_message_reader_cursor(r: EcsWD3MessageReader) -> i32 { return r.cursor; }
+fn ecs_wd3_message_reader_with_cursor(cursor: i32) -> EcsWD3MessageReader {
+    return EcsWD3MessageReader { cursor: cursor };
+}
+
+fn ecs_wd3_write_message(w0: EcsWD3World, amount: i32) -> EcsWD3World {
+    if w0.msg_tail >= ECS_WD3_CAP { panic(8108); };
+    w0 = _ecs_wd3_set_msg(w0, w0.msg_tail, amount);
+    w0.msg_tail = w0.msg_tail + 1;
+    return w0;
+}
+
+fn ecs_wd3_read_message(w: EcsWD3World, reader: EcsWD3MessageReader) -> EcsWD3Read {
+    if reader.cursor < w.msg_tail {
+        let amt = _ecs_wd3_msg_at(w, reader.cursor);
+        return EcsWD3Read { has_value: 1, amount: amt, cursor: reader.cursor + 1 };
+    };
+    return EcsWD3Read { has_value: 0, amount: 0, cursor: reader.cursor };
+}
+
+fn ecs_wd3_message_count(w: EcsWD3World) -> i32 { return w.msg_tail; }
+
+// ── Triple query over A × B × C. ────────────────────────────────────────────────────────
+// Iterates A store, finds B-slot and C-slot by eid, emits an item (entity, a_slot, b_slot,
+// c_slot, a: Pos, b: Vel, c: Player). Each item is a flat scalar slot family per index.
+
+struct EcsWD3TripleQuery {
+    count: i32,
+    e_id0: i32, e_id1: i32, e_id2: i32, e_id3: i32, e_id4: i32, e_id5: i32, e_id6: i32, e_id7: i32, e_id8: i32, e_id9: i32, e_id10: i32, e_id11: i32, e_id12: i32, e_id13: i32, e_id14: i32, e_id15: i32,
+    e_gen0: i32, e_gen1: i32, e_gen2: i32, e_gen3: i32, e_gen4: i32, e_gen5: i32, e_gen6: i32, e_gen7: i32, e_gen8: i32, e_gen9: i32, e_gen10: i32, e_gen11: i32, e_gen12: i32, e_gen13: i32, e_gen14: i32, e_gen15: i32,
+    a_slot0: i32, a_slot1: i32, a_slot2: i32, a_slot3: i32, a_slot4: i32, a_slot5: i32, a_slot6: i32, a_slot7: i32, a_slot8: i32, a_slot9: i32, a_slot10: i32, a_slot11: i32, a_slot12: i32, a_slot13: i32, a_slot14: i32, a_slot15: i32,
+    b_slot0: i32, b_slot1: i32, b_slot2: i32, b_slot3: i32, b_slot4: i32, b_slot5: i32, b_slot6: i32, b_slot7: i32, b_slot8: i32, b_slot9: i32, b_slot10: i32, b_slot11: i32, b_slot12: i32, b_slot13: i32, b_slot14: i32, b_slot15: i32,
+    c_slot0: i32, c_slot1: i32, c_slot2: i32, c_slot3: i32, c_slot4: i32, c_slot5: i32, c_slot6: i32, c_slot7: i32, c_slot8: i32, c_slot9: i32, c_slot10: i32, c_slot11: i32, c_slot12: i32, c_slot13: i32, c_slot14: i32, c_slot15: i32,
+    a_x0: i32, a_x1: i32, a_x2: i32, a_x3: i32, a_x4: i32, a_x5: i32, a_x6: i32, a_x7: i32, a_x8: i32, a_x9: i32, a_x10: i32, a_x11: i32, a_x12: i32, a_x13: i32, a_x14: i32, a_x15: i32,
+    a_y0: i32, a_y1: i32, a_y2: i32, a_y3: i32, a_y4: i32, a_y5: i32, a_y6: i32, a_y7: i32, a_y8: i32, a_y9: i32, a_y10: i32, a_y11: i32, a_y12: i32, a_y13: i32, a_y14: i32, a_y15: i32,
+    b_x0: i32, b_x1: i32, b_x2: i32, b_x3: i32, b_x4: i32, b_x5: i32, b_x6: i32, b_x7: i32, b_x8: i32, b_x9: i32, b_x10: i32, b_x11: i32, b_x12: i32, b_x13: i32, b_x14: i32, b_x15: i32,
+    b_y0: i32, b_y1: i32, b_y2: i32, b_y3: i32, b_y4: i32, b_y5: i32, b_y6: i32, b_y7: i32, b_y8: i32, b_y9: i32, b_y10: i32, b_y11: i32, b_y12: i32, b_y13: i32, b_y14: i32, b_y15: i32,
+    c_team0: i32, c_team1: i32, c_team2: i32, c_team3: i32, c_team4: i32, c_team5: i32, c_team6: i32, c_team7: i32, c_team8: i32, c_team9: i32, c_team10: i32, c_team11: i32, c_team12: i32, c_team13: i32, c_team14: i32, c_team15: i32,
+}
+
+fn ecs_wd3_pair_query_count(q: EcsWD3TripleQuery) -> i32 { return q.count; }
+
+fn ecs_wd3_pair_query_entity_at(q: EcsWD3TripleQuery, idx: i32) -> EcsWD3Entity {
+    return EcsWD3Entity { id: _ecs_wd3_q_e_id_at(q, idx), generation: _ecs_wd3_q_e_gen_at(q, idx) };
+}
+
+fn ecs_wd3_pair_query_a_at(q: EcsWD3TripleQuery, idx: i32) -> EcsWD3Pos {
+    return EcsWD3Pos { x: _ecs_wd3_q_a_x_at(q, idx), y: _ecs_wd3_q_a_y_at(q, idx) };
+}
+
+fn ecs_wd3_pair_query_b_at(q: EcsWD3TripleQuery, idx: i32) -> EcsWD3Vel {
+    return EcsWD3Vel { x: _ecs_wd3_q_b_x_at(q, idx), y: _ecs_wd3_q_b_y_at(q, idx) };
+}
+
+fn ecs_wd3_pair_query_c_at(q: EcsWD3TripleQuery, idx: i32) -> EcsWD3Player {
+    return EcsWD3Player { team: _ecs_wd3_q_c_team_at(q, idx) };
+}
+
+// Internal per-item getters (cap-16 cascade).
+fn _ecs_wd3_q_e_id_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.e_id0; };
+    if idx == 1 { return q.e_id1; };
+    if idx == 2 { return q.e_id2; };
+    if idx == 3 { return q.e_id3; };
+    if idx == 4 { return q.e_id4; };
+    if idx == 5 { return q.e_id5; };
+    if idx == 6 { return q.e_id6; };
+    if idx == 7 { return q.e_id7; };
+    if idx == 8 { return q.e_id8; };
+    if idx == 9 { return q.e_id9; };
+    if idx == 10 { return q.e_id10; };
+    if idx == 11 { return q.e_id11; };
+    if idx == 12 { return q.e_id12; };
+    if idx == 13 { return q.e_id13; };
+    if idx == 14 { return q.e_id14; };
+    return q.e_id15;
+}
+
+fn _ecs_wd3_q_e_gen_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.e_gen0; };
+    if idx == 1 { return q.e_gen1; };
+    if idx == 2 { return q.e_gen2; };
+    if idx == 3 { return q.e_gen3; };
+    if idx == 4 { return q.e_gen4; };
+    if idx == 5 { return q.e_gen5; };
+    if idx == 6 { return q.e_gen6; };
+    if idx == 7 { return q.e_gen7; };
+    if idx == 8 { return q.e_gen8; };
+    if idx == 9 { return q.e_gen9; };
+    if idx == 10 { return q.e_gen10; };
+    if idx == 11 { return q.e_gen11; };
+    if idx == 12 { return q.e_gen12; };
+    if idx == 13 { return q.e_gen13; };
+    if idx == 14 { return q.e_gen14; };
+    return q.e_gen15;
+}
+
+fn _ecs_wd3_q_a_slot_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.a_slot0; };
+    if idx == 1 { return q.a_slot1; };
+    if idx == 2 { return q.a_slot2; };
+    if idx == 3 { return q.a_slot3; };
+    if idx == 4 { return q.a_slot4; };
+    if idx == 5 { return q.a_slot5; };
+    if idx == 6 { return q.a_slot6; };
+    if idx == 7 { return q.a_slot7; };
+    if idx == 8 { return q.a_slot8; };
+    if idx == 9 { return q.a_slot9; };
+    if idx == 10 { return q.a_slot10; };
+    if idx == 11 { return q.a_slot11; };
+    if idx == 12 { return q.a_slot12; };
+    if idx == 13 { return q.a_slot13; };
+    if idx == 14 { return q.a_slot14; };
+    return q.a_slot15;
+}
+
+fn _ecs_wd3_q_b_slot_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.b_slot0; };
+    if idx == 1 { return q.b_slot1; };
+    if idx == 2 { return q.b_slot2; };
+    if idx == 3 { return q.b_slot3; };
+    if idx == 4 { return q.b_slot4; };
+    if idx == 5 { return q.b_slot5; };
+    if idx == 6 { return q.b_slot6; };
+    if idx == 7 { return q.b_slot7; };
+    if idx == 8 { return q.b_slot8; };
+    if idx == 9 { return q.b_slot9; };
+    if idx == 10 { return q.b_slot10; };
+    if idx == 11 { return q.b_slot11; };
+    if idx == 12 { return q.b_slot12; };
+    if idx == 13 { return q.b_slot13; };
+    if idx == 14 { return q.b_slot14; };
+    return q.b_slot15;
+}
+
+fn _ecs_wd3_q_c_slot_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.c_slot0; };
+    if idx == 1 { return q.c_slot1; };
+    if idx == 2 { return q.c_slot2; };
+    if idx == 3 { return q.c_slot3; };
+    if idx == 4 { return q.c_slot4; };
+    if idx == 5 { return q.c_slot5; };
+    if idx == 6 { return q.c_slot6; };
+    if idx == 7 { return q.c_slot7; };
+    if idx == 8 { return q.c_slot8; };
+    if idx == 9 { return q.c_slot9; };
+    if idx == 10 { return q.c_slot10; };
+    if idx == 11 { return q.c_slot11; };
+    if idx == 12 { return q.c_slot12; };
+    if idx == 13 { return q.c_slot13; };
+    if idx == 14 { return q.c_slot14; };
+    return q.c_slot15;
+}
+
+fn _ecs_wd3_q_a_x_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.a_x0; };
+    if idx == 1 { return q.a_x1; };
+    if idx == 2 { return q.a_x2; };
+    if idx == 3 { return q.a_x3; };
+    if idx == 4 { return q.a_x4; };
+    if idx == 5 { return q.a_x5; };
+    if idx == 6 { return q.a_x6; };
+    if idx == 7 { return q.a_x7; };
+    if idx == 8 { return q.a_x8; };
+    if idx == 9 { return q.a_x9; };
+    if idx == 10 { return q.a_x10; };
+    if idx == 11 { return q.a_x11; };
+    if idx == 12 { return q.a_x12; };
+    if idx == 13 { return q.a_x13; };
+    if idx == 14 { return q.a_x14; };
+    return q.a_x15;
+}
+
+fn _ecs_wd3_q_a_y_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.a_y0; };
+    if idx == 1 { return q.a_y1; };
+    if idx == 2 { return q.a_y2; };
+    if idx == 3 { return q.a_y3; };
+    if idx == 4 { return q.a_y4; };
+    if idx == 5 { return q.a_y5; };
+    if idx == 6 { return q.a_y6; };
+    if idx == 7 { return q.a_y7; };
+    if idx == 8 { return q.a_y8; };
+    if idx == 9 { return q.a_y9; };
+    if idx == 10 { return q.a_y10; };
+    if idx == 11 { return q.a_y11; };
+    if idx == 12 { return q.a_y12; };
+    if idx == 13 { return q.a_y13; };
+    if idx == 14 { return q.a_y14; };
+    return q.a_y15;
+}
+
+fn _ecs_wd3_q_b_x_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.b_x0; };
+    if idx == 1 { return q.b_x1; };
+    if idx == 2 { return q.b_x2; };
+    if idx == 3 { return q.b_x3; };
+    if idx == 4 { return q.b_x4; };
+    if idx == 5 { return q.b_x5; };
+    if idx == 6 { return q.b_x6; };
+    if idx == 7 { return q.b_x7; };
+    if idx == 8 { return q.b_x8; };
+    if idx == 9 { return q.b_x9; };
+    if idx == 10 { return q.b_x10; };
+    if idx == 11 { return q.b_x11; };
+    if idx == 12 { return q.b_x12; };
+    if idx == 13 { return q.b_x13; };
+    if idx == 14 { return q.b_x14; };
+    return q.b_x15;
+}
+
+fn _ecs_wd3_q_b_y_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.b_y0; };
+    if idx == 1 { return q.b_y1; };
+    if idx == 2 { return q.b_y2; };
+    if idx == 3 { return q.b_y3; };
+    if idx == 4 { return q.b_y4; };
+    if idx == 5 { return q.b_y5; };
+    if idx == 6 { return q.b_y6; };
+    if idx == 7 { return q.b_y7; };
+    if idx == 8 { return q.b_y8; };
+    if idx == 9 { return q.b_y9; };
+    if idx == 10 { return q.b_y10; };
+    if idx == 11 { return q.b_y11; };
+    if idx == 12 { return q.b_y12; };
+    if idx == 13 { return q.b_y13; };
+    if idx == 14 { return q.b_y14; };
+    return q.b_y15;
+}
+
+fn _ecs_wd3_q_c_team_at(q: EcsWD3TripleQuery, idx: i32) -> i32 {
+    if idx == 0 { return q.c_team0; };
+    if idx == 1 { return q.c_team1; };
+    if idx == 2 { return q.c_team2; };
+    if idx == 3 { return q.c_team3; };
+    if idx == 4 { return q.c_team4; };
+    if idx == 5 { return q.c_team5; };
+    if idx == 6 { return q.c_team6; };
+    if idx == 7 { return q.c_team7; };
+    if idx == 8 { return q.c_team8; };
+    if idx == 9 { return q.c_team9; };
+    if idx == 10 { return q.c_team10; };
+    if idx == 11 { return q.c_team11; };
+    if idx == 12 { return q.c_team12; };
+    if idx == 13 { return q.c_team13; };
+    if idx == 14 { return q.c_team14; };
+    return q.c_team15;
+}
+
+// Setters per-item so the build loop can write into the query item-by-item.
+fn _ecs_wd3_q_set_e_id(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.e_id0 = value; return q0; };
+    if idx == 1 { q0.e_id1 = value; return q0; };
+    if idx == 2 { q0.e_id2 = value; return q0; };
+    if idx == 3 { q0.e_id3 = value; return q0; };
+    if idx == 4 { q0.e_id4 = value; return q0; };
+    if idx == 5 { q0.e_id5 = value; return q0; };
+    if idx == 6 { q0.e_id6 = value; return q0; };
+    if idx == 7 { q0.e_id7 = value; return q0; };
+    if idx == 8 { q0.e_id8 = value; return q0; };
+    if idx == 9 { q0.e_id9 = value; return q0; };
+    if idx == 10 { q0.e_id10 = value; return q0; };
+    if idx == 11 { q0.e_id11 = value; return q0; };
+    if idx == 12 { q0.e_id12 = value; return q0; };
+    if idx == 13 { q0.e_id13 = value; return q0; };
+    if idx == 14 { q0.e_id14 = value; return q0; };
+    q0.e_id15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_e_gen(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.e_gen0 = value; return q0; };
+    if idx == 1 { q0.e_gen1 = value; return q0; };
+    if idx == 2 { q0.e_gen2 = value; return q0; };
+    if idx == 3 { q0.e_gen3 = value; return q0; };
+    if idx == 4 { q0.e_gen4 = value; return q0; };
+    if idx == 5 { q0.e_gen5 = value; return q0; };
+    if idx == 6 { q0.e_gen6 = value; return q0; };
+    if idx == 7 { q0.e_gen7 = value; return q0; };
+    if idx == 8 { q0.e_gen8 = value; return q0; };
+    if idx == 9 { q0.e_gen9 = value; return q0; };
+    if idx == 10 { q0.e_gen10 = value; return q0; };
+    if idx == 11 { q0.e_gen11 = value; return q0; };
+    if idx == 12 { q0.e_gen12 = value; return q0; };
+    if idx == 13 { q0.e_gen13 = value; return q0; };
+    if idx == 14 { q0.e_gen14 = value; return q0; };
+    q0.e_gen15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_a_slot(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.a_slot0 = value; return q0; };
+    if idx == 1 { q0.a_slot1 = value; return q0; };
+    if idx == 2 { q0.a_slot2 = value; return q0; };
+    if idx == 3 { q0.a_slot3 = value; return q0; };
+    if idx == 4 { q0.a_slot4 = value; return q0; };
+    if idx == 5 { q0.a_slot5 = value; return q0; };
+    if idx == 6 { q0.a_slot6 = value; return q0; };
+    if idx == 7 { q0.a_slot7 = value; return q0; };
+    if idx == 8 { q0.a_slot8 = value; return q0; };
+    if idx == 9 { q0.a_slot9 = value; return q0; };
+    if idx == 10 { q0.a_slot10 = value; return q0; };
+    if idx == 11 { q0.a_slot11 = value; return q0; };
+    if idx == 12 { q0.a_slot12 = value; return q0; };
+    if idx == 13 { q0.a_slot13 = value; return q0; };
+    if idx == 14 { q0.a_slot14 = value; return q0; };
+    q0.a_slot15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_b_slot(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.b_slot0 = value; return q0; };
+    if idx == 1 { q0.b_slot1 = value; return q0; };
+    if idx == 2 { q0.b_slot2 = value; return q0; };
+    if idx == 3 { q0.b_slot3 = value; return q0; };
+    if idx == 4 { q0.b_slot4 = value; return q0; };
+    if idx == 5 { q0.b_slot5 = value; return q0; };
+    if idx == 6 { q0.b_slot6 = value; return q0; };
+    if idx == 7 { q0.b_slot7 = value; return q0; };
+    if idx == 8 { q0.b_slot8 = value; return q0; };
+    if idx == 9 { q0.b_slot9 = value; return q0; };
+    if idx == 10 { q0.b_slot10 = value; return q0; };
+    if idx == 11 { q0.b_slot11 = value; return q0; };
+    if idx == 12 { q0.b_slot12 = value; return q0; };
+    if idx == 13 { q0.b_slot13 = value; return q0; };
+    if idx == 14 { q0.b_slot14 = value; return q0; };
+    q0.b_slot15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_c_slot(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.c_slot0 = value; return q0; };
+    if idx == 1 { q0.c_slot1 = value; return q0; };
+    if idx == 2 { q0.c_slot2 = value; return q0; };
+    if idx == 3 { q0.c_slot3 = value; return q0; };
+    if idx == 4 { q0.c_slot4 = value; return q0; };
+    if idx == 5 { q0.c_slot5 = value; return q0; };
+    if idx == 6 { q0.c_slot6 = value; return q0; };
+    if idx == 7 { q0.c_slot7 = value; return q0; };
+    if idx == 8 { q0.c_slot8 = value; return q0; };
+    if idx == 9 { q0.c_slot9 = value; return q0; };
+    if idx == 10 { q0.c_slot10 = value; return q0; };
+    if idx == 11 { q0.c_slot11 = value; return q0; };
+    if idx == 12 { q0.c_slot12 = value; return q0; };
+    if idx == 13 { q0.c_slot13 = value; return q0; };
+    if idx == 14 { q0.c_slot14 = value; return q0; };
+    q0.c_slot15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_a_x(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.a_x0 = value; return q0; };
+    if idx == 1 { q0.a_x1 = value; return q0; };
+    if idx == 2 { q0.a_x2 = value; return q0; };
+    if idx == 3 { q0.a_x3 = value; return q0; };
+    if idx == 4 { q0.a_x4 = value; return q0; };
+    if idx == 5 { q0.a_x5 = value; return q0; };
+    if idx == 6 { q0.a_x6 = value; return q0; };
+    if idx == 7 { q0.a_x7 = value; return q0; };
+    if idx == 8 { q0.a_x8 = value; return q0; };
+    if idx == 9 { q0.a_x9 = value; return q0; };
+    if idx == 10 { q0.a_x10 = value; return q0; };
+    if idx == 11 { q0.a_x11 = value; return q0; };
+    if idx == 12 { q0.a_x12 = value; return q0; };
+    if idx == 13 { q0.a_x13 = value; return q0; };
+    if idx == 14 { q0.a_x14 = value; return q0; };
+    q0.a_x15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_a_y(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.a_y0 = value; return q0; };
+    if idx == 1 { q0.a_y1 = value; return q0; };
+    if idx == 2 { q0.a_y2 = value; return q0; };
+    if idx == 3 { q0.a_y3 = value; return q0; };
+    if idx == 4 { q0.a_y4 = value; return q0; };
+    if idx == 5 { q0.a_y5 = value; return q0; };
+    if idx == 6 { q0.a_y6 = value; return q0; };
+    if idx == 7 { q0.a_y7 = value; return q0; };
+    if idx == 8 { q0.a_y8 = value; return q0; };
+    if idx == 9 { q0.a_y9 = value; return q0; };
+    if idx == 10 { q0.a_y10 = value; return q0; };
+    if idx == 11 { q0.a_y11 = value; return q0; };
+    if idx == 12 { q0.a_y12 = value; return q0; };
+    if idx == 13 { q0.a_y13 = value; return q0; };
+    if idx == 14 { q0.a_y14 = value; return q0; };
+    q0.a_y15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_b_x(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.b_x0 = value; return q0; };
+    if idx == 1 { q0.b_x1 = value; return q0; };
+    if idx == 2 { q0.b_x2 = value; return q0; };
+    if idx == 3 { q0.b_x3 = value; return q0; };
+    if idx == 4 { q0.b_x4 = value; return q0; };
+    if idx == 5 { q0.b_x5 = value; return q0; };
+    if idx == 6 { q0.b_x6 = value; return q0; };
+    if idx == 7 { q0.b_x7 = value; return q0; };
+    if idx == 8 { q0.b_x8 = value; return q0; };
+    if idx == 9 { q0.b_x9 = value; return q0; };
+    if idx == 10 { q0.b_x10 = value; return q0; };
+    if idx == 11 { q0.b_x11 = value; return q0; };
+    if idx == 12 { q0.b_x12 = value; return q0; };
+    if idx == 13 { q0.b_x13 = value; return q0; };
+    if idx == 14 { q0.b_x14 = value; return q0; };
+    q0.b_x15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_b_y(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.b_y0 = value; return q0; };
+    if idx == 1 { q0.b_y1 = value; return q0; };
+    if idx == 2 { q0.b_y2 = value; return q0; };
+    if idx == 3 { q0.b_y3 = value; return q0; };
+    if idx == 4 { q0.b_y4 = value; return q0; };
+    if idx == 5 { q0.b_y5 = value; return q0; };
+    if idx == 6 { q0.b_y6 = value; return q0; };
+    if idx == 7 { q0.b_y7 = value; return q0; };
+    if idx == 8 { q0.b_y8 = value; return q0; };
+    if idx == 9 { q0.b_y9 = value; return q0; };
+    if idx == 10 { q0.b_y10 = value; return q0; };
+    if idx == 11 { q0.b_y11 = value; return q0; };
+    if idx == 12 { q0.b_y12 = value; return q0; };
+    if idx == 13 { q0.b_y13 = value; return q0; };
+    if idx == 14 { q0.b_y14 = value; return q0; };
+    q0.b_y15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_q_set_c_team(q0: EcsWD3TripleQuery, idx: i32, value: i32) -> EcsWD3TripleQuery {
+    if idx == 0 { q0.c_team0 = value; return q0; };
+    if idx == 1 { q0.c_team1 = value; return q0; };
+    if idx == 2 { q0.c_team2 = value; return q0; };
+    if idx == 3 { q0.c_team3 = value; return q0; };
+    if idx == 4 { q0.c_team4 = value; return q0; };
+    if idx == 5 { q0.c_team5 = value; return q0; };
+    if idx == 6 { q0.c_team6 = value; return q0; };
+    if idx == 7 { q0.c_team7 = value; return q0; };
+    if idx == 8 { q0.c_team8 = value; return q0; };
+    if idx == 9 { q0.c_team9 = value; return q0; };
+    if idx == 10 { q0.c_team10 = value; return q0; };
+    if idx == 11 { q0.c_team11 = value; return q0; };
+    if idx == 12 { q0.c_team12 = value; return q0; };
+    if idx == 13 { q0.c_team13 = value; return q0; };
+    if idx == 14 { q0.c_team14 = value; return q0; };
+    q0.c_team15 = value;
+    return q0;
+}
+
+// ecs_wd3_query_a_b_c: iterate A store; find b_slot + c_slot by eid; emit triple if both found
+// AND entity alive (gen matches). Returns EcsWD3TripleQuery.
+fn ecs_wd3_query_a_b_c(w: EcsWD3World) -> EcsWD3TripleQuery {
+    let q0 = EcsWD3TripleQuery { count: 0, e_id0: 0, e_id1: 0, e_id2: 0, e_id3: 0, e_id4: 0, e_id5: 0, e_id6: 0, e_id7: 0, e_id8: 0, e_id9: 0, e_id10: 0, e_id11: 0, e_id12: 0, e_id13: 0, e_id14: 0, e_id15: 0, e_gen0: 0, e_gen1: 0, e_gen2: 0, e_gen3: 0, e_gen4: 0, e_gen5: 0, e_gen6: 0, e_gen7: 0, e_gen8: 0, e_gen9: 0, e_gen10: 0, e_gen11: 0, e_gen12: 0, e_gen13: 0, e_gen14: 0, e_gen15: 0, a_slot0: 0, a_slot1: 0, a_slot2: 0, a_slot3: 0, a_slot4: 0, a_slot5: 0, a_slot6: 0, a_slot7: 0, a_slot8: 0, a_slot9: 0, a_slot10: 0, a_slot11: 0, a_slot12: 0, a_slot13: 0, a_slot14: 0, a_slot15: 0, b_slot0: 0, b_slot1: 0, b_slot2: 0, b_slot3: 0, b_slot4: 0, b_slot5: 0, b_slot6: 0, b_slot7: 0, b_slot8: 0, b_slot9: 0, b_slot10: 0, b_slot11: 0, b_slot12: 0, b_slot13: 0, b_slot14: 0, b_slot15: 0, c_slot0: 0, c_slot1: 0, c_slot2: 0, c_slot3: 0, c_slot4: 0, c_slot5: 0, c_slot6: 0, c_slot7: 0, c_slot8: 0, c_slot9: 0, c_slot10: 0, c_slot11: 0, c_slot12: 0, c_slot13: 0, c_slot14: 0, c_slot15: 0, a_x0: 0, a_x1: 0, a_x2: 0, a_x3: 0, a_x4: 0, a_x5: 0, a_x6: 0, a_x7: 0, a_x8: 0, a_x9: 0, a_x10: 0, a_x11: 0, a_x12: 0, a_x13: 0, a_x14: 0, a_x15: 0, a_y0: 0, a_y1: 0, a_y2: 0, a_y3: 0, a_y4: 0, a_y5: 0, a_y6: 0, a_y7: 0, a_y8: 0, a_y9: 0, a_y10: 0, a_y11: 0, a_y12: 0, a_y13: 0, a_y14: 0, a_y15: 0, b_x0: 0, b_x1: 0, b_x2: 0, b_x3: 0, b_x4: 0, b_x5: 0, b_x6: 0, b_x7: 0, b_x8: 0, b_x9: 0, b_x10: 0, b_x11: 0, b_x12: 0, b_x13: 0, b_x14: 0, b_x15: 0, b_y0: 0, b_y1: 0, b_y2: 0, b_y3: 0, b_y4: 0, b_y5: 0, b_y6: 0, b_y7: 0, b_y8: 0, b_y9: 0, b_y10: 0, b_y11: 0, b_y12: 0, b_y13: 0, b_y14: 0, b_y15: 0, c_team0: 0, c_team1: 0, c_team2: 0, c_team3: 0, c_team4: 0, c_team5: 0, c_team6: 0, c_team7: 0, c_team8: 0, c_team9: 0, c_team10: 0, c_team11: 0, c_team12: 0, c_team13: 0, c_team14: 0, c_team15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_wd3_a_eid_at(w, i);
+        let gen = _ecs_wd3_gen_at(w, eid);
+        let e = EcsWD3Entity { id: eid, generation: gen };
+        if ecs_wd3_is_alive(w, e) {
+            let b_slot = _ecs_wd3_b_slot_of(w, eid);
+            let c_slot = _ecs_wd3_c_slot_of(w, eid);
+            if b_slot >= 0 {
+                if c_slot >= 0 {
+                    let out = q0.count;
+                    q0 = _ecs_wd3_q_set_e_id(q0, out, eid);
+                    q0 = _ecs_wd3_q_set_e_gen(q0, out, gen);
+                    q0 = _ecs_wd3_q_set_a_slot(q0, out, i);
+                    q0 = _ecs_wd3_q_set_b_slot(q0, out, b_slot);
+                    q0 = _ecs_wd3_q_set_c_slot(q0, out, c_slot);
+                    q0 = _ecs_wd3_q_set_a_x(q0, out, _ecs_wd3_a_x_at(w, i));
+                    q0 = _ecs_wd3_q_set_a_y(q0, out, _ecs_wd3_a_y_at(w, i));
+                    q0 = _ecs_wd3_q_set_b_x(q0, out, _ecs_wd3_b_x_at(w, b_slot));
+                    q0 = _ecs_wd3_q_set_b_y(q0, out, _ecs_wd3_b_y_at(w, b_slot));
+                    q0 = _ecs_wd3_q_set_c_team(q0, out, _ecs_wd3_c_team_at(w, c_slot));
+                    q0.count = out + 1;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+
+// ── QueryA (A-only flat list) used by query_a_with_c and query_a_without_c. ─────────────────
+struct EcsWD3QueryA {
+    count: i32,
+    a_x0: i32, a_x1: i32, a_x2: i32, a_x3: i32, a_x4: i32, a_x5: i32, a_x6: i32, a_x7: i32, a_x8: i32, a_x9: i32, a_x10: i32, a_x11: i32, a_x12: i32, a_x13: i32, a_x14: i32, a_x15: i32,
+    a_y0: i32, a_y1: i32, a_y2: i32, a_y3: i32, a_y4: i32, a_y5: i32, a_y6: i32, a_y7: i32, a_y8: i32, a_y9: i32, a_y10: i32, a_y11: i32, a_y12: i32, a_y13: i32, a_y14: i32, a_y15: i32,
+}
+
+fn ecs_wd3_query_a_count(q: EcsWD3QueryA) -> i32 { return q.count; }
+fn ecs_wd3_query_a_x_at(q: EcsWD3QueryA, idx: i32) -> i32 {
+    if idx == 0 { return q.a_x0; };
+    if idx == 1 { return q.a_x1; };
+    if idx == 2 { return q.a_x2; };
+    if idx == 3 { return q.a_x3; };
+    if idx == 4 { return q.a_x4; };
+    if idx == 5 { return q.a_x5; };
+    if idx == 6 { return q.a_x6; };
+    if idx == 7 { return q.a_x7; };
+    if idx == 8 { return q.a_x8; };
+    if idx == 9 { return q.a_x9; };
+    if idx == 10 { return q.a_x10; };
+    if idx == 11 { return q.a_x11; };
+    if idx == 12 { return q.a_x12; };
+    if idx == 13 { return q.a_x13; };
+    if idx == 14 { return q.a_x14; };
+    return q.a_x15;
+}
+
+fn ecs_wd3_query_a_y_at(q: EcsWD3QueryA, idx: i32) -> i32 {
+    if idx == 0 { return q.a_y0; };
+    if idx == 1 { return q.a_y1; };
+    if idx == 2 { return q.a_y2; };
+    if idx == 3 { return q.a_y3; };
+    if idx == 4 { return q.a_y4; };
+    if idx == 5 { return q.a_y5; };
+    if idx == 6 { return q.a_y6; };
+    if idx == 7 { return q.a_y7; };
+    if idx == 8 { return q.a_y8; };
+    if idx == 9 { return q.a_y9; };
+    if idx == 10 { return q.a_y10; };
+    if idx == 11 { return q.a_y11; };
+    if idx == 12 { return q.a_y12; };
+    if idx == 13 { return q.a_y13; };
+    if idx == 14 { return q.a_y14; };
+    return q.a_y15;
+}
+
+fn _ecs_wd3_qa_set_x(q0: EcsWD3QueryA, idx: i32, value: i32) -> EcsWD3QueryA {
+    if idx == 0 { q0.a_x0 = value; return q0; };
+    if idx == 1 { q0.a_x1 = value; return q0; };
+    if idx == 2 { q0.a_x2 = value; return q0; };
+    if idx == 3 { q0.a_x3 = value; return q0; };
+    if idx == 4 { q0.a_x4 = value; return q0; };
+    if idx == 5 { q0.a_x5 = value; return q0; };
+    if idx == 6 { q0.a_x6 = value; return q0; };
+    if idx == 7 { q0.a_x7 = value; return q0; };
+    if idx == 8 { q0.a_x8 = value; return q0; };
+    if idx == 9 { q0.a_x9 = value; return q0; };
+    if idx == 10 { q0.a_x10 = value; return q0; };
+    if idx == 11 { q0.a_x11 = value; return q0; };
+    if idx == 12 { q0.a_x12 = value; return q0; };
+    if idx == 13 { q0.a_x13 = value; return q0; };
+    if idx == 14 { q0.a_x14 = value; return q0; };
+    q0.a_x15 = value;
+    return q0;
+}
+
+fn _ecs_wd3_qa_set_y(q0: EcsWD3QueryA, idx: i32, value: i32) -> EcsWD3QueryA {
+    if idx == 0 { q0.a_y0 = value; return q0; };
+    if idx == 1 { q0.a_y1 = value; return q0; };
+    if idx == 2 { q0.a_y2 = value; return q0; };
+    if idx == 3 { q0.a_y3 = value; return q0; };
+    if idx == 4 { q0.a_y4 = value; return q0; };
+    if idx == 5 { q0.a_y5 = value; return q0; };
+    if idx == 6 { q0.a_y6 = value; return q0; };
+    if idx == 7 { q0.a_y7 = value; return q0; };
+    if idx == 8 { q0.a_y8 = value; return q0; };
+    if idx == 9 { q0.a_y9 = value; return q0; };
+    if idx == 10 { q0.a_y10 = value; return q0; };
+    if idx == 11 { q0.a_y11 = value; return q0; };
+    if idx == 12 { q0.a_y12 = value; return q0; };
+    if idx == 13 { q0.a_y13 = value; return q0; };
+    if idx == 14 { q0.a_y14 = value; return q0; };
+    q0.a_y15 = value;
+    return q0;
+}
+
+// ecs_wd3_query_a_with_c: iterate A store; if entity alive AND has_c(eid); push a (x,y).
+fn ecs_wd3_query_a_with_c(w: EcsWD3World) -> EcsWD3QueryA {
+    let q0 = EcsWD3QueryA { count: 0, a_x0: 0, a_x1: 0, a_x2: 0, a_x3: 0, a_x4: 0, a_x5: 0, a_x6: 0, a_x7: 0, a_x8: 0, a_x9: 0, a_x10: 0, a_x11: 0, a_x12: 0, a_x13: 0, a_x14: 0, a_x15: 0, a_y0: 0, a_y1: 0, a_y2: 0, a_y3: 0, a_y4: 0, a_y5: 0, a_y6: 0, a_y7: 0, a_y8: 0, a_y9: 0, a_y10: 0, a_y11: 0, a_y12: 0, a_y13: 0, a_y14: 0, a_y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_wd3_a_eid_at(w, i);
+        let gen = _ecs_wd3_gen_at(w, eid);
+        let e = EcsWD3Entity { id: eid, generation: gen };
+        if ecs_wd3_is_alive(w, e) {
+            if ecs_wd3_has_c(w, e) {
+                let out = q0.count;
+                q0 = _ecs_wd3_qa_set_x(q0, out, _ecs_wd3_a_x_at(w, i));
+                q0 = _ecs_wd3_qa_set_y(q0, out, _ecs_wd3_a_y_at(w, i));
+                q0.count = out + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+
+// ecs_wd3_query_a_without_c: iterate A store; if entity alive AND NOT has_c(eid); push a (x,y).
+fn ecs_wd3_query_a_without_c(w: EcsWD3World) -> EcsWD3QueryA {
+    let q0 = EcsWD3QueryA { count: 0, a_x0: 0, a_x1: 0, a_x2: 0, a_x3: 0, a_x4: 0, a_x5: 0, a_x6: 0, a_x7: 0, a_x8: 0, a_x9: 0, a_x10: 0, a_x11: 0, a_x12: 0, a_x13: 0, a_x14: 0, a_x15: 0, a_y0: 0, a_y1: 0, a_y2: 0, a_y3: 0, a_y4: 0, a_y5: 0, a_y6: 0, a_y7: 0, a_y8: 0, a_y9: 0, a_y10: 0, a_y11: 0, a_y12: 0, a_y13: 0, a_y14: 0, a_y15: 0 };
+    let i: i32 = 0;
+    while i < w.a_count {
+        let eid = _ecs_wd3_a_eid_at(w, i);
+        let gen = _ecs_wd3_gen_at(w, eid);
+        let e = EcsWD3Entity { id: eid, generation: gen };
+        if ecs_wd3_is_alive(w, e) {
+            if ecs_wd3_has_c(w, e) != true {
+                let out = q0.count;
+                q0 = _ecs_wd3_qa_set_x(q0, out, _ecs_wd3_a_x_at(w, i));
+                q0 = _ecs_wd3_qa_set_y(q0, out, _ecs_wd3_a_y_at(w, i));
+                q0.count = out + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return q0;
+}
+

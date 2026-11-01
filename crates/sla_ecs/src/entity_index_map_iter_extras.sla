@@ -1,0 +1,189 @@
+// Additional Bevy ECS EntityIndexMap iterator/boxed-slice wrappers.
+// Complements entity_index_map_extras.sla with IterMut, IntoIter, Drain::as_slice,
+// boxed Slice conversion/clone/default, and Slice equality/order/hash/index variants.
+
+struct EcsEim2Pair { key: i64, value: i32 }
+struct EcsEim2Map { entries: Vec<EcsEim2Pair> }
+struct EcsEim2Slice { entries: Vec<EcsEim2Pair>, boxed: i32 }
+struct EcsEim2IterMut { entries: Vec<EcsEim2Pair>, front: i64, back: i64 }
+struct EcsEim2IntoIter { entries: Vec<EcsEim2Pair>, front: i64, back: i64 }
+struct EcsEim2Drain { entries: Vec<EcsEim2Pair>, front: i64, back: i64 }
+
+struct EcsEim2PairResult { has: i32, key: i64, value: i32 }
+struct EcsEim2IterNext { iter_front: i64, iter_back: i64, has: i32, key: i64, value: i32 }
+struct EcsEim2IterMutSetResult { iter: EcsEim2IterMut, has: i32, key: i64, old_value: i32, new_value: i32 }
+struct EcsEim2RangeResult { has: i32, slice: EcsEim2Slice }
+struct EcsEim2DrainResult { map: EcsEim2Map, drain: EcsEim2Drain }
+
+fn ecs_eim2_pair(key: i64, value: i32) -> EcsEim2Pair { return EcsEim2Pair { key: key, value: value }; }
+
+fn ecs_eim2_new() -> EcsEim2Map { return EcsEim2Map { entries: Vec::new() }; }
+
+fn ecs_eim2_insert(map: EcsEim2Map, key: i64, value: i32) -> EcsEim2Map {
+    let i: i64 = 0;
+    let n = len(map.entries) as i64;
+    while i < n {
+        if map.entries[i].key == key { map.entries[i].value = value; return map; };
+        i = i + 1;
+    }
+    map.entries.push(EcsEim2Pair { key: key, value: value });
+    return map;
+}
+
+fn ecs_eim2_len(map: EcsEim2Map) -> i64 { return len(map.entries) as i64; }
+fn ecs_eim2_slice_len(slice: EcsEim2Slice) -> i64 { return len(slice.entries) as i64; }
+
+fn ecs_eim2_as_slice(map: EcsEim2Map) -> EcsEim2Slice { return EcsEim2Slice { entries: map.entries, boxed: 0 }; }
+fn ecs_eim2_empty_slice() -> EcsEim2Slice { return EcsEim2Slice { entries: Vec::new(), boxed: 0 }; }
+fn ecs_eim2_boxed_default() -> EcsEim2Slice { return EcsEim2Slice { entries: Vec::new(), boxed: 1 }; }
+fn ecs_eim2_into_boxed_slice(map: EcsEim2Map) -> EcsEim2Slice { return EcsEim2Slice { entries: map.entries, boxed: 1 }; }
+fn ecs_eim2_boxed_clone(slice: EcsEim2Slice) -> EcsEim2Slice { return EcsEim2Slice { entries: slice.entries, boxed: 1 }; }
+fn ecs_eim2_boxed_into_inner(slice: EcsEim2Slice) -> EcsEim2Slice { return EcsEim2Slice { entries: slice.entries, boxed: 0 }; }
+
+fn ecs_eim2_slice_at(slice: EcsEim2Slice, index: i64) -> EcsEim2PairResult {
+    if index < 0 { return EcsEim2PairResult { has: 0, key: -1, value: 0 }; };
+    if index >= len(slice.entries) as i64 { return EcsEim2PairResult { has: 0, key: -1, value: 0 }; };
+    let pair = slice.entries[index];
+    return EcsEim2PairResult { has: 1, key: pair.key, value: pair.value };
+}
+
+fn ecs_eim2_slice_range(slice: EcsEim2Slice, start: i64, end: i64) -> EcsEim2RangeResult {
+    let n = len(slice.entries) as i64;
+    if start < 0 { return EcsEim2RangeResult { has: 0, slice: ecs_eim2_empty_slice() }; };
+    if end < start { return EcsEim2RangeResult { has: 0, slice: ecs_eim2_empty_slice() }; };
+    if end > n { return EcsEim2RangeResult { has: 0, slice: ecs_eim2_empty_slice() }; };
+    let out: Vec<EcsEim2Pair> = Vec::new();
+    let i = start;
+    while i < end { out.push(slice.entries[i]); i = i + 1; }
+    return EcsEim2RangeResult { has: 1, slice: EcsEim2Slice { entries: out, boxed: slice.boxed } };
+}
+
+fn ecs_eim2_slice_range_from(slice: EcsEim2Slice, start: i64) -> EcsEim2RangeResult {
+    return ecs_eim2_slice_range(slice, start, len(slice.entries) as i64);
+}
+
+fn ecs_eim2_slice_range_to(slice: EcsEim2Slice, end: i64) -> EcsEim2RangeResult {
+    return ecs_eim2_slice_range(slice, 0, end);
+}
+
+fn ecs_eim2_slice_range_inclusive(slice: EcsEim2Slice, start: i64, end_inclusive: i64) -> EcsEim2RangeResult {
+    return ecs_eim2_slice_range(slice, start, end_inclusive + 1);
+}
+
+fn ecs_eim2_slice_eq(a: EcsEim2Slice, b: EcsEim2Slice) -> bool {
+    if len(a.entries) != len(b.entries) { return false; };
+    let i: i64 = 0;
+    let n = len(a.entries) as i64;
+    while i < n {
+        if a.entries[i].key != b.entries[i].key { return false; };
+        if a.entries[i].value != b.entries[i].value { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ecs_eim2_slice_cmp(a: EcsEim2Slice, b: EcsEim2Slice) -> i32 {
+    let min_len = len(a.entries) as i64;
+    if (len(b.entries) as i64) < min_len { min_len = len(b.entries) as i64; };
+    let i: i64 = 0;
+    while i < min_len {
+        if a.entries[i].key < b.entries[i].key { return -1; };
+        if a.entries[i].key > b.entries[i].key { return 1; };
+        if a.entries[i].value < b.entries[i].value { return -1; };
+        if a.entries[i].value > b.entries[i].value { return 1; };
+        i = i + 1;
+    }
+    if len(a.entries) < len(b.entries) { return -1; };
+    if len(a.entries) > len(b.entries) { return 1; };
+    return 0;
+}
+
+fn ecs_eim2_slice_hash(slice: EcsEim2Slice) -> i64 {
+    let hash_value: i64 = 17;
+    let i: i64 = 0;
+    let n = len(slice.entries) as i64;
+    while i < n {
+        hash_value = (hash_value * 31) + slice.entries[i].key;
+        hash_value = (hash_value * 31) + (slice.entries[i].value as i64);
+        i = i + 1;
+    }
+    return hash_value;
+}
+
+fn ecs_eim2_iter_mut(map: EcsEim2Map) -> EcsEim2IterMut {
+    return EcsEim2IterMut { entries: map.entries, front: 0, back: len(map.entries) as i64 };
+}
+
+fn ecs_eim2_iter_mut_set_next(iter: EcsEim2IterMut, new_value: i32) -> EcsEim2IterMutSetResult {
+    if iter.front >= iter.back { return EcsEim2IterMutSetResult { iter: iter, has: 0, key: -1, old_value: 0, new_value: 0 }; };
+    let key = iter.entries[iter.front].key;
+    let old_value = iter.entries[iter.front].value;
+    iter.entries[iter.front].value = new_value;
+    iter.front = iter.front + 1;
+    return EcsEim2IterMutSetResult { iter: iter, has: 1, key: key, old_value: old_value, new_value: new_value };
+}
+
+fn ecs_eim2_iter_mut_as_slice(iter: EcsEim2IterMut) -> EcsEim2Slice {
+    let out: Vec<EcsEim2Pair> = Vec::new();
+    let i = iter.front;
+    while i < iter.back { out.push(iter.entries[i]); i = i + 1; }
+    return EcsEim2Slice { entries: out, boxed: 0 };
+}
+
+fn ecs_eim2_into_iter(map: EcsEim2Map) -> EcsEim2IntoIter {
+    return EcsEim2IntoIter { entries: map.entries, front: 0, back: len(map.entries) as i64 };
+}
+
+fn ecs_eim2_into_iter_next(iter: EcsEim2IntoIter) -> EcsEim2IterNext {
+    if iter.front >= iter.back { return EcsEim2IterNext { iter_front: iter.front, iter_back: iter.back, has: 0, key: -1, value: 0 }; };
+    let pair = iter.entries[iter.front];
+    iter.front = iter.front + 1;
+    return EcsEim2IterNext { iter_front: iter.front, iter_back: iter.back, has: 1, key: pair.key, value: pair.value };
+}
+
+fn ecs_eim2_into_iter_next_back(iter: EcsEim2IntoIter) -> EcsEim2IterNext {
+    if iter.front >= iter.back { return EcsEim2IterNext { iter_front: iter.front, iter_back: iter.back, has: 0, key: -1, value: 0 }; };
+    iter.back = iter.back - 1;
+    let pair = iter.entries[iter.back];
+    return EcsEim2IterNext { iter_front: iter.front, iter_back: iter.back, has: 1, key: pair.key, value: pair.value };
+}
+
+fn ecs_eim2_into_iter_as_slice(iter: EcsEim2IntoIter) -> EcsEim2Slice {
+    let out: Vec<EcsEim2Pair> = Vec::new();
+    let i = iter.front;
+    while i < iter.back { out.push(iter.entries[i]); i = i + 1; }
+    return EcsEim2Slice { entries: out, boxed: 0 };
+}
+
+fn ecs_eim2_drain_clamped(map: EcsEim2Map, start: i64, end: i64) -> EcsEim2DrainResult {
+    let kept: Vec<EcsEim2Pair> = Vec::new();
+    let drained: Vec<EcsEim2Pair> = Vec::new();
+    let i: i64 = 0;
+    let n = len(map.entries) as i64;
+    while i < n {
+        if i >= start { if i < end { drained.push(map.entries[i]); }; };
+        if i < start { kept.push(map.entries[i]); };
+        if i >= end { kept.push(map.entries[i]); };
+        i = i + 1;
+    }
+    let out_map = EcsEim2Map { entries: kept };
+    let drain = EcsEim2Drain { entries: drained, front: 0, back: len(drained) as i64 };
+    return EcsEim2DrainResult { map: out_map, drain: drain };
+}
+
+fn ecs_eim2_drain(map: EcsEim2Map, start: i64, end: i64) -> EcsEim2DrainResult {
+    let n = len(map.entries) as i64;
+    if start <= 0 { if end >= n { return ecs_eim2_drain_clamped(map, 0, n); }; return ecs_eim2_drain_clamped(map, 0, end); };
+    if start >= n { return ecs_eim2_drain_clamped(map, n, n); };
+    if end <= start { return ecs_eim2_drain_clamped(map, start, start); };
+    if end >= n { return ecs_eim2_drain_clamped(map, start, n); };
+    return ecs_eim2_drain_clamped(map, start, end);
+}
+
+fn ecs_eim2_drain_as_slice(drain: EcsEim2Drain) -> EcsEim2Slice {
+    let out: Vec<EcsEim2Pair> = Vec::new();
+    let i = drain.front;
+    while i < drain.back { out.push(drain.entries[i]); i = i + 1; }
+    return EcsEim2Slice { entries: out, boxed: 0 };
+}
+

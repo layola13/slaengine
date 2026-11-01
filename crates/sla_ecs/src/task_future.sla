@@ -1,0 +1,139 @@
+// Bevy bevy_tasks futures/readiness helper model.
+//
+// Bevy's `now_or_never` and `check_ready` poll a Future exactly once. SLA has
+// no Rust Future/Waker runtime, so this module models the observable readiness
+// contract over explicit i32 future/task state.
+@import "thread_executor.sla"
+
+struct EcsTaskFutureI32 {
+    ready: bool,
+    value: i32,
+    canceled: bool,
+    poll_count: i64,
+}
+
+struct EcsTaskOptionI32 {
+    has: bool,
+    value: i32,
+}
+
+struct EcsTaskNowOrNeverResultI32 {
+    option: EcsTaskOptionI32,
+    canceled: bool,
+    poll_count: i64,
+}
+
+struct EcsTaskCheckReadyResultI32 {
+    future: EcsTaskFutureI32,
+    option: EcsTaskOptionI32,
+}
+
+struct EcsTaskHandlePollResultI32 {
+    ready: bool,
+    value: i32,
+}
+
+fn ecs_task_future_ready_i32(value: i32) -> EcsTaskFutureI32 {
+    return EcsTaskFutureI32 { ready: true, value: value, canceled: false, poll_count: 0 };
+}
+
+fn ecs_task_future_pending_i32(value: i32) -> EcsTaskFutureI32 {
+    return EcsTaskFutureI32 { ready: false, value: value, canceled: false, poll_count: 0 };
+}
+
+fn ecs_task_future_mark_ready_i32(future: EcsTaskFutureI32, value: i32) -> EcsTaskFutureI32 {
+    future.ready = true;
+    future.value = value;
+    future.canceled = false;
+    return future;
+}
+
+fn ecs_task_option_i32(has: bool, value: i32) -> EcsTaskOptionI32 {
+    return EcsTaskOptionI32 { has: has, value: value };
+}
+
+fn ecs_task_now_or_never_result_i32(option: EcsTaskOptionI32, canceled: bool, poll_count: i64) -> EcsTaskNowOrNeverResultI32 {
+    return EcsTaskNowOrNeverResultI32 { option: option, canceled: canceled, poll_count: poll_count };
+}
+
+fn ecs_task_check_ready_result_i32(future: EcsTaskFutureI32, option: EcsTaskOptionI32) -> EcsTaskCheckReadyResultI32 {
+    return EcsTaskCheckReadyResultI32 { future: future, option: option };
+}
+
+fn ecs_task_now_or_never_i32(future: EcsTaskFutureI32) -> EcsTaskNowOrNeverResultI32 {
+    let poll_count = future.poll_count + 1;
+    if future.ready {
+        return ecs_task_now_or_never_result_i32(ecs_task_option_i32(true, future.value), false, poll_count);
+    };
+    return ecs_task_now_or_never_result_i32(ecs_task_option_i32(false, 0), true, poll_count);
+}
+
+fn ecs_task_check_ready_i32(future: EcsTaskFutureI32) -> EcsTaskCheckReadyResultI32 {
+    future.poll_count = future.poll_count + 1;
+    if future.ready {
+        return ecs_task_check_ready_result_i32(future, ecs_task_option_i32(true, future.value));
+    };
+    return ecs_task_check_ready_result_i32(future, ecs_task_option_i32(false, 0));
+}
+
+fn ecs_task_poll_once_i32(future: EcsTaskFutureI32) -> EcsTaskCheckReadyResultI32 {
+    return ecs_task_check_ready_i32(future);
+}
+
+fn ecs_task_handle_poll_once_i32(executor: EcsThreadExecutor, task: EcsThreadTask) -> EcsTaskHandlePollResultI32 {
+    let ready = ecs_thread_task_is_finished(executor, task);
+    if ready {
+        return EcsTaskHandlePollResultI32 { ready: true, value: ecs_thread_task_value_or(executor, task, 0) };
+    };
+    return EcsTaskHandlePollResultI32 { ready: false, value: 0 };
+}
+
+@test "task now or never returns ready value"() {
+    let future = ecs_task_future_ready_i32(12);
+    let result = ecs_task_now_or_never_i32(future);
+    if result.option.has != true { panic(31410); };
+    if result.option.value != 12 { panic(31411); };
+    if result.canceled { panic(31412); };
+    if result.poll_count != 1 { panic(31413); };
+}
+
+@test "task now or never cancels pending future"() {
+    let future = ecs_task_future_pending_i32(99);
+    let result = ecs_task_now_or_never_i32(future);
+    if result.option.has { panic(31420); };
+    if result.canceled != true { panic(31421); };
+    if result.poll_count != 1 { panic(31422); };
+}
+
+@test "task check ready keeps pending future reusable"() {
+    let pending = ecs_task_future_pending_i32(0);
+    let first = ecs_task_check_ready_i32(pending);
+    if first.option.has { panic(31430); };
+    if first.future.canceled { panic(31431); };
+    if first.future.poll_count != 1 { panic(31432); };
+    let ready = ecs_task_future_mark_ready_i32(first.future, 44);
+    let second = ecs_task_check_ready_i32(ready);
+    if second.option.has != true { panic(31433); };
+    if second.option.value != 44 { panic(31434); };
+    if second.future.poll_count != 2 { panic(31435); };
+}
+
+@test "task poll once aliases check ready"() {
+    let ready = ecs_task_future_ready_i32(77);
+    let result = ecs_task_poll_once_i32(ready);
+    if result.option.has != true { panic(31440); };
+    if result.option.value != 77 { panic(31441); };
+    if result.future.poll_count != 1 { panic(31442); };
+}
+
+@test "task handle poll once observes executor tick"() {
+    let e0 = ecs_thread_executor_new(0);
+    let (e1, task) = ecs_thread_executor_spawn_value(e0, 5);
+    let before = ecs_task_handle_poll_once_i32(e1, task);
+    if before.ready { panic(31450); };
+    let ticker = ecs_thread_executor_ticker(e1, 0);
+    let tick = ecs_thread_executor_try_tick(e1, ticker);
+    let after = ecs_task_handle_poll_once_i32(tick.executor, task);
+    if after.ready != true { panic(31451); };
+    if after.value != 5 { panic(31452); };
+}

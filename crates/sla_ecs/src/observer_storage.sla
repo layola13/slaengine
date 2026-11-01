@@ -1,0 +1,210 @@
+// Bevy ECS observer storage (src/observer/centralized_storage.rs + distributed_storage.rs).
+//
+// Centralized: a single Observers catalog keyed by EventKey, with dedicated caches for
+// lifecycle events (add/insert/discard/remove/despawn) to save lookups. Each CachedObservers
+// splits observer runners by target type: global, component (ComponentId), entity (EntityHashMap).
+//
+// Distributed: each Observer is a self-contained node stored on its own entity, carrying an
+// ObserverDescriptor (components watched) + a runner. Lookup walks the per-entity local store.
+
+// === ObserverRunner (function id) ===
+// Modeled as an i64 runner id.
+
+// === CachedObservers: observers for one event, split by target ===
+struct EcsCachedObservers {
+    global_runners: Vec<i64>,                 // global observers (no target)
+    component_entities: Vec<i32>,             // ComponentId keys
+    component_runners: Vec<Vec<i64>>,         // parallel: per-component runner lists
+    entity_ids: Vec<i64>,                     // Entity keys
+    entity_runners: Vec<Vec<i64>>,            // parallel: per-entity runner lists
+}
+
+fn ecs_cached_observers_new() -> EcsCachedObservers {
+    return EcsCachedObservers { global_runners: Vec::new(), component_entities: Vec::new(), component_runners: Vec::new(), entity_ids: Vec::new(), entity_runners: Vec::new() };
+}
+
+fn ecs_cached_observers_add_global(c: EcsCachedObservers, runner: i64) -> EcsCachedObservers {
+    c.global_runners.push(runner);
+    return c;
+}
+
+fn ecs_cached_observers_add_component(c: EcsCachedObservers, component_id: i32, runner: i64) -> EcsCachedObservers {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_entities) as i64;
+    while i < n {
+        if c.component_entities[i] == component_id {
+            c.component_runners[i].push(runner);
+            return c;
+        };
+        i = i + 1;
+    }
+    c.component_entities.push(component_id);
+    let list: Vec<i64> = Vec::new();
+    list.push(runner);
+    c.component_runners.push(list);
+    return c;
+}
+
+fn ecs_cached_observers_add_entity(c: EcsCachedObservers, entity: i64, runner: i64) -> EcsCachedObservers {
+    let i: i64 = 0;
+    let n: i64 = len(c.entity_ids) as i64;
+    while i < n {
+        if c.entity_ids[i] == entity {
+            c.entity_runners[i].push(runner);
+            return c;
+        };
+        i = i + 1;
+    }
+    c.entity_ids.push(entity);
+    let list: Vec<i64> = Vec::new();
+    list.push(runner);
+    c.entity_runners.push(list);
+    return c;
+}
+
+fn ecs_cached_observers_global(c: EcsCachedObservers) -> i64 { return len(c.global_runners) as i64; }
+
+fn ecs_cached_observers_component_count(c: EcsCachedObservers) -> i64 { return len(c.component_entities) as i64; }
+
+fn ecs_cached_observers_entity_count(c: EcsCachedObservers) -> i64 { return len(c.entity_ids) as i64; }
+
+// get component runners for a component id
+fn ecs_cached_observers_component_runners(c: EcsCachedObservers, component_id: i32) -> Vec<i64> {
+    let i: i64 = 0;
+    let n: i64 = len(c.component_entities) as i64;
+    while i < n {
+        if c.component_entities[i] == component_id { return c.component_runners[i]; };
+        i = i + 1;
+    }
+    let empty: Vec<i64> = Vec::new();
+    return empty;
+}
+
+// get entity runners for an entity
+fn ecs_cached_observers_entity_runners(c: EcsCachedObservers, entity: i64) -> Vec<i64> {
+    let i: i64 = 0;
+    let n: i64 = len(c.entity_ids) as i64;
+    while i < n {
+        if c.entity_ids[i] == entity { return c.entity_runners[i]; };
+        i = i + 1;
+    }
+    let empty: Vec<i64> = Vec::new();
+    return empty;
+}
+
+// === Centralized Observers catalog (keyed by EventKey) ===
+struct EcsObserversCatalog {
+    event_keys: Vec<i64>,              // EventKey keys
+    caches: Vec<EcsCachedObservers>,   // parallel: per-event CachedObservers
+    // dedicated lifecycle caches (event_keys for add/insert/discard/remove/despawn)
+    add_cache: EcsCachedObservers,
+    insert_cache: EcsCachedObservers,
+    discard_cache: EcsCachedObservers,
+    remove_cache: EcsCachedObservers,
+    despawn_cache: EcsCachedObservers,
+}
+
+fn ecs_observers_catalog_new() -> EcsObserversCatalog {
+    return EcsObserversCatalog { event_keys: Vec::new(), caches: Vec::new(), add_cache: ecs_cached_observers_new(), insert_cache: ecs_cached_observers_new(), discard_cache: ecs_cached_observers_new(), remove_cache: ecs_cached_observers_new(), despawn_cache: ecs_cached_observers_new() };
+}
+
+// find the cache index for an event key
+fn ecs_observers_catalog_find(s: EcsObserversCatalog, event_key: i64) -> i64 {
+    let i: i64 = 0;
+    let n: i64 = len(s.event_keys) as i64;
+    while i < n {
+        if s.event_keys[i] == event_key { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// get_or_create: return mutable cache for an event key (creates if missing)
+fn ecs_observers_catalog_get_or_create(s: EcsObserversCatalog, event_key: i64) -> (EcsObserversCatalog, i64) {
+    let idx = ecs_observers_catalog_find(s, event_key);
+    if idx >= 0 { return (s, idx); };
+    s.event_keys.push(event_key);
+    s.caches.push(ecs_cached_observers_new());
+    return (s, len(s.event_keys) as i64 - 1);
+}
+
+fn ecs_observers_catalog_event_count(s: EcsObserversCatalog) -> i64 { return len(s.event_keys) as i64; }
+
+// add a global observer for an event key
+fn ecs_observers_catalog_add_global(s: EcsObserversCatalog, event_key: i64, runner: i64) -> EcsObserversCatalog {
+    let r = ecs_observers_catalog_get_or_create(s, event_key);
+    let s2 = r.0;
+    let idx = r.1;
+    s2.caches[idx] = ecs_cached_observers_add_global(s2.caches[idx], runner);
+    return s2;
+}
+
+// === Distributed: Observer node ===
+struct EcsObserverNode {
+    entity: i64,                 // the entity this observer lives on
+    runner: i64,                 // runner function id
+    descriptor_components: Vec<i32>,  // ComponentIds watched
+    descriptor_entities: Vec<i64>,    // Entities watched
+    error_handler_id: i32,
+    condition_id: i32,           // run_if condition (0 = none)
+}
+
+fn ecs_observer_node_new(entity: i64, runner: i64) -> EcsObserverNode {
+    return EcsObserverNode { entity: entity, runner: runner, descriptor_components: Vec::new(), descriptor_entities: Vec::new(), error_handler_id: 0, condition_id: 0 };
+}
+
+fn ecs_observer_node_with_entity(n: EcsObserverNode, entity: i64) -> EcsObserverNode {
+    n.descriptor_entities.push(entity);
+    return n;
+}
+
+fn ecs_observer_node_watch_entity(n: EcsObserverNode, entity: i64) -> EcsObserverNode {
+    n.descriptor_entities.push(entity);
+    return n;
+}
+
+fn ecs_observer_node_with_component(n: EcsObserverNode, component: i32) -> EcsObserverNode {
+    n.descriptor_components.push(component);
+    return n;
+}
+
+fn ecs_observer_node_with_error_handler(n: EcsObserverNode, handler: i32) -> EcsObserverNode {
+    n.error_handler_id = handler;
+    return n;
+}
+
+fn ecs_observer_node_run_if(n: EcsObserverNode, condition: i32) -> EcsObserverNode {
+    n.condition_id = condition;
+    return n;
+}
+
+fn ecs_observer_node_entity(n: EcsObserverNode) -> i64 { return n.entity; }
+fn ecs_observer_node_runner(n: EcsObserverNode) -> i64 { return n.runner; }
+fn ecs_observer_node_component_count(n: EcsObserverNode) -> i64 { return len(n.descriptor_components) as i64; }
+fn ecs_observer_node_entity_watch_count(n: EcsObserverNode) -> i64 { return len(n.descriptor_entities) as i64; }
+fn ecs_observer_node_condition(n: EcsObserverNode) -> i32 { return n.condition_id; }
+
+// === ObserverDescriptor ===
+struct EcsObserverDescriptor {
+    components: Vec<i32>,
+    entities: Vec<i64>,
+    event_kind: i32,
+}
+
+fn ecs_observer_descriptor_new(event_kind: i32) -> EcsObserverDescriptor {
+    return EcsObserverDescriptor { components: Vec::new(), entities: Vec::new(), event_kind: event_kind };
+}
+
+fn ecs_observer_descriptor_with_components(d: EcsObserverDescriptor, components: Vec<i32>) -> EcsObserverDescriptor {
+    d.components = components;
+    return d;
+}
+
+fn ecs_observer_descriptor_with_entities(d: EcsObserverDescriptor, entities: Vec<i64>) -> EcsObserverDescriptor {
+    d.entities = entities;
+    return d;
+}
+
+fn ecs_observer_descriptor_component_count(d: EcsObserverDescriptor) -> i64 { return len(d.components) as i64; }
+fn ecs_observer_descriptor_entity_count(d: EcsObserverDescriptor) -> i64 { return len(d.entities) as i64; }
+fn ecs_observer_descriptor_event_kind(d: EcsObserverDescriptor) -> i32 { return d.event_kind; }

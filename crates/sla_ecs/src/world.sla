@@ -1,0 +1,328 @@
+// Reusable fixed-capacity World owner.
+// This is the first Bevy-shaped owner layer over the generic primitives:
+// entities, two component stores, one resource slot, one message queue, and
+// added/changed ticks for query filters.
+@import "entity.sla"
+@import "store.sla"
+@import "resource.sla"
+@import "messages.sla"
+
+struct World<A, B, R, M> {
+    entities: EntityAllocator,
+    a_components: ComponentStore<A>,
+    b_components: ComponentStore<B>,
+    resource: ResourceSlot<R>,
+    messages: Messages<M>,
+    change_tick: i32,
+    a_added_ticks: [i32; 16],
+    a_changed_ticks: [i32; 16],
+    b_added_ticks: [i32; 16],
+    b_changed_ticks: [i32; 16],
+}
+
+struct WorldPairItem<A, B> {
+    entity: Entity,
+    a_slot: i64,
+    b_slot: i64,
+    a: A,
+    b: B,
+}
+
+struct WorldPairQuery<A, B> {
+    count: i64,
+    items: [WorldPairItem<A, B>; 16],
+}
+
+fn world_new<A, B, R, M>(default_a: A, default_b: B, default_r: R, default_m: M) -> World<A, B, R, M> {
+    return World<A, B, R, M> {
+        entities: allocator_new(),
+        a_components: store_new<A>(default_a),
+        b_components: store_new<B>(default_b),
+        resource: resource_slot_new<R>(default_r),
+        messages: messages_new<M>(default_m),
+        change_tick: 1,
+        a_added_ticks: [0; 16],
+        a_changed_ticks: [0; 16],
+        b_added_ticks: [0; 16],
+        b_changed_ticks: [0; 16],
+    };
+}
+
+fn world_increment_tick<A, B, R, M>(world: World<A, B, R, M>) -> World<A, B, R, M> {
+    world.change_tick = world.change_tick + 1;
+    return world;
+}
+
+fn world_spawn<A, B, R, M>(world: World<A, B, R, M>) -> (World<A, B, R, M>, Entity) {
+    let (allocator, entity) = alloc_entity(world.entities);
+    world.entities = allocator;
+    return (world, entity);
+}
+
+fn world_is_alive<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> bool {
+    return is_alive(world.entities, entity);
+}
+
+fn world_insert_a<A, B, R, M>(world: World<A, B, R, M>, entity: Entity, value: A) -> World<A, B, R, M> {
+    if world_is_alive<A, B, R, M>(world, entity) != true { panic(7001); };
+    let slot = store_slot_of<A>(world.a_components, entity.id);
+    if slot >= 0 {
+        world.a_components = store_write<A>(world.a_components, slot, value);
+        world.a_changed_ticks[slot] = world.change_tick;
+        return world;
+    };
+    let new_slot = world.a_components.count;
+    world.a_components = store_insert<A>(world.a_components, entity.id, value);
+    world.a_added_ticks[new_slot] = world.change_tick;
+    world.a_changed_ticks[new_slot] = world.change_tick;
+    return world;
+}
+
+fn world_insert_b<A, B, R, M>(world: World<A, B, R, M>, entity: Entity, value: B) -> World<A, B, R, M> {
+    if world_is_alive<A, B, R, M>(world, entity) != true { panic(7002); };
+    let slot = store_slot_of<B>(world.b_components, entity.id);
+    if slot >= 0 {
+        world.b_components = store_write<B>(world.b_components, slot, value);
+        world.b_changed_ticks[slot] = world.change_tick;
+        return world;
+    };
+    let new_slot = world.b_components.count;
+    world.b_components = store_insert<B>(world.b_components, entity.id, value);
+    world.b_added_ticks[new_slot] = world.change_tick;
+    world.b_changed_ticks[new_slot] = world.change_tick;
+    return world;
+}
+
+fn world_remove_a<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> World<A, B, R, M> {
+    let slot = store_slot_of<A>(world.a_components, entity.id);
+    if slot < 0 { return world; };
+    let last = world.a_components.count - 1;
+    world.a_components = store_remove<A>(world.a_components, entity.id);
+    world.a_added_ticks[slot] = world.a_added_ticks[last];
+    world.a_changed_ticks[slot] = world.a_changed_ticks[last];
+    world.a_added_ticks[last] = 0;
+    world.a_changed_ticks[last] = 0;
+    return world;
+}
+
+fn world_remove_b<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> World<A, B, R, M> {
+    let slot = store_slot_of<B>(world.b_components, entity.id);
+    if slot < 0 { return world; };
+    let last = world.b_components.count - 1;
+    world.b_components = store_remove<B>(world.b_components, entity.id);
+    world.b_added_ticks[slot] = world.b_added_ticks[last];
+    world.b_changed_ticks[slot] = world.b_changed_ticks[last];
+    world.b_added_ticks[last] = 0;
+    world.b_changed_ticks[last] = 0;
+    return world;
+}
+
+fn world_despawn<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> World<A, B, R, M> {
+    if world_is_alive<A, B, R, M>(world, entity) != true { return world; };
+    world = world_remove_a<A, B, R, M>(world, entity);
+    world = world_remove_b<A, B, R, M>(world, entity);
+    world.entities = free_entity(world.entities, entity);
+    return world;
+}
+
+fn world_has_a<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> bool {
+    if world_is_alive<A, B, R, M>(world, entity) != true { return false; };
+    return store_has<A>(world.a_components, entity.id);
+}
+
+fn world_has_b<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> bool {
+    if world_is_alive<A, B, R, M>(world, entity) != true { return false; };
+    return store_has<B>(world.b_components, entity.id);
+}
+
+fn world_get_a<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> A {
+    if world_has_a<A, B, R, M>(world, entity) != true { panic(7003); };
+    return store_get<A>(world.a_components, entity.id);
+}
+
+fn world_get_b<A, B, R, M>(world: World<A, B, R, M>, entity: Entity) -> B {
+    if world_has_b<A, B, R, M>(world, entity) != true { panic(7004); };
+    return store_get<B>(world.b_components, entity.id);
+}
+
+fn world_write_a<A, B, R, M>(world: World<A, B, R, M>, entity: Entity, value: A) -> World<A, B, R, M> {
+    if world_has_a<A, B, R, M>(world, entity) != true { panic(7005); };
+    let slot = store_slot_of<A>(world.a_components, entity.id);
+    world.a_components = store_write<A>(world.a_components, slot, value);
+    world.a_changed_ticks[slot] = world.change_tick;
+    return world;
+}
+
+fn world_insert_resource<A, B, R, M>(world: World<A, B, R, M>, value: R) -> World<A, B, R, M> {
+    world.resource = resource_insert<R>(world.resource, value);
+    return world;
+}
+
+fn world_has_resource<A, B, R, M>(world: World<A, B, R, M>) -> bool {
+    return resource_has<R>(world.resource);
+}
+
+fn world_get_resource<A, B, R, M>(world: World<A, B, R, M>) -> R {
+    return resource_get<R>(world.resource);
+}
+
+fn world_remove_resource<A, B, R, M>(world: World<A, B, R, M>) -> World<A, B, R, M> {
+    world.resource = resource_remove<R>(world.resource);
+    return world;
+}
+
+fn world_write_message<A, B, R, M>(world: World<A, B, R, M>, value: M) -> World<A, B, R, M> {
+    world.messages = messages_write<M>(world.messages, value);
+    return world;
+}
+
+fn world_read_message<A, B, R, M>(world: World<A, B, R, M>, reader: MessageReader, default_value: M) -> MessageRead<M> {
+    return messages_read_next<M>(world.messages, reader, default_value);
+}
+
+fn world_pair_query_new<A, B>(default_a: A, default_b: B) -> WorldPairQuery<A, B> {
+    let default_item = WorldPairItem<A, B> {
+        entity: entity_placeholder(),
+        a_slot: -1,
+        b_slot: -1,
+        a: default_a,
+        b: default_b,
+    };
+    return WorldPairQuery<A, B> { count: 0, items: [default_item; 16] };
+}
+
+fn world_query_a_b<A, B, R, M>(world: World<A, B, R, M>, default_a: A, default_b: B) -> WorldPairQuery<A, B> {
+    let query = world_pair_query_new<A, B>(default_a, default_b);
+    let i: i64 = 0;
+    while i < world.a_components.count {
+        let eid = world.a_components.entity_ids[i];
+        let b_slot = store_slot_of<B>(world.b_components, eid);
+        if b_slot >= 0 {
+            let entity = entity_new(eid, world.entities.generations[eid]);
+            if world_is_alive<A, B, R, M>(world, entity) {
+                let out = query.count;
+                query.items[out] = WorldPairItem<A, B> {
+                    entity: entity,
+                    a_slot: i,
+                    b_slot: b_slot,
+                    a: world.a_components.values[i],
+                    b: world.b_components.values[b_slot],
+                };
+                query.count = out + 1;
+            };
+        };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn world_pair_write_a<A, B, R, M>(world: World<A, B, R, M>, item: WorldPairItem<A, B>, value: A) -> World<A, B, R, M> {
+    if world_is_alive<A, B, R, M>(world, item.entity) != true { return world; };
+    world.a_components = store_write<A>(world.a_components, item.a_slot, value);
+    world.a_changed_ticks[item.a_slot] = world.change_tick;
+    return world;
+}
+
+fn world_a_added_since<A, B, R, M>(world: World<A, B, R, M>, entity: Entity, tick: i32) -> bool {
+    let slot = store_slot_of<A>(world.a_components, entity.id);
+    if slot < 0 { return false; };
+    return world.a_added_ticks[slot] > tick;
+}
+
+fn world_a_changed_since<A, B, R, M>(world: World<A, B, R, M>, entity: Entity, tick: i32) -> bool {
+    let slot = store_slot_of<A>(world.a_components, entity.id);
+    if slot < 0 { return false; };
+    return world.a_changed_ticks[slot] > tick;
+}
+
+struct WorldPos {
+    x: i32,
+    y: i32,
+}
+
+struct WorldVel {
+    x: i32,
+    y: i32,
+}
+
+struct WorldTime {
+    tick: i32,
+}
+
+struct WorldDamage {
+    amount: i32,
+}
+
+fn world_pos_default() -> WorldPos { return WorldPos { x: 0, y: 0 }; }
+fn world_vel_default() -> WorldVel { return WorldVel { x: 0, y: 0 }; }
+fn world_time_default() -> WorldTime { return WorldTime { tick: 0 }; }
+fn world_damage_default() -> WorldDamage { return WorldDamage { amount: 0 }; }
+
+fn test_world_new() -> World<WorldPos, WorldVel, WorldTime, WorldDamage> {
+    return world_new<WorldPos, WorldVel, WorldTime, WorldDamage>(
+        world_pos_default(),
+        world_vel_default(),
+        world_time_default(),
+        world_damage_default(),
+    );
+}
+
+@test "world spawn despawn rejects stale entity"() {
+    let w0 = test_world_new();
+    let (w1, e1) = world_spawn<WorldPos, WorldVel, WorldTime, WorldDamage>(w0);
+    if world_is_alive<WorldPos, WorldVel, WorldTime, WorldDamage>(w1, e1) != true { panic(7100); };
+    let w2 = world_despawn<WorldPos, WorldVel, WorldTime, WorldDamage>(w1, e1);
+    if world_is_alive<WorldPos, WorldVel, WorldTime, WorldDamage>(w2, e1) != false { panic(7101); };
+    let (w3, e2) = world_spawn<WorldPos, WorldVel, WorldTime, WorldDamage>(w2);
+    if e2.id != e1.id { panic(7102); };
+    if e2.gen != e1.gen + 1 { panic(7103); };
+    if world_has_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w3, e1) != false { panic(7104); };
+}
+
+@test "world insert remove components and query pair"() {
+    let w0 = test_world_new();
+    let (w1, e1) = world_spawn<WorldPos, WorldVel, WorldTime, WorldDamage>(w0);
+    let (w2, e2) = world_spawn<WorldPos, WorldVel, WorldTime, WorldDamage>(w1);
+    let w3 = world_insert_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w2, e1, WorldPos { x: 1, y: 2 });
+    let w4 = world_insert_b<WorldPos, WorldVel, WorldTime, WorldDamage>(w3, e1, WorldVel { x: 10, y: 20 });
+    let w5 = world_insert_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w4, e2, WorldPos { x: 5, y: 6 });
+    let q = world_query_a_b<WorldPos, WorldVel, WorldTime, WorldDamage>(w5, world_pos_default(), world_vel_default());
+    if q.count != 1 { panic(7110); };
+    if q.items[0].entity.id != e1.id { panic(7111); };
+    if q.items[0].a.x != 1 { panic(7112); };
+    if q.items[0].b.x != 10 { panic(7113); };
+    let w6 = world_remove_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w5, e1);
+    if world_has_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w6, e1) != false { panic(7114); };
+}
+
+@test "world pair writeback marks changed tick"() {
+    let w0 = test_world_new();
+    let (w1, e1) = world_spawn<WorldPos, WorldVel, WorldTime, WorldDamage>(w0);
+    let w2 = world_insert_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w1, e1, WorldPos { x: 1, y: 2 });
+    let w3 = world_insert_b<WorldPos, WorldVel, WorldTime, WorldDamage>(w2, e1, WorldVel { x: 3, y: 4 });
+    let baseline = w3.change_tick;
+    let w4 = world_increment_tick<WorldPos, WorldVel, WorldTime, WorldDamage>(w3);
+    let q = world_query_a_b<WorldPos, WorldVel, WorldTime, WorldDamage>(w4, world_pos_default(), world_vel_default());
+    let moved = WorldPos { x: q.items[0].a.x + q.items[0].b.x, y: q.items[0].a.y + q.items[0].b.y };
+    let w5 = world_pair_write_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w4, q.items[0], moved);
+    let p = world_get_a<WorldPos, WorldVel, WorldTime, WorldDamage>(w5, e1);
+    if p.x != 4 { panic(7120); };
+    if p.y != 6 { panic(7121); };
+    if world_a_changed_since<WorldPos, WorldVel, WorldTime, WorldDamage>(w5, e1, baseline) != true { panic(7122); };
+    if world_a_added_since<WorldPos, WorldVel, WorldTime, WorldDamage>(w5, e1, baseline) != false { panic(7123); };
+}
+
+@test "world resource and messages are owned by world"() {
+    let w0 = test_world_new();
+    if world_has_resource<WorldPos, WorldVel, WorldTime, WorldDamage>(w0) != false { panic(7130); };
+    let w1 = world_insert_resource<WorldPos, WorldVel, WorldTime, WorldDamage>(w0, WorldTime { tick: 9 });
+    if world_has_resource<WorldPos, WorldVel, WorldTime, WorldDamage>(w1) != true { panic(7131); };
+    let t = world_get_resource<WorldPos, WorldVel, WorldTime, WorldDamage>(w1);
+    if t.tick != 9 { panic(7132); };
+    let w2 = world_write_message<WorldPos, WorldVel, WorldTime, WorldDamage>(w1, WorldDamage { amount: 5 });
+    let read = world_read_message<WorldPos, WorldVel, WorldTime, WorldDamage>(w2, message_reader_new(), world_damage_default());
+    if read.has_value != true { panic(7133); };
+    if read.value.amount != 5 { panic(7134); };
+    let w3 = world_remove_resource<WorldPos, WorldVel, WorldTime, WorldDamage>(w2);
+    if world_has_resource<WorldPos, WorldVel, WorldTime, WorldDamage>(w3) != false { panic(7135); };
+}

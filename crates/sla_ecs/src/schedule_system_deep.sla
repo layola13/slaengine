@@ -1,0 +1,320 @@
+// Deepened Bevy ECS system::schedule_system surface.
+// Mirrors src/system/schedule_system.rs: WithInputWrapper, WithInputFromWrapper,
+// ScheduleSystem alias. Inner system is a flattened state machine (flags, last_run,
+// deferred, initialize/run). Shallow lib/schedule_system.sla retained.
+
+// === flags bits (proxied from inner system) ===
+const ECS_SS_FLAG_EMPTY: i32 = 0;
+const ECS_SS_FLAG_NON_SEND: i32 = 1;
+const ECS_SS_FLAG_DEFERRED: i32 = 2;
+const ECS_SS_FLAG_EXCLUSIVE: i32 = 4;
+
+// run errors
+const ECS_SS_ERR_OK: i32 = 0;
+const ECS_SS_ERR_UNINITIALIZED: i32 = 1;
+const ECS_SS_ERR_NO_INPUT: i32 = 2; // WithInputFromWrapper missing value
+const ECS_SS_ERR_INNER: i32 = 3;
+
+// === Inner system state (what ScheduleSystem / BoxedSystem holds) ===
+struct EcsScheduleInnerSystemDeep {
+    name_id: i64,
+    flags: i32,
+    last_run: i64,
+    initialized: bool,
+    deferred: i64,
+    run_count: i64,
+    last_output: i64,
+    last_error: i32,
+    // func: maps (input_value) -> output for modeling
+    func_id: i64,
+}
+
+fn ecs_ss_inner_deep_new(name_id: i64, func_id: i64) -> EcsScheduleInnerSystemDeep {
+    return EcsScheduleInnerSystemDeep {
+        name_id: name_id,
+        flags: ECS_SS_FLAG_EMPTY,
+        last_run: 0,
+        initialized: false,
+        deferred: 0,
+        run_count: 0,
+        last_output: 0,
+        last_error: ECS_SS_ERR_OK,
+        func_id: func_id,
+    };
+}
+
+fn ecs_ss_inner_deep_name(s: EcsScheduleInnerSystemDeep) -> i64 { return s.name_id; }
+fn ecs_ss_inner_deep_flags(s: EcsScheduleInnerSystemDeep) -> i32 { return s.flags; }
+fn ecs_ss_inner_deep_last_run(s: EcsScheduleInnerSystemDeep) -> i64 { return s.last_run; }
+fn ecs_ss_inner_deep_initialized(s: EcsScheduleInnerSystemDeep) -> bool { return s.initialized; }
+fn ecs_ss_inner_deep_run_count(s: EcsScheduleInnerSystemDeep) -> i64 { return s.run_count; }
+fn ecs_ss_inner_deep_last_output(s: EcsScheduleInnerSystemDeep) -> i64 { return s.last_output; }
+fn ecs_ss_inner_deep_last_error(s: EcsScheduleInnerSystemDeep) -> i32 { return s.last_error; }
+fn ecs_ss_inner_deep_deferred(s: EcsScheduleInnerSystemDeep) -> i64 { return s.deferred; }
+
+fn ecs_ss_inner_deep_set_flags(s: EcsScheduleInnerSystemDeep, flags: i32) -> EcsScheduleInnerSystemDeep {
+    s.flags = flags;
+    return s;
+}
+
+fn ecs_ss_inner_deep_set_last_run(s: EcsScheduleInnerSystemDeep, tick: i64) -> EcsScheduleInnerSystemDeep {
+    s.last_run = tick;
+    return s;
+}
+
+fn ecs_ss_inner_deep_initialize(s: EcsScheduleInnerSystemDeep) -> EcsScheduleInnerSystemDeep {
+    s.initialized = true;
+    s.last_error = ECS_SS_ERR_OK;
+    return s;
+}
+
+// run_unsafe with mut input value: output = input + func_id (simple model)
+fn ecs_ss_inner_deep_run_unsafe(s: EcsScheduleInnerSystemDeep, input: i64) -> EcsScheduleInnerSystemDeep {
+    if s.initialized != true {
+        s.last_error = ECS_SS_ERR_UNINITIALIZED;
+        return s;
+    };
+    s.last_output = input + s.func_id;
+    s.run_count = s.run_count + 1;
+    s.last_error = ECS_SS_ERR_OK;
+    return s;
+}
+
+fn ecs_ss_inner_deep_apply_deferred(s: EcsScheduleInnerSystemDeep) -> EcsScheduleInnerSystemDeep {
+    s.deferred = 0;
+    return s;
+}
+
+fn ecs_ss_inner_deep_queue_deferred(s: EcsScheduleInnerSystemDeep, n: i64) -> EcsScheduleInnerSystemDeep {
+    s.deferred = s.deferred + n;
+    return s;
+}
+
+fn ecs_ss_inner_deep_check_change_tick(s: EcsScheduleInnerSystemDeep, check: i64) -> EcsScheduleInnerSystemDeep {
+    if (check - s.last_run) > 1000000 {
+        s.last_run = check;
+    };
+    return s;
+}
+
+// === WithInputWrapper: always has value T; In=(); forwards System to inner with &mut value ===
+struct EcsWithInputWrapperDeep {
+    inner: EcsScheduleInnerSystemDeep,
+    value: i64,
+    last_error: i32,
+}
+
+fn ecs_with_input_wrapper_deep_new(name_id: i64, func_id: i64, value: i64) -> EcsWithInputWrapperDeep {
+    return EcsWithInputWrapperDeep {
+        inner: ecs_ss_inner_deep_new(name_id, func_id),
+        value: value,
+        last_error: ECS_SS_ERR_OK,
+    };
+}
+
+fn ecs_with_input_wrapper_deep_value(w: EcsWithInputWrapperDeep) -> i64 { return w.value; }
+fn ecs_with_input_wrapper_deep_value_mut(w: EcsWithInputWrapperDeep, v: i64) -> EcsWithInputWrapperDeep {
+    w.value = v;
+    return w;
+}
+fn ecs_with_input_wrapper_deep_name(w: EcsWithInputWrapperDeep) -> i64 { return w.inner.name_id; }
+fn ecs_with_input_wrapper_deep_flags(w: EcsWithInputWrapperDeep) -> i32 { return w.inner.flags; }
+fn ecs_with_input_wrapper_deep_last_run(w: EcsWithInputWrapperDeep) -> i64 { return w.inner.last_run; }
+fn ecs_with_input_wrapper_deep_last_output(w: EcsWithInputWrapperDeep) -> i64 { return w.inner.last_output; }
+fn ecs_with_input_wrapper_deep_last_error(w: EcsWithInputWrapperDeep) -> i32 { return w.last_error; }
+fn ecs_with_input_wrapper_deep_run_count(w: EcsWithInputWrapperDeep) -> i64 { return w.inner.run_count; }
+fn ecs_with_input_wrapper_deep_initialized(w: EcsWithInputWrapperDeep) -> bool { return w.inner.initialized; }
+fn ecs_with_input_wrapper_deep_deferred(w: EcsWithInputWrapperDeep) -> i64 { return w.inner.deferred; }
+
+fn ecs_with_input_wrapper_deep_set_flags(w: EcsWithInputWrapperDeep, flags: i32) -> EcsWithInputWrapperDeep {
+    w.inner = ecs_ss_inner_deep_set_flags(w.inner, flags);
+    return w;
+}
+
+fn ecs_with_input_wrapper_deep_set_last_run(w: EcsWithInputWrapperDeep, tick: i64) -> EcsWithInputWrapperDeep {
+    w.inner = ecs_ss_inner_deep_set_last_run(w.inner, tick);
+    return w;
+}
+
+fn ecs_with_input_wrapper_deep_initialize(w: EcsWithInputWrapperDeep) -> EcsWithInputWrapperDeep {
+    w.inner = ecs_ss_inner_deep_initialize(w.inner);
+    w.last_error = ECS_SS_ERR_OK;
+    return w;
+}
+
+// run_unsafe: ignores outer input; passes &mut value to inner
+fn ecs_with_input_wrapper_deep_run_unsafe(w: EcsWithInputWrapperDeep) -> EcsWithInputWrapperDeep {
+    let inner = ecs_ss_inner_deep_run_unsafe(w.inner, w.value);
+    w.inner = inner;
+    if w.inner.last_error != ECS_SS_ERR_OK {
+        w.last_error = ECS_SS_ERR_INNER;
+        if w.inner.last_error == ECS_SS_ERR_UNINITIALIZED {
+            w.last_error = ECS_SS_ERR_UNINITIALIZED;
+        };
+    } else {
+        w.last_error = ECS_SS_ERR_OK;
+        // mutate cached value as if system wrote through &mut T: value = last_output
+        w.value = w.inner.last_output;
+    };
+    return w;
+}
+
+fn ecs_with_input_wrapper_deep_apply_deferred(w: EcsWithInputWrapperDeep) -> EcsWithInputWrapperDeep {
+    w.inner = ecs_ss_inner_deep_apply_deferred(w.inner);
+    return w;
+}
+
+fn ecs_with_input_wrapper_deep_queue_deferred(w: EcsWithInputWrapperDeep, n: i64) -> EcsWithInputWrapperDeep {
+    w.inner = ecs_ss_inner_deep_queue_deferred(w.inner, n);
+    return w;
+}
+
+fn ecs_with_input_wrapper_deep_check_change_tick(w: EcsWithInputWrapperDeep, check: i64) -> EcsWithInputWrapperDeep {
+    w.inner = ecs_ss_inner_deep_check_change_tick(w.inner, check);
+    return w;
+}
+
+// === WithInputFromWrapper: Option<T> from FromWorld on initialize ===
+struct EcsWithInputFromWrapperDeep {
+    inner: EcsScheduleInnerSystemDeep,
+    has_value: bool,
+    value: i64,
+    from_world_seed: i64, // T::from_world modeled as seed
+    last_error: i32,
+}
+
+fn ecs_with_input_from_wrapper_deep_new(name_id: i64, func_id: i64, from_world_seed: i64) -> EcsWithInputFromWrapperDeep {
+    return EcsWithInputFromWrapperDeep {
+        inner: ecs_ss_inner_deep_new(name_id, func_id),
+        has_value: false,
+        value: 0,
+        from_world_seed: from_world_seed,
+        last_error: ECS_SS_ERR_OK,
+    };
+}
+
+fn ecs_with_input_from_wrapper_deep_has_value(w: EcsWithInputFromWrapperDeep) -> bool { return w.has_value; }
+fn ecs_with_input_from_wrapper_deep_value(w: EcsWithInputFromWrapperDeep) -> (bool, i64) {
+    return (w.has_value, w.value);
+}
+fn ecs_with_input_from_wrapper_deep_value_mut(w: EcsWithInputFromWrapperDeep, v: i64) -> EcsWithInputFromWrapperDeep {
+    if w.has_value {
+        w.value = v;
+    };
+    return w;
+}
+fn ecs_with_input_from_wrapper_deep_name(w: EcsWithInputFromWrapperDeep) -> i64 { return w.inner.name_id; }
+fn ecs_with_input_from_wrapper_deep_flags(w: EcsWithInputFromWrapperDeep) -> i32 { return w.inner.flags; }
+fn ecs_with_input_from_wrapper_deep_last_run(w: EcsWithInputFromWrapperDeep) -> i64 { return w.inner.last_run; }
+fn ecs_with_input_from_wrapper_deep_last_output(w: EcsWithInputFromWrapperDeep) -> i64 { return w.inner.last_output; }
+fn ecs_with_input_from_wrapper_deep_last_error(w: EcsWithInputFromWrapperDeep) -> i32 { return w.last_error; }
+fn ecs_with_input_from_wrapper_deep_run_count(w: EcsWithInputFromWrapperDeep) -> i64 { return w.inner.run_count; }
+fn ecs_with_input_from_wrapper_deep_initialized(w: EcsWithInputFromWrapperDeep) -> bool { return w.inner.initialized; }
+fn ecs_with_input_from_wrapper_deep_deferred(w: EcsWithInputFromWrapperDeep) -> i64 { return w.inner.deferred; }
+
+fn ecs_with_input_from_wrapper_deep_set_flags(w: EcsWithInputFromWrapperDeep, flags: i32) -> EcsWithInputFromWrapperDeep {
+    w.inner = ecs_ss_inner_deep_set_flags(w.inner, flags);
+    return w;
+}
+
+fn ecs_with_input_from_wrapper_deep_set_last_run(w: EcsWithInputFromWrapperDeep, tick: i64) -> EcsWithInputFromWrapperDeep {
+    w.inner = ecs_ss_inner_deep_set_last_run(w.inner, tick);
+    return w;
+}
+
+// initialize: if value None, FromWorld; then inner.initialize
+fn ecs_with_input_from_wrapper_deep_initialize(w: EcsWithInputFromWrapperDeep) -> EcsWithInputFromWrapperDeep {
+    if w.has_value != true {
+        w.value = w.from_world_seed;
+        w.has_value = true;
+    };
+    w.inner = ecs_ss_inner_deep_initialize(w.inner);
+    w.last_error = ECS_SS_ERR_OK;
+    return w;
+}
+
+// run_unsafe expects value present (panic/expect in Bevy)
+fn ecs_with_input_from_wrapper_deep_run_unsafe(w: EcsWithInputFromWrapperDeep) -> EcsWithInputFromWrapperDeep {
+    if w.has_value != true {
+        w.last_error = ECS_SS_ERR_NO_INPUT;
+        return w;
+    };
+    let inner = ecs_ss_inner_deep_run_unsafe(w.inner, w.value);
+    w.inner = inner;
+    if w.inner.last_error != ECS_SS_ERR_OK {
+        w.last_error = ECS_SS_ERR_INNER;
+        if w.inner.last_error == ECS_SS_ERR_UNINITIALIZED {
+            w.last_error = ECS_SS_ERR_UNINITIALIZED;
+        };
+    } else {
+        w.last_error = ECS_SS_ERR_OK;
+        w.value = w.inner.last_output;
+    };
+    return w;
+}
+
+fn ecs_with_input_from_wrapper_deep_apply_deferred(w: EcsWithInputFromWrapperDeep) -> EcsWithInputFromWrapperDeep {
+    w.inner = ecs_ss_inner_deep_apply_deferred(w.inner);
+    return w;
+}
+
+fn ecs_with_input_from_wrapper_deep_queue_deferred(w: EcsWithInputFromWrapperDeep, n: i64) -> EcsWithInputFromWrapperDeep {
+    w.inner = ecs_ss_inner_deep_queue_deferred(w.inner, n);
+    return w;
+}
+
+fn ecs_with_input_from_wrapper_deep_check_change_tick(w: EcsWithInputFromWrapperDeep, check: i64) -> EcsWithInputFromWrapperDeep {
+    w.inner = ecs_ss_inner_deep_check_change_tick(w.inner, check);
+    return w;
+}
+
+// re-initialize does not overwrite existing value
+fn ecs_with_input_from_wrapper_deep_reinitialize(w: EcsWithInputFromWrapperDeep) -> EcsWithInputFromWrapperDeep {
+    // has_value stays; only ensure initialized
+    w.inner = ecs_ss_inner_deep_initialize(w.inner);
+    w.last_error = ECS_SS_ERR_OK;
+    return w;
+}
+
+// === ScheduleSystem type alias surface ===
+// ScheduleSystem = BoxedSystem<(), ()> — opaque handle for schedule storage
+struct EcsScheduleSystemDeep {
+    system_id: i64,
+    name_id: i64,
+    initialized: bool,
+    run_count: i64,
+}
+
+fn ecs_schedule_system_deep_new(system_id: i64, name_id: i64) -> EcsScheduleSystemDeep {
+    return EcsScheduleSystemDeep {
+        system_id: system_id,
+        name_id: name_id,
+        initialized: false,
+        run_count: 0,
+    };
+}
+
+fn ecs_schedule_system_deep_id(s: EcsScheduleSystemDeep) -> i64 { return s.system_id; }
+fn ecs_schedule_system_deep_name(s: EcsScheduleSystemDeep) -> i64 { return s.name_id; }
+fn ecs_schedule_system_deep_initialized(s: EcsScheduleSystemDeep) -> bool { return s.initialized; }
+fn ecs_schedule_system_deep_run_count(s: EcsScheduleSystemDeep) -> i64 { return s.run_count; }
+
+fn ecs_schedule_system_deep_initialize(s: EcsScheduleSystemDeep) -> EcsScheduleSystemDeep {
+    s.initialized = true;
+    return s;
+}
+
+fn ecs_schedule_system_deep_run(s: EcsScheduleSystemDeep) -> EcsScheduleSystemDeep {
+    if s.initialized != true { return s; };
+    s.run_count = s.run_count + 1;
+    return s;
+}
+
+// IntoSystem::with_input / with_input_from facades
+fn ecs_into_system_with_input_deep(name_id: i64, func_id: i64, value: i64) -> EcsWithInputWrapperDeep {
+    return ecs_with_input_wrapper_deep_new(name_id, func_id, value);
+}
+
+fn ecs_into_system_with_input_from_deep(name_id: i64, func_id: i64, seed: i64) -> EcsWithInputFromWrapperDeep {
+    return ecs_with_input_from_wrapper_deep_new(name_id, func_id, seed);
+}

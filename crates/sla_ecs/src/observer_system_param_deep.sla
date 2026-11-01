@@ -1,0 +1,316 @@
+// Deepened Bevy ECS observer system param surface.
+// Mirrors src/observer/system_param.rs:
+//   On<'w,'t,E,B> { observer, event, trigger, trigger_context }
+//   event_key / event / event_mut / event_ptr / trigger / trigger_mut
+//   observer / caller
+//   original_event_target / propagate / get_propagate (PropagateEntityTrigger)
+//   TriggerContext { event_key, caller }
+//   Bundle specialization B: match any component interest
+// Shallow lib/observer_system_param.sla retained.
+
+// === Trigger kinds ===
+const ECS_OSP_TRIGGER_GLOBAL: i32 = 0;
+const ECS_OSP_TRIGGER_ENTITY: i32 = 1;
+const ECS_OSP_TRIGGER_PROPAGATE: i32 = 2;
+
+// === EventKey stand-in ===
+struct EcsOspEventKeyDeep {
+    id: i64,
+}
+
+fn ecs_osp_event_key_new(id: i64) -> EcsOspEventKeyDeep {
+    return EcsOspEventKeyDeep { id: id };
+}
+
+fn ecs_osp_event_key_id(k: EcsOspEventKeyDeep) -> i64 { return k.id; }
+
+fn ecs_osp_event_key_eq(a: EcsOspEventKeyDeep, b: EcsOspEventKeyDeep) -> bool {
+    return a.id == b.id;
+}
+
+// === TriggerContext ===
+// Bevy: pub struct TriggerContext { pub event_key: EventKey, pub caller: MaybeLocation }
+struct EcsOspTriggerContextDeep {
+    event_key: i64,
+    caller: i64, // MaybeLocation id; 0 = none
+    has_caller: bool,
+}
+
+fn ecs_osp_ctx_new(event_key: i64, caller: i64, has_caller: bool) -> EcsOspTriggerContextDeep {
+    return EcsOspTriggerContextDeep {
+        event_key: event_key,
+        caller: caller,
+        has_caller: has_caller,
+    };
+}
+
+fn ecs_osp_ctx_event_key(c: EcsOspTriggerContextDeep) -> i64 { return c.event_key; }
+fn ecs_osp_ctx_caller(c: EcsOspTriggerContextDeep) -> i64 { return c.caller; }
+fn ecs_osp_ctx_has_caller(c: EcsOspTriggerContextDeep) -> bool { return c.has_caller; }
+
+// === Trigger payload (E::Trigger<'t>) ===
+// Global: no entity target
+// Entity: event_target
+// Propagate: event_target + original_event_target + propagate flag + auto_propagate default
+struct EcsOspTriggerDeep {
+    kind: i32,
+    event_target: i64,
+    original_event_target: i64,
+    propagate: bool,
+    auto_propagate: bool,
+}
+
+fn ecs_osp_trigger_global() -> EcsOspTriggerDeep {
+    return EcsOspTriggerDeep {
+        kind: ECS_OSP_TRIGGER_GLOBAL,
+        event_target: 0,
+        original_event_target: 0,
+        propagate: false,
+        auto_propagate: false,
+    };
+}
+
+fn ecs_osp_trigger_entity(target: i64) -> EcsOspTriggerDeep {
+    return EcsOspTriggerDeep {
+        kind: ECS_OSP_TRIGGER_ENTITY,
+        event_target: target,
+        original_event_target: target,
+        propagate: false,
+        auto_propagate: false,
+    };
+}
+
+fn ecs_osp_trigger_propagate(target: i64, auto_propagate: bool) -> EcsOspTriggerDeep {
+    return EcsOspTriggerDeep {
+        kind: ECS_OSP_TRIGGER_PROPAGATE,
+        event_target: target,
+        original_event_target: target,
+        propagate: auto_propagate,
+        auto_propagate: auto_propagate,
+    };
+}
+
+fn ecs_osp_trigger_kind(t: EcsOspTriggerDeep) -> i32 { return t.kind; }
+fn ecs_osp_trigger_event_target(t: EcsOspTriggerDeep) -> i64 { return t.event_target; }
+fn ecs_osp_trigger_original(t: EcsOspTriggerDeep) -> i64 { return t.original_event_target; }
+fn ecs_osp_trigger_get_propagate(t: EcsOspTriggerDeep) -> bool { return t.propagate; }
+fn ecs_osp_trigger_auto_propagate(t: EcsOspTriggerDeep) -> bool { return t.auto_propagate; }
+
+fn ecs_osp_trigger_set_propagate(t: EcsOspTriggerDeep, should: bool) -> EcsOspTriggerDeep {
+    t.propagate = should;
+    return t;
+}
+
+// Advance propagation to next entity in traversal (keeps original_event_target)
+fn ecs_osp_trigger_advance(t: EcsOspTriggerDeep, next_target: i64) -> EcsOspTriggerDeep {
+    t.event_target = next_target;
+    return t;
+}
+
+// === Bundle interest (B: Bundle) ===
+// Bevy: observer fires if event matches ANY component in B (not all).
+// Up to 4 component interest ids; empty = unrestricted.
+struct EcsOspBundleInterestDeep {
+    c0: i32,
+    c1: i32,
+    c2: i32,
+    c3: i32,
+    len: i32,
+}
+
+fn ecs_osp_bundle_empty() -> EcsOspBundleInterestDeep {
+    return EcsOspBundleInterestDeep { c0: 0, c1: 0, c2: 0, c3: 0, len: 0 };
+}
+
+fn ecs_osp_bundle_one(c: i32) -> EcsOspBundleInterestDeep {
+    return EcsOspBundleInterestDeep { c0: c, c1: 0, c2: 0, c3: 0, len: 1 };
+}
+
+fn ecs_osp_bundle_two(a: i32, b: i32) -> EcsOspBundleInterestDeep {
+    return EcsOspBundleInterestDeep { c0: a, c1: b, c2: 0, c3: 0, len: 2 };
+}
+
+fn ecs_osp_bundle_push(b: EcsOspBundleInterestDeep, c: i32) -> EcsOspBundleInterestDeep {
+    if b.len >= 4 { return b; };
+    if b.len == 0 { b.c0 = c; };
+    if b.len == 1 { b.c1 = c; };
+    if b.len == 2 { b.c2 = c; };
+    if b.len == 3 { b.c3 = c; };
+    b.len = b.len + 1;
+    return b;
+}
+
+fn ecs_osp_bundle_len(b: EcsOspBundleInterestDeep) -> i32 { return b.len; }
+
+fn ecs_osp_bundle_matches_any(b: EcsOspBundleInterestDeep, component_id: i32) -> bool {
+    // empty B matches all (Bevy default B = ())
+    if b.len == 0 { return true; };
+    if b.len >= 1 {
+        if b.c0 == component_id { return true; };
+    };
+    if b.len >= 2 {
+        if b.c1 == component_id { return true; };
+    };
+    if b.len >= 3 {
+        if b.c2 == component_id { return true; };
+    };
+    if b.len >= 4 {
+        if b.c3 == component_id { return true; };
+    };
+    return false;
+}
+
+// === On system param ===
+// SAFETY WARNING in Bevy: never expose 'w lifetime externally — we model owned snapshot.
+struct EcsOspOnDeep {
+    observer: i64,
+    event_value: i64,
+    event_ptr_id: i64, // stand-in for Ptr
+    trigger: EcsOspTriggerDeep,
+    ctx: EcsOspTriggerContextDeep,
+    bundle: EcsOspBundleInterestDeep,
+    // specialized event component id for lifecycle-like events (Add/Insert/...)
+    event_component: i32,
+}
+
+fn ecs_osp_on_new(
+    event_value: i64,
+    observer: i64,
+    trigger: EcsOspTriggerDeep,
+    ctx: EcsOspTriggerContextDeep
+) -> EcsOspOnDeep {
+    return EcsOspOnDeep {
+        observer: observer,
+        event_value: event_value,
+        event_ptr_id: event_value, // ptr identity ~ event value for model
+        trigger: trigger,
+        ctx: ctx,
+        bundle: ecs_osp_bundle_empty(),
+        event_component: 0,
+    };
+}
+
+fn ecs_osp_on_with_bundle(o: EcsOspOnDeep, bundle: EcsOspBundleInterestDeep) -> EcsOspOnDeep {
+    o.bundle = bundle;
+    return o;
+}
+
+fn ecs_osp_on_with_event_component(o: EcsOspOnDeep, component_id: i32) -> EcsOspOnDeep {
+    o.event_component = component_id;
+    return o;
+}
+
+// Bevy On::event_key
+fn ecs_osp_on_event_key(o: EcsOspOnDeep) -> i64 {
+    return o.ctx.event_key;
+}
+
+// Bevy On::event / Deref
+fn ecs_osp_on_event(o: EcsOspOnDeep) -> i64 {
+    return o.event_value;
+}
+
+// Bevy On::event_mut / DerefMut
+fn ecs_osp_on_event_mut(o: EcsOspOnDeep, new_value: i64) -> EcsOspOnDeep {
+    o.event_value = new_value;
+    // ptr identity stays (same slot); value changes
+    return o;
+}
+
+// Bevy On::event_ptr
+fn ecs_osp_on_event_ptr(o: EcsOspOnDeep) -> i64 {
+    return o.event_ptr_id;
+}
+
+// Bevy On::trigger / trigger_mut accessors
+fn ecs_osp_on_trigger(o: EcsOspOnDeep) -> EcsOspTriggerDeep {
+    return o.trigger;
+}
+
+fn ecs_osp_on_trigger_mut(o: EcsOspOnDeep, t: EcsOspTriggerDeep) -> EcsOspOnDeep {
+    o.trigger = t;
+    return o;
+}
+
+// Bevy On::observer
+fn ecs_osp_on_observer(o: EcsOspOnDeep) -> i64 {
+    return o.observer;
+}
+
+// Bevy On::caller
+fn ecs_osp_on_caller(o: EcsOspOnDeep) -> i64 {
+    return o.ctx.caller;
+}
+
+fn ecs_osp_on_has_caller(o: EcsOspOnDeep) -> bool {
+    return o.ctx.has_caller;
+}
+
+// Bevy On::original_event_target (PropagateEntityTrigger only meaningfully)
+fn ecs_osp_on_original_event_target(o: EcsOspOnDeep) -> i64 {
+    return o.trigger.original_event_target;
+}
+
+// Bevy On::propagate / get_propagate
+fn ecs_osp_on_propagate(o: EcsOspOnDeep, should: bool) -> EcsOspOnDeep {
+    o.trigger = ecs_osp_trigger_set_propagate(o.trigger, should);
+    return o;
+}
+
+fn ecs_osp_on_get_propagate(o: EcsOspOnDeep) -> bool {
+    return o.trigger.propagate;
+}
+
+// Current event target after possible propagation steps
+fn ecs_osp_on_event_target(o: EcsOspOnDeep) -> i64 {
+    return o.trigger.event_target;
+}
+
+fn ecs_osp_on_advance(o: EcsOspOnDeep, next_target: i64) -> EcsOspOnDeep {
+    o.trigger = ecs_osp_trigger_advance(o.trigger, next_target);
+    return o;
+}
+
+// Should this On fire for a given event component? any-of B match.
+fn ecs_osp_on_should_trigger(o: EcsOspOnDeep, event_component: i32) -> bool {
+    return ecs_osp_bundle_matches_any(o.bundle, event_component);
+}
+
+// Convenience: build a full On for propagate entity event
+fn ecs_osp_on_propagate_new(
+    event_value: i64,
+    observer: i64,
+    target: i64,
+    event_key: i64,
+    caller: i64,
+    auto_propagate: bool
+) -> EcsOspOnDeep {
+    let t = ecs_osp_trigger_propagate(target, auto_propagate);
+    let c = ecs_osp_ctx_new(event_key, caller, true);
+    return ecs_osp_on_new(event_value, observer, t, c);
+}
+
+// Display/debug stand-in: packs key + observer + target
+fn ecs_osp_on_display_code(o: EcsOspOnDeep) -> i64 {
+    let base: i64 = 5000000000;
+    return base + o.ctx.event_key * 1000000 + o.observer * 1000 + o.trigger.event_target;
+}
+
+// Observer run model: read On, optionally mutate event + propagate, return updated On
+fn ecs_osp_run_observer(
+    o: EcsOspOnDeep,
+    mutate_event_to: i64,
+    set_propagate: bool,
+    do_set_propagate: bool
+) -> EcsOspOnDeep {
+    o = ecs_osp_on_event_mut(o, mutate_event_to);
+    if do_set_propagate {
+        o = ecs_osp_on_propagate(o, set_propagate);
+    };
+    return o;
+}
+
+// Kind constant accessors
+fn ecs_osp_kind_global() -> i32 { return ECS_OSP_TRIGGER_GLOBAL; }
+fn ecs_osp_kind_entity() -> i32 { return ECS_OSP_TRIGGER_ENTITY; }
+fn ecs_osp_kind_propagate() -> i32 { return ECS_OSP_TRIGGER_PROPAGATE; }

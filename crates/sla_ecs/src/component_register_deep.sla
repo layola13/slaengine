@@ -1,0 +1,460 @@
+// Deepened Bevy ECS component registration surface.
+// Mirrors src/component/register.rs:
+//   ComponentIds peek/next/len
+//   ComponentsRegistrator register_component/resource/non_send/with_descriptor
+//   ComponentsQueuedRegistrator queue_* + apply_queued_registrations
+//   type_id dedup for static registrations
+// Shallow lib/component_register.sla retained.
+// Fixed capacity: 8 registered components, 4 queued ops, 8 type mappings.
+
+// kind: 0=component, 1=resource, 2=non_send, 3=descriptor
+fn ecs_cr_kind_component() -> i32 { return 0; }
+fn ecs_cr_kind_resource() -> i32 { return 1; }
+fn ecs_cr_kind_non_send() -> i32 { return 2; }
+fn ecs_cr_kind_descriptor() -> i32 { return 3; }
+
+// storage: 0=table, 1=sparse
+fn ecs_cr_storage_table() -> i32 { return 0; }
+fn ecs_cr_storage_sparse() -> i32 { return 1; }
+
+struct EcsCrIds {
+    next_id: i32,
+}
+
+fn ecs_cr_ids_new(start: i32) -> EcsCrIds {
+    return EcsCrIds { next_id: start };
+}
+
+fn ecs_cr_ids_peek(ids: EcsCrIds) -> i32 { return ids.next_id; }
+fn ecs_cr_ids_len(ids: EcsCrIds) -> i32 { return ids.next_id; }
+fn ecs_cr_ids_is_empty(ids: EcsCrIds) -> bool {
+    if ids.next_id == 0 { return true; };
+    return false;
+}
+
+fn ecs_cr_ids_next(ids: EcsCrIds) -> (EcsCrIds, i32) {
+    let id = ids.next_id;
+    return (EcsCrIds { next_id: id + 1 }, id);
+}
+
+// Registered entry
+struct EcsCrEntry {
+    id: i32,
+    type_id: i64, // -1 if dynamic/no type
+    kind: i32,
+    storage_type: i32,
+    is_send: bool,
+    name_id: i64,
+}
+
+fn ecs_cr_entry_empty() -> EcsCrEntry {
+    return EcsCrEntry {
+        id: -1, type_id: -1, kind: -1, storage_type: 0, is_send: true, name_id: 0,
+    };
+}
+
+// Queued op
+struct EcsCrQueued {
+    type_id: i64,
+    kind: i32,
+    storage_type: i32,
+    is_send: bool,
+    name_id: i64,
+    assigned_id: i32,
+}
+
+fn ecs_cr_queued_empty() -> EcsCrQueued {
+    return EcsCrQueued {
+        type_id: -1, kind: -1, storage_type: 0, is_send: true, name_id: 0, assigned_id: -1,
+    };
+}
+
+struct EcsCrDeep {
+    ids: EcsCrIds,
+    // registered components
+    len: i32,
+    e0: EcsCrEntry, e1: EcsCrEntry, e2: EcsCrEntry, e3: EcsCrEntry,
+    e4: EcsCrEntry, e5: EcsCrEntry, e6: EcsCrEntry, e7: EcsCrEntry,
+    // type_id -> component id map (8)
+    t_len: i32,
+    t0_type: i64, t0_id: i32,
+    t1_type: i64, t1_id: i32,
+    t2_type: i64, t2_id: i32,
+    t3_type: i64, t3_id: i32,
+    t4_type: i64, t4_id: i32,
+    t5_type: i64, t5_id: i32,
+    t6_type: i64, t6_id: i32,
+    t7_type: i64, t7_id: i32,
+    // queue (4)
+    q_len: i32,
+    q0: EcsCrQueued, q1: EcsCrQueued, q2: EcsCrQueued, q3: EcsCrQueued,
+    as_queued: bool,
+}
+
+fn ecs_cr_new() -> EcsCrDeep {
+    let empty = ecs_cr_entry_empty();
+    let qe = ecs_cr_queued_empty();
+    return EcsCrDeep {
+        ids: ecs_cr_ids_new(0),
+        len: 0,
+        e0: empty, e1: empty, e2: empty, e3: empty,
+        e4: empty, e5: empty, e6: empty, e7: empty,
+        t_len: 0,
+        t0_type: -1, t0_id: -1, t1_type: -1, t1_id: -1,
+        t2_type: -1, t2_id: -1, t3_type: -1, t3_id: -1,
+        t4_type: -1, t4_id: -1, t5_type: -1, t5_id: -1,
+        t6_type: -1, t6_id: -1, t7_type: -1, t7_id: -1,
+        q_len: 0, q0: qe, q1: qe, q2: qe, q3: qe,
+        as_queued: false,
+    };
+}
+
+fn ecs_cr_len(c: EcsCrDeep) -> i32 { return c.len; }
+fn ecs_cr_num_queued(c: EcsCrDeep) -> i32 { return c.q_len; }
+fn ecs_cr_any_queued(c: EcsCrDeep) -> bool {
+    if c.q_len > 0 { return true; };
+    return false;
+}
+fn ecs_cr_peek(c: EcsCrDeep) -> i32 { return ecs_cr_ids_peek(c.ids); }
+fn ecs_cr_is_as_queued(c: EcsCrDeep) -> bool { return c.as_queued; }
+
+fn ecs_cr_as_queued(c: EcsCrDeep) -> EcsCrDeep {
+    return EcsCrDeep {
+        ids: c.ids, len: c.len,
+        e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+        t_len: c.t_len,
+        t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+        t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+        t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id,
+        t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+        q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3,
+        as_queued: true,
+    };
+}
+
+fn ecs_cr_get_type_id(c: EcsCrDeep, type_id: i64) -> (bool, i32) {
+    if c.t_len >= 1 { if c.t0_type == type_id { return (true, c.t0_id); }; };
+    if c.t_len >= 2 { if c.t1_type == type_id { return (true, c.t1_id); }; };
+    if c.t_len >= 3 { if c.t2_type == type_id { return (true, c.t2_id); }; };
+    if c.t_len >= 4 { if c.t3_type == type_id { return (true, c.t3_id); }; };
+    if c.t_len >= 5 { if c.t4_type == type_id { return (true, c.t4_id); }; };
+    if c.t_len >= 6 { if c.t5_type == type_id { return (true, c.t5_id); }; };
+    if c.t_len >= 7 { if c.t6_type == type_id { return (true, c.t6_id); }; };
+    if c.t_len >= 8 { if c.t7_type == type_id { return (true, c.t7_id); }; };
+    return (false, -1);
+}
+
+fn ecs_cr_map_type(c: EcsCrDeep, type_id: i64, id: i32) -> EcsCrDeep {
+    if c.t_len >= 8 { return c; };
+    if c.t_len == 0 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: 1, t0_type: type_id, t0_id: id,
+            t1_type: c.t1_type, t1_id: c.t1_id, t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if c.t_len == 1 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: 2, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: type_id, t1_id: id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if c.t_len == 2 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: 3, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id, t2_type: type_id, t2_id: id,
+            t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if c.t_len == 3 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: 4, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id, t2_type: c.t2_type, t2_id: c.t2_id,
+            t3_type: type_id, t3_id: id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    return c;
+}
+
+fn ecs_cr_set_entry(c: EcsCrDeep, idx: i32, e: EcsCrEntry) -> EcsCrDeep {
+    if idx == 0 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: e, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if idx == 1 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: e, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if idx == 2 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: e, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if idx == 3 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: e, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    return c;
+}
+
+fn ecs_cr_get_entry(c: EcsCrDeep, idx: i32) -> EcsCrEntry {
+    if idx == 0 { return c.e0; };
+    if idx == 1 { return c.e1; };
+    if idx == 2 { return c.e2; };
+    if idx == 3 { return c.e3; };
+    if idx == 4 { return c.e4; };
+    if idx == 5 { return c.e5; };
+    if idx == 6 { return c.e6; };
+    if idx == 7 { return c.e7; };
+    return ecs_cr_entry_empty();
+}
+
+fn ecs_cr_push_entry(c: EcsCrDeep, e: EcsCrEntry) -> EcsCrDeep {
+    if c.len >= 4 { return c; }; // active capacity 4 for set_entry helpers
+    let idx = c.len;
+    let c2 = ecs_cr_set_entry(c, idx, e);
+    return EcsCrDeep {
+        ids: c2.ids, len: idx + 1,
+        e0: c2.e0, e1: c2.e1, e2: c2.e2, e3: c2.e3, e4: c2.e4, e5: c2.e5, e6: c2.e6, e7: c2.e7,
+        t_len: c2.t_len, t0_type: c2.t0_type, t0_id: c2.t0_id, t1_type: c2.t1_type, t1_id: c2.t1_id,
+        t2_type: c2.t2_type, t2_id: c2.t2_id, t3_type: c2.t3_type, t3_id: c2.t3_id,
+        t4_type: c2.t4_type, t4_id: c2.t4_id, t5_type: c2.t5_type, t5_id: c2.t5_id, t6_type: c2.t6_type, t6_id: c2.t6_id, t7_type: c2.t7_type, t7_id: c2.t7_id,
+        q_len: c2.q_len, q0: c2.q0, q1: c2.q1, q2: c2.q2, q3: c2.q3, as_queued: c2.as_queued,
+    };
+}
+
+fn ecs_cr_with_ids(c: EcsCrDeep, ids: EcsCrIds) -> EcsCrDeep {
+    return EcsCrDeep {
+        ids: ids, len: c.len,
+        e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+        t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+        t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+        t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+        q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+    };
+}
+
+// Immediate register by type (dedup)
+fn ecs_cr_register(c: EcsCrDeep, type_id: i64, kind: i32, storage_type: i32, is_send: bool, name_id: i64) -> (EcsCrDeep, i32) {
+    if type_id >= 0 {
+        let existing = ecs_cr_get_type_id(c, type_id);
+        if existing.0 == true {
+            return (c, existing.1);
+        };
+    };
+    let nr = ecs_cr_ids_next(c.ids);
+    let c2 = ecs_cr_with_ids(c, nr.0);
+    let id = nr.1;
+    let e = EcsCrEntry {
+        id: id, type_id: type_id, kind: kind, storage_type: storage_type, is_send: is_send, name_id: name_id,
+    };
+    c2 = ecs_cr_push_entry(c2, e);
+    if type_id >= 0 {
+        c2 = ecs_cr_map_type(c2, type_id, id);
+    };
+    return (c2, id);
+}
+
+fn ecs_cr_register_component(c: EcsCrDeep, type_id: i64, name_id: i64, storage_type: i32) -> (EcsCrDeep, i32) {
+    return ecs_cr_register(c, type_id, ecs_cr_kind_component(), storage_type, true, name_id);
+}
+
+fn ecs_cr_register_resource(c: EcsCrDeep, type_id: i64, name_id: i64) -> (EcsCrDeep, i32) {
+    // resources always table storage + send
+    return ecs_cr_register(c, type_id, ecs_cr_kind_resource(), ecs_cr_storage_table(), true, name_id);
+}
+
+fn ecs_cr_register_non_send(c: EcsCrDeep, type_id: i64, name_id: i64, storage_type: i32) -> (EcsCrDeep, i32) {
+    return ecs_cr_register(c, type_id, ecs_cr_kind_non_send(), storage_type, false, name_id);
+}
+
+fn ecs_cr_register_with_descriptor(c: EcsCrDeep, storage_type: i32, is_resource: bool, name_id: i64) -> (EcsCrDeep, i32) {
+    let kind = ecs_cr_kind_descriptor();
+    if is_resource {
+        kind = ecs_cr_kind_resource();
+    };
+    return ecs_cr_register(c, -1, kind, storage_type, true, name_id);
+}
+
+fn ecs_cr_get(c: EcsCrDeep, id: i32) -> (bool, EcsCrEntry) {
+    if c.len >= 1 { if c.e0.id == id { return (true, c.e0); }; };
+    if c.len >= 2 { if c.e1.id == id { return (true, c.e1); }; };
+    if c.len >= 3 { if c.e2.id == id { return (true, c.e2); }; };
+    if c.len >= 4 { if c.e3.id == id { return (true, c.e3); }; };
+    return (false, ecs_cr_entry_empty());
+}
+
+fn ecs_cr_entry_kind(e: EcsCrEntry) -> i32 { return e.kind; }
+fn ecs_cr_entry_storage(e: EcsCrEntry) -> i32 { return e.storage_type; }
+fn ecs_cr_entry_is_send(e: EcsCrEntry) -> bool { return e.is_send; }
+fn ecs_cr_entry_name(e: EcsCrEntry) -> i64 { return e.name_id; }
+fn ecs_cr_entry_id(e: EcsCrEntry) -> i32 { return e.id; }
+
+// Queue helpers
+fn ecs_cr_set_queued(c: EcsCrDeep, idx: i32, q: EcsCrQueued) -> EcsCrDeep {
+    if idx == 0 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: q, q1: c.q1, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if idx == 1 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: q, q2: c.q2, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if idx == 2 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: q, q3: c.q3, as_queued: c.as_queued,
+        };
+    };
+    if idx == 3 {
+        return EcsCrDeep {
+            ids: c.ids, len: c.len, e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7,
+            t_len: c.t_len, t0_type: c.t0_type, t0_id: c.t0_id, t1_type: c.t1_type, t1_id: c.t1_id,
+            t2_type: c.t2_type, t2_id: c.t2_id, t3_type: c.t3_type, t3_id: c.t3_id,
+            t4_type: c.t4_type, t4_id: c.t4_id, t5_type: c.t5_type, t5_id: c.t5_id, t6_type: c.t6_type, t6_id: c.t6_id, t7_type: c.t7_type, t7_id: c.t7_id,
+            q_len: c.q_len, q0: c.q0, q1: c.q1, q2: c.q2, q3: q, as_queued: c.as_queued,
+        };
+    };
+    return c;
+}
+
+fn ecs_cr_queue_register(c: EcsCrDeep, type_id: i64, kind: i32, storage_type: i32, is_send: bool, name_id: i64) -> (EcsCrDeep, i32) {
+    // if already registered, return existing without queueing
+    if type_id >= 0 {
+        let existing = ecs_cr_get_type_id(c, type_id);
+        if existing.0 == true {
+            return (c, existing.1);
+        };
+    };
+    // check already queued for same type
+    if type_id >= 0 {
+        if c.q_len >= 1 { if c.q0.type_id == type_id { return (c, c.q0.assigned_id); }; };
+        if c.q_len >= 2 { if c.q1.type_id == type_id { return (c, c.q1.assigned_id); }; };
+        if c.q_len >= 3 { if c.q2.type_id == type_id { return (c, c.q2.assigned_id); }; };
+        if c.q_len >= 4 { if c.q3.type_id == type_id { return (c, c.q3.assigned_id); }; };
+    };
+    if c.q_len >= 4 { return (c, -1); };
+    let nr = ecs_cr_ids_next(c.ids);
+    let c2 = ecs_cr_with_ids(c, nr.0);
+    let id = nr.1;
+    let q = EcsCrQueued {
+        type_id: type_id, kind: kind, storage_type: storage_type, is_send: is_send, name_id: name_id, assigned_id: id,
+    };
+    let idx = c2.q_len;
+    c2 = ecs_cr_set_queued(c2, idx, q);
+    c2 = EcsCrDeep {
+        ids: c2.ids, len: c2.len,
+        e0: c2.e0, e1: c2.e1, e2: c2.e2, e3: c2.e3, e4: c2.e4, e5: c2.e5, e6: c2.e6, e7: c2.e7,
+        t_len: c2.t_len, t0_type: c2.t0_type, t0_id: c2.t0_id, t1_type: c2.t1_type, t1_id: c2.t1_id,
+        t2_type: c2.t2_type, t2_id: c2.t2_id, t3_type: c2.t3_type, t3_id: c2.t3_id,
+        t4_type: c2.t4_type, t4_id: c2.t4_id, t5_type: c2.t5_type, t5_id: c2.t5_id, t6_type: c2.t6_type, t6_id: c2.t6_id, t7_type: c2.t7_type, t7_id: c2.t7_id,
+        q_len: idx + 1, q0: c2.q0, q1: c2.q1, q2: c2.q2, q3: c2.q3, as_queued: c2.as_queued,
+    };
+    return (c2, id);
+}
+
+fn ecs_cr_queue_register_component(c: EcsCrDeep, type_id: i64, name_id: i64) -> (EcsCrDeep, i32) {
+    return ecs_cr_queue_register(c, type_id, ecs_cr_kind_component(), ecs_cr_storage_table(), true, name_id);
+}
+
+fn ecs_cr_queue_register_resource(c: EcsCrDeep, type_id: i64, name_id: i64) -> (EcsCrDeep, i32) {
+    return ecs_cr_queue_register(c, type_id, ecs_cr_kind_resource(), ecs_cr_storage_table(), true, name_id);
+}
+
+fn ecs_cr_queue_register_non_send(c: EcsCrDeep, type_id: i64, name_id: i64) -> (EcsCrDeep, i32) {
+    return ecs_cr_queue_register(c, type_id, ecs_cr_kind_non_send(), ecs_cr_storage_table(), false, name_id);
+}
+
+// apply one queued op
+fn ecs_cr_apply_one(c: EcsCrDeep, q: EcsCrQueued) -> EcsCrDeep {
+    // if already present by type, skip push but keep id mapping
+    if q.type_id >= 0 {
+        let existing = ecs_cr_get_type_id(c, q.type_id);
+        if existing.0 == true {
+            return c;
+        };
+    };
+    let e = EcsCrEntry {
+        id: q.assigned_id, type_id: q.type_id, kind: q.kind,
+        storage_type: q.storage_type, is_send: q.is_send, name_id: q.name_id,
+    };
+    let c2 = ecs_cr_push_entry(c, e);
+    if q.type_id >= 0 {
+        c2 = ecs_cr_map_type(c2, q.type_id, q.assigned_id);
+    };
+    return c2;
+}
+
+fn ecs_cr_apply_queued(c: EcsCrDeep) -> EcsCrDeep {
+    let qlen = c.q_len;
+    if qlen == 0 { return c; };
+    // Capture queued ops before moving c through apply_one chain.
+    let q0 = c.q0;
+    let q1 = c.q1;
+    let q2 = c.q2;
+    let q3 = c.q3;
+    let as_queued = c.as_queued;
+    let c2 = c;
+    if qlen >= 1 {
+        c2 = ecs_cr_apply_one(c2, q0);
+    };
+    if qlen >= 2 {
+        c2 = ecs_cr_apply_one(c2, q1);
+    };
+    if qlen >= 3 {
+        c2 = ecs_cr_apply_one(c2, q2);
+    };
+    if qlen >= 4 {
+        c2 = ecs_cr_apply_one(c2, q3);
+    };
+    let qe = ecs_cr_queued_empty();
+    return EcsCrDeep {
+        ids: c2.ids, len: c2.len,
+        e0: c2.e0, e1: c2.e1, e2: c2.e2, e3: c2.e3, e4: c2.e4, e5: c2.e5, e6: c2.e6, e7: c2.e7,
+        t_len: c2.t_len, t0_type: c2.t0_type, t0_id: c2.t0_id, t1_type: c2.t1_type, t1_id: c2.t1_id,
+        t2_type: c2.t2_type, t2_id: c2.t2_id, t3_type: c2.t3_type, t3_id: c2.t3_id,
+        t4_type: c2.t4_type, t4_id: c2.t4_id, t5_type: c2.t5_type, t5_id: c2.t5_id, t6_type: c2.t6_type, t6_id: c2.t6_id, t7_type: c2.t7_type, t7_id: c2.t7_id,
+        q_len: 0, q0: qe, q1: qe, q2: qe, q3: qe, as_queued: as_queued,
+    };
+}

@@ -1,0 +1,437 @@
+// Bevy ECS query/access.rs set-operations + AccessConflicts + FilteredAccess matches_* gaps —
+// union/intersection/union_with/intersect_with/extend/is_disjoint/is_clear/is_empty/iter/get_conflicts +
+// AccessConflicts {All,Individual} + FilteredAccess matches_everything/matches_nothing/extend_access.
+// Mirrors src/query/access.rs (gaps not in lib/query_access.sla).
+
+// === ComponentIdSet-equivalent ===
+struct EcsComponentSet {
+    ids: Vec<i32>,
+    inverted: bool,
+}
+
+fn ecs_cset_new() -> EcsComponentSet {
+    let s = EcsComponentSet { ids: Vec::new(), inverted: false };
+    return s;
+}
+
+fn ecs_cset_inverted() -> EcsComponentSet {
+    let s = EcsComponentSet { ids: Vec::new(), inverted: true };
+    return s;
+}
+
+fn ecs_cset_insert(s: EcsComponentSet, id: i32) -> EcsComponentSet {
+    let n: i32 = len(s.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if s.ids[i] == id { return s; }; i = i + 1; }
+    s.ids.push(id);
+    return s;
+}
+
+fn ecs_cset_contains(s: EcsComponentSet, id: i32) -> bool {
+    let n: i32 = len(s.ids) as i32;
+    let i: i32 = 0;
+    let present: bool = false;
+    while i < n { if s.ids[i] == id { present = true; }; i = i + 1; }
+    if s.inverted {
+        return !present;
+    };
+    return present;
+}
+
+fn ecs_cset_len(s: EcsComponentSet) -> i32 {
+    return len(s.ids) as i32;
+}
+
+fn ecs_cset_is_clear(s: EcsComponentSet) -> bool {
+    if s.inverted { return false; };
+    return len(s.ids) == 0;
+}
+
+fn ecs_cset_is_empty(s: EcsComponentSet) -> bool {
+    return ecs_cset_is_clear(s);
+}
+
+// iter(id) returns the id at i, or -1 for end-of-set.
+fn ecs_cset_at(s: EcsComponentSet, i: i32) -> i32 {
+    let n: i32 = len(s.ids) as i32;
+    if i < 0 || i >= n { return -1; };
+    return s.ids[i];
+}
+
+// is_subset: all elements of self are in other. inverted semantics simplified to direct membership only.
+fn ecs_cset_is_subset(self: EcsComponentSet, other: EcsComponentSet) -> bool {
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if !ecs_cset_contains(other, self.ids[i]) { return false; }; i = i + 1; }
+    return true;
+}
+
+// union: returns a new set with every id in self or other (no inversion semantics for the result).
+fn ecs_cset_union(self: EcsComponentSet, other: EcsComponentSet) -> EcsComponentSet {
+    let r = ecs_cset_new();
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { r.ids.push(self.ids[i]); i = i + 1; }
+    let m: i32 = len(other.ids) as i32;
+    let j: i32 = 0;
+    while j < m { r = ecs_cset_insert(r, other.ids[j]); j = j + 1; }
+    return r;
+}
+
+// intersection: ids present in both self and other (membership test uses each set's own inverted rule).
+fn ecs_cset_intersection(self: EcsComponentSet, other: EcsComponentSet) -> EcsComponentSet {
+    let r = ecs_cset_new();
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if ecs_cset_contains(other, self.ids[i]) { r.ids.push(self.ids[i]); }; i = i + 1; }
+    return r;
+}
+
+// difference: ids in self that are not in other.
+fn ecs_cset_difference(self: EcsComponentSet, other: EcsComponentSet) -> EcsComponentSet {
+    let r = ecs_cset_new();
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if !ecs_cset_contains(other, self.ids[i]) { r.ids.push(self.ids[i]); }; i = i + 1; }
+    return r;
+}
+
+// union_with: in-place union (mutates self, returns it).
+fn ecs_cset_union_with(self: EcsComponentSet, other: EcsComponentSet) -> EcsComponentSet {
+    let m: i32 = len(other.ids) as i32;
+    let j: i32 = 0;
+    while j < m { self = ecs_cset_insert(self, other.ids[j]); j = j + 1; }
+    return self;
+}
+
+// intersect_with: in-place intersection.
+fn ecs_cset_intersect_with(self: EcsComponentSet, other: EcsComponentSet) -> EcsComponentSet {
+    let kept = Vec::new();
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if ecs_cset_contains(other, self.ids[i]) { kept.push(self.ids[i]); }; i = i + 1; }
+    self.ids = kept;
+    return self;
+}
+
+// is_disjoint: no shared ids between self and other.
+fn ecs_cset_is_disjoint(self: EcsComponentSet, other: EcsComponentSet) -> bool {
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if ecs_cset_contains(other, self.ids[i]) { return false; }; i = i + 1; }
+    return true;
+}
+
+// === AccessConflicts ===
+struct EcsAccessConflicts {
+    // 0 = Individual (with ids), 1 = All
+    kind: i32,
+    ids: Vec<i32>,
+}
+
+// individual-conflict sentinel: returns a result struct with ids=[]
+fn ecs_access_conflicts_individual_empty() -> EcsAccessConflicts {
+    let c = EcsAccessConflicts { kind: 0, ids: Vec::new() };
+    return c;
+}
+
+fn ecs_access_conflicts_all() -> EcsAccessConflicts {
+    let c = EcsAccessConflicts { kind: 1, ids: Vec::new() };
+    return c;
+}
+
+fn ecs_access_conflicts_individual(ids: Vec<i32>) -> EcsAccessConflicts {
+    let c = EcsAccessConflicts { kind: 0, ids: ids };
+    return c;
+}
+
+fn ecs_access_conflicts_is_all(c: EcsAccessConflicts) -> bool {
+    return c.kind == 1;
+}
+
+fn ecs_access_conflicts_is_empty(c: EcsAccessConflicts) -> bool {
+    if c.kind == 1 { return false; };
+    return len(c.ids) == 0;
+}
+
+fn ecs_access_conflicts_count(c: EcsAccessConflicts) -> i32 {
+    if c.kind == 1 { return -1; };
+    return len(c.ids) as i32;
+}
+
+fn ecs_access_conflicts_at(c: EcsAccessConflicts, i: i32) -> i32 {
+    if c.kind == 1 { return -1; };
+    let n: i32 = len(c.ids) as i32;
+    if i < 0 || i >= n { return -1; };
+    return c.ids[i];
+}
+
+// add(other) into self matching Bevy's `Self::add(&mut self, other: &Self)`: All beats Individual, Individual extends ids.
+fn ecs_access_conflicts_add(self: EcsAccessConflicts, other: EcsAccessConflicts) -> EcsAccessConflicts {
+    if other.kind == 1 {
+        self.kind = 1;
+        self.ids = Vec::new();
+        return self;
+    };
+    if self.kind == 1 {
+        return self;
+    };
+    // both Individual: extend ids
+    let m: i32 = len(other.ids) as i32;
+    let j: i32 = 0;
+    while j < m { self = _access_conflicts_push_unique(self, other.ids[j]); j = j + 1; }
+    return self;
+}
+
+fn _access_conflicts_push_unique(self: EcsAccessConflicts, id: i32) -> EcsAccessConflicts {
+    let n: i32 = len(self.ids) as i32;
+    let i: i32 = 0;
+    while i < n { if self.ids[i] == id { return self; }; i = i + 1; }
+    self.ids.push(id);
+    return self;
+}
+
+// === Access get_conflicts ===
+struct EcsAccessOps {
+    reads: Vec<i32>,
+    writes: Vec<i32>,
+}
+
+fn ecs_access_ops_new() -> EcsAccessOps {
+    let a = EcsAccessOps { reads: Vec::new(), writes: Vec::new() };
+    return a;
+}
+
+fn ecs_access_ops_add_read(a: EcsAccessOps, id: i32) -> EcsAccessOps {
+    let n: i32 = len(a.reads) as i32;
+    let i: i32 = 0;
+    while i < n { if a.reads[i] == id { return a; }; i = i + 1; }
+    a.reads.push(id);
+    return a;
+}
+
+fn ecs_access_ops_add_write(a: EcsAccessOps, id: i32) -> EcsAccessOps {
+    let n: i32 = len(a.writes) as i32;
+    let i: i32 = 0;
+    while i < n { if a.writes[i] == id { return a; }; i = i + 1; }
+    a.writes.push(id);
+    return a;
+}
+
+fn ecs_access_ops_has_any_read(a: EcsAccessOps) -> bool {
+    return len(a.reads) > 0;
+}
+
+fn ecs_access_ops_has_any_write(a: EcsAccessOps) -> bool {
+    return len(a.writes) > 0;
+}
+
+// get_conflicts(other): a conflict is a component written by self that is read or written by other,
+// or a component written by other that is read or written by self.
+fn ecs_access_ops_get_conflicts(self: EcsAccessOps, other: EcsAccessOps) -> EcsAccessConflicts {
+    let r = ecs_access_conflicts_individual_empty();
+    // self.writes ∩ (other.reads ∪ other.writes)
+    let n: i32 = len(self.writes) as i32;
+    let i: i32 = 0;
+    while i < n {
+        let wid = self.writes[i];
+        if _access_ops_has_read_or_write(other, wid) {
+            r = _access_conflicts_push_unique(r, wid);
+        };
+        i = i + 1;
+    }
+    // other.writes ∩ (self.reads ∪ self.writes)
+    let m: i32 = len(other.writes) as i32;
+    let j: i32 = 0;
+    while j < m {
+        let wid = other.writes[j];
+        if _access_ops_has_read_or_write(self, wid) {
+            r = _access_conflicts_push_unique(r, wid);
+        };
+        j = j + 1;
+    }
+    return r;
+}
+
+fn _access_ops_has_read_or_write(a: EcsAccessOps, id: i32) -> bool {
+    let nr: i32 = len(a.reads) as i32;
+    let i: i32 = 0;
+    while i < nr { if a.reads[i] == id { return true; }; i = i + 1; }
+    let nw: i32 = len(a.writes) as i32;
+    let j: i32 = 0;
+    while j < nw { if a.writes[j] == id { return true; }; j = j + 1; }
+    return false;
+}
+
+// extend(other): union of reads and writes into self.
+fn ecs_access_ops_extend(self: EcsAccessOps, other: EcsAccessOps) -> EcsAccessOps {
+    let nr: i32 = len(other.reads) as i32;
+    let i: i32 = 0;
+    while i < nr { self = ecs_access_ops_add_read(self, other.reads[i]); i = i + 1; }
+    let nw: i32 = len(other.writes) as i32;
+    let j: i32 = 0;
+    while j < nw { self = ecs_access_ops_add_write(self, other.writes[j]); j = j + 1; }
+    return self;
+}
+
+// intersection(other): ids present in self and other's reads (or writes) — return two sets via accessor
+struct AccessOpsIntersectionResult {
+    reads: EcsComponentSet,
+    writes: EcsComponentSet,
+}
+
+fn ecs_access_ops_intersection(self: EcsAccessOps, other: EcsAccessOps) -> AccessOpsIntersectionResult {
+    let r_reads = ecs_cset_new();
+    let r_writes = ecs_cset_new();
+    let nr: i32 = len(self.reads) as i32;
+    let i: i32 = 0;
+    let or_set = ecs_cset_new();
+    let m: i32 = len(other.reads) as i32;
+    let k: i32 = 0;
+    while k < m { or_set = ecs_cset_insert(or_set, other.reads[k]); k = k + 1; }
+    while i < nr { if ecs_cset_contains(or_set, self.reads[i]) { r_reads = ecs_cset_insert(r_reads, self.reads[i]); }; i = i + 1; }
+    let nw: i32 = len(self.writes) as i32;
+    let j: i32 = 0;
+    let ow_set = ecs_cset_new();
+    let m2: i32 = len(other.writes) as i32;
+    let k2: i32 = 0;
+    while k2 < m2 { ow_set = ecs_cset_insert(ow_set, other.writes[k2]); k2 = k2 + 1; }
+    while j < nw { if ecs_cset_contains(ow_set, self.writes[j]) { r_writes = ecs_cset_insert(r_writes, self.writes[j]); }; j = j + 1; }
+    let r = AccessOpsIntersectionResult { reads: r_reads, writes: r_writes };
+    return r;
+}
+
+fn ecs_access_ops_intersection_reads(r: AccessOpsIntersectionResult) -> EcsComponentSet {
+    return r.reads;
+}
+
+fn ecs_access_ops_intersection_writes(r: AccessOpsIntersectionResult) -> EcsComponentSet {
+    return r.writes;
+}
+
+// union(other): the same as extend, but yields a fresh AccessOps (read+write union).
+fn ecs_access_ops_union(self: EcsAccessOps, other: EcsAccessOps) -> EcsAccessOps {
+    return ecs_access_ops_extend(self, other);
+}
+
+// remove_conflicting_access(other): drop from self.reads any id written by other; drop from self.writes any id read or written by other.
+fn ecs_access_ops_remove_conflicting_access(self: EcsAccessOps, other: EcsAccessOps) -> EcsAccessOps {
+    let kept_reads = Vec::new();
+    let nr: i32 = len(self.reads) as i32;
+    let i: i32 = 0;
+    while i < nr { if !_access_ops_has_write(other, self.reads[i]) { kept_reads.push(self.reads[i]); }; i = i + 1; }
+    self.reads = kept_reads;
+    let kept_writes = Vec::new();
+    let nw: i32 = len(self.writes) as i32;
+    let j: i32 = 0;
+    while j < nw { if !_access_ops_has_read_or_write(other, self.writes[j]) { kept_writes.push(self.writes[j]); }; j = j + 1; }
+    self.writes = kept_writes;
+    return self;
+}
+
+fn _access_ops_has_write(a: EcsAccessOps, id: i32) -> bool {
+    let nw: i32 = len(a.writes) as i32;
+    let i: i32 = 0;
+    while i < nw { if a.writes[i] == id { return true; }; i = i + 1; }
+    return false;
+}
+
+fn ecs_access_ops_reads_count(a: EcsAccessOps) -> i32 {
+    return len(a.reads) as i32;
+}
+
+fn ecs_access_ops_writes_count(a: EcsAccessOps) -> i32 {
+    return len(a.writes) as i32;
+}
+
+fn ecs_access_ops_read_at(a: EcsAccessOps, i: i32) -> i32 {
+    return a.reads[i];
+}
+
+fn ecs_access_ops_write_at(a: EcsAccessOps, i: i32) -> i32 {
+    return a.writes[i];
+}
+
+// === FilteredAccess ===
+struct EcsFilteredAccess {
+    access: EcsAccessOps,
+    required: EcsComponentSet,
+    filter_sets: i32,
+}
+
+fn ecs_filtered_access_new() -> EcsFilteredAccess {
+    let fa = EcsFilteredAccess { access: ecs_access_ops_new(), required: ecs_cset_new(), filter_sets: 1 };
+    return fa;
+}
+
+// matches_everything: empty access + a single empty filter set (= TRUE)
+fn ecs_filtered_access_matches_everything() -> EcsFilteredAccess {
+    let fa = EcsFilteredAccess { access: ecs_access_ops_new(), required: ecs_cset_new(), filter_sets: 1 };
+    return fa;
+}
+
+fn ecs_filtered_access_filter_set_count(fa: EcsFilteredAccess) -> i32 {
+    return fa.filter_sets;
+}
+
+// matches_nothing: empty access + zero filter sets (= FALSE)
+fn ecs_filtered_access_matches_nothing() -> EcsFilteredAccess {
+    let fa = EcsFilteredAccess { access: ecs_access_ops_new(), required: ecs_cset_new(), filter_sets: 0 };
+    return fa;
+}
+
+fn ecs_filtered_access_is_matching_everything(fa: EcsFilteredAccess) -> bool {
+    return fa.filter_sets == 1;
+}
+
+fn ecs_filtered_access_is_matching_nothing(fa: EcsFilteredAccess) -> bool {
+    return fa.filter_sets == 0;
+}
+
+fn ecs_filtered_access_access(fa: EcsFilteredAccess) -> EcsAccessOps {
+    return fa.access;
+}
+
+// get_conflicts(other): delegates to Access ops get_conflicts.
+fn ecs_filtered_access_get_conflicts(fa: EcsFilteredAccess, other: EcsFilteredAccess) -> EcsAccessConflicts {
+    return ecs_access_ops_get_conflicts(fa.access, other.access);
+}
+
+fn ecs_filtered_access_add_read(fa: EcsFilteredAccess, id: i32) -> EcsFilteredAccess {
+    fa.access = ecs_access_ops_add_read(fa.access, id);
+    return fa;
+}
+
+fn ecs_filtered_access_add_write(fa: EcsFilteredAccess, id: i32) -> EcsFilteredAccess {
+    fa.access = ecs_access_ops_add_write(fa.access, id);
+    return fa;
+}
+
+// extend_access(other): merges other's access into mine and unions the required.
+fn ecs_filtered_access_extend_access(fa: EcsFilteredAccess, other: EcsFilteredAccess) -> EcsFilteredAccess {
+    fa.access = ecs_access_ops_extend(fa.access, other.access);
+    fa.required = ecs_cset_union_with(fa.required, other.required);
+    return fa;
+}
+
+// is_disjoint(other): true if the underlying accesses share no read/write ids.
+fn ecs_filtered_access_is_disjoint(fa: EcsFilteredAccess, other: EcsFilteredAccess) -> bool {
+    let reads_set = ecs_cset_new();
+    let nr: i32 = len(fa.access.reads) as i32;
+    let i: i32 = 0;
+    while i < nr { reads_set = ecs_cset_insert(reads_set, fa.access.reads[i]); i = i + 1; }
+    let or_set = ecs_cset_new();
+    let m: i32 = len(other.access.reads) as i32;
+    let k: i32 = 0;
+    while k < m { or_set = ecs_cset_insert(or_set, other.access.reads[k]); k = k + 1; }
+    if !ecs_cset_is_disjoint(reads_set, or_set) { return false; };
+    let ws_set = ecs_cset_new();
+    let nw: i32 = len(fa.access.writes) as i32;
+    let j: i32 = 0;
+    while j < nw { ws_set = ecs_cset_insert(ws_set, fa.access.writes[j]); j = j + 1; }
+    let ow_set = ecs_cset_new();
+    let m2: i32 = len(other.access.writes) as i32;
+    let k2: i32 = 0;
+    while k2 < m2 { ow_set = ecs_cset_insert(ow_set, other.access.writes[k2]); k2 = k2 + 1; }
+    return ecs_cset_is_disjoint(ws_set, ow_set);
+}

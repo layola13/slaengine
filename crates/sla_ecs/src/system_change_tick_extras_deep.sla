@@ -1,0 +1,141 @@
+// Deepened Bevy ECS SystemChangeTick + ParamSet + Deferred + If.
+// Mirrors src/system/system_param.rs residual surface.
+// Fixed ParamSet capacity: 4 slots. Shallow lib/system_change_tick_extras.sla retained.
+
+struct EcsSctDeep {
+    this_run: i64,
+    last_run: i64,
+}
+
+fn ecs_sct_deep_new(this_run: i64, last_run: i64) -> EcsSctDeep {
+    return EcsSctDeep { this_run: this_run, last_run: last_run };
+}
+
+fn ecs_sct_deep_this_run(t: EcsSctDeep) -> i64 { return t.this_run; }
+fn ecs_sct_deep_last_run(t: EcsSctDeep) -> i64 { return t.last_run; }
+
+fn ecs_sct_deep_set_this(t: EcsSctDeep, this_run: i64) -> EcsSctDeep {
+    return EcsSctDeep { this_run: this_run, last_run: t.last_run };
+}
+
+fn ecs_sct_deep_set_last(t: EcsSctDeep, last_run: i64) -> EcsSctDeep {
+    return EcsSctDeep { this_run: t.this_run, last_run: last_run };
+}
+
+fn ecs_sct_deep_advance(t: EcsSctDeep, new_this: i64) -> EcsSctDeep {
+    return EcsSctDeep { this_run: new_this, last_run: t.this_run };
+}
+
+fn ecs_sct_deep_changed_since_last(t: EcsSctDeep, component_tick: i64) -> bool {
+    // changed if component_tick is newer than last_run (simple int compare)
+    return component_tick > t.last_run;
+}
+
+// ParamSet: 4 slots + active mut index (-1 free)
+struct EcsPsDeep {
+    s0: i64, s1: i64, s2: i64, s3: i64,
+    len: i32,
+    active: i32,
+}
+
+fn ecs_ps_deep_new() -> EcsPsDeep {
+    return EcsPsDeep { s0: 0, s1: 0, s2: 0, s3: 0, len: 0, active: 0 - 1 };
+}
+
+fn ecs_ps_deep_from4(a: i64, b: i64, c: i64, d: i64, len: i32) -> EcsPsDeep {
+    return EcsPsDeep { s0: a, s1: b, s2: c, s3: d, len: len, active: 0 - 1 };
+}
+
+fn ecs_ps_deep_len(p: EcsPsDeep) -> i32 { return p.len; }
+fn ecs_ps_deep_is_empty(p: EcsPsDeep) -> bool { return p.len == 0; }
+fn ecs_ps_deep_active(p: EcsPsDeep) -> i32 { return p.active; }
+
+fn ecs_ps_deep_rebuild(s0: i64, s1: i64, s2: i64, s3: i64, len: i32, active: i32) -> EcsPsDeep {
+    return EcsPsDeep { s0: s0, s1: s1, s2: s2, s3: s3, len: len, active: active };
+}
+
+fn ecs_ps_deep_push(p: EcsPsDeep, value: i64) -> EcsPsDeep {
+    if p.len == 0 { return ecs_ps_deep_rebuild(value, p.s1, p.s2, p.s3, 1, p.active); };
+    if p.len == 1 { return ecs_ps_deep_rebuild(p.s0, value, p.s2, p.s3, 2, p.active); };
+    if p.len == 2 { return ecs_ps_deep_rebuild(p.s0, p.s1, value, p.s3, 3, p.active); };
+    if p.len == 3 { return ecs_ps_deep_rebuild(p.s0, p.s1, p.s2, value, 4, p.active); };
+    return p;
+}
+
+fn ecs_ps_deep_slot(p: EcsPsDeep, idx: i32) -> i64 {
+    if idx == 0 { return p.s0; };
+    if idx == 1 { return p.s1; };
+    if idx == 2 { return p.s2; };
+    if idx == 3 { return p.s3; };
+    return 0 - 1;
+}
+
+struct EcsPsGetDeep {
+    ok: bool,
+    value: i64,
+    active: i32,
+    conflict: bool,
+}
+
+fn ecs_ps_get_ok(g: EcsPsGetDeep) -> bool { return g.ok; }
+fn ecs_ps_get_value(g: EcsPsGetDeep) -> i64 { return g.value; }
+fn ecs_ps_get_active(g: EcsPsGetDeep) -> i32 { return g.active; }
+fn ecs_ps_get_conflict(g: EcsPsGetDeep) -> bool { return g.conflict; }
+
+fn ecs_ps_deep_get_mut(p: EcsPsDeep, index: i32) -> EcsPsGetDeep {
+    if index < 0 { return EcsPsGetDeep { ok: false, value: 0 - 1, active: 0 - 1, conflict: false }; };
+    if index >= p.len { return EcsPsGetDeep { ok: false, value: 0 - 1, active: 0 - 1, conflict: false }; };
+    if p.active == index {
+        return EcsPsGetDeep { ok: false, value: 0 - 2, active: index, conflict: true };
+    };
+    let val = ecs_ps_deep_slot(p, index);
+    return EcsPsGetDeep { ok: true, value: val, active: index, conflict: false };
+}
+
+// apply get_mut active state into set
+fn ecs_ps_deep_with_active(p: EcsPsDeep, active: i32) -> EcsPsDeep {
+    return ecs_ps_deep_rebuild(p.s0, p.s1, p.s2, p.s3, p.len, active);
+}
+
+fn ecs_ps_deep_release(p: EcsPsDeep) -> EcsPsDeep {
+    return ecs_ps_deep_rebuild(p.s0, p.s1, p.s2, p.s3, p.len, 0 - 1);
+}
+
+fn ecs_ps_deep_for_each_count(p: EcsPsDeep) -> i32 { return p.len; }
+
+// Deferred
+struct EcsDefDeep {
+    buffer_state: i64,
+}
+
+fn ecs_def_deep_new(state: i64) -> EcsDefDeep {
+    return EcsDefDeep { buffer_state: state };
+}
+
+fn ecs_def_deep_state(d: EcsDefDeep) -> i64 { return d.buffer_state; }
+
+fn ecs_def_deep_push(d: EcsDefDeep, delta: i64) -> EcsDefDeep {
+    return EcsDefDeep { buffer_state: d.buffer_state + delta };
+}
+
+fn ecs_def_deep_reborrow(d: EcsDefDeep) -> EcsDefDeep {
+    return EcsDefDeep { buffer_state: d.buffer_state };
+}
+
+// If gate
+struct EcsIfDeep {
+    enabled: bool,
+    value: i64,
+}
+
+fn ecs_if_deep_new(enabled: bool, value: i64) -> EcsIfDeep {
+    return EcsIfDeep { enabled: enabled, value: value };
+}
+
+fn ecs_if_deep_enabled(i: EcsIfDeep) -> bool { return i.enabled; }
+fn ecs_if_deep_value(i: EcsIfDeep) -> i64 { return i.value; }
+
+fn ecs_if_deep_get(i: EcsIfDeep) -> i64 {
+    if i.enabled != true { return 0; };
+    return i.value;
+}

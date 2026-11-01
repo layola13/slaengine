@@ -1,0 +1,320 @@
+// Additional Bevy ECS EntityIndexSet bound/inner/set-operation iterator extras.
+// Complements entity_index_set_extras.sla with Bound ranges, unsafe conversion flags,
+// iterator into_inner models, boxed-slice owning iteration, set-op iterators, and splice.
+
+struct EcsEis3Set { items: Vec<i64> }
+struct EcsEis3Slice { items: Vec<i64>, boxed: i32, mutable_view: i32, inner_view: i32 }
+struct EcsEis3Bound { kind: i32, value: i64 }
+struct EcsEis3InnerInfo { len: i64, boxed: i32, mutable_view: i32, inner_view: i32 }
+struct EcsEis3RangeResult { has: i32, slice: EcsEis3Slice }
+struct EcsEis3InsertResult { inserted: i32, set: EcsEis3Set }
+struct EcsEis3Iter { items: Vec<i64>, front: i64, back: i64, trusted_unique: i32, inner_exposed: i32 }
+struct EcsEis3IntoIter { items: Vec<i64>, front: i64, back: i64, trusted_unique: i32, inner_exposed: i32 }
+struct EcsEis3Drain { items: Vec<i64>, front: i64, back: i64, trusted_unique: i32, inner_exposed: i32 }
+struct EcsEis3OpIter { items: Vec<i64>, front: i64, back: i64, trusted_unique: i32, op_kind: i32 }
+struct EcsEis3IterNext { iter: EcsEis3Iter, has: i32, value: i64 }
+struct EcsEis3IntoIterNext { iter: EcsEis3IntoIter, has: i32, value: i64 }
+struct EcsEis3DrainNext { drain: EcsEis3Drain, has: i32, value: i64 }
+struct EcsEis3OpIterNext { iter: EcsEis3OpIter, has: i32, value: i64 }
+struct EcsEis3DrainResult { set: EcsEis3Set, drain: EcsEis3Drain }
+struct EcsEis3SpliceResult { set: EcsEis3Set, removed: EcsEis3OpIter }
+
+fn ecs_eis3_bound_unbounded() -> EcsEis3Bound { return EcsEis3Bound { kind: 0, value: 0 }; }
+fn ecs_eis3_bound_included(value: i64) -> EcsEis3Bound { return EcsEis3Bound { kind: 1, value: value }; }
+fn ecs_eis3_bound_excluded(value: i64) -> EcsEis3Bound { return EcsEis3Bound { kind: 2, value: value }; }
+
+fn ecs_eis3_new() -> EcsEis3Set { return EcsEis3Set { items: Vec::new() }; }
+fn ecs_eis3_len(set: EcsEis3Set) -> i64 { return len(set.items) as i64; }
+fn ecs_eis3_slice_len(slice: EcsEis3Slice) -> i64 { return len(slice.items) as i64; }
+
+fn ecs_eis3_contains(set: EcsEis3Set, value: i64) -> bool {
+    let index: i64 = 0;
+    let count = len(set.items) as i64;
+    while index < count {
+        if set.items[index] == value { return true; };
+        index = index + 1;
+    }
+    return false;
+}
+
+fn ecs_eis3_insert(set: EcsEis3Set, value: i64) -> EcsEis3InsertResult {
+    if ecs_eis3_contains(set, value) { return EcsEis3InsertResult { inserted: 0, set: set }; };
+    set.items.push(value);
+    return EcsEis3InsertResult { inserted: 1, set: set };
+}
+
+fn ecs_eis3_from_vec(values: Vec<i64>) -> EcsEis3Set {
+    let set = ecs_eis3_new();
+    let index: i64 = 0;
+    let count = len(values) as i64;
+    while index < count {
+        let inserted = ecs_eis3_insert(set, values[index]);
+        set = inserted.set;
+        index = index + 1;
+    }
+    return set;
+}
+
+fn ecs_eis3_as_slice(set: EcsEis3Set) -> EcsEis3Slice {
+    return EcsEis3Slice { items: set.items, boxed: 0, mutable_view: 0, inner_view: 0 };
+}
+
+fn ecs_eis3_empty_slice() -> EcsEis3Slice {
+    return EcsEis3Slice { items: Vec::new(), boxed: 0, mutable_view: 0, inner_view: 0 };
+}
+
+fn ecs_eis3_from_slice_unchecked_mut(slice: EcsEis3Slice) -> EcsEis3Slice {
+    return EcsEis3Slice { items: slice.items, boxed: slice.boxed, mutable_view: 1, inner_view: slice.inner_view };
+}
+
+fn ecs_eis3_slice_as_inner(slice: EcsEis3Slice) -> EcsEis3InnerInfo {
+    return EcsEis3InnerInfo { len: len(slice.items) as i64, boxed: slice.boxed, mutable_view: slice.mutable_view, inner_view: 1 };
+}
+
+fn ecs_eis3_boxed_as_inner(slice: EcsEis3Slice) -> EcsEis3InnerInfo {
+    return EcsEis3InnerInfo { len: len(slice.items) as i64, boxed: 1, mutable_view: slice.mutable_view, inner_view: 1 };
+}
+
+fn ecs_eis3_bound_start(bound: EcsEis3Bound) -> i64 {
+    if bound.kind == 0 { return 0; };
+    if bound.kind == 1 { return bound.value; };
+    return bound.value + 1;
+}
+
+fn ecs_eis3_bound_end(bound: EcsEis3Bound, count: i64) -> i64 {
+    if bound.kind == 0 { return count; };
+    if bound.kind == 1 { return bound.value + 1; };
+    return bound.value;
+}
+
+fn ecs_eis3_slice_range(slice: EcsEis3Slice, start: i64, end: i64) -> EcsEis3RangeResult {
+    let count = len(slice.items) as i64;
+    if start < 0 { return EcsEis3RangeResult { has: 0, slice: ecs_eis3_empty_slice() }; };
+    if end < start { return EcsEis3RangeResult { has: 0, slice: ecs_eis3_empty_slice() }; };
+    if end > count { return EcsEis3RangeResult { has: 0, slice: ecs_eis3_empty_slice() }; };
+    let out: Vec<i64> = Vec::new();
+    let index = start;
+    while index < end {
+        out.push(slice.items[index]);
+        index = index + 1;
+    }
+    return EcsEis3RangeResult { has: 1, slice: EcsEis3Slice { items: out, boxed: slice.boxed, mutable_view: slice.mutable_view, inner_view: slice.inner_view } };
+}
+
+fn ecs_eis3_slice_bound_range(slice: EcsEis3Slice, start_bound: EcsEis3Bound, end_bound: EcsEis3Bound) -> EcsEis3RangeResult {
+    let count = len(slice.items) as i64;
+    return ecs_eis3_slice_range(slice, ecs_eis3_bound_start(start_bound), ecs_eis3_bound_end(end_bound, count));
+}
+
+fn ecs_eis3_set_bound_range(set: EcsEis3Set, start_bound: EcsEis3Bound, end_bound: EcsEis3Bound) -> EcsEis3RangeResult {
+    return ecs_eis3_slice_bound_range(ecs_eis3_as_slice(set), start_bound, end_bound);
+}
+
+fn ecs_eis3_slice_boxed(set: EcsEis3Set) -> EcsEis3Slice {
+    return EcsEis3Slice { items: set.items, boxed: 1, mutable_view: 0, inner_view: 0 };
+}
+
+fn ecs_eis3_boxed_into_iter(slice: EcsEis3Slice) -> EcsEis3IntoIter {
+    let count = len(slice.items) as i64;
+    return EcsEis3IntoIter { items: slice.items, front: 0, back: count, trusted_unique: 1, inner_exposed: 0 };
+}
+
+fn ecs_eis3_iter_from_slice(slice: EcsEis3Slice) -> EcsEis3Iter {
+    let count = len(slice.items) as i64;
+    return EcsEis3Iter { items: slice.items, front: 0, back: count, trusted_unique: 1, inner_exposed: 0 };
+}
+
+fn ecs_eis3_iter(set: EcsEis3Set) -> EcsEis3Iter { return ecs_eis3_iter_from_slice(ecs_eis3_as_slice(set)); }
+
+fn ecs_eis3_iter_next(iter: EcsEis3Iter) -> EcsEis3IterNext {
+    if iter.front >= iter.back { return EcsEis3IterNext { iter: iter, has: 0, value: -1 }; };
+    let value = iter.items[iter.front];
+    iter.front = iter.front + 1;
+    return EcsEis3IterNext { iter: iter, has: 1, value: value };
+}
+
+fn ecs_eis3_iter_into_inner(iter: EcsEis3Iter) -> EcsEis3Iter {
+    return EcsEis3Iter { items: iter.items, front: iter.front, back: iter.back, trusted_unique: iter.trusted_unique, inner_exposed: 1 };
+}
+
+fn ecs_eis3_into_iter_next(iter: EcsEis3IntoIter) -> EcsEis3IntoIterNext {
+    if iter.front >= iter.back { return EcsEis3IntoIterNext { iter: iter, has: 0, value: -1 }; };
+    let value = iter.items[iter.front];
+    iter.front = iter.front + 1;
+    return EcsEis3IntoIterNext { iter: iter, has: 1, value: value };
+}
+
+fn ecs_eis3_into_iter_next_back(iter: EcsEis3IntoIter) -> EcsEis3IntoIterNext {
+    if iter.front >= iter.back { return EcsEis3IntoIterNext { iter: iter, has: 0, value: -1 }; };
+    iter.back = iter.back - 1;
+    let value = iter.items[iter.back];
+    return EcsEis3IntoIterNext { iter: iter, has: 1, value: value };
+}
+
+fn ecs_eis3_into_iter_into_inner(iter: EcsEis3IntoIter) -> EcsEis3IntoIter {
+    return EcsEis3IntoIter { items: iter.items, front: iter.front, back: iter.back, trusted_unique: iter.trusted_unique, inner_exposed: 1 };
+}
+
+fn ecs_eis3_drain_clamped(set: EcsEis3Set, start: i64, end: i64) -> EcsEis3DrainResult {
+    let kept: Vec<i64> = Vec::new();
+    let drained: Vec<i64> = Vec::new();
+    let index: i64 = 0;
+    let count = len(set.items) as i64;
+    while index < count {
+        if index >= start { if index < end { drained.push(set.items[index]); }; };
+        if index < start { kept.push(set.items[index]); };
+        if index >= end { kept.push(set.items[index]); };
+        index = index + 1;
+    }
+    let drained_count = len(drained) as i64;
+    return EcsEis3DrainResult {
+        set: EcsEis3Set { items: kept },
+        drain: EcsEis3Drain { items: drained, front: 0, back: drained_count, trusted_unique: 1, inner_exposed: 0 },
+    };
+}
+
+fn ecs_eis3_drain(set: EcsEis3Set, start: i64, end: i64) -> EcsEis3DrainResult {
+    let count = len(set.items) as i64;
+    if start <= 0 {
+        if end >= count { return ecs_eis3_drain_clamped(set, 0, count); };
+        if end < 0 { return ecs_eis3_drain_clamped(set, 0, 0); };
+        return ecs_eis3_drain_clamped(set, 0, end);
+    };
+    if start >= count { return ecs_eis3_drain_clamped(set, count, count); };
+    if end <= start { return ecs_eis3_drain_clamped(set, start, start); };
+    if end >= count { return ecs_eis3_drain_clamped(set, start, count); };
+    return ecs_eis3_drain_clamped(set, start, end);
+}
+
+fn ecs_eis3_drain_next(drain: EcsEis3Drain) -> EcsEis3DrainNext {
+    if drain.front >= drain.back { return EcsEis3DrainNext { drain: drain, has: 0, value: -1 }; };
+    let value = drain.items[drain.front];
+    drain.front = drain.front + 1;
+    return EcsEis3DrainNext { drain: drain, has: 1, value: value };
+}
+
+fn ecs_eis3_drain_into_inner(drain: EcsEis3Drain) -> EcsEis3Drain {
+    return EcsEis3Drain { items: drain.items, front: drain.front, back: drain.back, trusted_unique: drain.trusted_unique, inner_exposed: 1 };
+}
+
+fn ecs_eis3_op_iter_from_set(set: EcsEis3Set, op_kind: i32) -> EcsEis3OpIter {
+    let count = len(set.items) as i64;
+    return EcsEis3OpIter { items: set.items, front: 0, back: count, trusted_unique: 1, op_kind: op_kind };
+}
+
+fn ecs_eis3_op_iter_next(iter: EcsEis3OpIter) -> EcsEis3OpIterNext {
+    if iter.front >= iter.back { return EcsEis3OpIterNext { iter: iter, has: 0, value: -1 }; };
+    let value = iter.items[iter.front];
+    iter.front = iter.front + 1;
+    return EcsEis3OpIterNext { iter: iter, has: 1, value: value };
+}
+
+fn ecs_eis3_op_iter_next_back(iter: EcsEis3OpIter) -> EcsEis3OpIterNext {
+    if iter.front >= iter.back { return EcsEis3OpIterNext { iter: iter, has: 0, value: -1 }; };
+    iter.back = iter.back - 1;
+    let value = iter.items[iter.back];
+    return EcsEis3OpIterNext { iter: iter, has: 1, value: value };
+}
+
+fn ecs_eis3_collect_op_iter(iter: EcsEis3OpIter) -> EcsEis3Set {
+    let out = ecs_eis3_new();
+    let index = iter.front;
+    while index < iter.back {
+        let inserted = ecs_eis3_insert(out, iter.items[index]);
+        out = inserted.set;
+        index = index + 1;
+    }
+    return out;
+}
+
+fn ecs_eis3_difference_set(left_set: EcsEis3Set, right_set: EcsEis3Set) -> EcsEis3Set {
+    let out = ecs_eis3_new();
+    let index: i64 = 0;
+    let count = len(left_set.items) as i64;
+    while index < count {
+        if ecs_eis3_contains(right_set, left_set.items[index]) != true {
+            let inserted = ecs_eis3_insert(out, left_set.items[index]);
+            out = inserted.set;
+        };
+        index = index + 1;
+    }
+    return out;
+}
+
+fn ecs_eis3_intersection_iter(left_set: EcsEis3Set, right_set: EcsEis3Set) -> EcsEis3OpIter {
+    let out = ecs_eis3_new();
+    let index: i64 = 0;
+    let count = len(left_set.items) as i64;
+    while index < count {
+        if ecs_eis3_contains(right_set, left_set.items[index]) {
+            let inserted = ecs_eis3_insert(out, left_set.items[index]);
+            out = inserted.set;
+        };
+        index = index + 1;
+    }
+    return ecs_eis3_op_iter_from_set(out, 1);
+}
+
+fn ecs_eis3_union_iter(left_set: EcsEis3Set, right_set: EcsEis3Set) -> EcsEis3OpIter {
+    let out = ecs_eis3_from_vec(left_set.items);
+    let index: i64 = 0;
+    let count = len(right_set.items) as i64;
+    while index < count {
+        let inserted = ecs_eis3_insert(out, right_set.items[index]);
+        out = inserted.set;
+        index = index + 1;
+    }
+    return ecs_eis3_op_iter_from_set(out, 2);
+}
+
+fn ecs_eis3_difference_iter(left_set: EcsEis3Set, right_set: EcsEis3Set) -> EcsEis3OpIter {
+    return ecs_eis3_op_iter_from_set(ecs_eis3_difference_set(left_set, right_set), 3);
+}
+
+fn ecs_eis3_symmetric_difference_iter(left_set: EcsEis3Set, right_set: EcsEis3Set) -> EcsEis3OpIter {
+    let out = ecs_eis3_new();
+    let left_index: i64 = 0;
+    let left_count = len(left_set.items) as i64;
+    while left_index < left_count {
+        if ecs_eis3_contains(right_set, left_set.items[left_index]) != true {
+            let inserted = ecs_eis3_insert(out, left_set.items[left_index]);
+            out = inserted.set;
+        };
+        left_index = left_index + 1;
+    }
+    let right_index: i64 = 0;
+    let right_count = len(right_set.items) as i64;
+    while right_index < right_count {
+        if ecs_eis3_contains(left_set, right_set.items[right_index]) != true {
+            let inserted = ecs_eis3_insert(out, right_set.items[right_index]);
+            out = inserted.set;
+        };
+        right_index = right_index + 1;
+    }
+    return ecs_eis3_op_iter_from_set(out, 4);
+}
+
+fn ecs_eis3_splice_unique(set: EcsEis3Set, start: i64, end: i64, replacement: EcsEis3Set) -> EcsEis3SpliceResult {
+    let drained = ecs_eis3_drain(set, start, end);
+    let out_values: Vec<i64> = Vec::new();
+    let kept_slice = ecs_eis3_as_slice(drained.set);
+    let index: i64 = 0;
+    let kept_count = len(kept_slice.items) as i64;
+    while index < start {
+        if index < kept_count { out_values.push(kept_slice.items[index]); };
+        index = index + 1;
+    }
+    let replacement_index: i64 = 0;
+    let replacement_count = len(replacement.items) as i64;
+    while replacement_index < replacement_count {
+        out_values.push(replacement.items[replacement_index]);
+        replacement_index = replacement_index + 1;
+    }
+    let tail_index = start;
+    while tail_index < kept_count {
+        out_values.push(kept_slice.items[tail_index]);
+        tail_index = tail_index + 1;
+    }
+    let out_set = ecs_eis3_from_vec(out_values);
+    return EcsEis3SpliceResult { set: out_set, removed: EcsEis3OpIter { items: drained.drain.items, front: drained.drain.front, back: drained.drain.back, trusted_unique: 1, op_kind: 5 } };
+}

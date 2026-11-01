@@ -1,0 +1,410 @@
+// Deferred command queue for TableErasedWorld<R, M>.
+// Component commands carry erased boxed payloads and apply through the
+// heterogeneous archetype table-row storage path.
+@import "bundle_table_erased.sla"
+
+const TABLE_ERASED_COMMAND_INSERT_COMPONENT: i32 = 1;
+const TABLE_ERASED_COMMAND_DESPAWN: i32 = 2;
+const TABLE_ERASED_COMMAND_INSERT_RESOURCE: i32 = 3;
+const TABLE_ERASED_COMMAND_WRITE_MESSAGE: i32 = 4;
+const TABLE_ERASED_COMMAND_SPAWN_BATCH_BUNDLE2: i32 = 5;
+const TABLE_ERASED_COMMAND_SPAWN_BATCH_BUNDLE3: i32 = 6;
+const TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE2: i32 = 7;
+const TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE3: i32 = 8;
+const TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE2_IF_NEW: i32 = 9;
+const TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE3_IF_NEW: i32 = 10;
+
+struct TableErasedCommand {
+    kind: i32,
+    entity: Entity,
+    component_id: i32,
+    value_index: i64,
+}
+
+struct TableErasedCommandBundle2Batch {
+    entities: Vec<Entity>,
+    bundles: Vec<TableErasedBundle2>,
+}
+
+struct TableErasedCommandBundle3Batch {
+    entities: Vec<Entity>,
+    bundles: Vec<TableErasedBundle3>,
+}
+
+struct TableErasedCommands<R, M> {
+    items: Vec<TableErasedCommand>,
+    component_values: Vec<ErasedComponentValue>,
+    resource_values: Vec<R>,
+    message_values: Vec<M>,
+    bundle2_batches: Vec<TableErasedCommandBundle2Batch>,
+    bundle3_batches: Vec<TableErasedCommandBundle3Batch>,
+}
+
+fn table_erased_commands_new<R, M>() -> TableErasedCommands<R, M> {
+    let items: Vec<TableErasedCommand> = Vec::new();
+    let component_values: Vec<ErasedComponentValue> = Vec::new();
+    let resource_values: Vec<R> = Vec::new();
+    let message_values: Vec<M> = Vec::new();
+    let bundle2_batches: Vec<TableErasedCommandBundle2Batch> = Vec::new();
+    let bundle3_batches: Vec<TableErasedCommandBundle3Batch> = Vec::new();
+    return TableErasedCommands<R, M> { items: items, component_values: component_values, resource_values: resource_values, message_values: message_values, bundle2_batches: bundle2_batches, bundle3_batches: bundle3_batches };
+}
+
+fn table_erased_command(kind: i32, entity: Entity, component_id: i32, value_index: i64) -> TableErasedCommand {
+    return TableErasedCommand { kind: kind, entity: entity, component_id: component_id, value_index: value_index };
+}
+
+fn table_erased_commands_len<R, M>(commands: TableErasedCommands<R, M>) -> i64 { return len(commands.items) as i64; }
+
+fn table_erased_commands_reserve_entity_with_location<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>, spawned_by: TableErasedSpawnLocation) -> (TableErasedWorld<R, M>, TableErasedCommands<R, M>, Entity) {
+    let (next_world, entity) = table_erased_world_spawn_with_location<R, M>(world, spawned_by);
+    return (next_world, commands, entity);
+}
+
+fn table_erased_commands_reserve_entity<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>) -> (TableErasedWorld<R, M>, TableErasedCommands<R, M>, Entity) {
+    return table_erased_commands_reserve_entity_with_location<R, M>(world, commands, table_erased_spawn_location_none());
+}
+
+fn table_erased_commands_insert<T, R, M>(commands: TableErasedCommands<R, M>, entity: Entity, component_id: i32, type_id: i32, value: T) -> TableErasedCommands<R, M> {
+    commands.component_values.push(registry_erased_value_new<T>(type_id, value));
+    let idx = (len(commands.component_values) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_INSERT_COMPONENT, entity, component_id, idx));
+    return commands;
+}
+
+fn table_erased_commands_insert_auto<T, R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>, entity: Entity, type_id: i32, value: T) -> TableErasedCommands<R, M> {
+    let component_id = table_erased_world_component_id_for_type<R, M>(world, type_id);
+    return table_erased_commands_insert<T, R, M>(commands, entity, component_id, type_id, value);
+}
+
+fn table_erased_commands_despawn<R, M>(commands: TableErasedCommands<R, M>, entity: Entity) -> TableErasedCommands<R, M> {
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_DESPAWN, entity, 0, -1));
+    return commands;
+}
+
+fn table_erased_commands_insert_resource<R, M>(commands: TableErasedCommands<R, M>, value: R) -> TableErasedCommands<R, M> {
+    commands.resource_values.push(value);
+    let idx = (len(commands.resource_values) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_INSERT_RESOURCE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_write_message<R, M>(commands: TableErasedCommands<R, M>, value: M) -> TableErasedCommands<R, M> {
+    commands.message_values.push(value);
+    let idx = (len(commands.message_values) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_WRITE_MESSAGE, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_command_bundle2_batch(entities: Vec<Entity>, bundles: Vec<TableErasedBundle2>) -> TableErasedCommandBundle2Batch {
+    return TableErasedCommandBundle2Batch { entities: entities, bundles: bundles };
+}
+
+fn table_erased_command_bundle3_batch(entities: Vec<Entity>, bundles: Vec<TableErasedBundle3>) -> TableErasedCommandBundle3Batch {
+    return TableErasedCommandBundle3Batch { entities: entities, bundles: bundles };
+}
+
+fn table_erased_commands_spawn_batch_bundle2<R, M>(commands: TableErasedCommands<R, M>, bundles: Vec<TableErasedBundle2>) -> TableErasedCommands<R, M> {
+    let entities: Vec<Entity> = Vec::new();
+    commands.bundle2_batches.push(table_erased_command_bundle2_batch(entities, bundles));
+    let idx = (len(commands.bundle2_batches) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_SPAWN_BATCH_BUNDLE2, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_spawn_batch_bundle3<R, M>(commands: TableErasedCommands<R, M>, bundles: Vec<TableErasedBundle3>) -> TableErasedCommands<R, M> {
+    let entities: Vec<Entity> = Vec::new();
+    commands.bundle3_batches.push(table_erased_command_bundle3_batch(entities, bundles));
+    let idx = (len(commands.bundle3_batches) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_SPAWN_BATCH_BUNDLE3, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_insert_batch_bundle2<R, M>(commands: TableErasedCommands<R, M>, entities: Vec<Entity>, bundles: Vec<TableErasedBundle2>) -> TableErasedCommands<R, M> {
+    if len(entities) != len(bundles) { panic(11840); };
+    commands.bundle2_batches.push(table_erased_command_bundle2_batch(entities, bundles));
+    let idx = (len(commands.bundle2_batches) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE2, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_insert_batch_bundle3<R, M>(commands: TableErasedCommands<R, M>, entities: Vec<Entity>, bundles: Vec<TableErasedBundle3>) -> TableErasedCommands<R, M> {
+    if len(entities) != len(bundles) { panic(11841); };
+    commands.bundle3_batches.push(table_erased_command_bundle3_batch(entities, bundles));
+    let idx = (len(commands.bundle3_batches) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE3, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_insert_batch_bundle2_if_new<R, M>(commands: TableErasedCommands<R, M>, entities: Vec<Entity>, bundles: Vec<TableErasedBundle2>) -> TableErasedCommands<R, M> {
+    if len(entities) != len(bundles) { panic(11842); };
+    commands.bundle2_batches.push(table_erased_command_bundle2_batch(entities, bundles));
+    let idx = (len(commands.bundle2_batches) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE2_IF_NEW, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_insert_batch_bundle3_if_new<R, M>(commands: TableErasedCommands<R, M>, entities: Vec<Entity>, bundles: Vec<TableErasedBundle3>) -> TableErasedCommands<R, M> {
+    if len(entities) != len(bundles) { panic(11843); };
+    commands.bundle3_batches.push(table_erased_command_bundle3_batch(entities, bundles));
+    let idx = (len(commands.bundle3_batches) as i64) - 1;
+    commands.items.push(table_erased_command(TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE3_IF_NEW, entity_placeholder(), 0, idx));
+    return commands;
+}
+
+fn table_erased_commands_apply_insert<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>, command: TableErasedCommand) -> TableErasedWorld<R, M> {
+    if command.kind == TABLE_ERASED_COMMAND_INSERT_COMPONENT {
+        return table_erased_world_insert_erased<R, M>(world, command.entity, command.component_id, commands.component_values[command.value_index]);
+    };
+    return world;
+}
+
+fn table_erased_commands_apply_despawn<R, M>(world: TableErasedWorld<R, M>, command: TableErasedCommand) -> TableErasedWorld<R, M> {
+    if command.kind == TABLE_ERASED_COMMAND_DESPAWN { return table_erased_world_despawn<R, M>(world, command.entity); };
+    return world;
+}
+
+fn table_erased_commands_apply_resource<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>, command: TableErasedCommand) -> TableErasedWorld<R, M> {
+    if command.kind == TABLE_ERASED_COMMAND_INSERT_RESOURCE { return table_erased_world_insert_resource<R, M>(world, commands.resource_values[command.value_index]); };
+    return world;
+}
+
+fn table_erased_commands_apply_message<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>, command: TableErasedCommand) -> TableErasedWorld<R, M> {
+    if command.kind == TABLE_ERASED_COMMAND_WRITE_MESSAGE { return table_erased_world_write_message<R, M>(world, commands.message_values[command.value_index]); };
+    return world;
+}
+
+fn table_erased_commands_apply_batch<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>, command: TableErasedCommand) -> TableErasedWorld<R, M> {
+    if command.kind == TABLE_ERASED_COMMAND_SPAWN_BATCH_BUNDLE2 {
+        let batch = commands.bundle2_batches[command.value_index];
+        let expected = len(batch.bundles);
+        let (next_world, spawned) = table_erased_world_spawn_batch_bundle2<R, M>(world, batch.bundles);
+        if len(spawned) != expected { panic(11844); };
+        return next_world;
+    };
+    if command.kind == TABLE_ERASED_COMMAND_SPAWN_BATCH_BUNDLE3 {
+        let batch = commands.bundle3_batches[command.value_index];
+        let expected = len(batch.bundles);
+        let (next_world, spawned) = table_erased_world_spawn_batch_bundle3<R, M>(world, batch.bundles);
+        if len(spawned) != expected { panic(11845); };
+        return next_world;
+    };
+    if command.kind == TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE2 {
+        let batch = commands.bundle2_batches[command.value_index];
+        return table_erased_world_insert_batch_bundle2<R, M>(world, batch.entities, batch.bundles);
+    };
+    if command.kind == TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE3 {
+        let batch = commands.bundle3_batches[command.value_index];
+        return table_erased_world_insert_batch_bundle3<R, M>(world, batch.entities, batch.bundles);
+    };
+    if command.kind == TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE2_IF_NEW {
+        let batch = commands.bundle2_batches[command.value_index];
+        return table_erased_world_insert_batch_bundle2_if_new<R, M>(world, batch.entities, batch.bundles);
+    };
+    if command.kind == TABLE_ERASED_COMMAND_INSERT_BATCH_BUNDLE3_IF_NEW {
+        let batch = commands.bundle3_batches[command.value_index];
+        return table_erased_world_insert_batch_bundle3_if_new<R, M>(world, batch.entities, batch.bundles);
+    };
+    return world;
+}
+
+fn table_erased_commands_apply<R, M>(world: TableErasedWorld<R, M>, commands: TableErasedCommands<R, M>) -> (TableErasedWorld<R, M>, TableErasedCommands<R, M>) {
+    let i: i64 = 0;
+    let cnt = table_erased_commands_len<R, M>(commands);
+    while i < cnt {
+        let command = commands.items[i];
+        world = table_erased_commands_apply_insert<R, M>(world, commands, command);
+        world = table_erased_commands_apply_despawn<R, M>(world, command);
+        world = table_erased_commands_apply_resource<R, M>(world, commands, command);
+        world = table_erased_commands_apply_message<R, M>(world, commands, command);
+        world = table_erased_commands_apply_batch<R, M>(world, commands, command);
+        i = i + 1;
+    }
+    let cleared = table_erased_commands_new<R, M>();
+    return (world, cleared);
+}
+
+const TABLE_ERASED_CMD_POS_TYPE: i32 = 411;
+const TABLE_ERASED_CMD_VEL_TYPE: i32 = 412;
+const TABLE_ERASED_CMD_MARKER_TYPE: i32 = 413;
+
+struct TableErasedCmdPos { x: i32, y: i32 }
+struct TableErasedCmdVel { x: i32, y: i32 }
+struct TableErasedCmdMarker { value: i32 }
+struct TableErasedCmdTime { tick: i32 }
+struct TableErasedCmdEvent { amount: i32 }
+
+fn table_erased_cmd_time_default() -> TableErasedCmdTime { return TableErasedCmdTime { tick: 0 }; }
+fn table_erased_cmd_event_default() -> TableErasedCmdEvent { return TableErasedCmdEvent { amount: 0 }; }
+fn table_erased_cmd_world_new() -> TableErasedWorld<TableErasedCmdTime, TableErasedCmdEvent> { return table_erased_world_new<TableErasedCmdTime, TableErasedCmdEvent>(table_erased_cmd_time_default(), table_erased_cmd_event_default()); }
+fn table_erased_cmd_commands_new() -> TableErasedCommands<TableErasedCmdTime, TableErasedCmdEvent> { return table_erased_commands_new<TableErasedCmdTime, TableErasedCmdEvent>(); }
+
+@test "table erased commands defer heterogeneous insertions and migrate rows"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_table<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, ecs_box_drop<TableErasedCmdPos>);
+    let (w2, velocity) = table_erased_world_register_table<TableErasedCmdTime, TableErasedCmdEvent>(w1, TABLE_ERASED_CMD_VEL_TYPE, ecs_box_drop<TableErasedCmdVel>);
+    let c0 = table_erased_cmd_commands_new();
+    let (w3, c1, entity) = table_erased_commands_reserve_entity<TableErasedCmdTime, TableErasedCmdEvent>(w2, c0);
+    let empty_group = table_erased_world_entity_archetype_id<TableErasedCmdTime, TableErasedCmdEvent>(w3, entity);
+    let c2 = table_erased_commands_insert<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(c1, entity, position.id, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 3, y: 0 });
+    let c3 = table_erased_commands_insert<TableErasedCmdVel, TableErasedCmdTime, TableErasedCmdEvent>(c2, entity, velocity.id, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 4, y: 0 });
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w3, entity, position.id) != false { panic(11800); };
+    let (w4, c4) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w3, c3);
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w4, entity, position.id) != true { panic(11801); };
+    if table_erased_world_entity_archetype_id<TableErasedCmdTime, TableErasedCmdEvent>(w4, entity) == empty_group { panic(11802); };
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c4) != 0 { panic(11803); };
+    let pairs = table_erased_world_query_pair<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdTime, TableErasedCmdEvent>(w4, position.id, TABLE_ERASED_CMD_POS_TYPE, velocity.id, TABLE_ERASED_CMD_VEL_TYPE);
+    if len(pairs.items) != 1 { panic(11804); };
+    if pairs.items[0].first.x + pairs.items[0].second.x != 7 { panic(11805); };
+}
+
+@test "table erased commands replace resource message and despawn"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_table<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, ecs_box_drop<TableErasedCmdPos>);
+    let (w2, marker) = table_erased_world_register_sparse_set<TableErasedCmdTime, TableErasedCmdEvent>(w1, TABLE_ERASED_CMD_MARKER_TYPE, ecs_box_drop<TableErasedCmdMarker>);
+    let c0 = table_erased_cmd_commands_new();
+    let (w3, c1, entity) = table_erased_commands_reserve_entity<TableErasedCmdTime, TableErasedCmdEvent>(w2, c0);
+    let c2 = table_erased_commands_insert<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(c1, entity, position.id, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 5, y: 0 });
+    let (w4, c3) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w3, c2);
+    let group_before = table_erased_world_entity_archetype_id<TableErasedCmdTime, TableErasedCmdEvent>(w4, entity);
+    let row_before = table_erased_world_entity_row<TableErasedCmdTime, TableErasedCmdEvent>(w4, entity);
+    let c4 = table_erased_commands_insert<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(c3, entity, position.id, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 9, y: 0 });
+    let c5 = table_erased_commands_insert<TableErasedCmdMarker, TableErasedCmdTime, TableErasedCmdEvent>(c4, entity, marker.id, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 1 });
+    let c6 = table_erased_commands_insert_resource<TableErasedCmdTime, TableErasedCmdEvent>(c5, TableErasedCmdTime { tick: 8 });
+    let c7 = table_erased_commands_write_message<TableErasedCmdTime, TableErasedCmdEvent>(c6, TableErasedCmdEvent { amount: 6 });
+    let (w5, c8) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w4, c7);
+    if table_erased_world_entity_archetype_id<TableErasedCmdTime, TableErasedCmdEvent>(w5, entity) == group_before { panic(11810); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w5, entity, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 9 { panic(11811); };
+    let c9 = table_erased_commands_despawn<TableErasedCmdTime, TableErasedCmdEvent>(c8, entity);
+    let (w6, c10) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w5, c9);
+    if table_erased_world_is_alive<TableErasedCmdTime, TableErasedCmdEvent>(w6, entity) != false { panic(11812); };
+    if table_erased_world_entity_archetype_id<TableErasedCmdTime, TableErasedCmdEvent>(w6, entity) != -1 { panic(11813); };
+    let time = table_erased_world_get_resource<TableErasedCmdTime, TableErasedCmdEvent>(w6);
+    let read = table_erased_world_read_message<TableErasedCmdTime, TableErasedCmdEvent>(w6, message_reader_new(), table_erased_cmd_event_default());
+    if time.tick != 8 { panic(11814); };
+    if read.value.amount != 6 { panic(11815); };
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c10) != 0 { panic(11816); };
+}
+
+@test "table erased commands auto insert by component type metadata"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_table<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, ecs_box_drop<TableErasedCmdPos>);
+    let c0 = table_erased_cmd_commands_new();
+    let (w2, c1, entity) = table_erased_commands_reserve_entity<TableErasedCmdTime, TableErasedCmdEvent>(w1, c0);
+    let c2 = table_erased_commands_insert_auto<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w2, c1, entity, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 14, y: 0 });
+    let (w3, c3) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w2, c2);
+    if table_erased_world_has_type<TableErasedCmdTime, TableErasedCmdEvent>(w3, entity, TABLE_ERASED_CMD_POS_TYPE) != true { panic(11820); };
+    if table_erased_world_get_auto<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w3, entity, TABLE_ERASED_CMD_POS_TYPE).x != 14 { panic(11821); };
+    if table_erased_world_component_id_for_type<TableErasedCmdTime, TableErasedCmdEvent>(w3, TABLE_ERASED_CMD_POS_TYPE) != position.id { panic(11822); };
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c3) != 0 { panic(11823); };
+}
+
+@test "table erased commands preserve explicit spawn location"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_table<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, ecs_box_drop<TableErasedCmdPos>);
+    let c0 = table_erased_cmd_commands_new();
+    let loc = table_erased_spawn_location_new(91, 24, 6);
+    let (w2, c1, entity) = table_erased_commands_reserve_entity_with_location<TableErasedCmdTime, TableErasedCmdEvent>(w1, c0, loc);
+    let c2 = table_erased_commands_insert<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(c1, entity, position.id, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 20, y: 0 });
+    let (w3, c3) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w2, c2);
+    let spawned_by = table_erased_world_spawned_by<TableErasedCmdTime, TableErasedCmdEvent>(w3, entity);
+    let details = table_erased_world_spawn_details<TableErasedCmdTime, TableErasedCmdEvent>(w3, entity, 0);
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c3) != 0 { panic(11830); };
+    if spawned_by.file_id != 91 { panic(11831); };
+    if spawned_by.line != 24 { panic(11832); };
+    if details.spawned_by().column != 6 { panic(11833); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w3, entity, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 20 { panic(11834); };
+}
+
+@test "table erased commands spawn batch bundles apply deferred"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, 0, ecs_box_drop<TableErasedCmdPos>);
+    let (w2, velocity) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w1, TABLE_ERASED_CMD_VEL_TYPE, 0, ecs_box_drop<TableErasedCmdVel>);
+    let (w3, marker) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w2, TABLE_ERASED_CMD_MARKER_TYPE, 1, ecs_box_drop<TableErasedCmdMarker>);
+
+    let bundles: Vec<TableErasedBundle3> = Vec::new();
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 2, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 5, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 10 }));
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 4, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 6, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 20 }));
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 8, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 7, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 30 }));
+
+    let c0 = table_erased_cmd_commands_new();
+    let c1 = table_erased_commands_spawn_batch_bundle3<TableErasedCmdTime, TableErasedCmdEvent>(c0, bundles);
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c1) != 1 { panic(11846); };
+    let before = table_erased_world_query_pair_auto<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdTime, TableErasedCmdEvent>(w3, TABLE_ERASED_CMD_POS_TYPE, TABLE_ERASED_CMD_VEL_TYPE);
+    if len(before.items) != 0 { panic(11847); };
+
+    let (w4, c2) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w3, c1);
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c2) != 0 { panic(11848); };
+    let triples = table_erased_world_query_triple_auto<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker, TableErasedCmdTime, TableErasedCmdEvent>(w4, TABLE_ERASED_CMD_POS_TYPE, TABLE_ERASED_CMD_VEL_TYPE, TABLE_ERASED_CMD_MARKER_TYPE);
+    if len(triples.items) != 3 { panic(11849); };
+    if triples.items[0].first.x + triples.items[1].first.x + triples.items[2].first.x != 14 { panic(11850); };
+    if triples.items[0].second.x + triples.items[1].second.x + triples.items[2].second.x != 18 { panic(11851); };
+    if triples.items[0].third.value + triples.items[1].third.value + triples.items[2].third.value != 60 { panic(11852); };
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w4, triples.items[0].entity, position.id) != true { panic(11853); };
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w4, triples.items[1].entity, velocity.id) != true { panic(11854); };
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w4, triples.items[2].entity, marker.id) != true { panic(11855); };
+}
+
+@test "table erased commands insert batch bundles apply deferred"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, 0, ecs_box_drop<TableErasedCmdPos>);
+    let (w2, velocity) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w1, TABLE_ERASED_CMD_VEL_TYPE, 0, ecs_box_drop<TableErasedCmdVel>);
+    let (w3, marker) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w2, TABLE_ERASED_CMD_MARKER_TYPE, 1, ecs_box_drop<TableErasedCmdMarker>);
+    let (w4, first) = table_erased_world_spawn<TableErasedCmdTime, TableErasedCmdEvent>(w3);
+    let (w5, second) = table_erased_world_spawn<TableErasedCmdTime, TableErasedCmdEvent>(w4);
+    let w6 = table_erased_world_insert_auto<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w5, first, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 1, y: 0 });
+    let w7 = table_erased_world_insert_auto<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w6, second, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 2, y: 0 });
+
+    let entities: Vec<Entity> = Vec::new();
+    entities.push(first);
+    entities.push(second);
+    let bundles: Vec<TableErasedBundle3> = Vec::new();
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 10, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 3, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 7 }));
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 20, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 4, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 8 }));
+
+    let c0 = table_erased_cmd_commands_new();
+    let c1 = table_erased_commands_insert_batch_bundle3<TableErasedCmdTime, TableErasedCmdEvent>(c0, entities, bundles);
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c1) != 1 { panic(11856); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w7, first, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 1 { panic(11857); };
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w7, first, velocity.id) != false { panic(11858); };
+    if table_erased_world_has<TableErasedCmdTime, TableErasedCmdEvent>(w7, second, marker.id) != false { panic(11859); };
+
+    let (w8, c2) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w7, c1);
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c2) != 0 { panic(11860); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w8, first, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 10 { panic(11861); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w8, second, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 20 { panic(11862); };
+    if table_erased_world_get<TableErasedCmdVel, TableErasedCmdTime, TableErasedCmdEvent>(w8, first, velocity.id, TABLE_ERASED_CMD_VEL_TYPE).x != 3 { panic(11863); };
+    if table_erased_world_get<TableErasedCmdMarker, TableErasedCmdTime, TableErasedCmdEvent>(w8, second, marker.id, TABLE_ERASED_CMD_MARKER_TYPE).value != 8 { panic(11864); };
+    let triples = table_erased_world_query_triple_auto<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker, TableErasedCmdTime, TableErasedCmdEvent>(w8, TABLE_ERASED_CMD_POS_TYPE, TABLE_ERASED_CMD_VEL_TYPE, TABLE_ERASED_CMD_MARKER_TYPE);
+    if len(triples.items) != 2 { panic(11865); };
+}
+
+@test "table erased commands insert batch if new keeps existing components"() {
+    let w0 = table_erased_cmd_world_new();
+    let (w1, position) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w0, TABLE_ERASED_CMD_POS_TYPE, 0, ecs_box_drop<TableErasedCmdPos>);
+    let (w2, velocity) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w1, TABLE_ERASED_CMD_VEL_TYPE, 0, ecs_box_drop<TableErasedCmdVel>);
+    let (w3, marker) = table_erased_world_register_component_metadata<TableErasedCmdTime, TableErasedCmdEvent>(w2, TABLE_ERASED_CMD_MARKER_TYPE, 1, ecs_box_drop<TableErasedCmdMarker>);
+    let (w4, first) = table_erased_world_spawn<TableErasedCmdTime, TableErasedCmdEvent>(w3);
+    let (w5, second) = table_erased_world_spawn<TableErasedCmdTime, TableErasedCmdEvent>(w4);
+    let w6 = table_erased_world_insert_auto<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w5, first, TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 1, y: 0 });
+
+    let entities: Vec<Entity> = Vec::new();
+    entities.push(first);
+    entities.push(second);
+    let bundles: Vec<TableErasedBundle3> = Vec::new();
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 10, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 3, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 7 }));
+    bundles.push(table_erased_bundle3_new<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker>(TABLE_ERASED_CMD_POS_TYPE, TableErasedCmdPos { x: 20, y: 0 }, TABLE_ERASED_CMD_VEL_TYPE, TableErasedCmdVel { x: 4, y: 0 }, TABLE_ERASED_CMD_MARKER_TYPE, TableErasedCmdMarker { value: 8 }));
+
+    let c0 = table_erased_cmd_commands_new();
+    let c1 = table_erased_commands_insert_batch_bundle3_if_new<TableErasedCmdTime, TableErasedCmdEvent>(c0, entities, bundles);
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w6, first, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 1 { panic(11866); };
+
+    let (w7, c2) = table_erased_commands_apply<TableErasedCmdTime, TableErasedCmdEvent>(w6, c1);
+    if table_erased_commands_len<TableErasedCmdTime, TableErasedCmdEvent>(c2) != 0 { panic(11867); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w7, first, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 1 { panic(11868); };
+    if table_erased_world_get<TableErasedCmdPos, TableErasedCmdTime, TableErasedCmdEvent>(w7, second, position.id, TABLE_ERASED_CMD_POS_TYPE).x != 20 { panic(11869); };
+    if table_erased_world_get<TableErasedCmdVel, TableErasedCmdTime, TableErasedCmdEvent>(w7, first, velocity.id, TABLE_ERASED_CMD_VEL_TYPE).x != 3 { panic(11870); };
+    if table_erased_world_get<TableErasedCmdMarker, TableErasedCmdTime, TableErasedCmdEvent>(w7, second, marker.id, TABLE_ERASED_CMD_MARKER_TYPE).value != 8 { panic(11871); };
+    let triples = table_erased_world_query_triple_auto<TableErasedCmdPos, TableErasedCmdVel, TableErasedCmdMarker, TableErasedCmdTime, TableErasedCmdEvent>(w7, TABLE_ERASED_CMD_POS_TYPE, TABLE_ERASED_CMD_VEL_TYPE, TABLE_ERASED_CMD_MARKER_TYPE);
+    if len(triples.items) != 2 { panic(11872); };
+}

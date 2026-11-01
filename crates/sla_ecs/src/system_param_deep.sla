@@ -1,0 +1,810 @@
+// Deepened Bevy ECS system::system_param surface (core algorithms).
+// Mirrors src/system/system_param.rs: init_state/init_access conflict detection,
+// ParamSet exclusive sub-param access (clone-check then merge), Local FromWorld,
+// Deferred SystemBuffer, SystemChangeTick, Option/If validation mapping,
+// Static/Dyn/Phantom params, SystemParamValidationError.
+// Shallow system_param_special/extras/table_* retained.
+
+// === param kind tags ===
+const ECS_SP_KIND_RES: i32 = 1;
+const ECS_SP_KIND_RES_MUT: i32 = 2;
+const ECS_SP_KIND_QUERY: i32 = 3;
+const ECS_SP_KIND_LOCAL: i32 = 4;
+const ECS_SP_KIND_DEFERRED: i32 = 5;
+const ECS_SP_KIND_PHANTOM: i32 = 6;
+const ECS_SP_KIND_OPTION: i32 = 7;
+const ECS_SP_KIND_IF: i32 = 8;
+const ECS_SP_KIND_PARAM_SET: i32 = 9;
+const ECS_SP_KIND_STATIC: i32 = 10;
+const ECS_SP_KIND_DYN: i32 = 11;
+const ECS_SP_KIND_CHANGE_TICK: i32 = 12;
+
+// access: bit flags on component ids 0..31 for simplicity (id as bit index)
+// write conflicts with any prior read/write of same bit; read conflicts with write
+
+// === Validation error ===
+const ECS_SP_VAL_OK: i32 = 0;
+const ECS_SP_VAL_INVALID: i32 = 1;
+const ECS_SP_VAL_SKIPPED: i32 = 2;
+
+struct EcsSpValidationDeep {
+    kind: i32, // 0 ok, 1 invalid, 2 skipped
+    message_id: i64,
+    param_id: i64,
+    field_id: i64,
+}
+
+fn ecs_sp_val_ok() -> EcsSpValidationDeep {
+    return EcsSpValidationDeep { kind: ECS_SP_VAL_OK, message_id: 0, param_id: 0, field_id: 0 };
+}
+
+fn ecs_sp_val_invalid(param_id: i64, message_id: i64) -> EcsSpValidationDeep {
+    return EcsSpValidationDeep {
+        kind: ECS_SP_VAL_INVALID,
+        message_id: message_id,
+        param_id: param_id,
+        field_id: 0,
+    };
+}
+
+fn ecs_sp_val_skipped(param_id: i64, message_id: i64) -> EcsSpValidationDeep {
+    return EcsSpValidationDeep {
+        kind: ECS_SP_VAL_SKIPPED,
+        message_id: message_id,
+        param_id: param_id,
+        field_id: 0,
+    };
+}
+
+fn ecs_sp_val_new(skipped: bool, param_id: i64, message_id: i64, field_id: i64) -> EcsSpValidationDeep {
+    let kind = ECS_SP_VAL_INVALID;
+    if skipped { kind = ECS_SP_VAL_SKIPPED; };
+    return EcsSpValidationDeep {
+        kind: kind,
+        message_id: message_id,
+        param_id: param_id,
+        field_id: field_id,
+    };
+}
+
+fn ecs_sp_val_is_ok(v: EcsSpValidationDeep) -> bool { return v.kind == ECS_SP_VAL_OK; }
+fn ecs_sp_val_is_skipped(v: EcsSpValidationDeep) -> bool { return v.kind == ECS_SP_VAL_SKIPPED; }
+fn ecs_sp_val_is_invalid(v: EcsSpValidationDeep) -> bool { return v.kind == ECS_SP_VAL_INVALID; }
+fn ecs_sp_val_param_id(v: EcsSpValidationDeep) -> i64 { return v.param_id; }
+fn ecs_sp_val_message_id(v: EcsSpValidationDeep) -> i64 { return v.message_id; }
+fn ecs_sp_val_field_id(v: EcsSpValidationDeep) -> i64 { return v.field_id; }
+
+// mark validation error as skipped (If mapping)
+fn ecs_sp_val_mark_skipped(v: EcsSpValidationDeep) -> EcsSpValidationDeep {
+    if v.kind == ECS_SP_VAL_INVALID {
+        v.kind = ECS_SP_VAL_SKIPPED;
+    };
+    return v;
+}
+
+// Option mapping: invalid -> ok None path (modeled as OK with special flag via kind still ok, message marks none)
+// We model Option get_param as always OK for outer; presence via separate bool.
+
+// === Filtered access set (reads/writes bitmasks) ===
+struct EcsSpAccessDeep {
+    reads: i64,
+    writes: i64,
+}
+
+fn ecs_sp_access_empty() -> EcsSpAccessDeep {
+    return EcsSpAccessDeep { reads: 0, writes: 0 };
+}
+
+fn ecs_sp_access_reads(a: EcsSpAccessDeep) -> i64 { return a.reads; }
+fn ecs_sp_access_writes(a: EcsSpAccessDeep) -> i64 { return a.writes; }
+
+fn ecs_sp_access_add_read(a: EcsSpAccessDeep, component_id: i64) -> EcsSpAccessDeep {
+    if component_id >= 0 && component_id < 63 {
+        let bit: i64 = 1;
+        // shift by component_id
+        let i: i64 = 0;
+        while i < component_id {
+            bit = bit * 2;
+            i = i + 1;
+        }
+        a.reads = a.reads | bit;
+    };
+    return a;
+}
+
+fn ecs_sp_access_add_write(a: EcsSpAccessDeep, component_id: i64) -> EcsSpAccessDeep {
+    if component_id >= 0 && component_id < 63 {
+        let bit: i64 = 1;
+        let i: i64 = 0;
+        while i < component_id {
+            bit = bit * 2;
+            i = i + 1;
+        }
+        a.writes = a.writes | bit;
+        // write implies read in Bevy component access often; keep both
+        a.reads = a.reads | bit;
+    };
+    return a;
+}
+
+// conflict if a.writes intersects b.reads|b.writes OR b.writes intersects a.reads|a.writes
+fn ecs_sp_access_conflicts(a: EcsSpAccessDeep, b: EcsSpAccessDeep) -> bool {
+    let a_touch = a.reads | a.writes;
+    let b_touch = b.reads | b.writes;
+    if (a.writes & b_touch) != 0 { return true; };
+    if (b.writes & a_touch) != 0 { return true; };
+    return false;
+}
+
+fn ecs_sp_access_extend(a: EcsSpAccessDeep, b: EcsSpAccessDeep) -> EcsSpAccessDeep {
+    a.reads = a.reads | b.reads;
+    a.writes = a.writes | b.writes;
+    return a;
+}
+
+fn ecs_sp_access_clone(a: EcsSpAccessDeep) -> EcsSpAccessDeep {
+    return EcsSpAccessDeep { reads: a.reads, writes: a.writes };
+}
+
+// === SystemMeta flags for deferred / non_send ===
+struct EcsSpMetaDeep {
+    name_id: i64,
+    has_deferred: bool,
+    is_non_send: bool,
+    last_run: i64,
+}
+
+fn ecs_sp_meta_deep_new(name_id: i64) -> EcsSpMetaDeep {
+    return EcsSpMetaDeep { name_id: name_id, has_deferred: false, is_non_send: false, last_run: 0 };
+}
+
+fn ecs_sp_meta_deep_set_deferred(m: EcsSpMetaDeep) -> EcsSpMetaDeep {
+    m.has_deferred = true;
+    return m;
+}
+
+fn ecs_sp_meta_deep_set_non_send(m: EcsSpMetaDeep) -> EcsSpMetaDeep {
+    m.is_non_send = true;
+    return m;
+}
+
+fn ecs_sp_meta_deep_has_deferred(m: EcsSpMetaDeep) -> bool { return m.has_deferred; }
+fn ecs_sp_meta_deep_is_non_send(m: EcsSpMetaDeep) -> bool { return m.is_non_send; }
+fn ecs_sp_meta_deep_last_run(m: EcsSpMetaDeep) -> i64 { return m.last_run; }
+fn ecs_sp_meta_deep_set_last_run(m: EcsSpMetaDeep, t: i64) -> EcsSpMetaDeep {
+    m.last_run = t;
+    return m;
+}
+
+// === Param descriptor (kind + component access + state value) ===
+struct EcsSpParamDeep {
+    kind: i32,
+    component_id: i64, // primary access id
+    state_id: i64,
+    local_value: i64,
+    deferred_len: i64,
+    deferred_applied: bool,
+    inner_kind: i32, // for Option/If/Static/Dyn wrappers
+    type_id: i64,    // for Dyn downcast
+    readonly: bool,
+    valid: bool,     // get_param succeeds?
+}
+
+fn ecs_sp_param_res(component_id: i64) -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_RES, component_id: component_id, state_id: component_id,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: true, valid: true,
+    };
+}
+
+fn ecs_sp_param_res_mut(component_id: i64) -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_RES_MUT, component_id: component_id, state_id: component_id,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: false, valid: true,
+    };
+}
+
+fn ecs_sp_param_query(component_id: i64, readonly: bool) -> EcsSpParamDeep {
+    let k = ECS_SP_KIND_QUERY;
+    return EcsSpParamDeep {
+        kind: k, component_id: component_id, state_id: component_id,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: readonly, valid: true,
+    };
+}
+
+fn ecs_sp_param_local(initial: i64) -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_LOCAL, component_id: -1, state_id: 0,
+        local_value: initial, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: false, valid: true,
+    };
+}
+
+fn ecs_sp_param_deferred() -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_DEFERRED, component_id: -1, state_id: 0,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: false, valid: true,
+    };
+}
+
+fn ecs_sp_param_phantom() -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_PHANTOM, component_id: -1, state_id: 0,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: true, valid: true,
+    };
+}
+
+fn ecs_sp_param_option(inner: EcsSpParamDeep) -> EcsSpParamDeep {
+    let ik = inner.kind;
+    let p = inner;
+    p.kind = ECS_SP_KIND_OPTION;
+    p.inner_kind = ik;
+    return p;
+}
+
+fn ecs_sp_param_if(inner: EcsSpParamDeep) -> EcsSpParamDeep {
+    let ik = inner.kind;
+    let p = inner;
+    p.kind = ECS_SP_KIND_IF;
+    p.inner_kind = ik;
+    return p;
+}
+
+fn ecs_sp_param_static(inner: EcsSpParamDeep) -> EcsSpParamDeep {
+    let ik = inner.kind;
+    let p = inner;
+    p.kind = ECS_SP_KIND_STATIC;
+    p.inner_kind = ik;
+    return p;
+}
+
+fn ecs_sp_param_dyn(type_id: i64, inner_kind: i32, component_id: i64) -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_DYN, component_id: component_id, state_id: 0,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: inner_kind, type_id: type_id, readonly: true, valid: true,
+    };
+}
+
+fn ecs_sp_param_change_tick() -> EcsSpParamDeep {
+    return EcsSpParamDeep {
+        kind: ECS_SP_KIND_CHANGE_TICK, component_id: -1, state_id: 0,
+        local_value: 0, deferred_len: 0, deferred_applied: false,
+        inner_kind: 0, type_id: 0, readonly: true, valid: true,
+    };
+}
+
+fn ecs_sp_param_kind(p: EcsSpParamDeep) -> i32 { return p.kind; }
+fn ecs_sp_param_component_id(p: EcsSpParamDeep) -> i64 { return p.component_id; }
+fn ecs_sp_param_local_value(p: EcsSpParamDeep) -> i64 { return p.local_value; }
+fn ecs_sp_param_deferred_len(p: EcsSpParamDeep) -> i64 { return p.deferred_len; }
+fn ecs_sp_param_readonly(p: EcsSpParamDeep) -> bool { return p.readonly; }
+fn ecs_sp_param_type_id(p: EcsSpParamDeep) -> i64 { return p.type_id; }
+fn ecs_sp_param_inner_kind(p: EcsSpParamDeep) -> i32 { return p.inner_kind; }
+fn ecs_sp_param_set_valid(p: EcsSpParamDeep, valid: bool) -> EcsSpParamDeep {
+    p.valid = valid;
+    return p;
+}
+
+// build access for a single param
+fn ecs_sp_param_build_access(p: EcsSpParamDeep) -> EcsSpAccessDeep {
+    let a = ecs_sp_access_empty();
+    if p.component_id < 0 { return a; };
+    if p.kind == ECS_SP_KIND_PHANTOM { return a; };
+    if p.kind == ECS_SP_KIND_LOCAL { return a; };
+    if p.kind == ECS_SP_KIND_DEFERRED { return a; };
+    if p.kind == ECS_SP_KIND_CHANGE_TICK { return a; };
+    if p.readonly {
+        return ecs_sp_access_add_read(a, p.component_id);
+    };
+    return ecs_sp_access_add_write(a, p.component_id);
+}
+
+// init_access into set; returns (new_set, conflict)
+fn ecs_sp_param_init_access(
+    p: EcsSpParamDeep,
+    set: EcsSpAccessDeep,
+    meta: EcsSpMetaDeep
+) -> (EcsSpAccessDeep, EcsSpMetaDeep, bool) {
+    let own = ecs_sp_param_build_access(p);
+    if ecs_sp_access_conflicts(set, own) {
+        return (set, meta, true);
+    };
+    set = ecs_sp_access_extend(set, own);
+    if p.kind == ECS_SP_KIND_DEFERRED {
+        meta = ecs_sp_meta_deep_set_deferred(meta);
+    };
+    // NonSend marker would set non_send; Res/Query default send
+    return (set, meta, false);
+}
+
+// === ParamSet of up to 4 sub-params ===
+struct EcsSpParamSetDeep {
+    count: i32,
+    p0: EcsSpParamDeep,
+    p1: EcsSpParamDeep,
+    p2: EcsSpParamDeep,
+    p3: EcsSpParamDeep,
+    // exclusive borrow: which index currently active (-1 none)
+    active: i32,
+}
+
+fn ecs_sp_param_set_new() -> EcsSpParamSetDeep {
+    let empty = ecs_sp_param_phantom();
+    return EcsSpParamSetDeep {
+        count: 0, p0: empty, p1: empty, p2: empty, p3: empty, active: -1,
+    };
+}
+
+fn ecs_sp_param_set_add(ps: EcsSpParamSetDeep, p: EcsSpParamDeep) -> EcsSpParamSetDeep {
+    let c = ps.count;
+    if c >= 4 { return ps; };
+    if c == 0 {
+        ps.p0 = p;
+        ps.count = c + 1;
+        return ps;
+    };
+    if c == 1 {
+        ps.p1 = p;
+        ps.count = c + 1;
+        return ps;
+    };
+    if c == 2 {
+        ps.p2 = p;
+        ps.count = c + 1;
+        return ps;
+    };
+    ps.p3 = p;
+    ps.count = c + 1;
+    return ps;
+}
+
+fn ecs_sp_param_set_count(ps: EcsSpParamSetDeep) -> i32 { return ps.count; }
+fn ecs_sp_param_set_active(ps: EcsSpParamSetDeep) -> i32 { return ps.active; }
+
+fn ecs_sp_param_set_at(ps: EcsSpParamSetDeep, i: i32) -> EcsSpParamDeep {
+    if i == 0 { return ps.p0; };
+    if i == 1 { return ps.p1; };
+    if i == 2 { return ps.p2; };
+    return ps.p3;
+}
+
+// init_access for ParamSet: each sub-param checked alone against prior set (clone),
+// then access merged (Bevy: clone-check per param, then extend each).
+fn ecs_sp_param_set_init_access(
+    ps: EcsSpParamSetDeep,
+    set: EcsSpAccessDeep,
+    meta: EcsSpMetaDeep
+) -> (EcsSpAccessDeep, EcsSpMetaDeep, bool) {
+    let n = ps.count;
+    if n > 0 {
+        if ecs_sp_access_conflicts(set, ecs_sp_param_build_access(ps.p0)) {
+            return (set, meta, true);
+        };
+    };
+    if n > 1 {
+        if ecs_sp_access_conflicts(set, ecs_sp_param_build_access(ps.p1)) {
+            return (set, meta, true);
+        };
+    };
+    if n > 2 {
+        if ecs_sp_access_conflicts(set, ecs_sp_param_build_access(ps.p2)) {
+            return (set, meta, true);
+        };
+    };
+    if n > 3 {
+        if ecs_sp_access_conflicts(set, ecs_sp_param_build_access(ps.p3)) {
+            return (set, meta, true);
+        };
+    };
+    if n > 0 {
+        set = ecs_sp_access_extend(set, ecs_sp_param_build_access(ps.p0));
+        if ps.p0.kind == ECS_SP_KIND_DEFERRED {
+            meta = ecs_sp_meta_deep_set_deferred(meta);
+        };
+    };
+    if n > 1 {
+        set = ecs_sp_access_extend(set, ecs_sp_param_build_access(ps.p1));
+        if ps.p1.kind == ECS_SP_KIND_DEFERRED {
+            meta = ecs_sp_meta_deep_set_deferred(meta);
+        };
+    };
+    if n > 2 {
+        set = ecs_sp_access_extend(set, ecs_sp_param_build_access(ps.p2));
+        if ps.p2.kind == ECS_SP_KIND_DEFERRED {
+            meta = ecs_sp_meta_deep_set_deferred(meta);
+        };
+    };
+    if n > 3 {
+        set = ecs_sp_access_extend(set, ecs_sp_param_build_access(ps.p3));
+        if ps.p3.kind == ECS_SP_KIND_DEFERRED {
+            meta = ecs_sp_meta_deep_set_deferred(meta);
+        };
+    };
+    return (set, meta, false);
+}
+
+// pN exclusive access: only one active at a time
+fn ecs_sp_param_set_p(ps: EcsSpParamSetDeep, index: i32) -> (EcsSpParamSetDeep, bool, EcsSpParamDeep) {
+    let n = ps.count;
+    if index < 0 || index >= n {
+        return (ps, false, ecs_sp_param_phantom());
+    };
+    if index == 0 {
+        let p = ps.p0;
+        ps.active = index;
+        return (ps, true, p);
+    };
+    if index == 1 {
+        let p = ps.p1;
+        ps.active = index;
+        return (ps, true, p);
+    };
+    if index == 2 {
+        let p = ps.p2;
+        ps.active = index;
+        return (ps, true, p);
+    };
+    let p = ps.p3;
+    ps.active = index;
+    return (ps, true, p);
+}
+
+fn ecs_sp_param_set_release(ps: EcsSpParamSetDeep) -> EcsSpParamSetDeep {
+    ps.active = -1;
+    return ps;
+}
+
+// two sub-params that would conflict if simultaneous (ResMut same id) are OK in ParamSet
+fn ecs_sp_param_set_allows_conflicting_pair(ps: EcsSpParamSetDeep) -> bool {
+    let n = ps.count;
+    if n < 2 { return true; };
+    let p0 = ps.p0;
+    let p1 = ps.p1;
+    let a = ecs_sp_param_build_access(p0);
+    let b = ecs_sp_param_build_access(p1);
+    if ecs_sp_access_conflicts(a, b) { return true; };
+    return true;
+}
+
+// === Local ===
+fn ecs_sp_local_get(p: EcsSpParamDeep) -> i64 { return p.local_value; }
+fn ecs_sp_local_set(p: EcsSpParamDeep, v: i64) -> EcsSpParamDeep {
+    p.local_value = v;
+    return p;
+}
+fn ecs_sp_local_bump(p: EcsSpParamDeep) -> EcsSpParamDeep {
+    p.local_value = p.local_value + 1;
+    return p;
+}
+
+// === Deferred buffer ===
+fn ecs_sp_deferred_queue(p: EcsSpParamDeep, n: i64) -> EcsSpParamDeep {
+    p.deferred_len = p.deferred_len + n;
+    p.deferred_applied = false;
+    return p;
+}
+
+fn ecs_sp_deferred_apply(p: EcsSpParamDeep) -> EcsSpParamDeep {
+    p.deferred_len = 0;
+    p.deferred_applied = true;
+    return p;
+}
+
+fn ecs_sp_deferred_is_applied(p: EcsSpParamDeep) -> bool { return p.deferred_applied; }
+
+// === get_param with validation ===
+// returns (param, validation). Option: invalid inner -> ok with valid=false presence none
+// If: invalid inner -> skipped. Plain: invalid -> invalid.
+fn ecs_sp_get_param(p: EcsSpParamDeep, change_tick: i64) -> (EcsSpParamDeep, EcsSpValidationDeep) {
+    let kind = p.kind;
+    let valid = p.valid;
+    let cid = p.component_id;
+    if kind == ECS_SP_KIND_OPTION {
+        // Option maps error to None — outer OK regardless of inner validity
+        return (p, ecs_sp_val_ok());
+    };
+    if kind == ECS_SP_KIND_IF {
+        if valid != true {
+            let vsk = ecs_sp_val_skipped(cid, 1);
+            return (p, vsk);
+        };
+        return (p, ecs_sp_val_ok());
+    };
+    if valid != true {
+        let vin = ecs_sp_val_invalid(cid, 1);
+        return (p, vin);
+    };
+    if kind == ECS_SP_KIND_CHANGE_TICK {
+        p.local_value = change_tick;
+    };
+    return (p, ecs_sp_val_ok());
+}
+
+// Static into_inner
+fn ecs_sp_static_into_inner(p: EcsSpParamDeep) -> EcsSpParamDeep {
+    if p.kind == ECS_SP_KIND_STATIC {
+        let ik = p.inner_kind;
+        p.kind = ik;
+    };
+    return p;
+}
+
+// Dyn downcast: ok if type_id matches
+fn ecs_sp_dyn_is_kind_and_type(p: EcsSpParamDeep, type_id: i64) -> bool {
+    if p.kind != ECS_SP_KIND_DYN { return false; };
+    return p.type_id == type_id;
+}
+
+fn ecs_sp_dyn_is(p: EcsSpParamDeep, type_id: i64) -> bool {
+    return ecs_sp_dyn_is_kind_and_type(p, type_id);
+}
+
+fn ecs_sp_dyn_downcast(p: EcsSpParamDeep, type_id: i64) -> (bool, EcsSpParamDeep) {
+    let is_dyn = p.kind == ECS_SP_KIND_DYN;
+    let matches = p.type_id == type_id;
+    if is_dyn && matches {
+        let ik = p.inner_kind;
+        let out = p;
+        out.kind = ik;
+        return (true, out);
+    };
+    return (false, p);
+}
+
+// === SystemChangeTick helper ===
+struct EcsSpChangeTickDeep {
+    last_run: i64,
+    this_run: i64,
+}
+
+fn ecs_sp_change_tick_new(last_run: i64, this_run: i64) -> EcsSpChangeTickDeep {
+    return EcsSpChangeTickDeep { last_run: last_run, this_run: this_run };
+}
+
+fn ecs_sp_change_tick_last_run(t: EcsSpChangeTickDeep) -> i64 { return t.last_run; }
+fn ecs_sp_change_tick_this_run(t: EcsSpChangeTickDeep) -> i64 { return t.this_run; }
+
+// from meta + world change tick
+fn ecs_sp_change_tick_from_meta(meta: EcsSpMetaDeep, this_run: i64) -> EcsSpChangeTickDeep {
+    return EcsSpChangeTickDeep { last_run: meta.last_run, this_run: this_run };
+}
+
+// === Combined system param init for a flat list (up to 4) ===
+struct EcsSpSystemParamsDeep {
+    count: i32,
+    p0: EcsSpParamDeep,
+    p1: EcsSpParamDeep,
+    p2: EcsSpParamDeep,
+    p3: EcsSpParamDeep,
+    access: EcsSpAccessDeep,
+    meta: EcsSpMetaDeep,
+    conflict: bool,
+    last_val: EcsSpValidationDeep,
+}
+
+fn ecs_sp_system_params_new(name_id: i64) -> EcsSpSystemParamsDeep {
+    let empty = ecs_sp_param_phantom();
+    return EcsSpSystemParamsDeep {
+        count: 0,
+        p0: empty, p1: empty, p2: empty, p3: empty,
+        access: ecs_sp_access_empty(),
+        meta: ecs_sp_meta_deep_new(name_id),
+        conflict: false,
+        last_val: ecs_sp_val_ok(),
+    };
+}
+
+fn ecs_sp_system_params_add(s: EcsSpSystemParamsDeep, p: EcsSpParamDeep) -> EcsSpSystemParamsDeep {
+    let c = s.count;
+    if c >= 4 { return s; };
+    if c == 0 {
+        s.p0 = p;
+        s.count = c + 1;
+        return s;
+    };
+    if c == 1 {
+        s.p1 = p;
+        s.count = c + 1;
+        return s;
+    };
+    if c == 2 {
+        s.p2 = p;
+        s.count = c + 1;
+        return s;
+    };
+    s.p3 = p;
+    s.count = c + 1;
+    return s;
+}
+
+fn ecs_sp_system_params_at(s: EcsSpSystemParamsDeep, i: i32) -> EcsSpParamDeep {
+    if i == 0 { return s.p0; };
+    if i == 1 { return s.p1; };
+    if i == 2 { return s.p2; };
+    return s.p3;
+}
+
+fn ecs_sp_system_params_set_at(s: EcsSpSystemParamsDeep, i: i32, p: EcsSpParamDeep) -> EcsSpSystemParamsDeep {
+    if i == 0 { s.p0 = p; return s; };
+    if i == 1 { s.p1 = p; return s; };
+    if i == 2 { s.p2 = p; return s; };
+    s.p3 = p;
+    return s;
+}
+
+// get field by index without consuming struct: returns copy via function param-by-value of struct.
+// Workaround for SLA: provide 4 specialized accessors and dispatch by index in caller.
+
+
+// init_access all plain params (not ParamSet)
+fn ecs_sp_system_params_init_access(s: EcsSpSystemParamsDeep) -> EcsSpSystemParamsDeep {
+    let acc = s.access;
+    let meta = s.meta;
+    let n = s.count;
+    if n > 0 {
+        let r = ecs_sp_param_init_access(s.p0, acc, meta);
+        acc = r.0;
+        meta = r.1;
+        if r.2 {
+            s.access = acc;
+            s.meta = meta;
+            s.conflict = true;
+            return s;
+        };
+    };
+    if n > 1 {
+        let r = ecs_sp_param_init_access(s.p1, acc, meta);
+        acc = r.0;
+        meta = r.1;
+        if r.2 {
+            s.access = acc;
+            s.meta = meta;
+            s.conflict = true;
+            return s;
+        };
+    };
+    if n > 2 {
+        let r = ecs_sp_param_init_access(s.p2, acc, meta);
+        acc = r.0;
+        meta = r.1;
+        if r.2 {
+            s.access = acc;
+            s.meta = meta;
+            s.conflict = true;
+            return s;
+        };
+    };
+    if n > 3 {
+        let r = ecs_sp_param_init_access(s.p3, acc, meta);
+        acc = r.0;
+        meta = r.1;
+        if r.2 {
+            s.access = acc;
+            s.meta = meta;
+            s.conflict = true;
+            return s;
+        };
+    };
+    s.access = acc;
+    s.meta = meta;
+    s.conflict = false;
+    return s;
+}
+
+fn ecs_sp_system_params_conflict(s: EcsSpSystemParamsDeep) -> bool { return s.conflict; }
+fn ecs_sp_system_params_access_reads(s: EcsSpSystemParamsDeep) -> i64 { return s.access.reads; }
+fn ecs_sp_system_params_access_writes(s: EcsSpSystemParamsDeep) -> i64 { return s.access.writes; }
+fn ecs_sp_system_params_has_deferred(s: EcsSpSystemParamsDeep) -> bool { return s.meta.has_deferred; }
+fn ecs_sp_system_params_count(s: EcsSpSystemParamsDeep) -> i32 { return s.count; }
+
+// get all params; first validation failure wins
+fn ecs_sp_system_params_get_all(s: EcsSpSystemParamsDeep, change_tick: i64) -> EcsSpSystemParamsDeep {
+    let n = s.count;
+    if n > 0 {
+        let g = ecs_sp_get_param(s.p0, change_tick);
+        s.p0 = g.0;
+        if ecs_sp_val_is_ok(g.1) != true {
+            s.last_val = g.1;
+            return s;
+        };
+    };
+    if n > 1 {
+        let g = ecs_sp_get_param(s.p1, change_tick);
+        s.p1 = g.0;
+        if ecs_sp_val_is_ok(g.1) != true {
+            s.last_val = g.1;
+            return s;
+        };
+    };
+    if n > 2 {
+        let g = ecs_sp_get_param(s.p2, change_tick);
+        s.p2 = g.0;
+        if ecs_sp_val_is_ok(g.1) != true {
+            s.last_val = g.1;
+            return s;
+        };
+    };
+    if n > 3 {
+        let g = ecs_sp_get_param(s.p3, change_tick);
+        s.p3 = g.0;
+        if ecs_sp_val_is_ok(g.1) != true {
+            s.last_val = g.1;
+            return s;
+        };
+    };
+    s.last_val = ecs_sp_val_ok();
+    return s;
+}
+
+fn ecs_sp_system_params_last_val(s: EcsSpSystemParamsDeep) -> EcsSpValidationDeep { return s.last_val; }
+
+// apply deferred on all deferred params
+fn ecs_sp_system_params_apply(s: EcsSpSystemParamsDeep) -> EcsSpSystemParamsDeep {
+    let n = s.count;
+    if n > 0 {
+        let p = s.p0;
+        if p.kind == ECS_SP_KIND_DEFERRED {
+            s.p0 = ecs_sp_deferred_apply(p);
+        };
+    };
+    if n > 1 {
+        let p = s.p1;
+        if p.kind == ECS_SP_KIND_DEFERRED {
+            s.p1 = ecs_sp_deferred_apply(p);
+        };
+    };
+    if n > 2 {
+        let p = s.p2;
+        if p.kind == ECS_SP_KIND_DEFERRED {
+            s.p2 = ecs_sp_deferred_apply(p);
+        };
+    };
+    if n > 3 {
+        let p = s.p3;
+        if p.kind == ECS_SP_KIND_DEFERRED {
+            s.p3 = ecs_sp_deferred_apply(p);
+        };
+    };
+    return s;
+}
+
+// ReadOnlySystemParam: all params readonly
+fn ecs_sp_system_params_is_readonly(s: EcsSpSystemParamsDeep) -> bool {
+    let n = s.count;
+    if n > 0 {
+        let p = s.p0;
+        if p.readonly != true { return false; };
+    };
+    if n > 1 {
+        let p = s.p1;
+        if p.readonly != true { return false; };
+    };
+    if n > 2 {
+        let p = s.p2;
+        if p.readonly != true { return false; };
+    };
+    if n > 3 {
+        let p = s.p3;
+        if p.readonly != true { return false; };
+    };
+    return true;
+}
+
+// Helper: simultaneous ResMut same resource conflicts; ParamSet allows sequential
+fn ecs_sp_res_mut_pair_conflicts(a: i64, b: i64) -> bool {
+    return a == b;
+}
+
+// ParamSet init against empty prior + check pair allowed
+fn ecs_sp_param_set_init_against_empty(ps: EcsSpParamSetDeep) -> (EcsSpAccessDeep, bool) {
+    let set = ecs_sp_access_empty();
+    let meta = ecs_sp_meta_deep_new(0);
+    let r = ecs_sp_param_set_init_access(ps, set, meta);
+    return (r.0, r.2);
+}

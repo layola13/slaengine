@@ -1,0 +1,660 @@
+// Deepened Bevy ECS observer storage facade.
+// Mirrors src/observer/centralized_storage.rs + distributed_storage.rs combined surface:
+//   CachedObservers: global / component / entity runner maps
+//   Observers catalog: get_or_create + lifecycle caches (add/insert/discard/remove/despawn)
+//   Distributed ObserverNode: descriptor components/entities, runner, error handler, condition
+//   collect runners for (event_key, component?, entity?) dispatch order:
+//     global then component then entity (Bevy CachedObservers layout)
+// Fixed capacity: 4 event caches, 4 runners per map, 4 distributed nodes, 2 components/entities per node.
+// Shallow lib/observer_storage.sla retained. Centralized/distributed deep modules remain.
+
+// Lifecycle EventKeys
+const ECS_OS_ADD: i64 = 0;
+const ECS_OS_INSERT: i64 = 1;
+const ECS_OS_DISCARD: i64 = 2;
+const ECS_OS_REMOVE: i64 = 3;
+const ECS_OS_DESPAWN: i64 = 4;
+
+fn ecs_os_key_add() -> i64 { return ECS_OS_ADD; }
+fn ecs_os_key_insert() -> i64 { return ECS_OS_INSERT; }
+fn ecs_os_key_discard() -> i64 { return ECS_OS_DISCARD; }
+fn ecs_os_key_remove() -> i64 { return ECS_OS_REMOVE; }
+fn ecs_os_key_despawn() -> i64 { return ECS_OS_DESPAWN; }
+
+fn ecs_os_is_lifecycle(k: i64) -> bool {
+    if k >= 0 {
+        if k <= 4 { return true; };
+    };
+    return false;
+}
+
+// Runner map: 4 (observer, runner) pairs
+struct EcsOsMapDeep {
+    o0: i64, r0: i64,
+    o1: i64, r1: i64,
+    o2: i64, r2: i64,
+    o3: i64, r3: i64,
+    len: i32,
+}
+
+fn ecs_os_map_new() -> EcsOsMapDeep {
+    return EcsOsMapDeep {
+        o0: 0, r0: 0, o1: 0, r1: 0, o2: 0, r2: 0, o3: 0, r3: 0, len: 0,
+    };
+}
+
+fn ecs_os_map_len(m: EcsOsMapDeep) -> i32 { return m.len; }
+
+fn ecs_os_map_rebuild(
+    o0: i64, r0: i64, o1: i64, r1: i64, o2: i64, r2: i64, o3: i64, r3: i64, len: i32
+) -> EcsOsMapDeep {
+    return EcsOsMapDeep {
+        o0: o0, r0: r0, o1: o1, r1: r1, o2: o2, r2: r2, o3: o3, r3: r3, len: len,
+    };
+}
+
+fn ecs_os_map_insert(m: EcsOsMapDeep, observer: i64, runner: i64) -> EcsOsMapDeep {
+    if m.len >= 1 {
+        if m.o0 == observer {
+            return ecs_os_map_rebuild(m.o0, runner, m.o1, m.r1, m.o2, m.r2, m.o3, m.r3, m.len);
+        };
+    };
+    if m.len >= 2 {
+        if m.o1 == observer {
+            return ecs_os_map_rebuild(m.o0, m.r0, m.o1, runner, m.o2, m.r2, m.o3, m.r3, m.len);
+        };
+    };
+    if m.len >= 3 {
+        if m.o2 == observer {
+            return ecs_os_map_rebuild(m.o0, m.r0, m.o1, m.r1, m.o2, runner, m.o3, m.r3, m.len);
+        };
+    };
+    if m.len >= 4 {
+        if m.o3 == observer {
+            return ecs_os_map_rebuild(m.o0, m.r0, m.o1, m.r1, m.o2, m.r2, m.o3, runner, m.len);
+        };
+    };
+    if m.len == 0 {
+        return ecs_os_map_rebuild(observer, runner, m.o1, m.r1, m.o2, m.r2, m.o3, m.r3, 1);
+    };
+    if m.len == 1 {
+        return ecs_os_map_rebuild(m.o0, m.r0, observer, runner, m.o2, m.r2, m.o3, m.r3, 2);
+    };
+    if m.len == 2 {
+        return ecs_os_map_rebuild(m.o0, m.r0, m.o1, m.r1, observer, runner, m.o3, m.r3, 3);
+    };
+    if m.len == 3 {
+        return ecs_os_map_rebuild(m.o0, m.r0, m.o1, m.r1, m.o2, m.r2, observer, runner, 4);
+    };
+    return m;
+}
+
+fn ecs_os_map_runner_at(m: EcsOsMapDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.r0; };
+    if idx == 1 { return m.r1; };
+    if idx == 2 { return m.r2; };
+    if idx == 3 { return m.r3; };
+    return 0;
+}
+
+// CachedObservers for one event
+struct EcsOsCachedDeep {
+    global: EcsOsMapDeep,
+    // single component map slot for simplicity (component_id + map)
+    comp_id: i32,
+    comp: EcsOsMapDeep,
+    has_comp: bool,
+    // single entity map slot
+    ent_id: i64,
+    ent: EcsOsMapDeep,
+    has_ent: bool,
+}
+
+fn ecs_os_cached_new() -> EcsOsCachedDeep {
+    return EcsOsCachedDeep {
+        global: ecs_os_map_new(),
+        comp_id: -1, comp: ecs_os_map_new(), has_comp: false,
+        ent_id: 0, ent: ecs_os_map_new(), has_ent: false,
+    };
+}
+
+fn ecs_os_cached_global_len(c: EcsOsCachedDeep) -> i32 { return c.global.len; }
+fn ecs_os_cached_has_comp(c: EcsOsCachedDeep) -> bool { return c.has_comp; }
+fn ecs_os_cached_has_ent(c: EcsOsCachedDeep) -> bool { return c.has_ent; }
+
+fn ecs_os_cached_add_global(c: EcsOsCachedDeep, observer: i64, runner: i64) -> EcsOsCachedDeep {
+    return EcsOsCachedDeep {
+        global: ecs_os_map_insert(c.global, observer, runner),
+        comp_id: c.comp_id, comp: c.comp, has_comp: c.has_comp,
+        ent_id: c.ent_id, ent: c.ent, has_ent: c.has_ent,
+    };
+}
+
+fn ecs_os_cached_add_component(c: EcsOsCachedDeep, component_id: i32, observer: i64, runner: i64) -> EcsOsCachedDeep {
+    if c.has_comp {
+        if c.comp_id != component_id {
+            // only one component bucket in this model; ignore other ids
+            return c;
+        };
+        return EcsOsCachedDeep {
+            global: c.global, comp_id: c.comp_id, comp: ecs_os_map_insert(c.comp, observer, runner), has_comp: true,
+            ent_id: c.ent_id, ent: c.ent, has_ent: c.has_ent,
+        };
+    };
+    return EcsOsCachedDeep {
+        global: c.global, comp_id: component_id, comp: ecs_os_map_insert(ecs_os_map_new(), observer, runner), has_comp: true,
+        ent_id: c.ent_id, ent: c.ent, has_ent: c.has_ent,
+    };
+}
+
+fn ecs_os_cached_add_entity(c: EcsOsCachedDeep, entity: i64, observer: i64, runner: i64) -> EcsOsCachedDeep {
+    if c.has_ent {
+        if c.ent_id != entity {
+            return c;
+        };
+        return EcsOsCachedDeep {
+            global: c.global, comp_id: c.comp_id, comp: c.comp, has_comp: c.has_comp,
+            ent_id: c.ent_id, ent: ecs_os_map_insert(c.ent, observer, runner), has_ent: true,
+        };
+    };
+    return EcsOsCachedDeep {
+        global: c.global, comp_id: c.comp_id, comp: c.comp, has_comp: c.has_comp,
+        ent_id: entity, ent: ecs_os_map_insert(ecs_os_map_new(), observer, runner), has_ent: true,
+    };
+}
+
+// Catalog with general event slots + lifecycle dedicated caches
+struct EcsOsCatalogDeep {
+    // general events 0..3 (non-lifecycle or overflow)
+    k0: i64, c0: EcsOsCachedDeep, u0: bool,
+    k1: i64, c1: EcsOsCachedDeep, u1: bool,
+    k2: i64, c2: EcsOsCachedDeep, u2: bool,
+    k3: i64, c3: EcsOsCachedDeep, u3: bool,
+    n: i32,
+    add: EcsOsCachedDeep,
+    insert: EcsOsCachedDeep,
+    discard: EcsOsCachedDeep,
+    remove: EcsOsCachedDeep,
+    despawn: EcsOsCachedDeep,
+}
+
+fn ecs_os_catalog_new() -> EcsOsCatalogDeep {
+    return EcsOsCatalogDeep {
+        k0: 0, c0: ecs_os_cached_new(), u0: false, k1: 0, c1: ecs_os_cached_new(), u1: false,
+        k2: 0, c2: ecs_os_cached_new(), u2: false, k3: 0, c3: ecs_os_cached_new(), u3: false, n: 0,
+        add: ecs_os_cached_new(), insert: ecs_os_cached_new(), discard: ecs_os_cached_new(),
+        remove: ecs_os_cached_new(), despawn: ecs_os_cached_new(),
+    };
+}
+
+fn ecs_os_catalog_event_count(s: EcsOsCatalogDeep) -> i32 { return s.n; }
+
+fn ecs_os_catalog_get_lifecycle(s: EcsOsCatalogDeep, key: i64) -> EcsOsCachedDeep {
+    if key == ECS_OS_ADD { return s.add; };
+    if key == ECS_OS_INSERT { return s.insert; };
+    if key == ECS_OS_DISCARD { return s.discard; };
+    if key == ECS_OS_REMOVE { return s.remove; };
+    if key == ECS_OS_DESPAWN { return s.despawn; };
+    return ecs_os_cached_new();
+}
+
+fn ecs_os_catalog_set_lifecycle(s: EcsOsCatalogDeep, key: i64, c: EcsOsCachedDeep) -> EcsOsCatalogDeep {
+    if key == ECS_OS_ADD {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: c, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if key == ECS_OS_INSERT {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: c, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if key == ECS_OS_DISCARD {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: c, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if key == ECS_OS_REMOVE {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: s.discard, remove: c, despawn: s.despawn,
+        };
+    };
+    if key == ECS_OS_DESPAWN {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: c,
+        };
+    };
+    return s;
+}
+
+fn ecs_os_catalog_find_general(s: EcsOsCatalogDeep, key: i64) -> i32 {
+    if s.u0 {
+        if s.k0 == key { return 0; };
+    };
+    if s.u1 {
+        if s.k1 == key { return 1; };
+    };
+    if s.u2 {
+        if s.k2 == key { return 2; };
+    };
+    if s.u3 {
+        if s.k3 == key { return 3; };
+    };
+    return -1;
+}
+
+fn ecs_os_catalog_get_or_create(s: EcsOsCatalogDeep, key: i64) -> EcsOsCatalogDeep {
+    if ecs_os_is_lifecycle(key) {
+        return s;
+    };
+    let idx = ecs_os_catalog_find_general(s, key);
+    if idx >= 0 { return s; };
+    if s.n == 0 {
+        return EcsOsCatalogDeep {
+            k0: key, c0: ecs_os_cached_new(), u0: true, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: 1,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if s.n == 1 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: key, c1: ecs_os_cached_new(), u1: true,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: 2,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if s.n == 2 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: key, c2: ecs_os_cached_new(), u2: true, k3: s.k3, c3: s.c3, u3: s.u3, n: 3,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if s.n == 3 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: key, c3: ecs_os_cached_new(), u3: true, n: 4,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    return s;
+}
+
+fn ecs_os_catalog_get_cache(s: EcsOsCatalogDeep, key: i64) -> EcsOsCachedDeep {
+    if ecs_os_is_lifecycle(key) {
+        return ecs_os_catalog_get_lifecycle(s, key);
+    };
+    let idx = ecs_os_catalog_find_general(s, key);
+    if idx == 0 { return s.c0; };
+    if idx == 1 { return s.c1; };
+    if idx == 2 { return s.c2; };
+    if idx == 3 { return s.c3; };
+    return ecs_os_cached_new();
+}
+
+fn ecs_os_catalog_set_cache(s: EcsOsCatalogDeep, key: i64, c: EcsOsCachedDeep) -> EcsOsCatalogDeep {
+    if ecs_os_is_lifecycle(key) {
+        return ecs_os_catalog_set_lifecycle(s, key, c);
+    };
+    let idx = ecs_os_catalog_find_general(s, key);
+    if idx == 0 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: c, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if idx == 1 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: c, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if idx == 2 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: c, u2: s.u2, k3: s.k3, c3: s.c3, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    if idx == 3 {
+        return EcsOsCatalogDeep {
+            k0: s.k0, c0: s.c0, u0: s.u0, k1: s.k1, c1: s.c1, u1: s.u1,
+            k2: s.k2, c2: s.c2, u2: s.u2, k3: s.k3, c3: c, u3: s.u3, n: s.n,
+            add: s.add, insert: s.insert, discard: s.discard, remove: s.remove, despawn: s.despawn,
+        };
+    };
+    return s;
+}
+
+fn ecs_os_catalog_add_global(s: EcsOsCatalogDeep, key: i64, observer: i64, runner: i64) -> EcsOsCatalogDeep {
+    let s2 = ecs_os_catalog_get_or_create(s, key);
+    let cache = ecs_os_catalog_get_cache(s2, key);
+    let cache2 = ecs_os_cached_add_global(cache, observer, runner);
+    return ecs_os_catalog_set_cache(s2, key, cache2);
+}
+
+fn ecs_os_catalog_add_component(s: EcsOsCatalogDeep, key: i64, component_id: i32, observer: i64, runner: i64) -> EcsOsCatalogDeep {
+    let s2 = ecs_os_catalog_get_or_create(s, key);
+    let cache = ecs_os_catalog_get_cache(s2, key);
+    let cache2 = ecs_os_cached_add_component(cache, component_id, observer, runner);
+    return ecs_os_catalog_set_cache(s2, key, cache2);
+}
+
+fn ecs_os_catalog_add_entity(s: EcsOsCatalogDeep, key: i64, entity: i64, observer: i64, runner: i64) -> EcsOsCatalogDeep {
+    let s2 = ecs_os_catalog_get_or_create(s, key);
+    let cache = ecs_os_catalog_get_cache(s2, key);
+    let cache2 = ecs_os_cached_add_entity(cache, entity, observer, runner);
+    return ecs_os_catalog_set_cache(s2, key, cache2);
+}
+
+// Collect runners for dispatch: global + matching component + matching entity
+struct EcsOsCollectDeep {
+    // up to 8 runners flattened
+    r0: i64, r1: i64, r2: i64, r3: i64,
+    r4: i64, r5: i64, r6: i64, r7: i64,
+    len: i32,
+}
+
+fn ecs_os_collect_len(c: EcsOsCollectDeep) -> i32 { return c.len; }
+fn ecs_os_collect_at(c: EcsOsCollectDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.r0; };
+    if idx == 1 { return c.r1; };
+    if idx == 2 { return c.r2; };
+    if idx == 3 { return c.r3; };
+    if idx == 4 { return c.r4; };
+    if idx == 5 { return c.r5; };
+    if idx == 6 { return c.r6; };
+    if idx == 7 { return c.r7; };
+    return 0;
+}
+
+fn ecs_os_collect_push(c: EcsOsCollectDeep, runner: i64) -> EcsOsCollectDeep {
+    if c.len == 0 {
+        return EcsOsCollectDeep { r0: runner, r1: c.r1, r2: c.r2, r3: c.r3, r4: c.r4, r5: c.r5, r6: c.r6, r7: c.r7, len: 1 };
+    };
+    if c.len == 1 {
+        return EcsOsCollectDeep { r0: c.r0, r1: runner, r2: c.r2, r3: c.r3, r4: c.r4, r5: c.r5, r6: c.r6, r7: c.r7, len: 2 };
+    };
+    if c.len == 2 {
+        return EcsOsCollectDeep { r0: c.r0, r1: c.r1, r2: runner, r3: c.r3, r4: c.r4, r5: c.r5, r6: c.r6, r7: c.r7, len: 3 };
+    };
+    if c.len == 3 {
+        return EcsOsCollectDeep { r0: c.r0, r1: c.r1, r2: c.r2, r3: runner, r4: c.r4, r5: c.r5, r6: c.r6, r7: c.r7, len: 4 };
+    };
+    if c.len == 4 {
+        return EcsOsCollectDeep { r0: c.r0, r1: c.r1, r2: c.r2, r3: c.r3, r4: runner, r5: c.r5, r6: c.r6, r7: c.r7, len: 5 };
+    };
+    if c.len == 5 {
+        return EcsOsCollectDeep { r0: c.r0, r1: c.r1, r2: c.r2, r3: c.r3, r4: c.r4, r5: runner, r6: c.r6, r7: c.r7, len: 6 };
+    };
+    if c.len == 6 {
+        return EcsOsCollectDeep { r0: c.r0, r1: c.r1, r2: c.r2, r3: c.r3, r4: c.r4, r5: c.r5, r6: runner, r7: c.r7, len: 7 };
+    };
+    if c.len == 7 {
+        return EcsOsCollectDeep { r0: c.r0, r1: c.r1, r2: c.r2, r3: c.r3, r4: c.r4, r5: c.r5, r6: c.r6, r7: runner, len: 8 };
+    };
+    return c;
+}
+
+fn ecs_os_collect_from_map(c: EcsOsCollectDeep, m: EcsOsMapDeep) -> EcsOsCollectDeep {
+    let out = c;
+    if m.len >= 1 { out = ecs_os_collect_push(out, m.r0); };
+    if m.len >= 2 { out = ecs_os_collect_push(out, m.r1); };
+    if m.len >= 3 { out = ecs_os_collect_push(out, m.r2); };
+    if m.len >= 4 { out = ecs_os_collect_push(out, m.r3); };
+    return out;
+}
+
+fn ecs_os_catalog_collect(
+    s: EcsOsCatalogDeep, key: i64, component_id: i32, entity: i64, has_comp: bool, has_ent: bool
+) -> EcsOsCollectDeep {
+    let cache = ecs_os_catalog_get_cache(s, key);
+    let gmap = cache.global;
+    let cmap = cache.comp;
+    let emap = cache.ent;
+    let has_c = cache.has_comp;
+    let has_e = cache.has_ent;
+    let cid = cache.comp_id;
+    let eid = cache.ent_id;
+    let out = EcsOsCollectDeep {
+        r0: 0, r1: 0, r2: 0, r3: 0, r4: 0, r5: 0, r6: 0, r7: 0, len: 0,
+    };
+    out = ecs_os_collect_from_map(out, gmap);
+    if has_comp {
+        if has_c {
+            if cid == component_id {
+                out = ecs_os_collect_from_map(out, cmap);
+            };
+        };
+    };
+    if has_ent {
+        if has_e {
+            if eid == entity {
+                out = ecs_os_collect_from_map(out, emap);
+            };
+        };
+    };
+    return out;
+}
+
+// Distributed node
+struct EcsOsNodeDeep {
+    entity: i64,
+    runner: i64,
+    c0: i32, c1: i32, c_len: i32,
+    e0: i64, e1: i64, e_len: i32,
+    error_handler_id: i32,
+    condition_id: i32,
+    used: bool,
+}
+
+fn ecs_os_node_new(entity: i64, runner: i64) -> EcsOsNodeDeep {
+    return EcsOsNodeDeep {
+        entity: entity, runner: runner,
+        c0: -1, c1: -1, c_len: 0, e0: 0, e1: 0, e_len: 0,
+        error_handler_id: 0, condition_id: 0, used: true,
+    };
+}
+
+fn ecs_os_node_entity(n: EcsOsNodeDeep) -> i64 { return n.entity; }
+fn ecs_os_node_runner(n: EcsOsNodeDeep) -> i64 { return n.runner; }
+fn ecs_os_node_c_len(n: EcsOsNodeDeep) -> i32 { return n.c_len; }
+fn ecs_os_node_e_len(n: EcsOsNodeDeep) -> i32 { return n.e_len; }
+fn ecs_os_node_handler(n: EcsOsNodeDeep) -> i32 { return n.error_handler_id; }
+fn ecs_os_node_condition(n: EcsOsNodeDeep) -> i32 { return n.condition_id; }
+
+fn ecs_os_node_with_component(n: EcsOsNodeDeep, cid: i32) -> EcsOsNodeDeep {
+    if n.c_len == 0 {
+        return EcsOsNodeDeep {
+            entity: n.entity, runner: n.runner, c0: cid, c1: n.c1, c_len: 1,
+            e0: n.e0, e1: n.e1, e_len: n.e_len, error_handler_id: n.error_handler_id,
+            condition_id: n.condition_id, used: n.used,
+        };
+    };
+    if n.c_len == 1 {
+        return EcsOsNodeDeep {
+            entity: n.entity, runner: n.runner, c0: n.c0, c1: cid, c_len: 2,
+            e0: n.e0, e1: n.e1, e_len: n.e_len, error_handler_id: n.error_handler_id,
+            condition_id: n.condition_id, used: n.used,
+        };
+    };
+    return n;
+}
+
+fn ecs_os_node_with_entity(n: EcsOsNodeDeep, entity: i64) -> EcsOsNodeDeep {
+    if n.e_len == 0 {
+        return EcsOsNodeDeep {
+            entity: n.entity, runner: n.runner, c0: n.c0, c1: n.c1, c_len: n.c_len,
+            e0: entity, e1: n.e1, e_len: 1, error_handler_id: n.error_handler_id,
+            condition_id: n.condition_id, used: n.used,
+        };
+    };
+    if n.e_len == 1 {
+        return EcsOsNodeDeep {
+            entity: n.entity, runner: n.runner, c0: n.c0, c1: n.c1, c_len: n.c_len,
+            e0: n.e0, e1: entity, e_len: 2, error_handler_id: n.error_handler_id,
+            condition_id: n.condition_id, used: n.used,
+        };
+    };
+    return n;
+}
+
+fn ecs_os_node_with_error_handler(n: EcsOsNodeDeep, handler: i32) -> EcsOsNodeDeep {
+    return EcsOsNodeDeep {
+        entity: n.entity, runner: n.runner, c0: n.c0, c1: n.c1, c_len: n.c_len,
+        e0: n.e0, e1: n.e1, e_len: n.e_len, error_handler_id: handler,
+        condition_id: n.condition_id, used: n.used,
+    };
+}
+
+fn ecs_os_node_run_if(n: EcsOsNodeDeep, condition: i32) -> EcsOsNodeDeep {
+    return EcsOsNodeDeep {
+        entity: n.entity, runner: n.runner, c0: n.c0, c1: n.c1, c_len: n.c_len,
+        e0: n.e0, e1: n.e1, e_len: n.e_len, error_handler_id: n.error_handler_id,
+        condition_id: condition, used: n.used,
+    };
+}
+
+fn ecs_os_node_watches_entity(n: EcsOsNodeDeep, entity: i64) -> bool {
+    if n.e_len >= 1 {
+        if n.e0 == entity { return true; };
+    };
+    if n.e_len >= 2 {
+        if n.e1 == entity { return true; };
+    };
+    return false;
+}
+
+// Distributed store of nodes
+struct EcsOsDistDeep {
+    n0: EcsOsNodeDeep, u0: bool,
+    n1: EcsOsNodeDeep, u1: bool,
+    n2: EcsOsNodeDeep, u2: bool,
+    n3: EcsOsNodeDeep, u3: bool,
+    count: i32,
+}
+
+fn ecs_os_dist_empty_node() -> EcsOsNodeDeep {
+    return EcsOsNodeDeep {
+        entity: 0, runner: 0, c0: -1, c1: -1, c_len: 0, e0: 0, e1: 0, e_len: 0,
+        error_handler_id: 0, condition_id: 0, used: false,
+    };
+}
+
+fn ecs_os_dist_new() -> EcsOsDistDeep {
+    return EcsOsDistDeep {
+        n0: ecs_os_dist_empty_node(), u0: false,
+        n1: ecs_os_dist_empty_node(), u1: false,
+        n2: ecs_os_dist_empty_node(), u2: false,
+        n3: ecs_os_dist_empty_node(), u3: false,
+        count: 0,
+    };
+}
+
+fn ecs_os_dist_count(d: EcsOsDistDeep) -> i32 { return d.count; }
+
+fn ecs_os_dist_add(d: EcsOsDistDeep, node: EcsOsNodeDeep) -> EcsOsDistDeep {
+    if d.count == 0 {
+        return EcsOsDistDeep {
+            n0: node, u0: true, n1: d.n1, u1: d.u1, n2: d.n2, u2: d.u2, n3: d.n3, u3: d.u3, count: 1,
+        };
+    };
+    if d.count == 1 {
+        return EcsOsDistDeep {
+            n0: d.n0, u0: d.u0, n1: node, u1: true, n2: d.n2, u2: d.u2, n3: d.n3, u3: d.u3, count: 2,
+        };
+    };
+    if d.count == 2 {
+        return EcsOsDistDeep {
+            n0: d.n0, u0: d.u0, n1: d.n1, u1: d.u1, n2: node, u2: true, n3: d.n3, u3: d.u3, count: 3,
+        };
+    };
+    if d.count == 3 {
+        return EcsOsDistDeep {
+            n0: d.n0, u0: d.u0, n1: d.n1, u1: d.u1, n2: d.n2, u2: d.u2, n3: node, u3: true, count: 4,
+        };
+    };
+    return d;
+}
+
+fn ecs_os_dist_at(d: EcsOsDistDeep, idx: i32) -> EcsOsNodeDeep {
+    if idx == 0 { return d.n0; };
+    if idx == 1 { return d.n1; };
+    if idx == 2 { return d.n2; };
+    if idx == 3 { return d.n3; };
+    return ecs_os_dist_empty_node();
+}
+
+// count distributed nodes watching entity
+fn ecs_os_dist_watchers_of(d: EcsOsDistDeep, entity: i64) -> i32 {
+    let n: i32 = 0;
+    if d.u0 {
+        if ecs_os_node_watches_entity(d.n0, entity) { n = n + 1; };
+    };
+    if d.u1 {
+        if ecs_os_node_watches_entity(d.n1, entity) { n = n + 1; };
+    };
+    if d.u2 {
+        if ecs_os_node_watches_entity(d.n2, entity) { n = n + 1; };
+    };
+    if d.u3 {
+        if ecs_os_node_watches_entity(d.n3, entity) { n = n + 1; };
+    };
+    return n;
+}
+
+// Unified storage facade
+struct EcsOsStorageDeep {
+    catalog: EcsOsCatalogDeep,
+    dist: EcsOsDistDeep,
+}
+
+fn ecs_os_storage_new() -> EcsOsStorageDeep {
+    return EcsOsStorageDeep { catalog: ecs_os_catalog_new(), dist: ecs_os_dist_new() };
+}
+
+fn ecs_os_storage_catalog(s: EcsOsStorageDeep) -> EcsOsCatalogDeep { return s.catalog; }
+fn ecs_os_storage_dist(s: EcsOsStorageDeep) -> EcsOsDistDeep { return s.dist; }
+
+fn ecs_os_storage_add_global(s: EcsOsStorageDeep, key: i64, observer: i64, runner: i64) -> EcsOsStorageDeep {
+    return EcsOsStorageDeep {
+        catalog: ecs_os_catalog_add_global(s.catalog, key, observer, runner),
+        dist: s.dist,
+    };
+}
+
+fn ecs_os_storage_add_component(s: EcsOsStorageDeep, key: i64, component_id: i32, observer: i64, runner: i64) -> EcsOsStorageDeep {
+    return EcsOsStorageDeep {
+        catalog: ecs_os_catalog_add_component(s.catalog, key, component_id, observer, runner),
+        dist: s.dist,
+    };
+}
+
+fn ecs_os_storage_add_entity(s: EcsOsStorageDeep, key: i64, entity: i64, observer: i64, runner: i64) -> EcsOsStorageDeep {
+    return EcsOsStorageDeep {
+        catalog: ecs_os_catalog_add_entity(s.catalog, key, entity, observer, runner),
+        dist: s.dist,
+    };
+}
+
+fn ecs_os_storage_add_node(s: EcsOsStorageDeep, node: EcsOsNodeDeep) -> EcsOsStorageDeep {
+    return EcsOsStorageDeep { catalog: s.catalog, dist: ecs_os_dist_add(s.dist, node) };
+}
+
+fn ecs_os_storage_collect(
+    s: EcsOsStorageDeep, key: i64, component_id: i32, entity: i64, has_comp: bool, has_ent: bool
+) -> EcsOsCollectDeep {
+    return ecs_os_catalog_collect(s.catalog, key, component_id, entity, has_comp, has_ent);
+}

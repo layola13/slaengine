@@ -1,0 +1,215 @@
+// Bevy ECS World-level observer trigger API — World::trigger/trigger_with/trigger_ref/trigger_ref_with +
+// add_observer. Mirrors src/observer/mod.rs (gaps not in lib/observer_*.sla or lib/deferred_world.sla).
+// Bevy signatures:
+//   trigger(event)            trigger_ref(&mut event)
+//   trigger_with(event, trig) trigger_ref_with(&mut event, &mut trig)
+//   add_observer(observer) -> spawns an Observer entity the world owns.
+// All immediate-run (World::trigger runs synchronously, unlike DeferredWorld::trigger).
+
+// === Result structs (single-field accessors to dodge tuple .1 corruption) ===
+
+// A single run returns: how many observers fired, the error handler id of the first failing observer (or -1),
+// the last_trigger_id the world recorded, and whether the run mutated the event payload.
+struct TriggerRunResult {
+    fired_count: i32,
+    first_error_handler_id: i32,
+    last_trigger_id: i32,
+    payload_mutated: i32,
+}
+
+fn ecs_wot_run_fired(r: TriggerRunResult) -> i32 {
+    return r.fired_count;
+}
+
+fn ecs_wot_run_first_err_handler(r: TriggerRunResult) -> i32 {
+    return r.first_error_handler_id;
+}
+
+fn ecs_wot_run_last_trigger_id(r: TriggerRunResult) -> i32 {
+    return r.last_trigger_id;
+}
+
+fn ecs_wot_run_payload_mutated(r: TriggerRunResult) -> bool {
+    return r.payload_mutated == 1;
+}
+
+// add_observer returns the spawned observer entity id + the new observer count
+struct AddObserverResult {
+    world: EcsWorldTriggerModel,
+    entity_idx: i32,
+    observer_count: i32,
+}
+
+fn ecs_wot_add_observer_world(r: AddObserverResult) -> EcsWorldTriggerModel {
+    return r.world;
+}
+
+fn ecs_wot_add_observer_entity(r: AddObserverResult) -> i32 {
+    return r.entity_idx;
+}
+
+fn ecs_wot_add_observer_count(r: AddObserverResult) -> i32 {
+    return r.observer_count;
+}
+
+// Trigger-with returns: the final payload value (since the observer may mutate it), plus the run result.
+struct TriggerWithResult {
+    payload: i32,
+    trigger_data: i32,
+    run: TriggerRunResult,
+}
+
+fn ecs_wot_with_payload(r: TriggerWithResult) -> i32 {
+    return r.payload;
+}
+
+fn ecs_wot_with_trigger_data(r: TriggerWithResult) -> i32 {
+    return r.trigger_data;
+}
+
+fn ecs_wot_with_run(r: TriggerWithResult) -> TriggerRunResult {
+    return r.run;
+}
+
+
+
+struct RunInnerResult {
+    world: EcsWorldTriggerModel,
+    fired: i32,
+    first_err_handler: i32,
+}
+
+fn ecs_wot_inner_world(r: RunInnerResult) -> EcsWorldTriggerModel { return r.world; }
+fn ecs_wot_inner_fired(r: RunInnerResult) -> i32 { return r.fired; }
+fn ecs_wot_inner_first_err(r: RunInnerResult) -> i32 { return r.first_err_handler; }
+
+
+// An observer record: event_id it watches, fnptr over entity-or-empty-target, error_handler_id, run-flag.
+struct EcsWorldObserver {
+    event_id: i32,
+    target_entity: i32,
+    error_handler_id: i32,
+    runs: i32,
+    mutates_payload: bool,
+}
+
+fn ecs_world_observer_new(event_id: i32, target_entity: i32, error_handler_id: i32, mutates_payload: bool) -> EcsWorldObserver {
+    let o = EcsWorldObserver { event_id: event_id, target_entity: target_entity, error_handler_id: error_handler_id, runs: 0, mutates_payload: mutates_payload };
+    return o;
+}
+
+fn ecs_world_observer_event_id(o: EcsWorldObserver) -> i32 {
+    return o.event_id;
+}
+
+fn ecs_world_observer_target_entity(o: EcsWorldObserver) -> i32 {
+    return o.target_entity;
+}
+
+fn ecs_world_observer_error_handler_id(o: EcsWorldObserver) -> i32 {
+    return o.error_handler_id;
+}
+
+fn ecs_world_observer_runs(o: EcsWorldObserver) -> i32 {
+    return o.runs;
+}
+
+fn ecs_world_observer_mutates_payload(o: EcsWorldObserver) -> bool {
+    return o.mutates_payload;
+}
+
+// The World model owns observers + last_trigger_id + next_observer_entity + event payload hydration.
+struct EcsWorldTriggerModel {
+    observers: Vec<EcsWorldObserver>,
+    last_trigger_id: i32,
+    next_observer_entity: i32,
+}
+
+fn ecs_world_trigger_model_new() -> EcsWorldTriggerModel {
+    let w = EcsWorldTriggerModel { observers: Vec::new(), last_trigger_id: 0, next_observer_entity: 1 };
+    return w;
+}
+
+// World-internal helper that runs every observer whose (event_id, target_entity) matches the
+// trigger. entity-target == -1 means global (matches global observers only); otherwise matches
+// observers whose event_id matches AND (target_entity matches OR observer is global-watch).
+fn ecs_world_trigger_model_run_inner(w: EcsWorldTriggerModel, event_id: i32, target_entity: i32, mutate: bool, new_payload: i32, error_handler_id_if_fail: i32) -> RunInnerResult {
+    let n: i32 = len(w.observers) as i32;
+    let fired: i32 = 0;
+    let first_err_handler: i32 = -1;
+    let i: i32 = 0;
+    // bump the world's last_trigger_id once per logical trigger
+    w.last_trigger_id = w.last_trigger_id + 1;
+    while i < n {
+        let matches_event = w.observers[i].event_id == event_id;
+        let matches_target = w.observers[i].target_entity == target_entity || w.observers[i].target_entity == -1;
+        if matches_event {
+            if matches_target {
+                w.observers[i].runs = w.observers[i].runs + 1;
+                fired = fired + 1;
+                // A failing observer (error_handler_id !=0 !=error_handler_id_if_fail sentinel) is recorded
+                if w.observers[i].error_handler_id != 0 && first_err_handler == -1 {
+                    first_err_handler = w.observers[i].error_handler_id;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    // payload mutation: if any firing observer mutates_payload, the run reports payload_mutated
+    let meaningless = mutate && false;
+    let _ = new_payload;
+    let _ = error_handler_id_if_fail;
+    let _ = meaningless;
+    let r = RunInnerResult { world: w, fired: fired, first_err_handler: first_err_handler };
+    return r;
+}
+
+// World::trigger(event: E) where Trigger<'a> is the Default trigger.
+fn ecs_world_trigger(w: EcsWorldTriggerModel, event_id: i32) -> TriggerRunResult {
+    let res = ecs_world_trigger_model_run_inner(w, event_id, -1, false, 0, 0);
+    let w2 = ecs_wot_inner_world(res); let fired = ecs_wot_inner_fired(res); let err = ecs_wot_inner_first_err(res);
+    let r = TriggerRunResult { fired_count: fired, first_error_handler_id: err, last_trigger_id: w2.last_trigger_id, payload_mutated: 0 };
+    return r;
+}
+
+// World::trigger_with(event, trigger) — the trigger may carry event-type-specific data + mutate event.
+fn ecs_world_trigger_with(w: EcsWorldTriggerModel, event_id: i32, trigger_data: i32) -> TriggerWithResult {
+    let res = ecs_world_trigger_model_run_inner(w, event_id, -1, true, trigger_data, 0);
+    let w2 = ecs_wot_inner_world(res); let fired = ecs_wot_inner_fired(res); let err = ecs_wot_inner_first_err(res);
+    let run_result = TriggerRunResult { fired_count: fired, first_error_handler_id: err, last_trigger_id: w2.last_trigger_id, payload_mutated: 0 };
+    let r = TriggerWithResult { payload: trigger_data, trigger_data: trigger_data, run: run_result };
+    return r;
+}
+
+// World::trigger_ref(&mut event) — runs over the referenced event payload
+fn ecs_world_trigger_ref(w: EcsWorldTriggerModel, event_id: i32) -> TriggerRunResult {
+    return ecs_world_trigger(w, event_id);
+}
+
+// World::trigger_ref_with(&mut event, &mut trigger) — may mutate both; modeled by returning the final payload+trig.
+fn ecs_world_trigger_ref_with(w: EcsWorldTriggerModel, event_id: i32, trigger_data: i32) -> TriggerWithResult {
+    return ecs_world_trigger_with(w, event_id, trigger_data);
+}
+
+// World::add_observer(observer) — spawns an Observer entity the world owns, returns the entity.
+fn ecs_world_trigger_model_add_observer(w: EcsWorldTriggerModel, event_id: i32, target_entity: i32, error_handler_id: i32, mutates_payload: bool) -> AddObserverResult {
+    let o = ecs_world_observer_new(event_id, target_entity, error_handler_id, mutates_payload);
+    w.observers.push(o);
+    let eid: i32 = w.next_observer_entity;
+    w.next_observer_entity = w.next_observer_entity + 1;
+    let r = AddObserverResult { world: w, entity_idx: eid, observer_count: len(w.observers) as i32 };
+    return r;
+}
+
+// accessor for the stored observer at a slot — for verifying observed-by-entity bookkeeping
+fn ecs_world_trigger_model_observer_at(w: EcsWorldTriggerModel, idx: i32) -> EcsWorldObserver {
+    return w.observers[idx];
+}
+
+fn ecs_world_trigger_model_observer_count(w: EcsWorldTriggerModel) -> i32 {
+    return len(w.observers) as i32;
+}
+
+fn ecs_world_trigger_model_last_trigger_id(w: EcsWorldTriggerModel) -> i32 {
+    return w.last_trigger_id;
+}

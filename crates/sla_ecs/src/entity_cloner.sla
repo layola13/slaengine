@@ -1,0 +1,146 @@
+// Bevy ECS entity::clone_entities EntityCloner + EntityClonerBuilder
+// (src/entity/clone_entities.rs). Opt-in/Opt-out filtering component cloner.
+
+// === Filter mode markers ===
+// OptOut = clone all except denied; OptIn = clone only allowed.
+struct EcsOptOut {}
+struct EcsOptIn {}
+
+// === InsertMode (bevy_ecs enum) ===
+// 0 = Default (insert), 1 = KeepExisting (insert_if_new)
+const ECS_INSERT_MODE_DEFAULT: i32 = 0;
+const ECS_INSERT_MODE_KEEP_EXISTING: i32 = 1;
+
+// === EntityClonerBuilder<Filter> ===
+struct EcsEntityClonerBuilder {
+    filter_mode: i32,     // 0 = opt_out, 1 = opt_in
+    move_components: bool,
+    linked_cloning: bool,
+    insert_mode: i32,
+    allowed: Vec<i32>,    // component ids explicitly allowed
+    denied: Vec<i32>,     // component ids explicitly denied
+}
+
+fn ecs_entity_cloner_builder_opt_out() -> EcsEntityClonerBuilder {
+    return EcsEntityClonerBuilder { filter_mode: 0, move_components: false, linked_cloning: false, insert_mode: ECS_INSERT_MODE_DEFAULT, allowed: Vec::new(), denied: Vec::new() };
+}
+
+fn ecs_entity_cloner_builder_opt_in() -> EcsEntityClonerBuilder {
+    return EcsEntityClonerBuilder { filter_mode: 1, move_components: false, linked_cloning: false, insert_mode: ECS_INSERT_MODE_DEFAULT, allowed: Vec::new(), denied: Vec::new() };
+}
+
+fn ecs_cloner_builder_move_components(b: EcsEntityClonerBuilder, enable: bool) -> EcsEntityClonerBuilder {
+    b.move_components = enable;
+    return b;
+}
+
+fn ecs_cloner_builder_linked_cloning(b: EcsEntityClonerBuilder, linked: bool) -> EcsEntityClonerBuilder {
+    b.linked_cloning = linked;
+    return b;
+}
+
+fn ecs_cloner_builder_insert_mode(b: EcsEntityClonerBuilder, mode: i32) -> EcsEntityClonerBuilder {
+    b.insert_mode = mode;
+    return b;
+}
+
+fn ecs_cloner_builder_allow(b: EcsEntityClonerBuilder, cid: i32) -> EcsEntityClonerBuilder {
+    b.allowed.push(cid);
+    return b;
+}
+
+fn ecs_cloner_builder_deny(b: EcsEntityClonerBuilder, cid: i32) -> EcsEntityClonerBuilder {
+    b.denied.push(cid);
+    return b;
+}
+
+// allow_if_new: like allow but only inserts if new (sets insert_mode keep existing for that id)
+fn ecs_cloner_builder_allow_if_new(b: EcsEntityClonerBuilder, cid: i32) -> EcsEntityClonerBuilder {
+    b.allowed.push(cid);
+    b.insert_mode = ECS_INSERT_MODE_KEEP_EXISTING;
+    return b;
+}
+
+fn ecs_cloner_builder_is_opt_in(b: EcsEntityClonerBuilder) -> bool { return b.filter_mode == 1; }
+
+fn ecs_cloner_builder_allowed_len(b: EcsEntityClonerBuilder) -> i64 { return len(b.allowed) as i64; }
+
+fn ecs_cloner_builder_denied_len(b: EcsEntityClonerBuilder) -> i64 { return len(b.denied) as i64; }
+
+// helper: is component id in a list
+fn ecs_cloner_list_contains(list: Vec<i32>, cid: i32) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(list) as i64;
+    while i < n {
+        if list[i] == cid { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === EntityCloner (built) ===
+struct EcsEntityCloner {
+    filter_mode: i32,
+    move_components: bool,
+    linked_cloning: bool,
+    insert_mode: i32,
+    allowed: Vec<i32>,
+    denied: Vec<i32>,
+}
+
+// finish: build the EntityCloner from a builder
+fn ecs_entity_cloner_builder_finish(b: EcsEntityClonerBuilder) -> EcsEntityCloner {
+    return EcsEntityCloner { filter_mode: b.filter_mode, move_components: b.move_components, linked_cloning: b.linked_cloning, insert_mode: b.insert_mode, allowed: b.allowed, denied: b.denied };
+}
+
+fn ecs_entity_cloner_linked_cloning(c: EcsEntityCloner) -> bool { return c.linked_cloning; }
+
+// should_clone: decide whether a component id is cloned given the filter mode
+fn ecs_entity_cloner_should_clone(c: EcsEntityCloner, cid: i32) -> bool {
+    // always respect explicit denies
+    if ecs_cloner_list_contains(c.denied, cid) { return false; };
+    if c.filter_mode == 1 {
+        // opt-in: only allowed
+        return ecs_cloner_list_contains(c.allowed, cid);
+    };
+    // opt-out: clone all except denied
+    return true;
+}
+
+// clone_entity: returns the count of cloned component ids from the source list
+fn ecs_entity_cloner_clone_entity(c: EcsEntityCloner, source_components: Vec<i32>) -> i64 {
+    let count = 0;
+    let i: i64 = 0;
+    let n: i64 = len(source_components) as i64;
+    while i < n {
+        if ecs_entity_cloner_should_clone(c, source_components[i]) { count = count + 1; };
+        i = i + 1;
+    }
+    return count;
+}
+
+// spawn_clone: returns a new entity id (next available) after cloning
+fn ecs_entity_cloner_spawn_clone(c: EcsEntityCloner, source_components: Vec<i32>, next_entity: i64) -> (i64, i64) {
+    let cloned = ecs_entity_cloner_clone_entity(c, source_components);
+    return (next_entity, cloned);
+}
+
+// build_opt_out / build_opt_in convenience constructors
+fn ecs_entity_cloner_build_opt_out() -> EcsEntityClonerBuilder { return ecs_entity_cloner_builder_opt_out(); }
+fn ecs_entity_cloner_build_opt_in() -> EcsEntityClonerBuilder { return ecs_entity_cloner_builder_opt_in(); }
+
+// add_observers (observer/entity_cloning.rs): toggle whether observers are added on clone
+struct EcsEntityClonerObserverToggle {
+    add_observers: bool,
+}
+
+fn ecs_entity_cloner_observers_new() -> EcsEntityClonerObserverToggle {
+    return EcsEntityClonerObserverToggle { add_observers: false };
+}
+
+fn ecs_entity_cloner_observers_add(t: EcsEntityClonerObserverToggle, add: bool) -> EcsEntityClonerObserverToggle {
+    t.add_observers = add;
+    return t;
+}
+
+fn ecs_entity_cloner_observers_get(t: EcsEntityClonerObserverToggle) -> bool { return t.add_observers; }

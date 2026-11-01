@@ -1,0 +1,167 @@
+// Deepened Bevy ECS QueryParManyIter / QueryParManyUniqueIter.
+// Mirrors src/query/par_iter.rs:
+//   batching_strategy, for_each, for_each_init, unique vs multi visit counts.
+// Parallelism modeled as sequential fold (no TaskPool).
+// Shallow lib/query_par_many_iter.sla retained.
+// Fixed capacity: 8 entity list slots.
+
+struct EcsQpmiDeep {
+    batch_size: i64,
+    list_len: i32,
+    unique: bool,
+    e0: i64, e1: i64, e2: i64, e3: i64,
+    e4: i64, e5: i64, e6: i64, e7: i64,
+    processed: i64,
+    init_value: i64,
+    sum: i64,
+}
+
+fn ecs_qpmi_deep_new(list_len: i32) -> EcsQpmiDeep {
+    return EcsQpmiDeep {
+        batch_size: 128, list_len: list_len, unique: false,
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        processed: 0, init_value: 0, sum: 0,
+    };
+}
+fn ecs_qpmi_deep_unique_new(list_len: i32) -> EcsQpmiDeep {
+    return EcsQpmiDeep {
+        batch_size: 128, list_len: list_len, unique: true,
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0,
+        processed: 0, init_value: 0, sum: 0,
+    };
+}
+
+fn ecs_qpmi_deep_batch_size(p: EcsQpmiDeep) -> i64 { return p.batch_size; }
+fn ecs_qpmi_deep_len(p: EcsQpmiDeep) -> i32 { return p.list_len; }
+fn ecs_qpmi_deep_is_unique(p: EcsQpmiDeep) -> bool { return p.unique; }
+fn ecs_qpmi_deep_is_empty(p: EcsQpmiDeep) -> bool {
+    if p.list_len == 0 { return true; };
+    return false;
+}
+fn ecs_qpmi_deep_processed(p: EcsQpmiDeep) -> i64 { return p.processed; }
+fn ecs_qpmi_deep_sum(p: EcsQpmiDeep) -> i64 { return p.sum; }
+fn ecs_qpmi_deep_init_value(p: EcsQpmiDeep) -> i64 { return p.init_value; }
+
+fn ecs_qpmi_deep_batching_strategy(p: EcsQpmiDeep, batch_size: i64) -> EcsQpmiDeep {
+    return EcsQpmiDeep {
+        batch_size: batch_size, list_len: p.list_len, unique: p.unique,
+        e0: p.e0, e1: p.e1, e2: p.e2, e3: p.e3, e4: p.e4, e5: p.e5, e6: p.e6, e7: p.e7,
+        processed: p.processed, init_value: p.init_value, sum: p.sum,
+    };
+}
+
+fn ecs_qpmi_deep_set_entity(p: EcsQpmiDeep, idx: i32, entity: i64) -> EcsQpmiDeep {
+    let e0 = p.e0; let e1 = p.e1; let e2 = p.e2; let e3 = p.e3;
+    let e4 = p.e4; let e5 = p.e5; let e6 = p.e6; let e7 = p.e7;
+    if idx == 0 { e0 = entity; };
+    if idx == 1 { e1 = entity; };
+    if idx == 2 { e2 = entity; };
+    if idx == 3 { e3 = entity; };
+    if idx == 4 { e4 = entity; };
+    if idx == 5 { e5 = entity; };
+    if idx == 6 { e6 = entity; };
+    if idx == 7 { e7 = entity; };
+    return EcsQpmiDeep {
+        batch_size: p.batch_size, list_len: p.list_len, unique: p.unique,
+        e0: e0, e1: e1, e2: e2, e3: e3, e4: e4, e5: e5, e6: e6, e7: e7,
+        processed: p.processed, init_value: p.init_value, sum: p.sum,
+    };
+}
+
+fn ecs_qpmi_deep_batch_count(p: EcsQpmiDeep) -> i64 {
+    if p.list_len <= 0 { return 0; };
+    if p.batch_size <= 0 { return p.list_len as i64; };
+    let n = (p.list_len as i64) / p.batch_size;
+    if (p.list_len as i64) % p.batch_size != 0 { return n + 1; };
+    return n;
+}
+
+// unique count of first list_len entities
+fn ecs_qpmi_deep_unique_count(p: EcsQpmiDeep) -> i32 {
+    let n = p.list_len;
+    let e0 = p.e0; let e1 = p.e1; let e2 = p.e2; let e3 = p.e3;
+    let e4 = p.e4; let e5 = p.e5; let e6 = p.e6; let e7 = p.e7;
+    let c = 0;
+    if n >= 1 { c = 1; };
+    if n >= 2 {
+        let ok = true;
+        if e1 == e0 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    if n >= 3 {
+        let ok = true;
+        if e2 == e0 { ok = false; };
+        if e2 == e1 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    if n >= 4 {
+        let ok = true;
+        if e3 == e0 { ok = false; };
+        if e3 == e1 { ok = false; };
+        if e3 == e2 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    if n >= 5 {
+        let ok = true;
+        if e4 == e0 { ok = false; };
+        if e4 == e1 { ok = false; };
+        if e4 == e2 { ok = false; };
+        if e4 == e3 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    if n >= 6 {
+        let ok = true;
+        if e5 == e0 { ok = false; };
+        if e5 == e1 { ok = false; };
+        if e5 == e2 { ok = false; };
+        if e5 == e3 { ok = false; };
+        if e5 == e4 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    if n >= 7 {
+        let ok = true;
+        if e6 == e0 { ok = false; };
+        if e6 == e1 { ok = false; };
+        if e6 == e2 { ok = false; };
+        if e6 == e3 { ok = false; };
+        if e6 == e4 { ok = false; };
+        if e6 == e5 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    if n >= 8 {
+        let ok = true;
+        if e7 == e0 { ok = false; };
+        if e7 == e1 { ok = false; };
+        if e7 == e2 { ok = false; };
+        if e7 == e3 { ok = false; };
+        if e7 == e4 { ok = false; };
+        if e7 == e5 { ok = false; };
+        if e7 == e6 { ok = false; };
+        if ok { c = c + 1; };
+    };
+    return c;
+}
+
+// for_each: multi visits list_len; unique visits unique_count
+fn ecs_qpmi_deep_for_each(p: EcsQpmiDeep, func_id: i64) -> EcsQpmiDeep {
+    let count = p.list_len as i64;
+    if p.unique {
+        count = ecs_qpmi_deep_unique_count(p) as i64;
+    };
+    // model sum as entity ids sum over visited slots (multi: all; unique: first occurrences only simplified as unique count * func_id)
+    let sum = count * func_id;
+    return EcsQpmiDeep {
+        batch_size: p.batch_size, list_len: p.list_len, unique: p.unique,
+        e0: p.e0, e1: p.e1, e2: p.e2, e3: p.e3, e4: p.e4, e5: p.e5, e6: p.e6, e7: p.e7,
+        processed: count, init_value: p.init_value, sum: sum,
+    };
+}
+
+fn ecs_qpmi_deep_for_each_init(p: EcsQpmiDeep, init_id: i64, func_id: i64) -> EcsQpmiDeep {
+    let p2 = ecs_qpmi_deep_for_each(p, func_id);
+    return EcsQpmiDeep {
+        batch_size: p2.batch_size, list_len: p2.list_len, unique: p2.unique,
+        e0: p2.e0, e1: p2.e1, e2: p2.e2, e3: p2.e3, e4: p2.e4, e5: p2.e5, e6: p2.e6, e7: p2.e7,
+        processed: p2.processed, init_value: init_id, sum: p2.sum + init_id,
+    };
+}

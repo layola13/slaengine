@@ -1,0 +1,198 @@
+// Bevy ECS entity::map_entities (src/entity/map_entities.rs):
+// MapEntities trait + SceneEntityMapper.
+
+// === EntityHashMap mirror (key -> value) for the mapper ===
+struct EcsEntityMap {
+    keys: Vec<i64>,
+    values: Vec<i64>,
+}
+
+fn ecs_entity_map_new() -> EcsEntityMap {
+    return EcsEntityMap { keys: Vec::new(), values: Vec::new() };
+}
+
+fn ecs_entity_map_insert(m: EcsEntityMap, key: i64, value: i64) -> EcsEntityMap {
+    let i: i64 = 0;
+    let n: i64 = len(m.keys) as i64;
+    while i < n {
+        if m.keys[i] == key {
+            m.values[i] = value;
+            return m;
+        };
+        i = i + 1;
+    }
+    m.keys.push(key);
+    m.values.push(value);
+    return m;
+}
+
+fn ecs_entity_map_get(m: EcsEntityMap, key: i64) -> (bool, i64) {
+    let i: i64 = 0;
+    let n: i64 = len(m.keys) as i64;
+    while i < n {
+        if m.keys[i] == key {
+            return (true, m.values[i]);
+        };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn ecs_entity_map_len(m: EcsEntityMap) -> i64 { return len(m.keys) as i64; }
+
+fn ecs_entity_map_contains(m: EcsEntityMap, key: i64) -> bool {
+    let i: i64 = 0;
+    let n: i64 = len(m.keys) as i64;
+    while i < n {
+        if m.keys[i] == key {
+            return true;
+        };
+        i = i + 1;
+    }
+    return false;
+}
+
+// === SceneEntityMapper ===
+// Mirrors SceneEntityMapper<'m>: wraps an EntityHashMap + a remote allocator.
+struct EcsSceneEntityMapper {
+    map: EcsEntityMap,
+    next_remote: i64,
+}
+
+fn ecs_scene_entity_mapper_new(start: i64) -> EcsSceneEntityMapper {
+    return EcsSceneEntityMapper { map: ecs_entity_map_new(), next_remote: start };
+}
+
+// get_or_allocate: MapEntities::map. Returns the mapped remote entity,
+// allocating a new one if not present. Mirrors SceneEntityMapper::get_or_allocate.
+fn ecs_scene_entity_mapper_get_or_allocate(m: EcsSceneEntityMapper, src: i64) -> (EcsSceneEntityMapper, i64) {
+    let found = ecs_entity_map_get(m.map, src);
+    if found.0 {
+        return (m, found.1);
+    };
+    let remote = m.next_remote;
+    let map2 = ecs_entity_map_insert(m.map, src, remote);
+    let m2 = EcsSceneEntityMapper { map: map2, next_remote: remote + 1 };
+    return (m2, remote);
+}
+
+fn ecs_scene_entity_mapper_get_map(m: EcsSceneEntityMapper) -> EcsEntityMap { return m.map; }
+
+fn ecs_scene_entity_mapper_len(m: EcsSceneEntityMapper) -> i64 { return ecs_entity_map_len(m.map); }
+
+fn ecs_scene_entity_mapper_next_remote(m: EcsSceneEntityMapper) -> i64 { return m.next_remote; }
+
+// resolve: lookup without allocating
+fn ecs_scene_entity_mapper_resolve(m: EcsSceneEntityMapper, src: i64) -> (bool, i64) {
+    return ecs_entity_map_get(m.map, src);
+}
+
+// === Serialization / batch remap helpers ===
+// Bevy scene serialization stores entity remap state outside the entity values
+// themselves. SLA has no serde runtime, so the stable library format here is a
+// flat scalar stream: [next_remote, count, src0, dst0, src1, dst1, ...].
+struct EcsEntityMapSnapshot {
+    data: Vec<i64>,
+}
+
+fn ecs_entity_map_snapshot_new() -> EcsEntityMapSnapshot {
+    return EcsEntityMapSnapshot { data: Vec::new() };
+}
+
+fn ecs_entity_map_snapshot_len(snapshot: EcsEntityMapSnapshot) -> i64 {
+    return len(snapshot.data) as i64;
+}
+
+fn ecs_entity_map_snapshot_at(snapshot: EcsEntityMapSnapshot, index: i64) -> i64 {
+    return snapshot.data[index];
+}
+
+fn ecs_scene_entity_mapper_snapshot(m: EcsSceneEntityMapper) -> EcsEntityMapSnapshot {
+    let data: Vec<i64> = Vec::new();
+    data.push(m.next_remote);
+    data.push(ecs_entity_map_len(m.map));
+    let i: i64 = 0;
+    let n: i64 = len(m.map.keys) as i64;
+    while i < n {
+        data.push(m.map.keys[i]);
+        data.push(m.map.values[i]);
+        i = i + 1;
+    }
+    return EcsEntityMapSnapshot { data: data };
+}
+
+fn ecs_scene_entity_mapper_from_snapshot(snapshot: EcsEntityMapSnapshot) -> EcsSceneEntityMapper {
+    if len(snapshot.data) < 2 { return ecs_scene_entity_mapper_new(0); };
+    let next_remote = snapshot.data[0];
+    let count = snapshot.data[1];
+    let map = ecs_entity_map_new();
+    let i: i64 = 0;
+    let offset: i64 = 2;
+    let total: i64 = len(snapshot.data) as i64;
+    while i < count {
+        if offset + 1 >= total {
+            return EcsSceneEntityMapper { map: map, next_remote: next_remote };
+        };
+        map = ecs_entity_map_insert(map, snapshot.data[offset], snapshot.data[offset + 1]);
+        offset = offset + 2;
+        i = i + 1;
+    }
+    return EcsSceneEntityMapper { map: map, next_remote: next_remote };
+}
+
+struct EcsEntityRemapBatch {
+    mapper: EcsSceneEntityMapper,
+    targets: Vec<i64>,
+    allocated_count: i64,
+}
+
+fn ecs_scene_entity_mapper_get_or_allocate_many(m: EcsSceneEntityMapper, sources: Vec<i64>) -> EcsEntityRemapBatch {
+    let targets: Vec<i64> = Vec::new();
+    return ecs_scene_entity_mapper_get_or_allocate_many_rec(m, sources, targets, 0, 0);
+}
+
+fn ecs_scene_entity_mapper_get_or_allocate_many_rec(m: EcsSceneEntityMapper, sources: Vec<i64>, targets: Vec<i64>, i: i64, allocated: i64) -> EcsEntityRemapBatch {
+    if i >= (len(sources) as i64) {
+        return EcsEntityRemapBatch { mapper: m, targets: targets, allocated_count: allocated };
+    };
+    let existing = ecs_scene_entity_mapper_resolve(m, sources[i]);
+    let r = ecs_scene_entity_mapper_get_or_allocate(m, sources[i]);
+    targets.push(r.1);
+    if existing.0 != true {
+        return ecs_scene_entity_mapper_get_or_allocate_many_rec(r.0, sources, targets, i + 1, allocated + 1);
+    };
+    return ecs_scene_entity_mapper_get_or_allocate_many_rec(r.0, sources, targets, i + 1, allocated);
+}
+
+fn ecs_entity_remap_batch_mapper(batch: EcsEntityRemapBatch) -> EcsSceneEntityMapper { return batch.mapper; }
+fn ecs_entity_remap_batch_len(batch: EcsEntityRemapBatch) -> i64 { return len(batch.targets) as i64; }
+fn ecs_entity_remap_batch_target_at(batch: EcsEntityRemapBatch, index: i64) -> i64 { return batch.targets[index]; }
+fn ecs_entity_remap_batch_allocated_count(batch: EcsEntityRemapBatch) -> i64 { return batch.allocated_count; }
+
+struct EcsEntityMapApplyResult {
+    targets: Vec<i64>,
+    missing_sources: Vec<i64>,
+}
+
+fn ecs_entity_map_apply_many(map: EcsEntityMap, sources: Vec<i64>, identity_on_missing: bool) -> EcsEntityMapApplyResult {
+    let targets: Vec<i64> = Vec::new();
+    let missing: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    let n: i64 = len(sources) as i64;
+    while i < n {
+        let r = ecs_entity_map_get(map, sources[i]);
+        if r.0 {
+            targets.push(r.1);
+        } else {
+            if identity_on_missing { targets.push(sources[i]); } else { targets.push(-1); };
+            missing.push(sources[i]);
+        };
+        i = i + 1;
+    }
+    return EcsEntityMapApplyResult { targets: targets, missing_sources: missing };
+}
+
+fn ecs_entity_map_apply_len(result: EcsEntityMapApplyResult) -> i64 { return len(result.targets) as i64; }
+fn ecs_entity_map_apply_target_at(result: EcsEntityMapApplyResult, index: i64) -> i64 { return result.targets[index]; }
+fn ecs_entity_map_apply_missing_count(result: EcsEntityMapApplyResult) -> i64 { return len(result.missing_sources) as i64; }
+fn ecs_entity_map_apply_missing_at(result: EcsEntityMapApplyResult, index: i64) -> i64 { return result.missing_sources[index]; }

@@ -1,0 +1,161 @@
+// Public BundleInfo API for bundle introspection
+@import "entity.sla"
+@import "component.sla"
+
+struct BundleId {
+    index: i32
+}
+
+fn bundle_id_new(index: i32) -> BundleId {
+    return BundleId { index: index };
+}
+
+fn bundle_id_is_valid(id: BundleId) -> bool {
+    return id.index >= 0;
+}
+
+// Bevy BundleInfo parity: contributed_component_ids = explicit + required,
+// with explicit_component_ids (the user-declared bundle members) and
+// required_component_ids (transitively-required components) tracked separately.
+struct BundleInfo {
+    bundle_id: BundleId,
+    component_ids: Vec<i32>,
+    explicit_component_ids: Vec<i32>,
+    required_component_ids: Vec<i32>,
+    name: String
+}
+
+fn bundle_info_new(bundle_id: BundleId, component_ids: Vec<i32>, name: String) -> BundleInfo {
+    let explicit: Vec<i32> = Vec::new();
+    let required: Vec<i32> = Vec::new();
+    return BundleInfo {
+        bundle_id: bundle_id,
+        component_ids: component_ids,
+        explicit_component_ids: explicit,
+        required_component_ids: required,
+        name: name
+    };
+}
+
+// Build a BundleInfo with explicit + required components split (Bevy parity).
+fn bundle_info_new_with_required(bundle_id: BundleId, explicit_component_ids: Vec<i32>, required_component_ids: Vec<i32>, name: String) -> BundleInfo {
+    let component_ids: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    let ecnt = len(explicit_component_ids) as i64;
+    while i < ecnt {
+        component_ids.push(explicit_component_ids[i]);
+        i = i + 1;
+    }
+    let j: i64 = 0;
+    let rcnt = len(required_component_ids) as i64;
+    while j < rcnt {
+        component_ids.push(required_component_ids[j]);
+        j = j + 1;
+    }
+    return BundleInfo {
+        bundle_id: bundle_id,
+        component_ids: component_ids,
+        explicit_component_ids: explicit_component_ids,
+        required_component_ids: required_component_ids,
+        name: name
+    };
+}
+
+fn bundle_info_component_count(info: BundleInfo) -> i32 {
+    return len(info.component_ids) as i32;
+}
+
+fn bundle_info_explicit_component_count(info: BundleInfo) -> i32 {
+    return len(info.explicit_component_ids) as i32;
+}
+
+fn bundle_info_required_component_count(info: BundleInfo) -> i32 {
+    return len(info.required_component_ids) as i32;
+}
+
+fn bundle_info_has_required(info: BundleInfo, component_id: i32) -> bool {
+    let i: i64 = 0;
+    let cnt = len(info.required_component_ids) as i64;
+    while i < cnt {
+        if info.required_component_ids[i] == component_id { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+struct BundleRegistry {
+    bundles: Vec<BundleInfo>,
+    next_id: i32
+}
+
+fn bundle_registry_new() -> BundleRegistry {
+    let bundles: Vec<BundleInfo> = Vec::new();
+    return BundleRegistry {
+        bundles: bundles,
+        next_id: 0
+    };
+}
+
+fn bundle_registry_register(registry: BundleRegistry, component_ids: Vec<i32>, name: String) -> (BundleRegistry, BundleId) {
+    let bundle_id = bundle_id_new(registry.next_id);
+    let info = bundle_info_new(bundle_id, component_ids, name);
+    registry.bundles.push(info);
+    registry.next_id = registry.next_id + 1;
+    return (registry, bundle_id);
+}
+
+fn bundle_registry_get(registry: BundleRegistry, bundle_id: BundleId) -> BundleInfo {
+    if bundle_id.index < 0 || (bundle_id.index as i64) >= len(registry.bundles) as i64 {
+        panic(15001);
+    };
+    return registry.bundles[bundle_id.index as i64];
+}
+
+fn bundle_registry_len(registry: BundleRegistry) -> i32 {
+    return len(registry.bundles) as i32;
+}
+
+@test "bundle registry registers and retrieves bundles"() {
+    let r0 = bundle_registry_new();
+    
+    let mut c1: Vec<i32> = Vec::new();
+    c1.push(10);
+    c1.push(20);
+    let (r1, id1) = bundle_registry_register(r0, c1, "Bundle1");
+    
+    let mut c2: Vec<i32> = Vec::new();
+    c2.push(30);
+    let (r2, id2) = bundle_registry_register(r1, c2, "Bundle2");
+    
+    if bundle_registry_len(r2) != 2 { panic(15104); };
+    
+    let info1 = bundle_registry_get(r2, id1);
+    if bundle_info_component_count(info1) != 2 { panic(15105); };
+    
+    let info2 = bundle_registry_get(r2, id2);
+    if bundle_info_component_count(info2) != 1 { panic(15107); };
+}
+
+fn bundle_registry_register_with_required(registry: BundleRegistry, explicit_component_ids: Vec<i32>, required_component_ids: Vec<i32>, name: String) -> (BundleRegistry, BundleId) {
+    let bundle_id = bundle_id_new(registry.next_id);
+    let info = bundle_info_new_with_required(bundle_id, explicit_component_ids, required_component_ids, name);
+    registry.bundles.push(info);
+    registry.next_id = registry.next_id + 1;
+    return (registry, bundle_id);
+}
+
+@test "bundle info with required components splits explicit and required"() {
+    let r0 = bundle_registry_new();
+    let mut expl: Vec<i32> = Vec::new();
+    expl.push(10);
+    let mut req: Vec<i32> = Vec::new();
+    req.push(20);
+    req.push(30);
+    let (r1, id) = bundle_registry_register_with_required(r0, expl, req, "WithReq");
+    let info = bundle_registry_get(r1, id);
+    if bundle_info_explicit_component_count(info) != 1 { panic(15110); };
+    if bundle_info_required_component_count(info) != 2 { panic(15111); };
+    if bundle_info_component_count(info) != 3 { panic(15112); };
+    if bundle_info_has_required(info, 20) != true { panic(15113); };
+    if bundle_info_has_required(info, 99) != false { panic(15114); };
+}

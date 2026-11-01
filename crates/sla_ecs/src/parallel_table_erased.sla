@@ -1,0 +1,74 @@
+// Thread-backed read-only helpers for TableErasedWorld snapshots.
+@import "table_erased_access.sla"
+@import "sa_std/core/arc.sa"
+@import "sa_std/thread.sa"
+@import "sa_std/core/result.sa"
+
+fn table_erased_readonly_parallel2<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<TableErasedWorld<R, M> >) -> i32, first_access: TableErasedSystemAccess, second: fn(Arc<TableErasedWorld<R, M> >) -> i32, second_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(15130); };
+    let shared = Arc::new(world);
+    let first_world = shared.clone();
+    let second_world = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_world));
+    let second_handle = thread::spawn(^|| second(second_world));
+    return first_handle.join().unwrap() + second_handle.join().unwrap();
+}
+
+const TABLE_ERASED_PARALLEL_POS_TYPE: i32 = 15131;
+const TABLE_ERASED_PARALLEL_VEL_TYPE: i32 = 15132;
+
+struct TableErasedParallelPos { x: i32, y: i32 }
+struct TableErasedParallelVel { x: i32, y: i32 }
+struct TableErasedParallelTime { tick: i32 }
+struct TableErasedParallelEvent { amount: i32 }
+
+fn table_erased_parallel_time_default() -> TableErasedParallelTime { return TableErasedParallelTime { tick: 0 }; }
+fn table_erased_parallel_event_default() -> TableErasedParallelEvent { return TableErasedParallelEvent { amount: 0 }; }
+
+fn table_erased_parallel_world_new() -> TableErasedWorld<TableErasedParallelTime, TableErasedParallelEvent> {
+    return table_erased_world_new<TableErasedParallelTime, TableErasedParallelEvent>(table_erased_parallel_time_default(), table_erased_parallel_event_default());
+}
+
+fn table_erased_parallel_spawn(world: TableErasedWorld<TableErasedParallelTime, TableErasedParallelEvent>, position_id: i32, velocity_id: i32, x: i32, vx: i32) -> TableErasedWorld<TableErasedParallelTime, TableErasedParallelEvent> {
+    let (w1, entity) = table_erased_world_spawn<TableErasedParallelTime, TableErasedParallelEvent>(world);
+    let w2 = table_erased_world_insert<TableErasedParallelPos, TableErasedParallelTime, TableErasedParallelEvent>(w1, entity, position_id, TABLE_ERASED_PARALLEL_POS_TYPE, TableErasedParallelPos { x: x, y: 0 });
+    return table_erased_world_insert<TableErasedParallelVel, TableErasedParallelTime, TableErasedParallelEvent>(w2, entity, velocity_id, TABLE_ERASED_PARALLEL_VEL_TYPE, TableErasedParallelVel { x: vx, y: 0 });
+}
+
+fn table_erased_parallel_sum_positions(shared: Arc<TableErasedWorld<TableErasedParallelTime, TableErasedParallelEvent> >) -> i32 {
+    let query = table_erased_world_query_auto<TableErasedParallelPos, TableErasedParallelTime, TableErasedParallelEvent>(*shared, TABLE_ERASED_PARALLEL_POS_TYPE);
+    let total: i32 = 0;
+    let i: i64 = 0;
+    let cnt = len(query.items) as i64;
+    while i < cnt {
+        let item = query.items[i];
+        total = total + item.value.x;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn table_erased_parallel_sum_velocities(shared: Arc<TableErasedWorld<TableErasedParallelTime, TableErasedParallelEvent> >) -> i32 {
+    let query = table_erased_world_query_auto<TableErasedParallelVel, TableErasedParallelTime, TableErasedParallelEvent>(*shared, TABLE_ERASED_PARALLEL_VEL_TYPE);
+    let total: i32 = 0;
+    let i: i64 = 0;
+    let cnt = len(query.items) as i64;
+    while i < cnt {
+        let item = query.items[i];
+        total = total + item.value.x;
+        i = i + 1;
+    }
+    return total;
+}
+
+@test "table erased readonly parallel runner executes no conflict systems on threads"() {
+    let w0 = table_erased_parallel_world_new();
+    let (w1, position) = table_erased_world_register_table<TableErasedParallelTime, TableErasedParallelEvent>(w0, TABLE_ERASED_PARALLEL_POS_TYPE, ecs_box_drop<TableErasedParallelPos>);
+    let (w2, velocity) = table_erased_world_register_table<TableErasedParallelTime, TableErasedParallelEvent>(w1, TABLE_ERASED_PARALLEL_VEL_TYPE, ecs_box_drop<TableErasedParallelVel>);
+    let w3 = table_erased_parallel_spawn(w2, position.id, velocity.id, 3, 7);
+    let w4 = table_erased_parallel_spawn(w3, position.id, velocity.id, 5, 11);
+    let position_access = table_erased_access_read_component(table_erased_system_access_none(), position.id);
+    let velocity_access = table_erased_access_read_component(table_erased_system_access_none(), velocity.id);
+    let total = table_erased_readonly_parallel2<TableErasedParallelTime, TableErasedParallelEvent>(w4, table_erased_parallel_sum_positions, position_access, table_erased_parallel_sum_velocities, velocity_access);
+    if total != 26 { panic(15133); };
+}

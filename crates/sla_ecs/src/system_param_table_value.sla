@@ -1,0 +1,253 @@
+// SA-native system parameter adapters for TableValueWorld<T, R, M>.
+// These mirror the archetype-value adapters but write back through table-row
+// storage and migration semantics.
+@import "schedule_table_value.sla"
+
+struct TableValueResourceMessageParam<R, M> {
+    resource: R,
+    message: M,
+    should_write_message: bool,
+}
+
+struct TableValueResMutMessageReadParam<R, M> {
+    resource: ResMut<R>,
+    read: MessageRead<M>,
+}
+
+struct TableValueCommandsParam<T, R, M> {
+    world: TableValueWorld<T, R, M>,
+    commands: TableValueCommands<T, R, M>,
+}
+
+struct TableValueQueryResourceParam<T, R> {
+    query: Query<EntityItem<T>>,
+    resource: R,
+}
+
+fn table_value_resource_message_param<R, M>(resource: R, message: M, should_write_message: bool) -> TableValueResourceMessageParam<R, M> {
+    return TableValueResourceMessageParam<R, M> { resource: resource, message: message, should_write_message: should_write_message };
+}
+
+fn table_value_resmut_message_read_param<R, M>(resource: ResMut<R>, read: MessageRead<M>) -> TableValueResMutMessageReadParam<R, M> {
+    return TableValueResMutMessageReadParam<R, M> { resource: resource, read: read };
+}
+
+fn table_value_commands_param_new<T, R, M>(world: TableValueWorld<T, R, M>) -> TableValueCommandsParam<T, R, M> {
+    return TableValueCommandsParam<T, R, M> { world: world, commands: table_value_commands_new<T, R, M>() };
+}
+
+fn table_value_commands_param_reserve_entity<T, R, M>(param: TableValueCommandsParam<T, R, M>) -> (TableValueCommandsParam<T, R, M>, Entity) {
+    let (world, commands, entity) = table_value_commands_reserve_entity<T, R, M>(param.world, param.commands);
+    return (TableValueCommandsParam<T, R, M> { world: world, commands: commands }, entity);
+}
+
+fn table_value_commands_param_insert<T, R, M>(param: TableValueCommandsParam<T, R, M>, entity: Entity, component_id: i32, value: T) -> TableValueCommandsParam<T, R, M> {
+    return TableValueCommandsParam<T, R, M> { world: param.world, commands: table_value_commands_insert<T, R, M>(param.commands, entity, component_id, value) };
+}
+
+fn table_value_commands_param_insert_resource<T, R, M>(param: TableValueCommandsParam<T, R, M>, value: R) -> TableValueCommandsParam<T, R, M> {
+    return TableValueCommandsParam<T, R, M> { world: param.world, commands: table_value_commands_insert_resource<T, R, M>(param.commands, value) };
+}
+
+fn table_value_commands_param_write_message<T, R, M>(param: TableValueCommandsParam<T, R, M>, value: M) -> TableValueCommandsParam<T, R, M> {
+    return TableValueCommandsParam<T, R, M> { world: param.world, commands: table_value_commands_write_message<T, R, M>(param.commands, value) };
+}
+
+fn table_value_query_resource_param<T, R>(query: Query<EntityItem<T>>, resource: R) -> TableValueQueryResourceParam<T, R> {
+    return TableValueQueryResourceParam<T, R> { query: query, resource: resource };
+}
+
+fn table_value_run_pair_mut_system<T, R, M>(world: TableValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32, run: fn(Query<TableValuePairMut<T>>) -> Query<TableValuePairMut<T>>) -> TableValueWorld<T, R, M> {
+    let query = table_value_world_query_pair_mut_first<T, R, M>(world, first_component_id, second_component_id);
+    let updated = run(query);
+    let i: i64 = 0;
+    let cnt = len(updated.items) as i64;
+    while i < cnt {
+        let item = updated.items[i];
+        world = table_value_world_pair_write_first<T, R, M>(world, item, item.first.value);
+        i = i + 1;
+    }
+    return world;
+}
+
+fn table_value_run_resource_message_system<T, R, M>(world: TableValueWorld<T, R, M>, default_message: M, run: fn(TableValueResourceMessageParam<R, M>) -> TableValueResourceMessageParam<R, M>) -> TableValueWorld<T, R, M> {
+    let param0 = table_value_resource_message_param<R, M>(table_value_world_get_resource<T, R, M>(world), default_message, false);
+    let param1 = run(param0);
+    world = table_value_world_insert_resource<T, R, M>(world, param1.resource);
+    if param1.should_write_message { world = table_value_world_write_message<T, R, M>(world, param1.message); };
+    return world;
+}
+
+fn table_value_run_res_mut_system<T, R, M>(world: TableValueWorld<T, R, M>, run: fn(ResMut<R>) -> ResMut<R>) -> TableValueWorld<T, R, M> {
+    let param0 = table_value_world_res_mut<T, R, M>(world);
+    let param1 = run(param0);
+    return table_value_world_res_mut_write<T, R, M>(world, param1, param1.value);
+}
+
+fn table_value_run_message_reader_res_mut_system<T, R, M>(world: TableValueWorld<T, R, M>, reader: MessageReader, default_message: M, run: fn(TableValueResMutMessageReadParam<R, M>) -> TableValueResMutMessageReadParam<R, M>) -> (TableValueWorld<T, R, M>, MessageReader) {
+    let read = table_value_world_read_message<T, R, M>(world, reader, default_message);
+    let param0 = table_value_resmut_message_read_param<R, M>(table_value_world_res_mut<T, R, M>(world), read);
+    let param1 = run(param0);
+    world = table_value_world_res_mut_write<T, R, M>(world, param1.resource, param1.resource.value);
+    return (world, param1.read.reader);
+}
+
+fn table_value_run_commands_system<T, R, M>(world: TableValueWorld<T, R, M>, run: fn(TableValueCommandsParam<T, R, M>) -> TableValueCommandsParam<T, R, M>) -> TableValueWorld<T, R, M> {
+    let param0 = table_value_commands_param_new<T, R, M>(world);
+    let param1 = run(param0);
+    let (world2, cleared) = table_value_commands_apply<T, R, M>(param1.world, param1.commands);
+    return world2;
+}
+
+fn table_value_run_message_writer_system<T, R, M>(world: TableValueWorld<T, R, M>, run: fn(MessageWriter<M>) -> MessageWriter<M>) -> TableValueWorld<T, R, M> {
+    let writer0 = message_writer_new<M>();
+    let writer1 = run(writer0);
+    world.messages = messages_apply_writer<M>(world.messages, writer1);
+    return world;
+}
+
+fn table_value_run_without_query_resource_system<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, without_component_id: i32, run: fn(TableValueQueryResourceParam<T, R>) -> TableValueQueryResourceParam<T, R>) -> TableValueWorld<T, R, M> {
+    let query = table_value_world_query_without<T, R, M>(world, component_id, without_component_id);
+    let param0 = table_value_query_resource_param<T, R>(query, table_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return table_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+fn table_value_run_with_query_resource_system<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, with_component_id: i32, run: fn(TableValueQueryResourceParam<T, R>) -> TableValueQueryResourceParam<T, R>) -> TableValueWorld<T, R, M> {
+    let query = table_value_world_query_with<T, R, M>(world, component_id, with_component_id);
+    let param0 = table_value_query_resource_param<T, R>(query, table_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return table_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+fn table_value_run_added_query_resource_system<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, since_tick: i32, run: fn(TableValueQueryResourceParam<T, R>) -> TableValueQueryResourceParam<T, R>) -> TableValueWorld<T, R, M> {
+    let query = table_value_world_query_added<T, R, M>(world, component_id, since_tick);
+    let param0 = table_value_query_resource_param<T, R>(query, table_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return table_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+fn table_value_run_changed_query_resource_system<T, R, M>(world: TableValueWorld<T, R, M>, component_id: i32, since_tick: i32, run: fn(TableValueQueryResourceParam<T, R>) -> TableValueQueryResourceParam<T, R>) -> TableValueWorld<T, R, M> {
+    let query = table_value_world_query_changed<T, R, M>(world, component_id, since_tick);
+    let param0 = table_value_query_resource_param<T, R>(query, table_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return table_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+struct TableParamData { amount: i32 }
+struct TableParamTime { tick: i32 }
+struct TableParamEvent { amount: i32 }
+
+fn table_param_time_default() -> TableParamTime { return TableParamTime { tick: 0 }; }
+fn table_param_event_default() -> TableParamEvent { return TableParamEvent { amount: 0 }; }
+fn table_param_world_new() -> TableValueWorld<TableParamData, TableParamTime, TableParamEvent> { return table_value_world_new<TableParamData, TableParamTime, TableParamEvent>(table_param_time_default(), table_param_event_default()); }
+
+fn table_param_movement_system(query: Query<TableValuePairMut<TableParamData>>) -> Query<TableValuePairMut<TableParamData>> {
+    let i: i64 = 0;
+    let cnt = len(query.items) as i64;
+    while i < cnt {
+        query.items[i].first.value = TableParamData { amount: query.items[i].first.value.amount + query.items[i].second.amount };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn table_param_time_message_system(param: TableValueResourceMessageParam<TableParamTime, TableParamEvent>) -> TableValueResourceMessageParam<TableParamTime, TableParamEvent> {
+    return table_value_resource_message_param<TableParamTime, TableParamEvent>(TableParamTime { tick: param.resource.tick + 1 }, TableParamEvent { amount: param.resource.tick + 4 }, true);
+}
+
+fn table_param_res_mut_system(res: ResMut<TableParamTime>) -> ResMut<TableParamTime> {
+    return ResMut<TableParamTime> { value: TableParamTime { tick: res.value.tick + 2 }, added_tick: res.added_tick, changed_tick: res.changed_tick };
+}
+
+fn table_param_reader_resmut_system(param: TableValueResMutMessageReadParam<TableParamTime, TableParamEvent>) -> TableValueResMutMessageReadParam<TableParamTime, TableParamEvent> {
+    if param.read.has_value { param.resource.value = TableParamTime { tick: param.resource.value.tick + param.read.value.amount }; };
+    return param;
+}
+
+fn table_param_commands_system(param: TableValueCommandsParam<TableParamData, TableParamTime, TableParamEvent>) -> TableValueCommandsParam<TableParamData, TableParamTime, TableParamEvent> {
+    let (param1, entity) = table_value_commands_param_reserve_entity<TableParamData, TableParamTime, TableParamEvent>(param);
+    let param2 = table_value_commands_param_insert<TableParamData, TableParamTime, TableParamEvent>(param1, entity, 1, TableParamData { amount: 12 });
+    let param3 = table_value_commands_param_insert_resource<TableParamData, TableParamTime, TableParamEvent>(param2, TableParamTime { tick: 7 });
+    return table_value_commands_param_write_message<TableParamData, TableParamTime, TableParamEvent>(param3, TableParamEvent { amount: 4 });
+}
+
+fn table_param_writer_system(writer: MessageWriter<TableParamEvent>) -> MessageWriter<TableParamEvent> {
+    let writer1 = message_writer_send<TableParamEvent>(writer, TableParamEvent { amount: 2 });
+    return message_writer_send<TableParamEvent>(writer1, TableParamEvent { amount: 8 });
+}
+
+fn table_param_count_query_system(param: TableValueQueryResourceParam<TableParamData, TableParamTime>) -> TableValueQueryResourceParam<TableParamData, TableParamTime> {
+    return table_value_query_resource_param<TableParamData, TableParamTime>(param.query, TableParamTime { tick: len(param.query.items) as i32 });
+}
+
+@test "table value pair query system param writes back"() {
+    let w0 = table_param_world_new();
+    let (w1, position) = table_value_world_register_table<TableParamData, TableParamTime, TableParamEvent>(w0);
+    let (w2, velocity) = table_value_world_register_table<TableParamData, TableParamTime, TableParamEvent>(w1);
+    let (w3, entity) = table_value_world_spawn<TableParamData, TableParamTime, TableParamEvent>(w2);
+    let w4 = table_value_world_insert<TableParamData, TableParamTime, TableParamEvent>(w3, entity, position.id, TableParamData { amount: 8 });
+    let w5 = table_value_world_insert<TableParamData, TableParamTime, TableParamEvent>(w4, entity, velocity.id, TableParamData { amount: 3 });
+    let before = w5.registry.change_tick;
+    let group_before = table_value_world_entity_archetype_id<TableParamData, TableParamTime, TableParamEvent>(w5, entity);
+    let row_before = table_value_world_entity_row<TableParamData, TableParamTime, TableParamEvent>(w5, entity);
+    let w6 = table_value_run_pair_mut_system<TableParamData, TableParamTime, TableParamEvent>(w5, position.id, velocity.id, table_param_movement_system);
+    if table_value_world_get<TableParamData, TableParamTime, TableParamEvent>(w6, entity, position.id).amount != 11 { panic(11400); };
+    if table_value_world_entity_archetype_id<TableParamData, TableParamTime, TableParamEvent>(w6, entity) != group_before { panic(11401); };
+    if table_value_world_entity_row<TableParamData, TableParamTime, TableParamEvent>(w6, entity) != row_before { panic(11402); };
+    if table_value_world_changed_since<TableParamData, TableParamTime, TableParamEvent>(w6, entity, position.id, before - 1) != true { panic(11403); };
+}
+
+@test "table value resource message and resmut params write back"() {
+    let w0 = table_param_world_new();
+    let w1 = table_value_world_insert_resource<TableParamData, TableParamTime, TableParamEvent>(w0, TableParamTime { tick: 5 });
+    let before = w1.registry.change_tick;
+    let w2 = table_value_run_resource_message_system<TableParamData, TableParamTime, TableParamEvent>(w1, table_param_event_default(), table_param_time_message_system);
+    let w3 = table_value_world_increment_tick<TableParamData, TableParamTime, TableParamEvent>(w2);
+    let w4 = table_value_run_res_mut_system<TableParamData, TableParamTime, TableParamEvent>(w3, table_param_res_mut_system);
+    let event = table_value_world_read_message<TableParamData, TableParamTime, TableParamEvent>(w4, message_reader_new(), table_param_event_default());
+    if table_value_world_get_resource<TableParamData, TableParamTime, TableParamEvent>(w4).tick != 8 { panic(11410); };
+    if event.value.amount != 9 { panic(11411); };
+    if table_value_world_resource_added_since<TableParamData, TableParamTime, TableParamEvent>(w4, before) != false { panic(11412); };
+    if table_value_world_resource_changed_since<TableParamData, TableParamTime, TableParamEvent>(w4, before) != true { panic(11413); };
+}
+
+@test "table value commands writer reader and filtered params"() {
+    let w0 = table_param_world_new();
+    let (w1, health) = table_value_world_register_table<TableParamData, TableParamTime, TableParamEvent>(w0);
+    let (w2, selected) = table_value_world_register_table<TableParamData, TableParamTime, TableParamEvent>(w1);
+    let w3 = table_value_run_commands_system<TableParamData, TableParamTime, TableParamEvent>(w2, table_param_commands_system);
+    let w4 = table_value_run_message_writer_system<TableParamData, TableParamTime, TableParamEvent>(w3, table_param_writer_system);
+    let w5 = table_value_run_without_query_resource_system<TableParamData, TableParamTime, TableParamEvent>(w4, health.id, selected.id, table_param_count_query_system);
+    let read1 = table_value_world_read_message<TableParamData, TableParamTime, TableParamEvent>(w5, message_reader_new(), table_param_event_default());
+    let (w6, reader2) = table_value_run_message_reader_res_mut_system<TableParamData, TableParamTime, TableParamEvent>(w5, read1.reader, table_param_event_default(), table_param_reader_resmut_system);
+    if table_value_world_get_resource<TableParamData, TableParamTime, TableParamEvent>(w6).tick != 3 { panic(11420); };
+    if read1.value.amount != 4 { panic(11421); };
+    if reader2.cursor != 2 { panic(11422); };
+    let query = table_value_world_query<TableParamData, TableParamTime, TableParamEvent>(w6, health.id);
+    if len(query.items) != 1 { panic(11423); };
+}
+
+@test "table value with added changed query resource params"() {
+    let w0 = table_param_world_new();
+    let (w1, health) = table_value_world_register_table<TableParamData, TableParamTime, TableParamEvent>(w0);
+    let (w2, selected) = table_value_world_register_table<TableParamData, TableParamTime, TableParamEvent>(w1);
+    let (w3, e1) = table_value_world_spawn<TableParamData, TableParamTime, TableParamEvent>(w2);
+    let (w4, e2) = table_value_world_spawn<TableParamData, TableParamTime, TableParamEvent>(w3);
+    let w5 = table_value_world_insert_resource<TableParamData, TableParamTime, TableParamEvent>(w4, TableParamTime { tick: 0 });
+    let before_add = w5.registry.change_tick;
+    let w6 = table_value_world_increment_tick<TableParamData, TableParamTime, TableParamEvent>(w5);
+    let w7 = table_value_world_insert<TableParamData, TableParamTime, TableParamEvent>(w6, e1, health.id, TableParamData { amount: 1 });
+    let w8 = table_value_world_insert<TableParamData, TableParamTime, TableParamEvent>(w7, e2, health.id, TableParamData { amount: 2 });
+    let w9 = table_value_world_insert<TableParamData, TableParamTime, TableParamEvent>(w8, e2, selected.id, TableParamData { amount: 1 });
+    let w10 = table_value_run_with_query_resource_system<TableParamData, TableParamTime, TableParamEvent>(w9, health.id, selected.id, table_param_count_query_system);
+    if table_value_world_get_resource<TableParamData, TableParamTime, TableParamEvent>(w10).tick != 1 { panic(11424); };
+    let w11 = table_value_run_added_query_resource_system<TableParamData, TableParamTime, TableParamEvent>(w10, health.id, before_add, table_param_count_query_system);
+    if table_value_world_get_resource<TableParamData, TableParamTime, TableParamEvent>(w11).tick != 2 { panic(11425); };
+    let before_change = w11.registry.change_tick;
+    let w12 = table_value_world_increment_tick<TableParamData, TableParamTime, TableParamEvent>(w11);
+    let item = table_value_world_query_mut<TableParamData, TableParamTime, TableParamEvent>(w12, health.id).items[0];
+    let w13 = table_value_world_write<TableParamData, TableParamTime, TableParamEvent>(w12, item, TableParamData { amount: 9 });
+    let w14 = table_value_run_changed_query_resource_system<TableParamData, TableParamTime, TableParamEvent>(w13, health.id, before_change, table_param_count_query_system);
+    if table_value_world_get_resource<TableParamData, TableParamTime, TableParamEvent>(w14).tick != 1 { panic(11426); };
+}

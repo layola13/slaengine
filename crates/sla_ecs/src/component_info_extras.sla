@@ -1,0 +1,286 @@
+// Bevy ECS component::info extension — ComponentInfo accessors + Components registry surface.
+// Mirrors src/component/info.rs (ComponentInfo accessors + Components registry API gaps not in
+// existing lib/component.sla / lib/ecs_metadata.sla).
+
+// === ComponentInfo (descriptor fields flattened) ===
+struct EcsComponentInfoV2 {
+    id: i32,
+    name_id: i64,
+    mutable: bool,
+    type_id: i64,
+    has_type_id: bool,
+    storage_type: i32,
+    is_send_and_sync: bool,
+    has_hook_id: i64,
+    required_count: i32,
+    required_by_count: i32,
+}
+
+fn ecs_component_info_v2_new(id: i32, name_id: i64, mutable: bool, type_id: i64, has_type_id: bool, storage_type: i32, is_send_and_sync: bool, has_hook_id: i64, required_count: i32, required_by_count: i32) -> EcsComponentInfoV2 {
+    let info = EcsComponentInfoV2 { id: id, name_id: name_id, mutable: mutable, type_id: type_id, has_type_id: has_type_id, storage_type: storage_type, is_send_and_sync: is_send_and_sync, has_hook_id: has_hook_id, required_count: required_count, required_by_count: required_by_count };
+    return info;
+}
+
+fn ecs_component_info_v2_id(info: EcsComponentInfoV2) -> i32 {
+    return info.id;
+}
+
+fn ecs_component_info_v2_name(info: EcsComponentInfoV2) -> i64 {
+    return info.name_id;
+}
+
+fn ecs_component_info_v2_mutable(info: EcsComponentInfoV2) -> bool {
+    return info.mutable;
+}
+
+fn ecs_component_info_v2_clone_behavior(info: EcsComponentInfoV2) -> i64 {
+    return info.has_hook_id;
+}
+
+fn ecs_component_info_v2_type_id(info: EcsComponentInfoV2) -> (bool, i64) {
+    return (info.has_type_id, info.type_id);
+}
+
+fn ecs_component_info_v2_storage_type(info: EcsComponentInfoV2) -> i32 {
+    return info.storage_type;
+}
+
+fn ecs_component_info_v2_is_send_and_sync(info: EcsComponentInfoV2) -> bool {
+    return info.is_send_and_sync;
+}
+
+fn ecs_component_info_v2_has_hooks(info: EcsComponentInfoV2) -> bool {
+    return info.has_hook_id > 0;
+}
+
+fn ecs_component_info_v2_required_components(info: EcsComponentInfoV2) -> i32 {
+    return info.required_count;
+}
+
+fn ecs_component_info_v2_required_by(info: EcsComponentInfoV2) -> i32 {
+    return info.required_by_count;
+}
+
+// === Components registry ===
+// Slot model: components[i] holds (registered: bool, info: EcsComponentInfoV2-or-placeholder)
+struct EcsComponentSlot {
+    registered: bool,
+    info_id: i32,
+    name_id: i64,
+    type_id: i64,
+    mutable: bool,
+    is_resource: bool,
+}
+
+struct EcsComponents {
+    slots: Vec<EcsComponentSlot>,
+    // indices: paired (type_id -> component_id)
+    indices_type_id: Vec<i64>,
+    indices_component_id: Vec<i32>,
+    queued_count: i32,
+    resource_count: i32,
+}
+
+fn ecs_components_new() -> EcsComponents {
+    let c = EcsComponents { slots: Vec::new(), indices_type_id: Vec::new(), indices_component_id: Vec::new(), queued_count: 0, resource_count: 0 };
+    return c;
+}
+
+// internal: push a slot
+fn ecs_components_push_slot(c: EcsComponents, info_id: i32, name_id: i64, type_id: i64, mutable: bool, is_resource: bool, registered: bool) -> EcsComponents {
+    let slot = EcsComponentSlot { registered: registered, info_id: info_id, name_id: name_id, type_id: type_id, mutable: mutable, is_resource: is_resource };
+    c.slots.push(slot);
+    c.indices_type_id.push(type_id);
+    c.indices_component_id.push(info_id);
+    return c;
+}
+
+// init_component (registered immediately) -> returns new component_id = slot count - 1
+fn ecs_components_init_component(c: EcsComponents, name_id: i64, type_id: i64, mutable: bool, storage: i32, send_sync: bool) -> (EcsComponents, i32) {
+    let id = len(c.slots) as i32;
+    let c2 = ecs_components_push_slot(c, id, name_id, type_id, mutable, false, true);
+    return (c2, id);
+}
+
+// init_resource -> like init_component but flagged is_resource
+fn ecs_components_init_resource(c: EcsComponents, name_id: i64, type_id: i64) -> (EcsComponents, i32) {
+    let id = len(c.slots) as i32;
+    let c2 = ecs_components_push_slot(c, id, name_id, type_id, true, true, true);
+    return (c2, id);
+}
+
+// queue_component (registered=false, increments queued_count)
+fn ecs_components_queue_component(c: EcsComponents, name_id: i64, type_id: i64, mutable: bool) -> (EcsComponents, i32) {
+    let id = len(c.slots) as i32;
+    let c2 = ecs_components_push_slot(c, id, name_id, type_id, mutable, false, false);
+    c2.queued_count = c2.queued_count + 1;
+    return (c2, id);
+}
+
+fn ecs_components_len(c: EcsComponents) -> i32 {
+    return len(c.slots) as i32;
+}
+
+fn ecs_components_is_empty(c: EcsComponents) -> bool {
+    return len(c.slots) as i32 == 0;
+}
+
+fn ecs_components_num_queued(c: EcsComponents) -> i32 {
+    return c.queued_count;
+}
+
+fn ecs_components_any_queued(c: EcsComponents) -> bool {
+    return c.queued_count > 0;
+}
+
+fn ecs_components_num_queued_mut(c: EcsComponents) -> i32 {
+    return c.queued_count;
+}
+
+fn ecs_components_any_queued_mut(c: EcsComponents) -> bool {
+    return c.queued_count > 0;
+}
+
+fn ecs_components_num_registered(c: EcsComponents) -> i32 {
+    let count: i32 = 0;
+    let idx: i32 = 0;
+    let n: i32 = len(c.slots) as i32;
+    while idx < n {
+        let slot = c.slots[idx];
+        if slot.registered {
+            count = count + 1;
+        };
+        idx = idx + 1;
+    }
+    return count;
+}
+
+fn ecs_components_any_registered(c: EcsComponents) -> bool {
+    return ecs_components_num_registered(c) > 0;
+}
+
+// get_info(id): returns (found, info) — built from the slot
+fn ecs_components_get_info(c: EcsComponents, id: i32) -> (bool, EcsComponentInfoV2) {
+    if id < 0 {
+        return (false, ecs_component_info_v2_new(0, 0, false, 0, false, 0, false, 0, 0, 0));
+    };
+    let n: i32 = len(c.slots) as i32;
+    if id >= n {
+        return (false, ecs_component_info_v2_new(0, 0, false, 0, false, 0, false, 0, 0, 0));
+    };
+    let slot = c.slots[id];
+    let info = ecs_component_info_v2_new(slot.info_id, slot.name_id, slot.mutable, slot.type_id, true, 0, true, 0, 0, 0);
+    return (true, info);
+}
+
+fn ecs_components_get_name(c: EcsComponents, id: i32) -> (bool, i64) {
+    if id < 0 {
+        return (false, 0);
+    };
+    let n: i32 = len(c.slots) as i32;
+    if id >= n {
+        return (false, 0);
+    };
+    let slot = c.slots[id];
+    if slot.registered != true {
+        return (false, 0);
+    };
+    return (true, slot.name_id);
+}
+
+fn ecs_components_is_id_valid(c: EcsComponents, id: i32) -> bool {
+    if id < 0 {
+        return false;
+    };
+    let n: i32 = len(c.slots) as i32;
+    return id < n;
+}
+
+// get_valid_id: only returns component_id when the slot is registered (and not a resource)
+fn ecs_components_get_valid_id(c: EcsComponents, type_id: i64) -> (bool, i32) {
+    let idx: i32 = 0;
+    let n: i32 = len(c.indices_type_id) as i32;
+    while idx < n {
+        let tid = c.indices_type_id[idx];
+        if tid == type_id {
+            let cid = c.indices_component_id[idx];
+            if cid >= 0 && cid < len(c.slots) as i32 {
+                let slot = c.slots[cid];
+                if slot.registered {
+                    if slot.is_resource != true {
+                        return (true, cid);
+                    };
+                };
+            };
+        };
+        idx = idx + 1;
+    }
+    return (false, 0);
+}
+
+// get_id: any slot (registered or queued). Returns (found, component_id).
+fn ecs_components_get_id(c: EcsComponents, type_id: i64) -> (bool, i32) {
+    let idx: i32 = 0;
+    let n: i32 = len(c.indices_type_id) as i32;
+    while idx < n {
+        let tid = c.indices_type_id[idx];
+        if tid == type_id {
+            let cid = c.indices_component_id[idx];
+            return (true, cid);
+        };
+        idx = idx + 1;
+    }
+    return (false, 0);
+}
+
+// get_valid_resource_id: only when registered AND is_resource
+fn ecs_components_get_valid_resource_id(c: EcsComponents, type_id: i64) -> (bool, i32) {
+    let idx: i32 = 0;
+    let n: i32 = len(c.indices_type_id) as i32;
+    while idx < n {
+        let tid = c.indices_type_id[idx];
+        if tid == type_id {
+            let cid = c.indices_component_id[idx];
+            if cid >= 0 && cid < len(c.slots) as i32 {
+                let slot = c.slots[cid];
+                if slot.registered {
+                    if slot.is_resource {
+                        return (true, cid);
+                    };
+                };
+            };
+        };
+        idx = idx + 1;
+    }
+    return (false, 0);
+}
+
+// get_resource_id: any slot flagged as resource.
+fn ecs_components_get_resource_id(c: EcsComponents, type_id: i64) -> (bool, i32) {
+    let idx: i32 = 0;
+    let n: i32 = len(c.indices_type_id) as i32;
+    while idx < n {
+        let tid = c.indices_type_id[idx];
+        if tid == type_id {
+            let cid = c.indices_component_id[idx];
+            return (true, cid);
+        };
+        idx = idx + 1;
+    }
+    return (false, 0);
+}
+
+// iter_registered(): returns indexes of registered slots
+fn ecs_components_iter_registered(c: EcsComponents) -> Vec<i32> {
+    let out = Vec::new();
+    let idx: i32 = 0;
+    let n: i32 = len(c.slots) as i32;
+    while idx < n {
+        let slot = c.slots[idx];
+        if slot.registered {
+            out.push(idx);
+        };
+        idx = idx + 1;
+    }
+    return out;
+}

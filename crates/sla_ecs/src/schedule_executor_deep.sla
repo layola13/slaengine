@@ -1,0 +1,177 @@
+// Deepened Bevy ECS schedule executor (lib/schedule_executor.sla deep;
+// src/schedule/executor/single_threaded.rs + multi_threaded.rs).
+// Fixed cap-8 system-queue + state machine tracking applied/skipped counts and
+// apply_deferred flush. Operations:
+//   single_threaded, multi_threaded, kind, is_multi_threaded,
+//   set_up(cap), run_system, skip_system, applied_count, skipped_count,
+//   next_to_run, apply_deferred, has_apply_deferred,
+//   finish, iteration_count, run_finish_check (after applying the last system),
+//   queued/queue_at/queue_len (introspection).
+
+const ECS_EXEC_SINGLE_DEEP: i32 = 0;
+const ECS_EXEC_MULTI_DEEP: i32 = 1;
+const ECS_EXEC_QUEUE_CAP_DEEP: i32 = 8;
+
+struct EcsExecSystemDeep {
+    id: i32,
+    run: i32,
+    skipped: i32,
+}
+
+fn ecs_exec_system_new(id: i32) -> EcsExecSystemDeep {
+    return EcsExecSystemDeep { id: id, run: 0, skipped: 0 };
+}
+fn ecs_exec_system_id(s: EcsExecSystemDeep) -> i32 { return s.id; }
+fn ecs_exec_system_run(s: EcsExecSystemDeep) -> i32 { return s.run; }
+fn ecs_exec_system_skipped(s: EcsExecSystemDeep) -> i32 { return s.skipped; }
+
+struct EcsScheduleExecutorDeep {
+    q0: EcsExecSystemDeep, q1: EcsExecSystemDeep, q2: EcsExecSystemDeep, q3: EcsExecSystemDeep,
+    q4: EcsExecSystemDeep, q5: EcsExecSystemDeep, q6: EcsExecSystemDeep, q7: EcsExecSystemDeep,
+    kind: i32,
+    applied_count: i32,
+    skipped_count: i32,
+    has_apply_deferred: i32,
+    next_to_run: i32,
+    iteration_count: i32,
+}
+
+fn ecs_executor_single_threaded() -> EcsScheduleExecutorDeep {
+    let blank = ecs_exec_system_new(0);
+    let e = EcsScheduleExecutorDeep {
+        q0: blank, q1: ecs_exec_system_new(1), q2: ecs_exec_system_new(2), q3: ecs_exec_system_new(3),
+        q4: ecs_exec_system_new(4), q5: ecs_exec_system_new(5), q6: ecs_exec_system_new(6), q7: ecs_exec_system_new(7),
+        kind: ECS_EXEC_SINGLE_DEEP,
+        applied_count: 0,
+        skipped_count: 0,
+        has_apply_deferred: 0,
+        next_to_run: 0,
+        iteration_count: 0,
+    };
+    return e;
+}
+
+fn ecs_executor_multi_threaded() -> EcsScheduleExecutorDeep {
+    let e = ecs_executor_single_threaded();
+    e.kind = ECS_EXEC_MULTI_DEEP;
+    return e;
+}
+
+fn ecs_executor_kind(e: EcsScheduleExecutorDeep) -> i32 { return e.kind; }
+fn ecs_executor_is_multi_threaded(e: EcsScheduleExecutorDeep) -> bool { return e.kind == ECS_EXEC_MULTI_DEEP; }
+fn ecs_executor_applied_count(e: EcsScheduleExecutorDeep) -> i32 { return e.applied_count; }
+fn ecs_executor_skipped_count(e: EcsScheduleExecutorDeep) -> i32 { return e.skipped_count; }
+fn ecs_executor_next_to_run(e: EcsScheduleExecutorDeep) -> i32 { return e.next_to_run; }
+fn ecs_executor_iteration_count(e: EcsScheduleExecutorDeep) -> i32 { return e.iteration_count; }
+
+fn ecs_executor_has_apply_deferred(e: EcsScheduleExecutorDeep) -> bool {
+    return e.has_apply_deferred == 1;
+}
+
+fn ecs_executor_apply_deferred(e: EcsScheduleExecutorDeep) -> EcsScheduleExecutorDeep {
+    e.has_apply_deferred = 1;
+    return e;
+}
+
+// set_up seeds the executor with the first N system ids (1..1+N up to cap), resets counters.
+fn ecs_executor_set_up(e: EcsScheduleExecutorDeep, system_count: i32) -> EcsScheduleExecutorDeep {
+    if system_count > ECS_EXEC_QUEUE_CAP_DEEP {
+        e.iteration_count = ECS_EXEC_QUEUE_CAP_DEEP;
+    } else {
+        e.iteration_count = system_count;
+    };
+    e.next_to_run = 0;
+    e.applied_count = 0;
+    e.skipped_count = 0;
+    e.has_apply_deferred = 0;
+    // Seed queue slots with ascending ids 0..iteration_count.
+    let i: i32 = 0;
+    while i < ECS_EXEC_QUEUE_CAP_DEEP {
+        if i < e.iteration_count {
+            if i == 0 { e.q0 = ecs_exec_system_new(0); };
+            if i == 1 { e.q1 = ecs_exec_system_new(1); };
+            if i == 2 { e.q2 = ecs_exec_system_new(2); };
+            if i == 3 { e.q3 = ecs_exec_system_new(3); };
+            if i == 4 { e.q4 = ecs_exec_system_new(4); };
+            if i == 5 { e.q5 = ecs_exec_system_new(5); };
+            if i == 6 { e.q6 = ecs_exec_system_new(6); };
+            if i == 7 { e.q7 = ecs_exec_system_new(7); };
+        } else {
+            if i == 0 { e.q0 = ecs_exec_system_new(0); };
+            if i == 1 { e.q1 = ecs_exec_system_new(0); };
+            if i == 2 { e.q2 = ecs_exec_system_new(0); };
+            if i == 3 { e.q3 = ecs_exec_system_new(0); };
+            if i == 4 { e.q4 = ecs_exec_system_new(0); };
+            if i == 5 { e.q5 = ecs_exec_system_new(0); };
+            if i == 6 { e.q6 = ecs_exec_system_new(0); };
+            if i == 7 { e.q7 = ecs_exec_system_new(0); };
+        };
+        i = i + 1;
+    }
+    return e;
+}
+
+fn ecs_executor_queue_at(e: EcsScheduleExecutorDeep, idx: i32) -> EcsExecSystemDeep {
+    if idx == 0 { return e.q0; };
+    if idx == 1 { return e.q1; };
+    if idx == 2 { return e.q2; };
+    if idx == 3 { return e.q3; };
+    if idx == 4 { return e.q4; };
+    if idx == 5 { return e.q5; };
+    if idx == 6 { return e.q6; };
+    if idx == 7 { return e.q7; };
+    return ecs_exec_system_new(0);
+}
+
+fn ecs_executor_set_queue_slot(e: EcsScheduleExecutorDeep, idx: i32, sys: EcsExecSystemDeep) -> EcsScheduleExecutorDeep {
+    // Capture scalar fields once, then build fresh per branch (struct-by-value moved on first reassign).
+    let sid = ecs_exec_system_id(sys);
+    let sr = ecs_exec_system_run(sys);
+    let ss = ecs_exec_system_skipped(sys);
+    if idx == 0 { e.q0 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 1 { e.q1 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 2 { e.q2 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 3 { e.q3 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 4 { e.q4 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 5 { e.q5 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 6 { e.q6 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    if idx == 7 { e.q7 = EcsExecSystemDeep { id: sid, run: sr, skipped: ss }; };
+    return e;
+}
+
+// run_system: marks system at queue position system_id as run; advances next_to_run.
+fn ecs_executor_run_system(e: EcsScheduleExecutorDeep, system_id: i32) -> EcsScheduleExecutorDeep {
+    let blk = ecs_executor_queue_at(e, system_id);
+    let run = ecs_exec_system_run(blk);
+    let sk = ecs_exec_system_skipped(blk);
+    let updated = EcsExecSystemDeep { id: ecs_exec_system_id(blk), run: run + 1, skipped: sk };
+    e = ecs_executor_set_queue_slot(e, system_id, updated);
+    e.applied_count = e.applied_count + 1;
+    e.next_to_run = system_id + 1;
+    if e.next_to_run > e.iteration_count { e.next_to_run = e.iteration_count; };
+    return e;
+}
+
+// skip_system: marks the current next_to_run system as skipped (Skipped due to condition fail).
+fn ecs_executor_skip_system(e: EcsScheduleExecutorDeep) -> EcsScheduleExecutorDeep {
+    let idx = e.next_to_run;
+    let blk = ecs_executor_queue_at(e, idx);
+    let run = ecs_exec_system_run(blk);
+    let updated = EcsExecSystemDeep { id: ecs_exec_system_id(blk), run: run, skipped: 1 };
+    e = ecs_executor_set_queue_slot(e, idx, updated);
+    e.skipped_count = e.skipped_count + 1;
+    e.next_to_run = idx + 1;
+    if e.next_to_run > e.iteration_count { e.next_to_run = e.iteration_count; };
+    return e;
+}
+
+// finish: end of a run, sets next_to_run to iteration_count.
+fn ecs_executor_finish(e: EcsScheduleExecutorDeep) -> EcsScheduleExecutorDeep {
+    e.next_to_run = e.iteration_count;
+    return e;
+}
+
+// is_finished: reports whether all queued systems have been processed.
+fn ecs_executor_is_finished(e: EcsScheduleExecutorDeep) -> bool {
+    return e.next_to_run >= e.iteration_count;
+}

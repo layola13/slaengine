@@ -1,0 +1,306 @@
+// Deepened Bevy ECS ComponentEntry / OccupiedComponentEntry / VacantComponentEntry.
+// Mirrors src/world/entity_access/entry.rs:
+//   ComponentEntry::{and_modify, insert_entry, or_insert, or_insert_with, or_default}
+//   OccupiedComponentEntry::{get, insert, take, get_mut, into_mut}
+//   VacantComponentEntry::{insert}
+// Entity-backed component storage (fixed 4 slots) so insert/take mutate presence.
+// Shallow lib/entry.sla retained.
+
+const ECS_ENTRY_DEEP_VACANT: i32 = 0;
+const ECS_ENTRY_DEEP_OCCUPIED: i32 = 1;
+
+// Entity component bag for entry operations
+struct EcsEntryEntityDeep {
+    entity: i64,
+    c0: i32, v0: i64,
+    c1: i32, v1: i64,
+    c2: i32, v2: i64,
+    c3: i32, v3: i64,
+    len: i32,
+}
+
+fn ecs_entry_entity_deep_new(entity: i64) -> EcsEntryEntityDeep {
+    return EcsEntryEntityDeep {
+        entity: entity,
+        c0: -1, v0: 0, c1: -1, v1: 0, c2: -1, v2: 0, c3: -1, v3: 0, len: 0,
+    };
+}
+
+fn ecs_entry_entity_deep_id(e: EcsEntryEntityDeep) -> i64 { return e.entity; }
+fn ecs_entry_entity_deep_len(e: EcsEntryEntityDeep) -> i32 { return e.len; }
+
+fn ecs_entry_entity_deep_rebuild(
+    entity: i64,
+    c0: i32, v0: i64, c1: i32, v1: i64, c2: i32, v2: i64, c3: i32, v3: i64, len: i32
+) -> EcsEntryEntityDeep {
+    return EcsEntryEntityDeep {
+        entity: entity, c0: c0, v0: v0, c1: c1, v1: v1, c2: c2, v2: v2, c3: c3, v3: v3, len: len,
+    };
+}
+
+fn ecs_entry_entity_deep_contains(e: EcsEntryEntityDeep, cid: i32) -> bool {
+    if e.len >= 1 {
+        if e.c0 == cid { return true; };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return true; };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return true; };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return true; };
+    };
+    return false;
+}
+
+fn ecs_entry_entity_deep_get_value(e: EcsEntryEntityDeep, cid: i32) -> i64 {
+    if e.len >= 1 {
+        if e.c0 == cid { return e.v0; };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid { return e.v1; };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid { return e.v2; };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid { return e.v3; };
+    };
+    return 0;
+}
+
+fn ecs_entry_entity_deep_set(e: EcsEntryEntityDeep, cid: i32, value: i64) -> EcsEntryEntityDeep {
+    if e.len >= 1 {
+        if e.c0 == cid {
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, value, e.c1, e.v1, e.c2, e.v2, e.c3, e.v3, e.len);
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid {
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, value, e.c2, e.v2, e.c3, e.v3, e.len);
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid {
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, value, e.c3, e.v3, e.len);
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid {
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, e.v2, e.c3, value, e.len);
+        };
+    };
+    // insert new
+    if e.len == 0 {
+        return ecs_entry_entity_deep_rebuild(e.entity, cid, value, e.c1, e.v1, e.c2, e.v2, e.c3, e.v3, 1);
+    };
+    if e.len == 1 {
+        return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, cid, value, e.c2, e.v2, e.c3, e.v3, 2);
+    };
+    if e.len == 2 {
+        return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, cid, value, e.c3, e.v3, 3);
+    };
+    if e.len == 3 {
+        return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, e.v2, cid, value, 4);
+    };
+    return e;
+}
+
+fn ecs_entry_entity_deep_remove(e: EcsEntryEntityDeep, cid: i32) -> EcsEntryEntityDeep {
+    // rebuild without cid via scan into temps
+    let n0 = 0;
+    let c0 = -1; let v0: i64 = 0;
+    let c1 = -1; let v1: i64 = 0;
+    let c2 = -1; let v2: i64 = 0;
+    let c3 = -1; let v3: i64 = 0;
+    if e.len >= 1 {
+        if e.c0 != cid {
+            c0 = e.c0; v0 = e.v0; n0 = 1;
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 != cid {
+            if n0 == 0 { c0 = e.c1; v0 = e.v1; n0 = 1; };
+            if n0 == 1 {
+                if c0 != e.c1 {
+                    // if we already set from c0 path and this is different, need second slot
+                };
+            };
+        };
+    };
+    // simpler explicit remove by slot match + swap-from-end
+    if e.len >= 1 {
+        if e.c0 == cid {
+            if e.len == 1 {
+                return ecs_entry_entity_deep_rebuild(e.entity, -1, 0, -1, 0, -1, 0, -1, 0, 0);
+            };
+            if e.len == 2 {
+                return ecs_entry_entity_deep_rebuild(e.entity, e.c1, e.v1, -1, 0, -1, 0, -1, 0, 1);
+            };
+            if e.len == 3 {
+                return ecs_entry_entity_deep_rebuild(e.entity, e.c2, e.v2, e.c1, e.v1, -1, 0, -1, 0, 2);
+            };
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c3, e.v3, e.c1, e.v1, e.c2, e.v2, -1, 0, 3);
+        };
+    };
+    if e.len >= 2 {
+        if e.c1 == cid {
+            if e.len == 2 {
+                return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, -1, 0, -1, 0, -1, 0, 1);
+            };
+            if e.len == 3 {
+                return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c2, e.v2, -1, 0, -1, 0, 2);
+            };
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c3, e.v3, e.c2, e.v2, -1, 0, 3);
+        };
+    };
+    if e.len >= 3 {
+        if e.c2 == cid {
+            if e.len == 3 {
+                return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, -1, 0, -1, 0, 2);
+            };
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c3, e.v3, -1, 0, 3);
+        };
+    };
+    if e.len >= 4 {
+        if e.c3 == cid {
+            return ecs_entry_entity_deep_rebuild(e.entity, e.c0, e.v0, e.c1, e.v1, e.c2, e.v2, -1, 0, 3);
+        };
+    };
+    return e;
+}
+
+// ComponentEntry
+struct EcsEntryDeep {
+    kind: i32,
+    component_id: i32,
+    value: i64,
+    entity: EcsEntryEntityDeep,
+}
+
+fn ecs_entry_deep_occupied(entity: EcsEntryEntityDeep, cid: i32) -> EcsEntryDeep {
+    let v = ecs_entry_entity_deep_get_value(entity, cid);
+    return EcsEntryDeep { kind: ECS_ENTRY_DEEP_OCCUPIED, component_id: cid, value: v, entity: entity };
+}
+
+fn ecs_entry_deep_vacant(entity: EcsEntryEntityDeep, cid: i32) -> EcsEntryDeep {
+    return EcsEntryDeep { kind: ECS_ENTRY_DEEP_VACANT, component_id: cid, value: 0, entity: entity };
+}
+
+// entry() construction: occupied if present else vacant
+fn ecs_entry_deep_from_entity(entity: EcsEntryEntityDeep, cid: i32) -> EcsEntryDeep {
+    if ecs_entry_entity_deep_contains(entity, cid) {
+        return ecs_entry_deep_occupied(entity, cid);
+    };
+    return ecs_entry_deep_vacant(entity, cid);
+}
+
+fn ecs_entry_deep_is_occupied(e: EcsEntryDeep) -> bool {
+    if e.kind == ECS_ENTRY_DEEP_OCCUPIED { return true; };
+    return false;
+}
+fn ecs_entry_deep_is_vacant(e: EcsEntryDeep) -> bool {
+    if e.kind == ECS_ENTRY_DEEP_VACANT { return true; };
+    return false;
+}
+fn ecs_entry_deep_component_id(e: EcsEntryDeep) -> i32 { return e.component_id; }
+fn ecs_entry_deep_value(e: EcsEntryDeep) -> i64 { return e.value; }
+fn ecs_entry_deep_entity_id(e: EcsEntryDeep) -> i64 { return ecs_entry_entity_deep_id(e.entity); }
+fn ecs_entry_deep_entity(e: EcsEntryDeep) -> EcsEntryEntityDeep { return e.entity; }
+
+// and_modify: if occupied, apply delta
+fn ecs_entry_deep_and_modify(e: EcsEntryDeep, delta: i64) -> EcsEntryDeep {
+    if e.kind != ECS_ENTRY_DEEP_OCCUPIED {
+        return e;
+    };
+    let nv = e.value + delta;
+    let ent = ecs_entry_entity_deep_set(e.entity, e.component_id, nv);
+    return EcsEntryDeep {
+        kind: ECS_ENTRY_DEEP_OCCUPIED, component_id: e.component_id, value: nv, entity: ent,
+    };
+}
+
+// OccupiedComponentEntry
+struct EcsOccupiedEntryDeep {
+    component_id: i32,
+    value: i64,
+    entity: EcsEntryEntityDeep,
+}
+
+fn ecs_occupied_entry_deep_component_id(o: EcsOccupiedEntryDeep) -> i32 { return o.component_id; }
+fn ecs_occupied_entry_deep_get(o: EcsOccupiedEntryDeep) -> i64 { return o.value; }
+fn ecs_occupied_entry_deep_entity_id(o: EcsOccupiedEntryDeep) -> i64 { return ecs_entry_entity_deep_id(o.entity); }
+fn ecs_occupied_entry_deep_entity(o: EcsOccupiedEntryDeep) -> EcsEntryEntityDeep { return o.entity; }
+
+fn ecs_occupied_entry_deep_insert(o: EcsOccupiedEntryDeep, value: i64) -> EcsOccupiedEntryDeep {
+    let ent = ecs_entry_entity_deep_set(o.entity, o.component_id, value);
+    return EcsOccupiedEntryDeep { component_id: o.component_id, value: value, entity: ent };
+}
+
+fn ecs_occupied_entry_deep_get_mut(o: EcsOccupiedEntryDeep) -> i64 { return o.value; }
+fn ecs_occupied_entry_deep_into_mut(o: EcsOccupiedEntryDeep) -> i64 { return o.value; }
+
+// take: remove component, return value + updated entity
+struct EcsOccupiedTakeDeep {
+    value: i64,
+    entity: EcsEntryEntityDeep,
+}
+
+fn ecs_occupied_take_value(r: EcsOccupiedTakeDeep) -> i64 { return r.value; }
+fn ecs_occupied_take_entity(r: EcsOccupiedTakeDeep) -> EcsEntryEntityDeep { return r.entity; }
+
+fn ecs_occupied_entry_deep_take(o: EcsOccupiedEntryDeep) -> EcsOccupiedTakeDeep {
+    let ent = ecs_entry_entity_deep_remove(o.entity, o.component_id);
+    return EcsOccupiedTakeDeep { value: o.value, entity: ent };
+}
+
+// VacantComponentEntry
+struct EcsVacantEntryDeep {
+    component_id: i32,
+    entity: EcsEntryEntityDeep,
+}
+
+fn ecs_vacant_entry_deep_component_id(v: EcsVacantEntryDeep) -> i32 { return v.component_id; }
+fn ecs_vacant_entry_deep_entity_id(v: EcsVacantEntryDeep) -> i64 { return ecs_entry_entity_deep_id(v.entity); }
+
+fn ecs_vacant_entry_deep_insert(v: EcsVacantEntryDeep, value: i64) -> EcsOccupiedEntryDeep {
+    let ent = ecs_entry_entity_deep_set(v.entity, v.component_id, value);
+    return EcsOccupiedEntryDeep { component_id: v.component_id, value: value, entity: ent };
+}
+
+// insert_entry on ComponentEntry
+fn ecs_entry_deep_insert_entry(e: EcsEntryDeep, value: i64) -> EcsOccupiedEntryDeep {
+    if e.kind == ECS_ENTRY_DEEP_OCCUPIED {
+        let o = EcsOccupiedEntryDeep { component_id: e.component_id, value: e.value, entity: e.entity };
+        return ecs_occupied_entry_deep_insert(o, value);
+    };
+    let v = EcsVacantEntryDeep { component_id: e.component_id, entity: e.entity };
+    return ecs_vacant_entry_deep_insert(v, value);
+}
+
+// or_insert
+fn ecs_entry_deep_or_insert(e: EcsEntryDeep, default: i64) -> EcsOccupiedEntryDeep {
+    if e.kind == ECS_ENTRY_DEEP_OCCUPIED {
+        return EcsOccupiedEntryDeep { component_id: e.component_id, value: e.value, entity: e.entity };
+    };
+    let v = EcsVacantEntryDeep { component_id: e.component_id, entity: e.entity };
+    return ecs_vacant_entry_deep_insert(v, default);
+}
+
+fn ecs_entry_deep_or_insert_with(e: EcsEntryDeep, default: i64) -> EcsOccupiedEntryDeep {
+    return ecs_entry_deep_or_insert(e, default);
+}
+
+fn ecs_entry_deep_or_default(e: EcsEntryDeep) -> EcsOccupiedEntryDeep {
+    return ecs_entry_deep_or_insert(e, 0);
+}
+
+// into vacant/occupied views
+fn ecs_entry_deep_as_occupied(e: EcsEntryDeep) -> EcsOccupiedEntryDeep {
+    return EcsOccupiedEntryDeep { component_id: e.component_id, value: e.value, entity: e.entity };
+}
+
+fn ecs_entry_deep_as_vacant(e: EcsEntryDeep) -> EcsVacantEntryDeep {
+    return EcsVacantEntryDeep { component_id: e.component_id, entity: e.entity };
+}

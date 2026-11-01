@@ -1,0 +1,806 @@
+// Deepened Bevy ECS relationship related_methods surface.
+// Mirrors src/relationship/related_methods.rs EntityWorldMut/EntityCommands:
+//   with_related / with_related_entities (RelatedSpawner)
+//   add_related / add_one_related / insert_related (ordered place)
+//   detach_all_related / replace_related / replace_related_with_difference
+//   despawn_related / despawn_children
+//   insert_recursive / remove_recursive BFS tree walk
+//   RelationshipHookMode Run vs Skip on reparent
+// Shallow lib/relationship_related_methods.sla + extras retained.
+
+const ECS_RRM_HOOK_RUN: i32 = 0;
+const ECS_RRM_HOOK_SKIP: i32 = 1;
+
+fn ecs_rrm_hook_run() -> i32 { return ECS_RRM_HOOK_RUN; }
+fn ecs_rrm_hook_skip() -> i32 { return ECS_RRM_HOOK_SKIP; }
+
+// Ordered source collection capacity 8
+struct EcsRrmCollDeep {
+    e0: i64, e1: i64, e2: i64, e3: i64,
+    e4: i64, e5: i64, e6: i64, e7: i64,
+    len: i32,
+}
+
+fn ecs_rrm_coll_new() -> EcsRrmCollDeep {
+    return EcsRrmCollDeep {
+        e0: 0, e1: 0, e2: 0, e3: 0, e4: 0, e5: 0, e6: 0, e7: 0, len: 0,
+    };
+}
+
+fn ecs_rrm_coll_len(c: EcsRrmCollDeep) -> i32 { return c.len; }
+
+fn ecs_rrm_coll_at(c: EcsRrmCollDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.e0; };
+    if idx == 1 { return c.e1; };
+    if idx == 2 { return c.e2; };
+    if idx == 3 { return c.e3; };
+    if idx == 4 { return c.e4; };
+    if idx == 5 { return c.e5; };
+    if idx == 6 { return c.e6; };
+    if idx == 7 { return c.e7; };
+    return 0;
+}
+
+fn ecs_rrm_coll_contains(c: EcsRrmCollDeep, e: i64) -> bool {
+    if c.len >= 1 && c.e0 == e { return true; };
+    if c.len >= 2 && c.e1 == e { return true; };
+    if c.len >= 3 && c.e2 == e { return true; };
+    if c.len >= 4 && c.e3 == e { return true; };
+    if c.len >= 5 && c.e4 == e { return true; };
+    if c.len >= 6 && c.e5 == e { return true; };
+    if c.len >= 7 && c.e6 == e { return true; };
+    if c.len >= 8 && c.e7 == e { return true; };
+    return false;
+}
+
+fn ecs_rrm_coll_set(c: EcsRrmCollDeep, idx: i32, e: i64) -> EcsRrmCollDeep {
+    if idx == 0 { return EcsRrmCollDeep { e0: e, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7, len: c.len }; };
+    if idx == 1 { return EcsRrmCollDeep { e0: c.e0, e1: e, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7, len: c.len }; };
+    if idx == 2 { return EcsRrmCollDeep { e0: c.e0, e1: c.e1, e2: e, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7, len: c.len }; };
+    if idx == 3 { return EcsRrmCollDeep { e0: c.e0, e1: c.e1, e2: c.e2, e3: e, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7, len: c.len }; };
+    if idx == 4 { return EcsRrmCollDeep { e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: e, e5: c.e5, e6: c.e6, e7: c.e7, len: c.len }; };
+    if idx == 5 { return EcsRrmCollDeep { e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: e, e6: c.e6, e7: c.e7, len: c.len }; };
+    if idx == 6 { return EcsRrmCollDeep { e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: e, e7: c.e7, len: c.len }; };
+    if idx == 7 { return EcsRrmCollDeep { e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: e, len: c.len }; };
+    return c;
+}
+
+fn ecs_rrm_coll_push(c: EcsRrmCollDeep, e: i64) -> EcsRrmCollDeep {
+    if c.len >= 8 { return c; };
+    let n = c.len;
+    c = ecs_rrm_coll_set(c, n, e);
+    return EcsRrmCollDeep {
+        e0: c.e0, e1: c.e1, e2: c.e2, e3: c.e3, e4: c.e4, e5: c.e5, e6: c.e6, e7: c.e7, len: n + 1,
+    };
+}
+
+fn ecs_rrm_coll_clear(c: EcsRrmCollDeep) -> EcsRrmCollDeep {
+    return ecs_rrm_coll_new();
+}
+
+fn ecs_rrm_coll_remove(c: EcsRrmCollDeep, e: i64) -> EcsRrmCollDeep {
+    let out = ecs_rrm_coll_new();
+    if c.len >= 1 && c.e0 != e { out = ecs_rrm_coll_push(out, c.e0); };
+    if c.len >= 2 && c.e1 != e { out = ecs_rrm_coll_push(out, c.e1); };
+    if c.len >= 3 && c.e2 != e { out = ecs_rrm_coll_push(out, c.e2); };
+    if c.len >= 4 && c.e3 != e { out = ecs_rrm_coll_push(out, c.e3); };
+    if c.len >= 5 && c.e4 != e { out = ecs_rrm_coll_push(out, c.e4); };
+    if c.len >= 6 && c.e5 != e { out = ecs_rrm_coll_push(out, c.e5); };
+    if c.len >= 7 && c.e6 != e { out = ecs_rrm_coll_push(out, c.e6); };
+    if c.len >= 8 && c.e7 != e { out = ecs_rrm_coll_push(out, c.e7); };
+    return out;
+}
+
+// place entity at index (remove first if present, then insert)
+fn ecs_rrm_coll_place(c: EcsRrmCollDeep, entity: i64, index: i32) -> EcsRrmCollDeep {
+    c = ecs_rrm_coll_remove(c, entity);
+    if index < 0 { index = 0; };
+    if index > c.len { index = c.len; };
+    if c.len >= 8 { return c; };
+    // expand
+    c = ecs_rrm_coll_push(c, 0);
+    let i = c.len - 1;
+    // shift right
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    if i > index { c = ecs_rrm_coll_set(c, i, ecs_rrm_coll_at(c, i - 1)); i = i - 1; };
+    c = ecs_rrm_coll_set(c, index, entity);
+    return c;
+}
+
+fn ecs_rrm_coll_place_most_recent(c: EcsRrmCollDeep, index: i32) -> EcsRrmCollDeep {
+    if c.len == 0 { return c; };
+    let last = ecs_rrm_coll_at(c, c.len - 1);
+    // remove last without reordering others: rebuild without last
+    let out = ecs_rrm_coll_new();
+    let n = c.len - 1;
+    if n >= 1 { out = ecs_rrm_coll_push(out, c.e0); };
+    if n >= 2 { out = ecs_rrm_coll_push(out, c.e1); };
+    if n >= 3 { out = ecs_rrm_coll_push(out, c.e2); };
+    if n >= 4 { out = ecs_rrm_coll_push(out, c.e3); };
+    if n >= 5 { out = ecs_rrm_coll_push(out, c.e4); };
+    if n >= 6 { out = ecs_rrm_coll_push(out, c.e5); };
+    if n >= 7 { out = ecs_rrm_coll_push(out, c.e6); };
+    return ecs_rrm_coll_place(out, last, index);
+}
+
+// Entity relationship component: parent pointer
+struct EcsRrmEntityDeep {
+    id: i64,
+    has_rel: bool,
+    parent: i64,
+    alive: bool,
+    // recursive children for BFS (capacity 4)
+    d0: i64, d1: i64, d2: i64, d3: i64, dlen: i32,
+    has_bundle_marker: bool,
+    bundle_marker: i32,
+}
+
+fn ecs_rrm_entity_new(id: i64) -> EcsRrmEntityDeep {
+    return EcsRrmEntityDeep {
+        id: id, has_rel: false, parent: 0, alive: true,
+        d0: 0, d1: 0, d2: 0, d3: 0, dlen: 0,
+        has_bundle_marker: false, bundle_marker: 0,
+    };
+}
+
+fn ecs_rrm_entity_add_desc(e: EcsRrmEntityDeep, child: i64) -> EcsRrmEntityDeep {
+    let n = e.dlen;
+    if n == 0 { return EcsRrmEntityDeep { id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive, d0: child, d1: e.d1, d2: e.d2, d3: e.d3, dlen: 1, has_bundle_marker: e.has_bundle_marker, bundle_marker: e.bundle_marker }; };
+    if n == 1 { return EcsRrmEntityDeep { id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive, d0: e.d0, d1: child, d2: e.d2, d3: e.d3, dlen: 2, has_bundle_marker: e.has_bundle_marker, bundle_marker: e.bundle_marker }; };
+    if n == 2 { return EcsRrmEntityDeep { id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive, d0: e.d0, d1: e.d1, d2: child, d3: e.d3, dlen: 3, has_bundle_marker: e.has_bundle_marker, bundle_marker: e.bundle_marker }; };
+    if n == 3 { return EcsRrmEntityDeep { id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive, d0: e.d0, d1: e.d1, d2: e.d2, d3: child, dlen: 4, has_bundle_marker: e.has_bundle_marker, bundle_marker: e.bundle_marker }; };
+    return e;
+}
+
+// World: main entity + up to 8 related entities
+struct EcsRrmWorldDeep {
+    main: i64,
+    coll: EcsRrmCollDeep,
+    has_target: bool,
+    // related entities slots by id match (capacity 8)
+    e0: EcsRrmEntityDeep, e1: EcsRrmEntityDeep, e2: EcsRrmEntityDeep, e3: EcsRrmEntityDeep,
+    e4: EcsRrmEntityDeep, e5: EcsRrmEntityDeep, e6: EcsRrmEntityDeep, e7: EcsRrmEntityDeep,
+    elen: i32,
+    next_entity: i64,
+    hook_run_count: i32,
+    hook_skip_count: i32,
+    despawn_count: i32,
+    recursive_visit: i32,
+    spawned_related: i32,
+}
+
+fn ecs_rrm_world_new(main: i64, next_entity: i64) -> EcsRrmWorldDeep {
+    return EcsRrmWorldDeep {
+        main: main, coll: ecs_rrm_coll_new(), has_target: false,
+        e0: ecs_rrm_entity_new(0), e1: ecs_rrm_entity_new(0), e2: ecs_rrm_entity_new(0), e3: ecs_rrm_entity_new(0),
+        e4: ecs_rrm_entity_new(0), e5: ecs_rrm_entity_new(0), e6: ecs_rrm_entity_new(0), e7: ecs_rrm_entity_new(0),
+        elen: 0, next_entity: next_entity,
+        hook_run_count: 0, hook_skip_count: 0, despawn_count: 0, recursive_visit: 0, spawned_related: 0,
+    };
+}
+
+fn ecs_rrm_world_coll_len(w: EcsRrmWorldDeep) -> i32 { return ecs_rrm_coll_len(w.coll); }
+fn ecs_rrm_world_coll_at(w: EcsRrmWorldDeep, idx: i32) -> i64 { return ecs_rrm_coll_at(w.coll, idx); }
+fn ecs_rrm_world_has_target(w: EcsRrmWorldDeep) -> bool { return w.has_target; }
+fn ecs_rrm_world_hook_run(w: EcsRrmWorldDeep) -> i32 { return w.hook_run_count; }
+fn ecs_rrm_world_hook_skip(w: EcsRrmWorldDeep) -> i32 { return w.hook_skip_count; }
+fn ecs_rrm_world_despawn_count(w: EcsRrmWorldDeep) -> i32 { return w.despawn_count; }
+fn ecs_rrm_world_recursive_visit(w: EcsRrmWorldDeep) -> i32 { return w.recursive_visit; }
+fn ecs_rrm_world_spawned(w: EcsRrmWorldDeep) -> i32 { return w.spawned_related; }
+
+fn ecs_rrm_world_find_entity(w: EcsRrmWorldDeep, id: i64) -> (bool, EcsRrmEntityDeep) {
+    if w.elen >= 1 && w.e0.id == id { return (true, w.e0); };
+    if w.elen >= 2 && w.e1.id == id { return (true, w.e1); };
+    if w.elen >= 3 && w.e2.id == id { return (true, w.e2); };
+    if w.elen >= 4 && w.e3.id == id { return (true, w.e3); };
+    if w.elen >= 5 && w.e4.id == id { return (true, w.e4); };
+    if w.elen >= 6 && w.e5.id == id { return (true, w.e5); };
+    if w.elen >= 7 && w.e6.id == id { return (true, w.e6); };
+    if w.elen >= 8 && w.e7.id == id { return (true, w.e7); };
+    return (false, ecs_rrm_entity_new(0));
+}
+
+fn ecs_rrm_world_set_entity(w: EcsRrmWorldDeep, e: EcsRrmEntityDeep) -> EcsRrmWorldDeep {
+    if w.elen >= 1 && w.e0.id == e.id {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: e, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: w.elen, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if w.elen >= 2 && w.e1.id == e.id {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: e, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: w.elen, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if w.elen >= 3 && w.e2.id == e.id {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: e, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: w.elen, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if w.elen >= 4 && w.e3.id == e.id {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: w.e2, e3: e, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: w.elen, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    // append
+    let n = w.elen;
+    if n == 0 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: e, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: 1, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 1 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: e, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: 2, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 2 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: e, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: 3, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 3 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: w.e2, e3: e, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: 4, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 4 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: e, e5: w.e5, e6: w.e6, e7: w.e7,
+            elen: 5, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 5 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: e, e6: w.e6, e7: w.e7,
+            elen: 6, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 6 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: e, e7: w.e7,
+            elen: 7, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    if n == 7 {
+        return EcsRrmWorldDeep {
+            main: w.main, coll: w.coll, has_target: w.has_target,
+            e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: e,
+            elen: 8, next_entity: w.next_entity,
+            hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+            despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+        };
+    };
+    return w;
+}
+
+fn ecs_rrm_world_ensure_entity(w: EcsRrmWorldDeep, id: i64) -> EcsRrmWorldDeep {
+    let f = ecs_rrm_world_find_entity(w, id);
+    if f.0 { return w; };
+    return ecs_rrm_world_set_entity(w, ecs_rrm_entity_new(id));
+}
+
+// relate one entity with hook mode
+fn ecs_rrm_relate_one(w: EcsRrmWorldDeep, related: i64, hook: i32) -> EcsRrmWorldDeep {
+    w = ecs_rrm_world_ensure_entity(w, related);
+    let f = ecs_rrm_world_find_entity(w, related);
+    let e = f.1;
+    e = EcsRrmEntityDeep {
+        id: e.id, has_rel: true, parent: w.main, alive: e.alive,
+        d0: e.d0, d1: e.d1, d2: e.d2, d3: e.d3, dlen: e.dlen,
+        has_bundle_marker: e.has_bundle_marker, bundle_marker: e.bundle_marker,
+    };
+    w = ecs_rrm_world_set_entity(w, e);
+    let coll = w.coll;
+    if ecs_rrm_coll_contains(coll, related) != true {
+        coll = ecs_rrm_coll_push(coll, related);
+    };
+    let run = w.hook_run_count;
+    let skip = w.hook_skip_count;
+    if hook == ECS_RRM_HOOK_SKIP { skip = skip + 1; } else { run = run + 1; };
+    return EcsRrmWorldDeep {
+        main: w.main, coll: coll, has_target: true,
+        e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+        elen: w.elen, next_entity: w.next_entity,
+        hook_run_count: run, hook_skip_count: skip,
+        despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+    };
+}
+
+fn ecs_rrm_add_one_related(w: EcsRrmWorldDeep, related: i64) -> EcsRrmWorldDeep {
+    return ecs_rrm_relate_one(w, related, ECS_RRM_HOOK_RUN);
+}
+
+fn ecs_rrm_add_related2(w: EcsRrmWorldDeep, a: i64, b: i64) -> EcsRrmWorldDeep {
+    w = ecs_rrm_add_one_related(w, a);
+    w = ecs_rrm_add_one_related(w, b);
+    return w;
+}
+
+fn ecs_rrm_add_related3(w: EcsRrmWorldDeep, a: i64, b: i64, c: i64) -> EcsRrmWorldDeep {
+    w = ecs_rrm_add_related2(w, a, b);
+    return ecs_rrm_add_one_related(w, c);
+}
+
+// insert_related starting at index with up to 4 entities (last occurrence wins for dups via place)
+fn ecs_rrm_insert_related(w: EcsRrmWorldDeep, index: i32, a: i64, b: i64, c: i64, d: i64, n: i32) -> EcsRrmWorldDeep {
+    // process each with offset
+    if n >= 1 {
+        let idx = index;
+        if ecs_rrm_coll_contains(w.coll, a) && ecs_rrm_world_find_entity(w, a).1.parent == w.main {
+            let coll = ecs_rrm_coll_place(w.coll, a, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        } else {
+            w = ecs_rrm_add_one_related(w, a);
+            let coll = ecs_rrm_coll_place_most_recent(w.coll, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        };
+    };
+    if n >= 2 {
+        let idx = index + 1;
+        if ecs_rrm_coll_contains(w.coll, b) && ecs_rrm_world_find_entity(w, b).1.parent == w.main {
+            let coll = ecs_rrm_coll_place(w.coll, b, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        } else {
+            w = ecs_rrm_add_one_related(w, b);
+            let coll = ecs_rrm_coll_place_most_recent(w.coll, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        };
+    };
+    if n >= 3 {
+        let idx = index + 2;
+        if ecs_rrm_coll_contains(w.coll, c) && ecs_rrm_world_find_entity(w, c).1.parent == w.main {
+            let coll = ecs_rrm_coll_place(w.coll, c, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        } else {
+            w = ecs_rrm_add_one_related(w, c);
+            let coll = ecs_rrm_coll_place_most_recent(w.coll, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        };
+    };
+    if n >= 4 {
+        let idx = index + 3;
+        if ecs_rrm_coll_contains(w.coll, d) && ecs_rrm_world_find_entity(w, d).1.parent == w.main {
+            let coll = ecs_rrm_coll_place(w.coll, d, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        } else {
+            w = ecs_rrm_add_one_related(w, d);
+            let coll = ecs_rrm_coll_place_most_recent(w.coll, idx);
+            w = EcsRrmWorldDeep {
+                main: w.main, coll: coll, has_target: true,
+                e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+                elen: w.elen, next_entity: w.next_entity,
+                hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+                despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+            };
+        };
+    };
+    return w;
+}
+
+fn ecs_rrm_detach_all_related(w: EcsRrmWorldDeep) -> EcsRrmWorldDeep {
+    // clear target collection; entities keep/lose relation component
+    let n = w.coll.len;
+    // remove rel from each
+    if n >= 1 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e0);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 2 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e1);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 3 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e2);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 4 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e3);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    return EcsRrmWorldDeep {
+        main: w.main, coll: ecs_rrm_coll_new(), has_target: false,
+        e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+        elen: w.elen, next_entity: w.next_entity,
+        hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+        despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+    };
+}
+
+// replace_related_with_difference: clear collection, set to entities_to_relate, unrelate, skip-hook for newly
+fn ecs_rrm_replace_related_with_difference(
+    w: EcsRrmWorldDeep,
+    un0: i64, un1: i64, un_n: i32,
+    rel0: i64, rel1: i64, rel2: i64, rel_n: i32,
+    new0: i64, new1: i64, new_n: i32,
+) -> EcsRrmWorldDeep {
+    if w.has_target != true {
+        // just add_related
+        if rel_n >= 1 { w = ecs_rrm_add_one_related(w, rel0); };
+        if rel_n >= 2 { w = ecs_rrm_add_one_related(w, rel1); };
+        if rel_n >= 3 { w = ecs_rrm_add_one_related(w, rel2); };
+        return w;
+    };
+    // clear collection then extend with relate list
+    let coll = ecs_rrm_coll_new();
+    if rel_n >= 1 { coll = ecs_rrm_coll_push(coll, rel0); };
+    if rel_n >= 2 { coll = ecs_rrm_coll_push(coll, rel1); };
+    if rel_n >= 3 { coll = ecs_rrm_coll_push(coll, rel2); };
+    w = EcsRrmWorldDeep {
+        main: w.main, coll: coll, has_target: true,
+        e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+        elen: w.elen, next_entity: w.next_entity,
+        hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+        despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+    };
+    // unrelate
+    if un_n >= 1 {
+        let f = ecs_rrm_world_find_entity(w, un0);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if un_n >= 2 {
+        let f = ecs_rrm_world_find_entity(w, un1);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    // newly related with Skip hook
+    if new_n >= 1 { w = ecs_rrm_relate_one(w, new0, ECS_RRM_HOOK_SKIP); };
+    if new_n >= 2 { w = ecs_rrm_relate_one(w, new1, ECS_RRM_HOOK_SKIP); };
+    return w;
+}
+
+fn ecs_rrm_despawn_related(w: EcsRrmWorldDeep) -> EcsRrmWorldDeep {
+    if w.has_target != true { return w; };
+    let n = w.coll.len;
+    let desp = w.despawn_count + n;
+    // mark dead
+    if n >= 1 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e0);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: false,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 2 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e1);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: false,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 3 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e2);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: false, parent: 0, alive: false,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: f.1.has_bundle_marker, bundle_marker: f.1.bundle_marker,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    return EcsRrmWorldDeep {
+        main: w.main, coll: ecs_rrm_coll_new(), has_target: false,
+        e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+        elen: w.elen, next_entity: w.next_entity,
+        hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+        despawn_count: desp, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related,
+    };
+}
+
+fn ecs_rrm_despawn_children(w: EcsRrmWorldDeep) -> EcsRrmWorldDeep {
+    return ecs_rrm_despawn_related(w);
+}
+
+fn ecs_rrm_with_related(w: EcsRrmWorldDeep, bundle_id: i32) -> EcsRrmWorldDeep {
+    let id = w.next_entity;
+    let e = EcsRrmEntityDeep {
+        id: id, has_rel: true, parent: w.main, alive: true,
+        d0: 0, d1: 0, d2: 0, d3: 0, dlen: 0,
+        has_bundle_marker: true, bundle_marker: bundle_id,
+    };
+    w = ecs_rrm_world_set_entity(w, e);
+    let coll = ecs_rrm_coll_push(w.coll, id);
+    return EcsRrmWorldDeep {
+        main: w.main, coll: coll, has_target: true,
+        e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+        elen: w.elen, next_entity: id + 1,
+        hook_run_count: w.hook_run_count + 1, hook_skip_count: w.hook_skip_count,
+        despawn_count: w.despawn_count, recursive_visit: w.recursive_visit, spawned_related: w.spawned_related + 1,
+    };
+}
+
+fn ecs_rrm_with_related_entities2(w: EcsRrmWorldDeep, b0: i32, b1: i32) -> EcsRrmWorldDeep {
+    w = ecs_rrm_with_related(w, b0);
+    w = ecs_rrm_with_related(w, b1);
+    return w;
+}
+
+// RelatedSpawner model
+struct EcsRrmSpawnerDeep {
+    parent: i64,
+    spawned0: i64, spawned1: i64, spawned2: i64, spawned3: i64,
+    len: i32,
+}
+
+fn ecs_rrm_spawner_new(parent: i64) -> EcsRrmSpawnerDeep {
+    return EcsRrmSpawnerDeep { parent: parent, spawned0: 0, spawned1: 0, spawned2: 0, spawned3: 0, len: 0 };
+}
+
+fn ecs_rrm_spawner_len(s: EcsRrmSpawnerDeep) -> i32 { return s.len; }
+
+fn ecs_rrm_with_related_entities_spawner(w: EcsRrmWorldDeep, spawn_count: i32) -> (EcsRrmWorldDeep, EcsRrmSpawnerDeep) {
+    let s = ecs_rrm_spawner_new(w.main);
+    let i = 0;
+    if spawn_count >= 1 {
+        w = ecs_rrm_with_related(w, 1);
+        s = EcsRrmSpawnerDeep { parent: s.parent, spawned0: w.next_entity - 1, spawned1: s.spawned1, spawned2: s.spawned2, spawned3: s.spawned3, len: 1 };
+    };
+    if spawn_count >= 2 {
+        w = ecs_rrm_with_related(w, 2);
+        s = EcsRrmSpawnerDeep { parent: s.parent, spawned0: s.spawned0, spawned1: w.next_entity - 1, spawned2: s.spawned2, spawned3: s.spawned3, len: 2 };
+    };
+    if spawn_count >= 3 {
+        w = ecs_rrm_with_related(w, 3);
+        s = EcsRrmSpawnerDeep { parent: s.parent, spawned0: s.spawned0, spawned1: s.spawned1, spawned2: w.next_entity - 1, spawned3: s.spawned3, len: 3 };
+    };
+    return (w, s);
+}
+
+// BFS insert_recursive: visit main's related + their descendants, set bundle marker
+fn ecs_rrm_insert_recursive(w: EcsRrmWorldDeep, bundle_id: i32) -> EcsRrmWorldDeep {
+    let visit = 0;
+    // related list as first BFS layer
+    let n = w.coll.len;
+    if n >= 1 {
+        visit = visit + 1;
+        let f = ecs_rrm_world_find_entity(w, w.coll.e0);
+        if f.0 {
+            let e = f.1;
+            e = EcsRrmEntityDeep {
+                id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive,
+                d0: e.d0, d1: e.d1, d2: e.d2, d3: e.d3, dlen: e.dlen,
+                has_bundle_marker: true, bundle_marker: bundle_id,
+            };
+            // visit descendants
+            if e.dlen >= 1 { visit = visit + 1; };
+            if e.dlen >= 2 { visit = visit + 1; };
+            if e.dlen >= 3 { visit = visit + 1; };
+            if e.dlen >= 4 { visit = visit + 1; };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 2 {
+        visit = visit + 1;
+        let f = ecs_rrm_world_find_entity(w, w.coll.e1);
+        if f.0 {
+            let e = f.1;
+            e = EcsRrmEntityDeep {
+                id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive,
+                d0: e.d0, d1: e.d1, d2: e.d2, d3: e.d3, dlen: e.dlen,
+                has_bundle_marker: true, bundle_marker: bundle_id,
+            };
+            if e.dlen >= 1 { visit = visit + 1; };
+            if e.dlen >= 2 { visit = visit + 1; };
+            if e.dlen >= 3 { visit = visit + 1; };
+            if e.dlen >= 4 { visit = visit + 1; };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 3 {
+        visit = visit + 1;
+        let f = ecs_rrm_world_find_entity(w, w.coll.e2);
+        if f.0 {
+            let e = f.1;
+            e = EcsRrmEntityDeep {
+                id: e.id, has_rel: e.has_rel, parent: e.parent, alive: e.alive,
+                d0: e.d0, d1: e.d1, d2: e.d2, d3: e.d3, dlen: e.dlen,
+                has_bundle_marker: true, bundle_marker: bundle_id,
+            };
+            if e.dlen >= 1 { visit = visit + 1; };
+            if e.dlen >= 2 { visit = visit + 1; };
+            if e.dlen >= 3 { visit = visit + 1; };
+            if e.dlen >= 4 { visit = visit + 1; };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    return EcsRrmWorldDeep {
+        main: w.main, coll: w.coll, has_target: w.has_target,
+        e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, e6: w.e6, e7: w.e7,
+        elen: w.elen, next_entity: w.next_entity,
+        hook_run_count: w.hook_run_count, hook_skip_count: w.hook_skip_count,
+        despawn_count: w.despawn_count, recursive_visit: visit, spawned_related: w.spawned_related,
+    };
+}
+
+fn ecs_rrm_remove_recursive(w: EcsRrmWorldDeep) -> EcsRrmWorldDeep {
+    // same visit count, clear markers
+    w = ecs_rrm_insert_recursive(w, -1);
+    // clear markers
+    let n = w.coll.len;
+    if n >= 1 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e0);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: f.1.has_rel, parent: f.1.parent, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: false, bundle_marker: 0,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    if n >= 2 {
+        let f = ecs_rrm_world_find_entity(w, w.coll.e1);
+        if f.0 {
+            let e = EcsRrmEntityDeep {
+                id: f.1.id, has_rel: f.1.has_rel, parent: f.1.parent, alive: f.1.alive,
+                d0: f.1.d0, d1: f.1.d1, d2: f.1.d2, d3: f.1.d3, dlen: f.1.dlen,
+                has_bundle_marker: false, bundle_marker: 0,
+            };
+            w = ecs_rrm_world_set_entity(w, e);
+        };
+    };
+    return w;
+}
+
+fn ecs_rrm_world_add_descendant(w: EcsRrmWorldDeep, parent: i64, child: i64) -> EcsRrmWorldDeep {
+    w = ecs_rrm_world_ensure_entity(w, parent);
+    w = ecs_rrm_world_ensure_entity(w, child);
+    let f = ecs_rrm_world_find_entity(w, parent);
+    let e = ecs_rrm_entity_add_desc(f.1, child);
+    return ecs_rrm_world_set_entity(w, e);
+}
+
+fn ecs_rrm_entity_alive(w: EcsRrmWorldDeep, id: i64) -> bool {
+    let f = ecs_rrm_world_find_entity(w, id);
+    if f.0 != true { return false; };
+    return f.1.alive;
+}
+
+fn ecs_rrm_entity_has_rel(w: EcsRrmWorldDeep, id: i64) -> bool {
+    let f = ecs_rrm_world_find_entity(w, id);
+    if f.0 != true { return false; };
+    return f.1.has_rel;
+}
+
+fn ecs_rrm_entity_bundle(w: EcsRrmWorldDeep, id: i64) -> (bool, i32) {
+    let f = ecs_rrm_world_find_entity(w, id);
+    if f.0 != true { return (false, 0); };
+    return (f.1.has_bundle_marker, f.1.bundle_marker);
+}

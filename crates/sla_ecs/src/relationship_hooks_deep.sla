@@ -1,0 +1,485 @@
+// Deepened Bevy ECS relationship hooks surface.
+// Mirrors src/relationship/mod.rs Relationship / RelationshipTarget hooks:
+//   RelationshipHookMode { Run, Skip, RunIfNotLinked }
+//   on_insert: self-ref reject (unless ALLOW_SELF), ensure target, collection.add
+//   on_replace/on_remove: remove from target; empty target deferred remove
+//   on_discard target: linked_spawn despawn sources
+//   one-to-one: source_to_remove_before_add when adding new source
+// Shallow lib/relationship.sla retained.
+
+const ECS_RH_RUN: i32 = 0;
+const ECS_RH_SKIP: i32 = 1;
+const ECS_RH_RUN_IF_NOT_LINKED: i32 = 2;
+
+fn ecs_rh_run() -> i32 { return ECS_RH_RUN; }
+fn ecs_rh_skip() -> i32 { return ECS_RH_SKIP; }
+fn ecs_rh_run_if_not_linked() -> i32 { return ECS_RH_RUN_IF_NOT_LINKED; }
+
+// Kind config
+struct EcsRhKindDeep {
+    id: i32,
+    linked_spawn: bool,
+    allow_self: bool,
+    one_to_one: bool,
+}
+
+fn ecs_rh_kind_new(id: i32, linked_spawn: bool, allow_self: bool, one_to_one: bool) -> EcsRhKindDeep {
+    return EcsRhKindDeep {
+        id: id, linked_spawn: linked_spawn, allow_self: allow_self, one_to_one: one_to_one,
+    };
+}
+
+fn ecs_rh_kind_linked(k: EcsRhKindDeep) -> bool { return k.linked_spawn; }
+fn ecs_rh_kind_allow_self(k: EcsRhKindDeep) -> bool { return k.allow_self; }
+fn ecs_rh_kind_one_to_one(k: EcsRhKindDeep) -> bool { return k.one_to_one; }
+
+// Source collection capacity 4
+struct EcsRhCollDeep {
+    s0: i64, s1: i64, s2: i64, s3: i64, len: i32,
+}
+
+fn ecs_rh_coll_new() -> EcsRhCollDeep {
+    return EcsRhCollDeep { s0: 0, s1: 0, s2: 0, s3: 0, len: 0 };
+}
+
+fn ecs_rh_coll_len(c: EcsRhCollDeep) -> i32 { return c.len; }
+fn ecs_rh_coll_is_empty(c: EcsRhCollDeep) -> bool { return c.len == 0; }
+
+fn ecs_rh_coll_at(c: EcsRhCollDeep, idx: i32) -> i64 {
+    if idx == 0 { return c.s0; };
+    if idx == 1 { return c.s1; };
+    if idx == 2 { return c.s2; };
+    if idx == 3 { return c.s3; };
+    return 0;
+}
+
+fn ecs_rh_coll_contains(c: EcsRhCollDeep, e: i64) -> bool {
+    if c.len >= 1 && c.s0 == e { return true; };
+    if c.len >= 2 && c.s1 == e { return true; };
+    if c.len >= 3 && c.s2 == e { return true; };
+    if c.len >= 4 && c.s3 == e { return true; };
+    return false;
+}
+
+fn ecs_rh_coll_push(c: EcsRhCollDeep, e: i64) -> EcsRhCollDeep {
+    if c.len == 0 { return EcsRhCollDeep { s0: e, s1: c.s1, s2: c.s2, s3: c.s3, len: 1 }; };
+    if c.len == 1 { return EcsRhCollDeep { s0: c.s0, s1: e, s2: c.s2, s3: c.s3, len: 2 }; };
+    if c.len == 2 { return EcsRhCollDeep { s0: c.s0, s1: c.s1, s2: e, s3: c.s3, len: 3 }; };
+    if c.len == 3 { return EcsRhCollDeep { s0: c.s0, s1: c.s1, s2: c.s2, s3: e, len: 4 }; };
+    return c;
+}
+
+fn ecs_rh_coll_remove(c: EcsRhCollDeep, e: i64) -> EcsRhCollDeep {
+    let out = ecs_rh_coll_new();
+    if c.len >= 1 && c.s0 != e { out = ecs_rh_coll_push(out, c.s0); };
+    if c.len >= 2 && c.s1 != e { out = ecs_rh_coll_push(out, c.s1); };
+    if c.len >= 3 && c.s2 != e { out = ecs_rh_coll_push(out, c.s2); };
+    if c.len >= 4 && c.s3 != e { out = ecs_rh_coll_push(out, c.s3); };
+    return out;
+}
+
+fn ecs_rh_coll_source_to_remove_before_add(c: EcsRhCollDeep, one_to_one: bool) -> (bool, i64) {
+    if one_to_one != true { return (false, 0); };
+    if c.len >= 1 { return (true, c.s0); };
+    return (false, 0);
+}
+
+// Entity: optional Relationship (points to target) + optional RelationshipTarget collection
+struct EcsRhEntityDeep {
+    id: i64,
+    alive: bool,
+    has_rel: bool,
+    rel_target: i64,
+    has_target_comp: bool,
+    sources: EcsRhCollDeep,
+}
+
+fn ecs_rh_entity_new(id: i64) -> EcsRhEntityDeep {
+    return EcsRhEntityDeep {
+        id: id, alive: true, has_rel: false, rel_target: 0,
+        has_target_comp: false, sources: ecs_rh_coll_new(),
+    };
+}
+
+// World with kind + up to 6 entities
+struct EcsRhWorldDeep {
+    kind: EcsRhKindDeep,
+    e0: EcsRhEntityDeep, e1: EcsRhEntityDeep, e2: EcsRhEntityDeep,
+    e3: EcsRhEntityDeep, e4: EcsRhEntityDeep, e5: EcsRhEntityDeep,
+    elen: i32,
+    // deferred empty-target removes
+    pending_empty_remove0: i64, pending_empty_remove1: i64, pending_n: i32,
+    self_ref_rejects: i32,
+    despawned_linked: i32,
+    hooks_skipped: i32,
+}
+
+fn ecs_rh_world_new(kind: EcsRhKindDeep) -> EcsRhWorldDeep {
+    return EcsRhWorldDeep {
+        kind: kind,
+        e0: ecs_rh_entity_new(0), e1: ecs_rh_entity_new(0), e2: ecs_rh_entity_new(0),
+        e3: ecs_rh_entity_new(0), e4: ecs_rh_entity_new(0), e5: ecs_rh_entity_new(0),
+        elen: 0,
+        pending_empty_remove0: 0, pending_empty_remove1: 0, pending_n: 0,
+        self_ref_rejects: 0, despawned_linked: 0, hooks_skipped: 0,
+    };
+}
+
+fn ecs_rh_world_self_ref_rejects(w: EcsRhWorldDeep) -> i32 { return w.self_ref_rejects; }
+fn ecs_rh_world_despawned_linked(w: EcsRhWorldDeep) -> i32 { return w.despawned_linked; }
+fn ecs_rh_world_hooks_skipped(w: EcsRhWorldDeep) -> i32 { return w.hooks_skipped; }
+fn ecs_rh_world_pending_n(w: EcsRhWorldDeep) -> i32 { return w.pending_n; }
+
+fn ecs_rh_world_get(w: EcsRhWorldDeep, id: i64) -> (bool, EcsRhEntityDeep) {
+    if w.elen >= 1 && w.e0.id == id { return (true, w.e0); };
+    if w.elen >= 2 && w.e1.id == id { return (true, w.e1); };
+    if w.elen >= 3 && w.e2.id == id { return (true, w.e2); };
+    if w.elen >= 4 && w.e3.id == id { return (true, w.e3); };
+    if w.elen >= 5 && w.e4.id == id { return (true, w.e4); };
+    if w.elen >= 6 && w.e5.id == id { return (true, w.e5); };
+    return (false, ecs_rh_entity_new(0));
+}
+
+fn ecs_rh_world_set(w: EcsRhWorldDeep, e: EcsRhEntityDeep) -> EcsRhWorldDeep {
+    if w.elen >= 1 && w.e0.id == e.id {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: e, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if w.elen >= 2 && w.e1.id == e.id {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: e, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if w.elen >= 3 && w.e2.id == e.id {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: e, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if w.elen >= 4 && w.e3.id == e.id {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: e, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if w.elen >= 5 && w.e4.id == e.id {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: e, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if w.elen >= 6 && w.e5.id == e.id {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: e, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    // append
+    let n = w.elen;
+    if n == 0 {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: e, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: 1,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if n == 1 {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: e, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: 2,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if n == 2 {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: e, e3: w.e3, e4: w.e4, e5: w.e5, elen: 3,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if n == 3 {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: e, e4: w.e4, e5: w.e5, elen: 4,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if n == 4 {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: e, e5: w.e5, elen: 5,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    if n == 5 {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: e, elen: 6,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    return w;
+}
+
+fn ecs_rh_world_spawn(w: EcsRhWorldDeep, id: i64) -> EcsRhWorldDeep {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 { return w; };
+    return ecs_rh_world_set(w, ecs_rh_entity_new(id));
+}
+
+fn ecs_rh_should_run_hook(mode: i32, linked: bool) -> bool {
+    if mode == ECS_RH_SKIP { return false; };
+    if mode == ECS_RH_RUN_IF_NOT_LINKED {
+        if linked { return false; };
+        return true;
+    };
+    return true;
+}
+
+// insert Relationship on source -> target
+fn ecs_rh_on_insert(w: EcsRhWorldDeep, source: i64, target: i64, mode: i32) -> EcsRhWorldDeep {
+    if ecs_rh_should_run_hook(mode, w.kind.linked_spawn) != true {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped + 1,
+        };
+    };
+    // self-ref
+    if w.kind.allow_self != true && source == target {
+        // remove invalid relationship (not inserted)
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects + 1, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    w = ecs_rh_world_spawn(w, source);
+    w = ecs_rh_world_spawn(w, target);
+    // set relationship on source
+    let sf = ecs_rh_world_get(w, source);
+    let se = EcsRhEntityDeep {
+        id: sf.1.id, alive: sf.1.alive, has_rel: true, rel_target: target,
+        has_target_comp: sf.1.has_target_comp, sources: sf.1.sources,
+    };
+    w = ecs_rh_world_set(w, se);
+    // ensure target component
+    let tf = ecs_rh_world_get(w, target);
+    let sources = tf.1.sources;
+    let t_id = tf.1.id;
+    let t_alive = tf.1.alive;
+    let t_has_rel = tf.1.has_rel;
+    let t_rel_target = tf.1.rel_target;
+    // one-to-one: remove previous source first
+    let prev = ecs_rh_coll_source_to_remove_before_add(sources, w.kind.one_to_one);
+    if prev.0 {
+        sources = ecs_rh_coll_remove(sources, prev.1);
+        // clear previous source's relationship if still pointing here
+        let pf = ecs_rh_world_get(w, prev.1);
+        if pf.0 && pf.1.has_rel && pf.1.rel_target == target {
+            let pe = EcsRhEntityDeep {
+                id: pf.1.id, alive: pf.1.alive, has_rel: false, rel_target: 0,
+                has_target_comp: pf.1.has_target_comp, sources: pf.1.sources,
+            };
+            w = ecs_rh_world_set(w, pe);
+        };
+    };
+    if ecs_rh_coll_contains(sources, source) != true {
+        sources = ecs_rh_coll_push(sources, source);
+    };
+    let te = EcsRhEntityDeep {
+        id: t_id, alive: t_alive, has_rel: t_has_rel, rel_target: t_rel_target,
+        has_target_comp: true, sources: sources,
+    };
+    return ecs_rh_world_set(w, te);
+}
+
+// on_remove / on_replace cleanup for old relationship
+fn ecs_rh_on_remove_rel(w: EcsRhWorldDeep, source: i64, mode: i32) -> EcsRhWorldDeep {
+    if ecs_rh_should_run_hook(mode, w.kind.linked_spawn) != true {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped + 1,
+        };
+    };
+    let sf = ecs_rh_world_get(w, source);
+    if sf.0 != true || sf.1.has_rel != true { return w; };
+    let target = sf.1.rel_target;
+    let se = EcsRhEntityDeep {
+        id: sf.1.id, alive: sf.1.alive, has_rel: false, rel_target: 0,
+        has_target_comp: sf.1.has_target_comp, sources: sf.1.sources,
+    };
+    w = ecs_rh_world_set(w, se);
+    let tf = ecs_rh_world_get(w, target);
+    if tf.0 != true || tf.1.has_target_comp != true { return w; };
+    let sources = ecs_rh_coll_remove(tf.1.sources, source);
+    let sources_empty = ecs_rh_coll_is_empty(sources);
+    let te = EcsRhEntityDeep {
+        id: tf.1.id, alive: tf.1.alive, has_rel: tf.1.has_rel, rel_target: tf.1.rel_target,
+        has_target_comp: true, sources: sources,
+    };
+    w = ecs_rh_world_set(w, te);
+    if sources_empty {
+        // queue empty remove
+        let p0 = w.pending_empty_remove0;
+        let p1 = w.pending_empty_remove1;
+        let pn = w.pending_n;
+        if pn == 0 {
+            p0 = target; pn = 1;
+        } else {
+            if pn == 1 { p1 = target; pn = 2; };
+        };
+        w = EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: p0, pending_empty_remove1: p1, pending_n: pn,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+        };
+    };
+    return w;
+}
+
+// flush pending empty target removes (only if still empty)
+fn ecs_rh_flush_pending(w: EcsRhWorldDeep) -> EcsRhWorldDeep {
+    if w.pending_n >= 1 {
+        let id = w.pending_empty_remove0;
+        let f = ecs_rh_world_get(w, id);
+        if f.0 && f.1.has_target_comp && ecs_rh_coll_is_empty(f.1.sources) {
+            let e = EcsRhEntityDeep {
+                id: f.1.id, alive: f.1.alive, has_rel: f.1.has_rel, rel_target: f.1.rel_target,
+                has_target_comp: false, sources: ecs_rh_coll_new(),
+            };
+            w = ecs_rh_world_set(w, e);
+        };
+    };
+    if w.pending_n >= 2 {
+        let id = w.pending_empty_remove1;
+        let f = ecs_rh_world_get(w, id);
+        if f.0 && f.1.has_target_comp && ecs_rh_coll_is_empty(f.1.sources) {
+            let e = EcsRhEntityDeep {
+                id: f.1.id, alive: f.1.alive, has_rel: f.1.has_rel, rel_target: f.1.rel_target,
+                has_target_comp: false, sources: ecs_rh_coll_new(),
+            };
+            w = ecs_rh_world_set(w, e);
+        };
+    };
+    return EcsRhWorldDeep {
+        kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+        pending_empty_remove0: 0, pending_empty_remove1: 0, pending_n: 0,
+        self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped,
+    };
+}
+
+// RelationshipTarget on_discard / despawn: if LINKED_SPAWN, despawn sources
+fn ecs_rh_on_discard_target(w: EcsRhWorldDeep, target: i64, mode: i32) -> EcsRhWorldDeep {
+    // Skip and RunIfNotLinked both return for RelationshipTarget discard
+    if mode == ECS_RH_SKIP || mode == ECS_RH_RUN_IF_NOT_LINKED {
+        return EcsRhWorldDeep {
+            kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+            pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+            self_ref_rejects: w.self_ref_rejects, despawned_linked: w.despawned_linked, hooks_skipped: w.hooks_skipped + 1,
+        };
+    };
+    let tf = ecs_rh_world_get(w, target);
+    if tf.0 != true || tf.1.has_target_comp != true { return w; };
+    let s0 = tf.1.sources.s0;
+    let s1 = tf.1.sources.s1;
+    let s2 = tf.1.sources.s2;
+    let slen = tf.1.sources.len;
+    let t_alive = tf.1.alive;
+    let t_has_rel = tf.1.has_rel;
+    let t_rel_target = tf.1.rel_target;
+    let t_id = tf.1.id;
+    let desp = w.despawned_linked;
+    if w.kind.linked_spawn {
+        if slen >= 1 {
+            let sf = ecs_rh_world_get(w, s0);
+            if sf.0 {
+                let se = EcsRhEntityDeep {
+                    id: sf.1.id, alive: false, has_rel: false, rel_target: 0,
+                    has_target_comp: sf.1.has_target_comp, sources: sf.1.sources,
+                };
+                w = ecs_rh_world_set(w, se);
+                desp = desp + 1;
+            };
+        };
+        if slen >= 2 {
+            let sf = ecs_rh_world_get(w, s1);
+            if sf.0 {
+                let se = EcsRhEntityDeep {
+                    id: sf.1.id, alive: false, has_rel: false, rel_target: 0,
+                    has_target_comp: sf.1.has_target_comp, sources: sf.1.sources,
+                };
+                w = ecs_rh_world_set(w, se);
+                desp = desp + 1;
+            };
+        };
+        if slen >= 3 {
+            let sf = ecs_rh_world_get(w, s2);
+            if sf.0 {
+                let se = EcsRhEntityDeep {
+                    id: sf.1.id, alive: false, has_rel: false, rel_target: 0,
+                    has_target_comp: sf.1.has_target_comp, sources: sf.1.sources,
+                };
+                w = ecs_rh_world_set(w, se);
+                desp = desp + 1;
+            };
+        };
+    };
+    // clear target component on target (entity itself may still alive if not despawning self)
+    let te = EcsRhEntityDeep {
+        id: t_id, alive: t_alive, has_rel: t_has_rel, rel_target: t_rel_target,
+        has_target_comp: false, sources: ecs_rh_coll_new(),
+    };
+    w = ecs_rh_world_set(w, te);
+    return EcsRhWorldDeep {
+        kind: w.kind, e0: w.e0, e1: w.e1, e2: w.e2, e3: w.e3, e4: w.e4, e5: w.e5, elen: w.elen,
+        pending_empty_remove0: w.pending_empty_remove0, pending_empty_remove1: w.pending_empty_remove1, pending_n: w.pending_n,
+        self_ref_rejects: w.self_ref_rejects, despawned_linked: desp, hooks_skipped: w.hooks_skipped,
+    };
+}
+
+fn ecs_rh_entity_has_rel(w: EcsRhWorldDeep, id: i64) -> bool {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 != true { return false; };
+    return f.1.has_rel;
+}
+
+fn ecs_rh_entity_rel_target(w: EcsRhWorldDeep, id: i64) -> i64 {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 != true { return 0; };
+    return f.1.rel_target;
+}
+
+fn ecs_rh_entity_has_target_comp(w: EcsRhWorldDeep, id: i64) -> bool {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 != true { return false; };
+    return f.1.has_target_comp;
+}
+
+fn ecs_rh_entity_sources_len(w: EcsRhWorldDeep, id: i64) -> i32 {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 != true { return 0; };
+    return ecs_rh_coll_len(f.1.sources);
+}
+
+fn ecs_rh_entity_alive(w: EcsRhWorldDeep, id: i64) -> bool {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 != true { return false; };
+    return f.1.alive;
+}
+
+fn ecs_rh_entity_sources_contains(w: EcsRhWorldDeep, id: i64, source: i64) -> bool {
+    let f = ecs_rh_world_get(w, id);
+    if f.0 != true { return false; };
+    return ecs_rh_coll_contains(f.1.sources, source);
+}

@@ -1,0 +1,344 @@
+// Deepened Bevy ECS QueryBuilder surface.
+// Mirrors src/query/builder.rs:
+//   data/ref/mut, with/without, or/and groups, optional, extend_access,
+//   transmute, is_dense inference, build -> QueryState-like snapshot.
+// Shallow lib/query_builder.sla retained.
+// Fixed capacity: 4 data, 4 with, 4 without.
+
+struct EcsQbDeep {
+    world_id: i64,
+    or_mode: bool,
+    first_in_or: bool,
+    or_groups: i32,
+    optional_count: i32,
+    // data access
+    data_len: i32,
+    d0: i32, dw0: i32, // dw*: 0 read 1 write
+    d1: i32, dw1: i32,
+    d2: i32, dw2: i32,
+    d3: i32, dw3: i32,
+    // with filters
+    with_len: i32,
+    w0: i32, w1: i32, w2: i32, w3: i32,
+    // without filters
+    without_len: i32,
+    n0: i32, n1: i32, n2: i32, n3: i32,
+    // dense assumption flags for filters (1 dense / 0 sparse)
+    dense_with: i32,
+    dense_without: i32,
+    dense_data: i32,
+}
+
+fn ecs_qb_deep_new(world_id: i64) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: world_id, or_mode: false, first_in_or: false, or_groups: 0, optional_count: 0,
+        data_len: 0, d0: -1, dw0: 0, d1: -1, dw1: 0, d2: -1, dw2: 0, d3: -1, dw3: 0,
+        with_len: 0, w0: -1, w1: -1, w2: -1, w3: -1,
+        without_len: 0, n0: -1, n1: -1, n2: -1, n3: -1,
+        dense_with: 1, dense_without: 1, dense_data: 1,
+    };
+}
+
+fn ecs_qb_deep_world(b: EcsQbDeep) -> i64 { return b.world_id; }
+fn ecs_qb_deep_data_len(b: EcsQbDeep) -> i32 { return b.data_len; }
+fn ecs_qb_deep_with_len(b: EcsQbDeep) -> i32 { return b.with_len; }
+fn ecs_qb_deep_without_len(b: EcsQbDeep) -> i32 { return b.without_len; }
+fn ecs_qb_deep_or_groups(b: EcsQbDeep) -> i32 { return b.or_groups; }
+fn ecs_qb_deep_optional_count(b: EcsQbDeep) -> i32 { return b.optional_count; }
+fn ecs_qb_deep_in_or(b: EcsQbDeep) -> bool { return b.or_mode; }
+
+fn ecs_qb_deep_copy_base(b: EcsQbDeep) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: b.first_in_or, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_or(b: EcsQbDeep) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: true, first_in_or: true, or_groups: b.or_groups + 1, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_and(b: EcsQbDeep) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: false, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_optional(b: EcsQbDeep) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: b.first_in_or, or_groups: b.or_groups, optional_count: b.optional_count + 1,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_mark_data_sparse(b: EcsQbDeep) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: b.first_in_or, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: 0,
+    };
+}
+
+fn ecs_qb_deep_mark_with_sparse(b: EcsQbDeep) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: b.first_in_or, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: 0, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_add_data(b: EcsQbDeep, id: i32, is_write: i32) -> EcsQbDeep {
+    if b.data_len >= 4 { return b; };
+    if b.data_len == 0 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: 1, d0: id, dw0: is_write, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    if b.data_len == 1 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: 2, d0: b.d0, dw0: b.dw0, d1: id, dw1: is_write, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    if b.data_len == 2 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: 3, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: id, dw2: is_write, d3: b.d3, dw3: b.dw3,
+            with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: 4, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: id, dw3: is_write,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_data(b: EcsQbDeep, id: i32) -> EcsQbDeep { return ecs_qb_deep_add_data(b, id, 0); }
+fn ecs_qb_deep_ref_id(b: EcsQbDeep, id: i32) -> EcsQbDeep { return ecs_qb_deep_add_data(b, id, 0); }
+fn ecs_qb_deep_mut_id(b: EcsQbDeep, id: i32) -> EcsQbDeep { return ecs_qb_deep_add_data(b, id, 1); }
+
+fn ecs_qb_deep_with(b: EcsQbDeep, id: i32) -> EcsQbDeep {
+    if b.with_len >= 4 { return b; };
+    if b.with_len == 0 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: 1, w0: id, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    if b.with_len == 1 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: 2, w0: b.w0, w1: id, w2: b.w2, w3: b.w3,
+            without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    if b.with_len == 2 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: 3, w0: b.w0, w1: b.w1, w2: id, w3: b.w3,
+            without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: 4, w0: b.w0, w1: b.w1, w2: b.w2, w3: id,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_without(b: EcsQbDeep, id: i32) -> EcsQbDeep {
+    if b.without_len >= 4 { return b; };
+    if b.without_len == 0 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: 1, n0: id, n1: b.n1, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    if b.without_len == 1 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: 2, n0: b.n0, n1: id, n2: b.n2, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    if b.without_len == 2 {
+        return EcsQbDeep {
+            world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+            data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+            with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+            without_len: 3, n0: b.n0, n1: b.n1, n2: id, n3: b.n3,
+            dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+        };
+    };
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: false, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: b.data_len, d0: b.d0, dw0: b.dw0, d1: b.d1, dw1: b.dw1, d2: b.d2, dw2: b.dw2, d3: b.d3, dw3: b.dw3,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: 4, n0: b.n0, n1: b.n1, n2: b.n2, n3: id,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+fn ecs_qb_deep_is_dense(b: EcsQbDeep) -> bool {
+    if b.dense_data == 0 { return false; };
+    if b.dense_with == 0 { return false; };
+    if b.dense_without == 0 { return false; };
+    return true;
+}
+
+// extend_access: append other's data/with/without
+fn ecs_qb_deep_extend(b: EcsQbDeep, other: EcsQbDeep) -> EcsQbDeep {
+    let odlen = other.data_len;
+    let od0 = other.d0; let odw0 = other.dw0; let od1 = other.d1; let odw1 = other.dw1;
+    let od2 = other.d2; let odw2 = other.dw2; let od3 = other.d3; let odw3 = other.dw3;
+    let owlen = other.with_len; let ow0 = other.w0; let ow1 = other.w1; let ow2 = other.w2; let ow3 = other.w3;
+    let onlen = other.without_len; let on0 = other.n0; let on1 = other.n1; let on2 = other.n2; let on3 = other.n3;
+    let odense_data = other.dense_data; let odense_with = other.dense_with;
+    let out = b;
+    if odlen >= 1 { out = ecs_qb_deep_add_data(out, od0, odw0); };
+    if odlen >= 2 { out = ecs_qb_deep_add_data(out, od1, odw1); };
+    if odlen >= 3 { out = ecs_qb_deep_add_data(out, od2, odw2); };
+    if odlen >= 4 { out = ecs_qb_deep_add_data(out, od3, odw3); };
+    if owlen >= 1 { out = ecs_qb_deep_with(out, ow0); };
+    if owlen >= 2 { out = ecs_qb_deep_with(out, ow1); };
+    if owlen >= 3 { out = ecs_qb_deep_with(out, ow2); };
+    if owlen >= 4 { out = ecs_qb_deep_with(out, ow3); };
+    if onlen >= 1 { out = ecs_qb_deep_without(out, on0); };
+    if onlen >= 2 { out = ecs_qb_deep_without(out, on1); };
+    if onlen >= 3 { out = ecs_qb_deep_without(out, on2); };
+    if onlen >= 4 { out = ecs_qb_deep_without(out, on3); };
+    if odense_data == 0 { out = ecs_qb_deep_mark_data_sparse(out); };
+    if odense_with == 0 { out = ecs_qb_deep_mark_with_sparse(out); };
+    return out;
+}
+
+// transmute: replace data ids with new list (all read)
+fn ecs_qb_deep_transmute2(b: EcsQbDeep, id0: i32, id1: i32) -> EcsQbDeep {
+    return EcsQbDeep {
+        world_id: b.world_id, or_mode: b.or_mode, first_in_or: b.first_in_or, or_groups: b.or_groups, optional_count: b.optional_count,
+        data_len: 2, d0: id0, dw0: 0, d1: id1, dw1: 0, d2: -1, dw2: 0, d3: -1, dw3: 0,
+        with_len: b.with_len, w0: b.w0, w1: b.w1, w2: b.w2, w3: b.w3,
+        without_len: b.without_len, n0: b.n0, n1: b.n1, n2: b.n2, n3: b.n3,
+        dense_with: b.dense_with, dense_without: b.dense_without, dense_data: b.dense_data,
+    };
+}
+
+// build snapshot: maps builder into a compact state summary
+struct EcsQbBuildDeep {
+    world_id: i64,
+    is_dense: bool,
+    data_len: i32,
+    with_len: i32,
+    without_len: i32,
+    write_count: i32,
+    or_groups: i32,
+    optional_count: i32,
+}
+
+fn ecs_qb_build_world(b: EcsQbBuildDeep) -> i64 { return b.world_id; }
+fn ecs_qb_build_is_dense(b: EcsQbBuildDeep) -> bool { return b.is_dense; }
+fn ecs_qb_build_data_len(b: EcsQbBuildDeep) -> i32 { return b.data_len; }
+fn ecs_qb_build_with_len(b: EcsQbBuildDeep) -> i32 { return b.with_len; }
+fn ecs_qb_build_without_len(b: EcsQbBuildDeep) -> i32 { return b.without_len; }
+fn ecs_qb_build_write_count(b: EcsQbBuildDeep) -> i32 { return b.write_count; }
+fn ecs_qb_build_or_groups(b: EcsQbBuildDeep) -> i32 { return b.or_groups; }
+fn ecs_qb_build_optional_count(b: EcsQbBuildDeep) -> i32 { return b.optional_count; }
+
+fn ecs_qb_deep_build(b: EcsQbDeep) -> EcsQbBuildDeep {
+    let writes = 0;
+    if b.data_len >= 1 { if b.dw0 != 0 { writes = writes + 1; }; };
+    if b.data_len >= 2 { if b.dw1 != 0 { writes = writes + 1; }; };
+    if b.data_len >= 3 { if b.dw2 != 0 { writes = writes + 1; }; };
+    if b.data_len >= 4 { if b.dw3 != 0 { writes = writes + 1; }; };
+    return EcsQbBuildDeep {
+        world_id: b.world_id,
+        is_dense: ecs_qb_deep_is_dense(b),
+        data_len: b.data_len,
+        with_len: b.with_len,
+        without_len: b.without_len,
+        write_count: writes,
+        or_groups: b.or_groups,
+        optional_count: b.optional_count,
+    };
+}
+
+// entity matches builder filters (with all present, without none present)
+fn ecs_qb_deep_entity_matches(b: EcsQbDeep, c0: i32, c1: i32, c2: i32, c3: i32, clen: i32) -> bool {
+    // with
+    if b.with_len >= 1 {
+        let ok = false;
+        if clen >= 1 { if c0 == b.w0 { ok = true; }; };
+        if clen >= 2 { if c1 == b.w0 { ok = true; }; };
+        if clen >= 3 { if c2 == b.w0 { ok = true; }; };
+        if clen >= 4 { if c3 == b.w0 { ok = true; }; };
+        if ok != true { return false; };
+    };
+    if b.with_len >= 2 {
+        let ok = false;
+        if clen >= 1 { if c0 == b.w1 { ok = true; }; };
+        if clen >= 2 { if c1 == b.w1 { ok = true; }; };
+        if clen >= 3 { if c2 == b.w1 { ok = true; }; };
+        if clen >= 4 { if c3 == b.w1 { ok = true; }; };
+        if ok != true { return false; };
+    };
+    // without
+    if b.without_len >= 1 {
+        if clen >= 1 { if c0 == b.n0 { return false; }; };
+        if clen >= 2 { if c1 == b.n0 { return false; }; };
+        if clen >= 3 { if c2 == b.n0 { return false; }; };
+        if clen >= 4 { if c3 == b.n0 { return false; }; };
+    };
+    if b.without_len >= 2 {
+        if clen >= 1 { if c0 == b.n1 { return false; }; };
+        if clen >= 2 { if c1 == b.n1 { return false; }; };
+        if clen >= 3 { if c2 == b.n1 { return false; }; };
+        if clen >= 4 { if c3 == b.n1 { return false; }; };
+    };
+    return true;
+}

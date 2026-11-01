@@ -1,0 +1,489 @@
+// Deepened Bevy ECS observer entity cloning surface.
+// Mirrors src/observer/entity_cloning.rs:
+//   EntityClonerBuilder::add_observers(true|false)
+//     - true: override ObservedBy clone behavior to Custom(component_clone_observed_by)
+//     - false: remove ObservedBy clone override
+//   component_clone_observed_by deferred work:
+//     - clone ObservedBy list source → target
+//     - for each observer: push target into descriptor.entities
+//     - for each event_key: clone entity_observers map entry source→target
+//       (empty components) or per-component entity_component_observers
+// Shallow lib/observer_entity_cloning.sla retained.
+
+// === Clone builder option ===
+const ECS_OEC_BEHAVIOR_DEFAULT: i32 = 0;
+const ECS_OEC_BEHAVIOR_CUSTOM_OBSERVED_BY: i32 = 1;
+const ECS_OEC_BEHAVIOR_REMOVED_OVERRIDE: i32 = 2;
+
+struct EcsOecBuilderDeep {
+    observed_by_behavior: i32,
+    clone_count: i64,
+}
+
+fn ecs_oec_builder_new() -> EcsOecBuilderDeep {
+    return EcsOecBuilderDeep {
+        observed_by_behavior: ECS_OEC_BEHAVIOR_DEFAULT,
+        clone_count: 0,
+    };
+}
+
+fn ecs_oec_builder_add_observers(b: EcsOecBuilderDeep, add: bool) -> EcsOecBuilderDeep {
+    if add {
+        b.observed_by_behavior = ECS_OEC_BEHAVIOR_CUSTOM_OBSERVED_BY;
+    } else {
+        b.observed_by_behavior = ECS_OEC_BEHAVIOR_REMOVED_OVERRIDE;
+    };
+    return b;
+}
+
+fn ecs_oec_builder_behavior(b: EcsOecBuilderDeep) -> i32 { return b.observed_by_behavior; }
+fn ecs_oec_builder_will_clone_observers(b: EcsOecBuilderDeep) -> bool {
+    return b.observed_by_behavior == ECS_OEC_BEHAVIOR_CUSTOM_OBSERVED_BY;
+}
+fn ecs_oec_builder_clone_count(b: EcsOecBuilderDeep) -> i64 { return b.clone_count; }
+
+// === ObservedBy list (up to 4 observer entities) ===
+struct EcsOecObservedByDeep {
+    o0: i64, o1: i64, o2: i64, o3: i64,
+    len: i32,
+}
+
+fn ecs_oec_observed_by_new() -> EcsOecObservedByDeep {
+    return EcsOecObservedByDeep { o0: 0, o1: 0, o2: 0, o3: 0, len: 0 };
+}
+
+fn ecs_oec_observed_by_len(o: EcsOecObservedByDeep) -> i32 { return o.len; }
+
+fn ecs_oec_observed_by_push(o: EcsOecObservedByDeep, observer: i64) -> EcsOecObservedByDeep {
+    if o.len == 0 { o.o0 = observer; o.len = 1; return o; };
+    if o.len == 1 { o.o1 = observer; o.len = 2; return o; };
+    if o.len == 2 { o.o2 = observer; o.len = 3; return o; };
+    if o.len == 3 { o.o3 = observer; o.len = 4; return o; };
+    return o;
+}
+
+fn ecs_oec_observed_by_at(o: EcsOecObservedByDeep, idx: i32) -> i64 {
+    if idx == 0 { return o.o0; };
+    if idx == 1 { return o.o1; };
+    if idx == 2 { return o.o2; };
+    if idx == 3 { return o.o3; };
+    return 0;
+}
+
+fn ecs_oec_observed_by_clone(o: EcsOecObservedByDeep) -> EcsOecObservedByDeep {
+    return EcsOecObservedByDeep {
+        o0: o.o0, o1: o.o1, o2: o.o2, o3: o.o3, len: o.len,
+    };
+}
+
+fn ecs_oec_observed_by_contains(o: EcsOecObservedByDeep, observer: i64) -> bool {
+    if o.len >= 1 && o.o0 == observer { return true; };
+    if o.len >= 2 && o.o1 == observer { return true; };
+    if o.len >= 3 && o.o2 == observer { return true; };
+    if o.len >= 4 && o.o3 == observer { return true; };
+    return false;
+}
+
+// === Observer descriptor: entities watched + event_keys + components ===
+// Fixed capacity 4 entities, 4 event keys, 4 components
+struct EcsOecObserverDescDeep {
+    e0: i64, e1: i64, e2: i64, e3: i64, e_len: i32,
+    k0: i64, k1: i64, k2: i64, k3: i64, k_len: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c_len: i32,
+}
+
+fn ecs_oec_desc_new() -> EcsOecObserverDescDeep {
+    return EcsOecObserverDescDeep {
+        e0: 0, e1: 0, e2: 0, e3: 0, e_len: 0,
+        k0: 0, k1: 0, k2: 0, k3: 0, k_len: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0, c_len: 0,
+    };
+}
+
+fn ecs_oec_desc_push_entity(d: EcsOecObserverDescDeep, entity: i64) -> EcsOecObserverDescDeep {
+    if d.e_len == 0 { d.e0 = entity; d.e_len = 1; return d; };
+    if d.e_len == 1 { d.e1 = entity; d.e_len = 2; return d; };
+    if d.e_len == 2 { d.e2 = entity; d.e_len = 3; return d; };
+    if d.e_len == 3 { d.e3 = entity; d.e_len = 4; return d; };
+    return d;
+}
+
+fn ecs_oec_desc_push_event_key(d: EcsOecObserverDescDeep, key: i64) -> EcsOecObserverDescDeep {
+    if d.k_len == 0 { d.k0 = key; d.k_len = 1; return d; };
+    if d.k_len == 1 { d.k1 = key; d.k_len = 2; return d; };
+    if d.k_len == 2 { d.k2 = key; d.k_len = 3; return d; };
+    if d.k_len == 3 { d.k3 = key; d.k_len = 4; return d; };
+    return d;
+}
+
+fn ecs_oec_desc_push_component(d: EcsOecObserverDescDeep, component: i32) -> EcsOecObserverDescDeep {
+    if d.c_len == 0 { d.c0 = component; d.c_len = 1; return d; };
+    if d.c_len == 1 { d.c1 = component; d.c_len = 2; return d; };
+    if d.c_len == 2 { d.c2 = component; d.c_len = 3; return d; };
+    if d.c_len == 3 { d.c3 = component; d.c_len = 4; return d; };
+    return d;
+}
+
+fn ecs_oec_desc_entity_len(d: EcsOecObserverDescDeep) -> i32 { return d.e_len; }
+fn ecs_oec_desc_event_key_len(d: EcsOecObserverDescDeep) -> i32 { return d.k_len; }
+fn ecs_oec_desc_component_len(d: EcsOecObserverDescDeep) -> i32 { return d.c_len; }
+
+fn ecs_oec_desc_entity_at(d: EcsOecObserverDescDeep, idx: i32) -> i64 {
+    if idx == 0 { return d.e0; };
+    if idx == 1 { return d.e1; };
+    if idx == 2 { return d.e2; };
+    if idx == 3 { return d.e3; };
+    return 0;
+}
+
+fn ecs_oec_desc_event_key_at(d: EcsOecObserverDescDeep, idx: i32) -> i64 {
+    if idx == 0 { return d.k0; };
+    if idx == 1 { return d.k1; };
+    if idx == 2 { return d.k2; };
+    if idx == 3 { return d.k3; };
+    return 0;
+}
+
+fn ecs_oec_desc_component_at(d: EcsOecObserverDescDeep, idx: i32) -> i32 {
+    if idx == 0 { return d.c0; };
+    if idx == 1 { return d.c1; };
+    if idx == 2 { return d.c2; };
+    if idx == 3 { return d.c3; };
+    return 0;
+}
+
+fn ecs_oec_desc_has_entity(d: EcsOecObserverDescDeep, entity: i64) -> bool {
+    if d.e_len >= 1 && d.e0 == entity { return true; };
+    if d.e_len >= 2 && d.e1 == entity { return true; };
+    if d.e_len >= 3 && d.e2 == entity { return true; };
+    if d.e_len >= 4 && d.e3 == entity { return true; };
+    return false;
+}
+
+// === Entity observers map entry for one event_key (source entity → map_id) ===
+// Track up to 4 entity→map_id pairs per event key; 2 event keys
+struct EcsOecEntityMapDeep {
+    // pairs
+    e0: i64, m0: i64,
+    e1: i64, m1: i64,
+    e2: i64, m2: i64,
+    e3: i64, m3: i64,
+    len: i32,
+}
+
+fn ecs_oec_emap_new() -> EcsOecEntityMapDeep {
+    return EcsOecEntityMapDeep {
+        e0: 0, m0: 0, e1: 0, m1: 0, e2: 0, m2: 0, e3: 0, m3: 0, len: 0,
+    };
+}
+
+fn ecs_oec_emap_len(m: EcsOecEntityMapDeep) -> i32 { return m.len; }
+
+fn ecs_oec_emap_insert(m: EcsOecEntityMapDeep, entity: i64, map_id: i64) -> EcsOecEntityMapDeep {
+    // update existing
+    if m.len >= 1 && m.e0 == entity { m.m0 = map_id; return m; };
+    if m.len >= 2 && m.e1 == entity { m.m1 = map_id; return m; };
+    if m.len >= 3 && m.e2 == entity { m.m2 = map_id; return m; };
+    if m.len >= 4 && m.e3 == entity { m.m3 = map_id; return m; };
+    if m.len == 0 { m.e0 = entity; m.m0 = map_id; m.len = 1; return m; };
+    if m.len == 1 { m.e1 = entity; m.m1 = map_id; m.len = 2; return m; };
+    if m.len == 2 { m.e2 = entity; m.m2 = map_id; m.len = 3; return m; };
+    if m.len == 3 { m.e3 = entity; m.m3 = map_id; m.len = 4; return m; };
+    return m;
+}
+
+fn ecs_oec_emap_get(m: EcsOecEntityMapDeep, entity: i64) -> (bool, i64) {
+    if m.len >= 1 && m.e0 == entity { return (true, m.m0); };
+    if m.len >= 2 && m.e1 == entity { return (true, m.m1); };
+    if m.len >= 3 && m.e2 == entity { return (true, m.m2); };
+    if m.len >= 4 && m.e3 == entity { return (true, m.m3); };
+    return (false, 0);
+}
+
+fn ecs_oec_emap_clone_entry(m: EcsOecEntityMapDeep, source: i64, target: i64) -> EcsOecEntityMapDeep {
+    let g = ecs_oec_emap_get(m, source);
+    if g.0 != true { return m; };
+    return ecs_oec_emap_insert(m, target, g.1);
+}
+
+// === World model for clone ===
+// entities 0..3 have ObservedBy; observers 0..1 have descriptors
+// event maps: event_key 1 and 2 use entity maps; component maps for component id 10
+struct EcsOecWorldDeep {
+    // entity ObservedBy for entities 1..4 (index by entity-1 if 1..4)
+    // simplify: only track source_entity and target_entity ObservedBy
+    source_entity: i64,
+    target_entity: i64,
+    source_obs: EcsOecObservedByDeep,
+    target_obs: EcsOecObservedByDeep,
+    target_has_obs: bool,
+    // observers: two slots
+    obs0_entity: i64,
+    obs0_desc: EcsOecObserverDescDeep,
+    obs1_entity: i64,
+    obs1_desc: EcsOecObserverDescDeep,
+    obs_count: i32,
+    // entity_observers for event_key empty-components path
+    emap_k1: EcsOecEntityMapDeep,
+    emap_k2: EcsOecEntityMapDeep,
+    // component-scoped maps for event_key1 component 10 / 20
+    emap_k1_c10: EcsOecEntityMapDeep,
+    emap_k1_c20: EcsOecEntityMapDeep,
+    deferred_runs: i64,
+}
+
+fn ecs_oec_world_new(source: i64, target: i64) -> EcsOecWorldDeep {
+    return EcsOecWorldDeep {
+        source_entity: source,
+        target_entity: target,
+        source_obs: ecs_oec_observed_by_new(),
+        target_obs: ecs_oec_observed_by_new(),
+        target_has_obs: false,
+        obs0_entity: 0,
+        obs0_desc: ecs_oec_desc_new(),
+        obs1_entity: 0,
+        obs1_desc: ecs_oec_desc_new(),
+        obs_count: 0,
+        emap_k1: ecs_oec_emap_new(),
+        emap_k2: ecs_oec_emap_new(),
+        emap_k1_c10: ecs_oec_emap_new(),
+        emap_k1_c20: ecs_oec_emap_new(),
+        deferred_runs: 0,
+    };
+}
+
+fn ecs_oec_world_set_source_obs(w: EcsOecWorldDeep, obs: EcsOecObservedByDeep) -> EcsOecWorldDeep {
+    w.source_obs = obs;
+    return w;
+}
+
+fn ecs_oec_world_source_obs(w: EcsOecWorldDeep) -> EcsOecObservedByDeep { return w.source_obs; }
+fn ecs_oec_world_target_obs(w: EcsOecWorldDeep) -> EcsOecObservedByDeep { return w.target_obs; }
+fn ecs_oec_world_target_has_obs(w: EcsOecWorldDeep) -> bool { return w.target_has_obs; }
+fn ecs_oec_world_deferred_runs(w: EcsOecWorldDeep) -> i64 { return w.deferred_runs; }
+
+fn ecs_oec_world_add_observer(w: EcsOecWorldDeep, observer_entity: i64, desc: EcsOecObserverDescDeep) -> EcsOecWorldDeep {
+    if w.obs_count == 0 {
+        w.obs0_entity = observer_entity;
+        w.obs0_desc = desc;
+        w.obs_count = 1;
+        return w;
+    };
+    if w.obs_count == 1 {
+        w.obs1_entity = observer_entity;
+        w.obs1_desc = desc;
+        w.obs_count = 2;
+        return w;
+    };
+    return w;
+}
+
+fn ecs_oec_world_obs_desc_entity_len(w: EcsOecWorldDeep, observer_entity: i64) -> i32 {
+    if w.obs_count >= 1 && w.obs0_entity == observer_entity {
+        return ecs_oec_desc_entity_len(w.obs0_desc);
+    };
+    if w.obs_count >= 2 && w.obs1_entity == observer_entity {
+        return ecs_oec_desc_entity_len(w.obs1_desc);
+    };
+    return 0;
+}
+
+fn ecs_oec_world_obs_has_target(w: EcsOecWorldDeep, observer_entity: i64, target: i64) -> bool {
+    if w.obs_count >= 1 && w.obs0_entity == observer_entity {
+        return ecs_oec_desc_has_entity(w.obs0_desc, target);
+    };
+    if w.obs_count >= 2 && w.obs1_entity == observer_entity {
+        return ecs_oec_desc_has_entity(w.obs1_desc, target);
+    };
+    return false;
+}
+
+fn ecs_oec_world_set_emap_k1(w: EcsOecWorldDeep, m: EcsOecEntityMapDeep) -> EcsOecWorldDeep {
+    w.emap_k1 = m;
+    return w;
+}
+fn ecs_oec_world_set_emap_k2(w: EcsOecWorldDeep, m: EcsOecEntityMapDeep) -> EcsOecWorldDeep {
+    w.emap_k2 = m;
+    return w;
+}
+fn ecs_oec_world_set_emap_k1_c10(w: EcsOecWorldDeep, m: EcsOecEntityMapDeep) -> EcsOecWorldDeep {
+    w.emap_k1_c10 = m;
+    return w;
+}
+fn ecs_oec_world_set_emap_k1_c20(w: EcsOecWorldDeep, m: EcsOecEntityMapDeep) -> EcsOecWorldDeep {
+    w.emap_k1_c20 = m;
+    return w;
+}
+
+fn ecs_oec_world_emap_k1_get(w: EcsOecWorldDeep, entity: i64) -> (bool, i64) {
+    return ecs_oec_emap_get(w.emap_k1, entity);
+}
+fn ecs_oec_world_emap_k2_get(w: EcsOecWorldDeep, entity: i64) -> (bool, i64) {
+    return ecs_oec_emap_get(w.emap_k2, entity);
+}
+fn ecs_oec_world_emap_k1_c10_get(w: EcsOecWorldDeep, entity: i64) -> (bool, i64) {
+    return ecs_oec_emap_get(w.emap_k1_c10, entity);
+}
+fn ecs_oec_world_emap_k1_c20_get(w: EcsOecWorldDeep, entity: i64) -> (bool, i64) {
+    return ecs_oec_emap_get(w.emap_k1_c20, entity);
+}
+
+// Helper: push target into observer descriptor by observer entity id
+fn ecs_oec_world_push_desc_entity(w: EcsOecWorldDeep, observer_entity: i64, target: i64) -> EcsOecWorldDeep {
+    if w.obs_count >= 1 && w.obs0_entity == observer_entity {
+        w.obs0_desc = ecs_oec_desc_push_entity(w.obs0_desc, target);
+        return w;
+    };
+    if w.obs_count >= 2 && w.obs1_entity == observer_entity {
+        w.obs1_desc = ecs_oec_desc_push_entity(w.obs1_desc, target);
+        return w;
+    };
+    return w;
+}
+
+fn ecs_oec_world_obs_desc(w: EcsOecWorldDeep, observer_entity: i64) -> EcsOecObserverDescDeep {
+    if w.obs_count >= 1 && w.obs0_entity == observer_entity {
+        return w.obs0_desc;
+    };
+    if w.obs_count >= 2 && w.obs1_entity == observer_entity {
+        return w.obs1_desc;
+    };
+    return ecs_oec_desc_new();
+}
+
+// Clone entity_observers maps for one observer descriptor
+fn ecs_oec_clone_maps_for_key(
+    w: EcsOecWorldDeep,
+    key: i64,
+    c_len: i32,
+    c0: i32,
+    c1: i32,
+    c2: i32,
+    c3: i32,
+    source: i64,
+    target: i64
+) -> EcsOecWorldDeep {
+    if c_len == 0 {
+        if key == 1 {
+            w.emap_k1 = ecs_oec_emap_clone_entry(w.emap_k1, source, target);
+        };
+        if key == 2 {
+            w.emap_k2 = ecs_oec_emap_clone_entry(w.emap_k2, source, target);
+        };
+        return w;
+    };
+    if key == 1 {
+        if c_len >= 1 {
+            if c0 == 10 {
+                w.emap_k1_c10 = ecs_oec_emap_clone_entry(w.emap_k1_c10, source, target);
+            };
+            if c0 == 20 {
+                w.emap_k1_c20 = ecs_oec_emap_clone_entry(w.emap_k1_c20, source, target);
+            };
+        };
+        if c_len >= 2 {
+            if c1 == 10 {
+                w.emap_k1_c10 = ecs_oec_emap_clone_entry(w.emap_k1_c10, source, target);
+            };
+            if c1 == 20 {
+                w.emap_k1_c20 = ecs_oec_emap_clone_entry(w.emap_k1_c20, source, target);
+            };
+        };
+        if c_len >= 3 {
+            if c2 == 10 {
+                w.emap_k1_c10 = ecs_oec_emap_clone_entry(w.emap_k1_c10, source, target);
+            };
+            if c2 == 20 {
+                w.emap_k1_c20 = ecs_oec_emap_clone_entry(w.emap_k1_c20, source, target);
+            };
+        };
+        if c_len >= 4 {
+            if c3 == 10 {
+                w.emap_k1_c10 = ecs_oec_emap_clone_entry(w.emap_k1_c10, source, target);
+            };
+            if c3 == 20 {
+                w.emap_k1_c20 = ecs_oec_emap_clone_entry(w.emap_k1_c20, source, target);
+            };
+        };
+    };
+    return w;
+}
+
+fn ecs_oec_world_clone_maps_for_desc(
+    w: EcsOecWorldDeep,
+    desc: EcsOecObserverDescDeep,
+    source: i64,
+    target: i64
+) -> EcsOecWorldDeep {
+    let k_len = desc.k_len;
+    let c_len = desc.c_len;
+    let k0 = desc.k0;
+    let k1 = desc.k1;
+    let k2 = desc.k2;
+    let k3 = desc.k3;
+    let c0 = desc.c0;
+    let c1 = desc.c1;
+    let c2 = desc.c2;
+    let c3 = desc.c3;
+    if k_len >= 1 {
+        w = ecs_oec_clone_maps_for_key(w, k0, c_len, c0, c1, c2, c3, source, target);
+    };
+    if k_len >= 2 {
+        w = ecs_oec_clone_maps_for_key(w, k1, c_len, c0, c1, c2, c3, source, target);
+    };
+    if k_len >= 3 {
+        w = ecs_oec_clone_maps_for_key(w, k2, c_len, c0, c1, c2, c3, source, target);
+    };
+    if k_len >= 4 {
+        w = ecs_oec_clone_maps_for_key(w, k3, c_len, c0, c1, c2, c3, source, target);
+    };
+    return w;
+}
+
+// Deferred component_clone_observed_by
+fn ecs_oec_run_clone_observed_by(w: EcsOecWorldDeep) -> EcsOecWorldDeep {
+    w.deferred_runs = w.deferred_runs + 1;
+    let source = w.source_entity;
+    let target = w.target_entity;
+    // clone ObservedBy — capture scalars before move into target_obs
+    let obs = ecs_oec_observed_by_clone(w.source_obs);
+    let n = obs.len;
+    let o0 = obs.o0;
+    let o1 = obs.o1;
+    let o2 = obs.o2;
+    let o3 = obs.o3;
+    w.target_obs = obs;
+    w.target_has_obs = true;
+
+    // for each observer in ObservedBy
+    if n >= 1 {
+        w = ecs_oec_world_push_desc_entity(w, o0, target);
+        let desc0 = ecs_oec_world_obs_desc(w, o0);
+        w = ecs_oec_world_clone_maps_for_desc(w, desc0, source, target);
+    };
+    if n >= 2 {
+        w = ecs_oec_world_push_desc_entity(w, o1, target);
+        let desc1 = ecs_oec_world_obs_desc(w, o1);
+        w = ecs_oec_world_clone_maps_for_desc(w, desc1, source, target);
+    };
+    if n >= 3 {
+        w = ecs_oec_world_push_desc_entity(w, o2, target);
+        let desc2 = ecs_oec_world_obs_desc(w, o2);
+        w = ecs_oec_world_clone_maps_for_desc(w, desc2, source, target);
+    };
+    if n >= 4 {
+        w = ecs_oec_world_push_desc_entity(w, o3, target);
+        let desc3 = ecs_oec_world_obs_desc(w, o3);
+        w = ecs_oec_world_clone_maps_for_desc(w, desc3, source, target);
+    };
+    return w;
+}
+
+// Full clone_entity path gated by builder
+fn ecs_oec_clone_entity(b: EcsOecBuilderDeep, w: EcsOecWorldDeep) -> (EcsOecBuilderDeep, EcsOecWorldDeep) {
+    b.clone_count = b.clone_count + 1;
+    if ecs_oec_builder_will_clone_observers(b) {
+        w = ecs_oec_run_clone_observed_by(w);
+    };
+    return (b, w);
+}

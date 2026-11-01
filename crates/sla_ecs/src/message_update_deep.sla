@@ -1,0 +1,284 @@
+// Deepened Bevy ECS message update surface.
+// Mirrors src/message/update.rs:
+//   MessageUpdateSystems set
+//   ShouldUpdateMessages { Always, Waiting, Ready }
+//   signal_message_update_system -> Ready
+//   message_update_system -> run_updates + transition Ready/Waiting -> Waiting; Always stays
+//   message_update_condition: Always|Ready => true; Waiting => false; no registry => true
+// Also models MessageRegistry.run_updates over registered message buffers (count).
+// Shallow lib/message_update.sla retained.
+
+// === ShouldUpdateMessages ===
+const ECS_MU_ALWAYS: i32 = 0;
+const ECS_MU_WAITING: i32 = 1;
+const ECS_MU_READY: i32 = 2;
+
+// === Message buffer stand-in (for run_updates) ===
+struct EcsMuMessagesDeep {
+    // dual buffer lens
+    a_len: i64,
+    b_len: i64,
+    message_count: i64,
+    update_count: i64,
+}
+
+fn ecs_mu_messages_new() -> EcsMuMessagesDeep {
+    return EcsMuMessagesDeep {
+        a_len: 0,
+        b_len: 0,
+        message_count: 0,
+        update_count: 0,
+    };
+}
+
+fn ecs_mu_messages_write(m: EcsMuMessagesDeep, n: i64) -> EcsMuMessagesDeep {
+    // write n messages into B
+    m.b_len = m.b_len + n;
+    m.message_count = m.message_count + n;
+    return m;
+}
+
+// Messages::update: swap A/B, clear B
+fn ecs_mu_messages_update(m: EcsMuMessagesDeep) -> EcsMuMessagesDeep {
+    m.a_len = m.b_len;
+    m.b_len = 0;
+    m.update_count = m.update_count + 1;
+    return m;
+}
+
+fn ecs_mu_messages_len(m: EcsMuMessagesDeep) -> i64 {
+    return m.a_len + m.b_len;
+}
+
+fn ecs_mu_messages_update_count(m: EcsMuMessagesDeep) -> i64 { return m.update_count; }
+
+// === MessageRegistry ===
+// Fixed slots of message buffers + should_update policy
+const ECS_MU_REG_CAP: i32 = 8;
+
+struct EcsMessageRegistryDeep {
+    should_update: i32,
+    // buffer slots (message_count / update_count tracked)
+    m0_count: i64, m0_updates: i64, m0_len: i64,
+    m1_count: i64, m1_updates: i64, m1_len: i64,
+    m2_count: i64, m2_updates: i64, m2_len: i64,
+    m3_count: i64, m3_updates: i64, m3_len: i64,
+    m4_count: i64, m4_updates: i64, m4_len: i64,
+    m5_count: i64, m5_updates: i64, m5_len: i64,
+    m6_count: i64, m6_updates: i64, m6_len: i64,
+    m7_count: i64, m7_updates: i64, m7_len: i64,
+    len: i32,
+    // last run_updates change tick snapshot
+    last_run_tick: i64,
+    run_updates_calls: i64,
+}
+
+fn ecs_mu_registry_new() -> EcsMessageRegistryDeep {
+    return EcsMessageRegistryDeep {
+        should_update: ECS_MU_ALWAYS,
+        m0_count: 0, m0_updates: 0, m0_len: 0,
+        m1_count: 0, m1_updates: 0, m1_len: 0,
+        m2_count: 0, m2_updates: 0, m2_len: 0,
+        m3_count: 0, m3_updates: 0, m3_len: 0,
+        m4_count: 0, m4_updates: 0, m4_len: 0,
+        m5_count: 0, m5_updates: 0, m5_len: 0,
+        m6_count: 0, m6_updates: 0, m6_len: 0,
+        m7_count: 0, m7_updates: 0, m7_len: 0,
+        len: 0,
+        last_run_tick: 0,
+        run_updates_calls: 0,
+    };
+}
+
+// default is Always (every frame)
+fn ecs_mu_registry_default() -> EcsMessageRegistryDeep {
+    return ecs_mu_registry_new();
+}
+
+fn ecs_mu_registry_should_update(r: EcsMessageRegistryDeep) -> i32 { return r.should_update; }
+fn ecs_mu_registry_len(r: EcsMessageRegistryDeep) -> i32 { return r.len; }
+fn ecs_mu_registry_run_calls(r: EcsMessageRegistryDeep) -> i64 { return r.run_updates_calls; }
+
+fn ecs_mu_registry_set_should(r: EcsMessageRegistryDeep, v: i32) -> EcsMessageRegistryDeep {
+    r.should_update = v;
+    return r;
+}
+
+// register a message type buffer
+fn ecs_mu_registry_register(r: EcsMessageRegistryDeep) -> (EcsMessageRegistryDeep, i32) {
+    if r.len >= ECS_MU_REG_CAP {
+        return (r, 0 - 1);
+    };
+    let idx = r.len;
+    r.len = idx + 1;
+    return (r, idx);
+}
+
+fn ecs_mu_registry_write(r: EcsMessageRegistryDeep, idx: i32, n: i64) -> EcsMessageRegistryDeep {
+    if idx == 0 { r.m0_count = r.m0_count + n; r.m0_len = r.m0_len + n; return r; };
+    if idx == 1 { r.m1_count = r.m1_count + n; r.m1_len = r.m1_len + n; return r; };
+    if idx == 2 { r.m2_count = r.m2_count + n; r.m2_len = r.m2_len + n; return r; };
+    if idx == 3 { r.m3_count = r.m3_count + n; r.m3_len = r.m3_len + n; return r; };
+    if idx == 4 { r.m4_count = r.m4_count + n; r.m4_len = r.m4_len + n; return r; };
+    if idx == 5 { r.m5_count = r.m5_count + n; r.m5_len = r.m5_len + n; return r; };
+    if idx == 6 { r.m6_count = r.m6_count + n; r.m6_len = r.m6_len + n; return r; };
+    if idx == 7 { r.m7_count = r.m7_count + n; r.m7_len = r.m7_len + n; return r; };
+    return r;
+}
+
+fn ecs_mu_registry_buf_updates(r: EcsMessageRegistryDeep, idx: i32) -> i64 {
+    if idx == 0 { return r.m0_updates; };
+    if idx == 1 { return r.m1_updates; };
+    if idx == 2 { return r.m2_updates; };
+    if idx == 3 { return r.m3_updates; };
+    if idx == 4 { return r.m4_updates; };
+    if idx == 5 { return r.m5_updates; };
+    if idx == 6 { return r.m6_updates; };
+    if idx == 7 { return r.m7_updates; };
+    return 0;
+}
+
+fn ecs_mu_registry_buf_len(r: EcsMessageRegistryDeep, idx: i32) -> i64 {
+    if idx == 0 { return r.m0_len; };
+    if idx == 1 { return r.m1_len; };
+    if idx == 2 { return r.m2_len; };
+    if idx == 3 { return r.m3_len; };
+    if idx == 4 { return r.m4_len; };
+    if idx == 5 { return r.m5_len; };
+    if idx == 6 { return r.m6_len; };
+    if idx == 7 { return r.m7_len; };
+    return 0;
+}
+
+// run_updates: for each buffer, perform Messages::update (drop old period)
+// last_change_tick is recorded but not used for filtering in this model
+fn ecs_mu_registry_run_updates(r: EcsMessageRegistryDeep, last_change_tick: i64) -> EcsMessageRegistryDeep {
+    r.last_run_tick = last_change_tick;
+    r.run_updates_calls = r.run_updates_calls + 1;
+    // each registered buffer: clear current period (len -> 0 after update of dual buffer)
+    // model: update drops previous; active len becomes 0 after swap+clear of new period empty
+    // Simpler: each update increments updates and sets len to 0 (messages from prior period discarded if not read)
+    if r.len > 0 { r.m0_updates = r.m0_updates + 1; r.m0_len = 0; };
+    if r.len > 1 { r.m1_updates = r.m1_updates + 1; r.m1_len = 0; };
+    if r.len > 2 { r.m2_updates = r.m2_updates + 1; r.m2_len = 0; };
+    if r.len > 3 { r.m3_updates = r.m3_updates + 1; r.m3_len = 0; };
+    if r.len > 4 { r.m4_updates = r.m4_updates + 1; r.m4_len = 0; };
+    if r.len > 5 { r.m5_updates = r.m5_updates + 1; r.m5_len = 0; };
+    if r.len > 6 { r.m6_updates = r.m6_updates + 1; r.m6_len = 0; };
+    if r.len > 7 { r.m7_updates = r.m7_updates + 1; r.m7_len = 0; };
+    return r;
+}
+
+// === signal_message_update_system ===
+// If registry present: should_update = Ready
+fn ecs_mu_signal_message_update_system(
+    has_registry: bool,
+    r: EcsMessageRegistryDeep
+) -> (bool, EcsMessageRegistryDeep) {
+    if has_registry != true {
+        return (false, r);
+    };
+    r.should_update = ECS_MU_READY;
+    return (true, r);
+}
+
+// === message_update_condition ===
+// None registry => true
+// Always | Ready => true
+// Waiting => false
+fn ecs_mu_message_update_condition(has_registry: bool, r: EcsMessageRegistryDeep) -> bool {
+    if has_registry != true {
+        return true;
+    };
+    if r.should_update == ECS_MU_ALWAYS { return true; };
+    if r.should_update == ECS_MU_READY { return true; };
+    return false;
+}
+
+// === message_update_system ===
+// Local last_change_tick + registry.run_updates + transition should_update
+struct EcsMessageUpdateSystemDeep {
+    last_change_tick: i64,
+    ran_count: i64,
+}
+
+fn ecs_mu_system_new() -> EcsMessageUpdateSystemDeep {
+    return EcsMessageUpdateSystemDeep { last_change_tick: 0, ran_count: 0 };
+}
+
+fn ecs_mu_system_last_tick(s: EcsMessageUpdateSystemDeep) -> i64 { return s.last_change_tick; }
+fn ecs_mu_system_ran_count(s: EcsMessageUpdateSystemDeep) -> i64 { return s.ran_count; }
+
+// world change_tick provided by caller
+fn ecs_mu_message_update_system(
+    s: EcsMessageUpdateSystemDeep,
+    r: EcsMessageRegistryDeep,
+    world_change_tick: i64
+) -> (EcsMessageUpdateSystemDeep, EcsMessageRegistryDeep) {
+    r = ecs_mu_registry_run_updates(r, s.last_change_tick);
+
+    // transition
+    if r.should_update == ECS_MU_ALWAYS {
+        // keep Always
+        r.should_update = ECS_MU_ALWAYS;
+    };
+    if r.should_update == ECS_MU_READY {
+        r.should_update = ECS_MU_WAITING;
+    };
+    if r.should_update == ECS_MU_WAITING {
+        // stays Waiting (also entered from Ready above)
+        // if was Waiting before run, remains Waiting
+        r.should_update = ECS_MU_WAITING;
+    };
+
+    s.last_change_tick = world_change_tick;
+    s.ran_count = s.ran_count + 1;
+    return (s, r);
+}
+
+// Fixed-update style: after first signal, policy becomes Ready/Waiting cycle
+// Enable waiting mode by setting Waiting initially (as if signal system is used)
+fn ecs_mu_enable_fixed_update_mode(r: EcsMessageRegistryDeep) -> EcsMessageRegistryDeep {
+    // once signal system is in schedule, registry starts Waiting until signal
+    r.should_update = ECS_MU_WAITING;
+    return r;
+}
+
+// Full frame simulation helpers
+// always mode: condition true every frame
+fn ecs_mu_frame_always(
+    s: EcsMessageUpdateSystemDeep,
+    r: EcsMessageRegistryDeep,
+    tick: i64
+) -> (EcsMessageUpdateSystemDeep, EcsMessageRegistryDeep, bool) {
+    let cond = ecs_mu_message_update_condition(true, r);
+    if cond {
+        let out = ecs_mu_message_update_system(s, r, tick);
+        return (out.0, out.1, true);
+    };
+    return (s, r, false);
+}
+
+// fixed mode: need signal between updates
+fn ecs_mu_frame_fixed(
+    s: EcsMessageUpdateSystemDeep,
+    r: EcsMessageRegistryDeep,
+    tick: i64,
+    signal: bool
+) -> (EcsMessageUpdateSystemDeep, EcsMessageRegistryDeep, bool) {
+    if signal {
+        let sig = ecs_mu_signal_message_update_system(true, r);
+        r = sig.1;
+    };
+    let cond = ecs_mu_message_update_condition(true, r);
+    if cond {
+        let out = ecs_mu_message_update_system(s, r, tick);
+        return (out.0, out.1, true);
+    };
+    return (s, r, false);
+}
+
+// MessageUpdateSystems label stand-in
+fn ecs_mu_systems_set_id() -> i64 {
+    return 88001;
+}

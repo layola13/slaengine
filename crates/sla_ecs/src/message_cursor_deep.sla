@@ -1,0 +1,501 @@
+// Deepened Bevy ECS MessageCursor surface.
+// Mirrors src/message/message_cursor.rs (+ Messages dual-buffer bits needed by cursor):
+//   MessageCursor { last_message_count }
+//   read / read_mut / read_with_id / read_mut_with_id
+//   par_read / par_read_mut (unread count + batch marker; no real TaskPool)
+//   len = min(message_count - last, messages.len())  saturating
+//   missed_messages = oldest_message_count.saturating_sub(last_message_count)
+//   is_empty / clear
+// Iterator construction (MessageIteratorWithId::new): clamp last_message_count when
+// messages dropped by update(), then advance on next/count/last/nth.
+// Shallow lib/message_cursor.sla retained.
+
+// Fixed payload capacity for dual buffers (A=oldest, B=newer)
+const ECS_MC_CAP: i32 = 16;
+
+// === Messages dual buffer (minimal model for cursor) ===
+// message_count: total ever written (monotonic)
+// messages_a / messages_b: two rings of payload ids; start_* is the global id of index 0
+struct EcsMessagesDeep {
+    message_count: i64,
+    // sequence A (oldest still active)
+    a_start: i64,
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    a4: i64, a5: i64, a6: i64, a7: i64,
+    a_len: i32,
+    // sequence B (newer)
+    b_start: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+    b4: i64, b5: i64, b6: i64, b7: i64,
+    b_len: i32,
+}
+
+fn ecs_mc_messages_new() -> EcsMessagesDeep {
+    return EcsMessagesDeep {
+        message_count: 0,
+        a_start: 0,
+        a0: 0, a1: 0, a2: 0, a3: 0,
+        a4: 0, a5: 0, a6: 0, a7: 0,
+        a_len: 0,
+        b_start: 0,
+        b0: 0, b1: 0, b2: 0, b3: 0,
+        b4: 0, b5: 0, b6: 0, b7: 0,
+        b_len: 0,
+    };
+}
+
+fn ecs_mc_messages_message_count(m: EcsMessagesDeep) -> i64 { return m.message_count; }
+fn ecs_mc_messages_oldest(m: EcsMessagesDeep) -> i64 { return m.a_start; }
+fn ecs_mc_messages_len(m: EcsMessagesDeep) -> i64 {
+    return (m.a_len as i64) + (m.b_len as i64);
+}
+fn ecs_mc_messages_is_empty(m: EcsMessagesDeep) -> bool {
+    return ecs_mc_messages_len(m) == 0;
+}
+fn ecs_mc_messages_a_len(m: EcsMessagesDeep) -> i32 { return m.a_len; }
+fn ecs_mc_messages_b_len(m: EcsMessagesDeep) -> i32 { return m.b_len; }
+fn ecs_mc_messages_a_start(m: EcsMessagesDeep) -> i64 { return m.a_start; }
+fn ecs_mc_messages_b_start(m: EcsMessagesDeep) -> i64 { return m.b_start; }
+
+fn ecs_mc_a_get(m: EcsMessagesDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.a0; };
+    if idx == 1 { return m.a1; };
+    if idx == 2 { return m.a2; };
+    if idx == 3 { return m.a3; };
+    if idx == 4 { return m.a4; };
+    if idx == 5 { return m.a5; };
+    if idx == 6 { return m.a6; };
+    if idx == 7 { return m.a7; };
+    return 0;
+}
+
+fn ecs_mc_a_set(m: EcsMessagesDeep, idx: i32, v: i64) -> EcsMessagesDeep {
+    if idx == 0 { m.a0 = v; };
+    if idx == 1 { m.a1 = v; };
+    if idx == 2 { m.a2 = v; };
+    if idx == 3 { m.a3 = v; };
+    if idx == 4 { m.a4 = v; };
+    if idx == 5 { m.a5 = v; };
+    if idx == 6 { m.a6 = v; };
+    if idx == 7 { m.a7 = v; };
+    return m;
+}
+
+fn ecs_mc_b_get(m: EcsMessagesDeep, idx: i32) -> i64 {
+    if idx == 0 { return m.b0; };
+    if idx == 1 { return m.b1; };
+    if idx == 2 { return m.b2; };
+    if idx == 3 { return m.b3; };
+    if idx == 4 { return m.b4; };
+    if idx == 5 { return m.b5; };
+    if idx == 6 { return m.b6; };
+    if idx == 7 { return m.b7; };
+    return 0;
+}
+
+fn ecs_mc_b_set(m: EcsMessagesDeep, idx: i32, v: i64) -> EcsMessagesDeep {
+    if idx == 0 { m.b0 = v; };
+    if idx == 1 { m.b1 = v; };
+    if idx == 2 { m.b2 = v; };
+    if idx == 3 { m.b3 = v; };
+    if idx == 4 { m.b4 = v; };
+    if idx == 5 { m.b5 = v; };
+    if idx == 6 { m.b6 = v; };
+    if idx == 7 { m.b7 = v; };
+    return m;
+}
+
+// write -> MessageId.id = message_count, push into B
+fn ecs_mc_messages_write(m: EcsMessagesDeep, value: i64) -> (EcsMessagesDeep, i64) {
+    let id = m.message_count;
+    if m.b_len < 8 {
+        m = ecs_mc_b_set(m, m.b_len, value);
+        m.b_len = m.b_len + 1;
+    };
+    m.message_count = m.message_count + 1;
+    return (m, id);
+}
+
+// update: swap A/B, clear B, B.start = message_count
+// Models Bevy Messages::update once per frame.
+fn ecs_mc_messages_update(m: EcsMessagesDeep) -> EcsMessagesDeep {
+    // swap A and B fields
+    let ta_start = m.a_start;
+    let ta0 = m.a0; let ta1 = m.a1; let ta2 = m.a2; let ta3 = m.a3;
+    let ta4 = m.a4; let ta5 = m.a5; let ta6 = m.a6; let ta7 = m.a7;
+    let ta_len = m.a_len;
+
+    m.a_start = m.b_start;
+    m.a0 = m.b0; m.a1 = m.b1; m.a2 = m.b2; m.a3 = m.b3;
+    m.a4 = m.b4; m.a5 = m.b5; m.a6 = m.b6; m.a7 = m.b7;
+    m.a_len = m.b_len;
+
+    // clear B (was A content dropped)
+    m.b_start = m.message_count;
+    m.b0 = 0; m.b1 = 0; m.b2 = 0; m.b3 = 0;
+    m.b4 = 0; m.b5 = 0; m.b6 = 0; m.b7 = 0;
+    m.b_len = 0;
+
+    // silence unused swap temps (A content is dropped by clear of B)
+    let _u = ta_start + (ta_len as i64) + ta0 + ta1 + ta2 + ta3 + ta4 + ta5 + ta6 + ta7;
+    if _u < 0 { };
+    return m;
+}
+
+// clear both sequences, reset starts to message_count (Bevy clear)
+fn ecs_mc_messages_clear(m: EcsMessagesDeep) -> EcsMessagesDeep {
+    m.a_start = m.message_count;
+    m.b_start = m.message_count;
+    m.a_len = 0;
+    m.b_len = 0;
+    m.a0 = 0; m.a1 = 0; m.a2 = 0; m.a3 = 0;
+    m.a4 = 0; m.a5 = 0; m.a6 = 0; m.a7 = 0;
+    m.b0 = 0; m.b1 = 0; m.b2 = 0; m.b3 = 0;
+    m.b4 = 0; m.b5 = 0; m.b6 = 0; m.b7 = 0;
+    return m;
+}
+
+// === MessageCursor ===
+struct EcsMessageCursorDeep {
+    last_message_count: i64,
+}
+
+fn ecs_mc_cursor_default() -> EcsMessageCursorDeep {
+    return EcsMessageCursorDeep { last_message_count: 0 };
+}
+
+fn ecs_mc_cursor_clone(c: EcsMessageCursorDeep) -> EcsMessageCursorDeep {
+    return EcsMessageCursorDeep { last_message_count: c.last_message_count };
+}
+
+fn ecs_mc_cursor_last(c: EcsMessageCursorDeep) -> i64 { return c.last_message_count; }
+
+// Messages::get_cursor — includes all already-buffered messages
+fn ecs_mc_get_cursor(_m: EcsMessagesDeep) -> EcsMessageCursorDeep {
+    return ecs_mc_cursor_default();
+}
+
+// Messages::get_cursor_current — ignore already-buffered; only future messages
+fn ecs_mc_get_cursor_current(m: EcsMessagesDeep) -> EcsMessageCursorDeep {
+    return EcsMessageCursorDeep { last_message_count: m.message_count };
+}
+
+// saturating_sub helper
+fn ecs_mc_sat_sub(a: i64, b: i64) -> i64 {
+    if a < b { return 0; };
+    return a - b;
+}
+
+// min helper
+fn ecs_mc_min(a: i64, b: i64) -> i64 {
+    if a < b { return a; };
+    return b;
+}
+
+// MessageCursor::len
+fn ecs_mc_len(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> i64 {
+    let diff = ecs_mc_sat_sub(m.message_count, c.last_message_count);
+    return ecs_mc_min(diff, ecs_mc_messages_len(m));
+}
+
+// MessageCursor::missed_messages
+fn ecs_mc_missed(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> i64 {
+    return ecs_mc_sat_sub(ecs_mc_messages_oldest(m), c.last_message_count);
+}
+
+fn ecs_mc_is_empty(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> bool {
+    return ecs_mc_len(c, m) == 0;
+}
+
+// MessageCursor::clear — jump to current end
+fn ecs_mc_clear(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> EcsMessageCursorDeep {
+    c.last_message_count = m.message_count;
+    return c;
+}
+
+// === Read iterator state (MessageIteratorWithId) ===
+// Flattens unread A then B payloads into a fixed window; tracks unread remaining.
+struct EcsMessageReadIterDeep {
+    // cursor last after construction clamp / advances
+    last_message_count: i64,
+    unread: i64,
+    // up to 16 unread payloads + their message ids
+    p0: i64, p1: i64, p2: i64, p3: i64,
+    p4: i64, p5: i64, p6: i64, p7: i64,
+    p8: i64, p9: i64, p10: i64, p11: i64,
+    p12: i64, p13: i64, p14: i64, p15: i64,
+    id0: i64, id1: i64, id2: i64, id3: i64,
+    id4: i64, id5: i64, id6: i64, id7: i64,
+    id8: i64, id9: i64, id10: i64, id11: i64,
+    id12: i64, id13: i64, id14: i64, id15: i64,
+    // next index into the flattened window
+    pos: i64,
+    // mut vs shared flag (read_mut sets true; behavior same for payload model)
+    is_mut: bool,
+}
+
+fn ecs_mc_iter_empty() -> EcsMessageReadIterDeep {
+    return EcsMessageReadIterDeep {
+        last_message_count: 0,
+        unread: 0,
+        p0: 0, p1: 0, p2: 0, p3: 0,
+        p4: 0, p5: 0, p6: 0, p7: 0,
+        p8: 0, p9: 0, p10: 0, p11: 0,
+        p12: 0, p13: 0, p14: 0, p15: 0,
+        id0: 0, id1: 0, id2: 0, id3: 0,
+        id4: 0, id5: 0, id6: 0, id7: 0,
+        id8: 0, id9: 0, id10: 0, id11: 0,
+        id12: 0, id13: 0, id14: 0, id15: 0,
+        pos: 0,
+        is_mut: false,
+    };
+}
+
+fn ecs_mc_iter_set_payload(it: EcsMessageReadIterDeep, idx: i64, value: i64, id: i64) -> EcsMessageReadIterDeep {
+    if idx == 0 { it.p0 = value; it.id0 = id; };
+    if idx == 1 { it.p1 = value; it.id1 = id; };
+    if idx == 2 { it.p2 = value; it.id2 = id; };
+    if idx == 3 { it.p3 = value; it.id3 = id; };
+    if idx == 4 { it.p4 = value; it.id4 = id; };
+    if idx == 5 { it.p5 = value; it.id5 = id; };
+    if idx == 6 { it.p6 = value; it.id6 = id; };
+    if idx == 7 { it.p7 = value; it.id7 = id; };
+    if idx == 8 { it.p8 = value; it.id8 = id; };
+    if idx == 9 { it.p9 = value; it.id9 = id; };
+    if idx == 10 { it.p10 = value; it.id10 = id; };
+    if idx == 11 { it.p11 = value; it.id11 = id; };
+    if idx == 12 { it.p12 = value; it.id12 = id; };
+    if idx == 13 { it.p13 = value; it.id13 = id; };
+    if idx == 14 { it.p14 = value; it.id14 = id; };
+    if idx == 15 { it.p15 = value; it.id15 = id; };
+    return it;
+}
+
+fn ecs_mc_iter_get_payload(it: EcsMessageReadIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return it.p0; };
+    if idx == 1 { return it.p1; };
+    if idx == 2 { return it.p2; };
+    if idx == 3 { return it.p3; };
+    if idx == 4 { return it.p4; };
+    if idx == 5 { return it.p5; };
+    if idx == 6 { return it.p6; };
+    if idx == 7 { return it.p7; };
+    if idx == 8 { return it.p8; };
+    if idx == 9 { return it.p9; };
+    if idx == 10 { return it.p10; };
+    if idx == 11 { return it.p11; };
+    if idx == 12 { return it.p12; };
+    if idx == 13 { return it.p13; };
+    if idx == 14 { return it.p14; };
+    if idx == 15 { return it.p15; };
+    return 0;
+}
+
+fn ecs_mc_iter_get_id(it: EcsMessageReadIterDeep, idx: i64) -> i64 {
+    if idx == 0 { return it.id0; };
+    if idx == 1 { return it.id1; };
+    if idx == 2 { return it.id2; };
+    if idx == 3 { return it.id3; };
+    if idx == 4 { return it.id4; };
+    if idx == 5 { return it.id5; };
+    if idx == 6 { return it.id6; };
+    if idx == 7 { return it.id7; };
+    if idx == 8 { return it.id8; };
+    if idx == 9 { return it.id9; };
+    if idx == 10 { return it.id10; };
+    if idx == 11 { return it.id11; };
+    if idx == 12 { return it.id12; };
+    if idx == 13 { return it.id13; };
+    if idx == 14 { return it.id14; };
+    if idx == 15 { return it.id15; };
+    return 0;
+}
+
+// Build read iterator; also returns updated cursor (last_message_count clamped)
+// is_mut distinguishes read vs read_mut entry points (same iteration model).
+fn ecs_mc_read_with_id(
+    c: EcsMessageCursorDeep,
+    m: EcsMessagesDeep,
+    is_mut: bool
+) -> (EcsMessageCursorDeep, EcsMessageReadIterDeep) {
+    // a_index = last.saturating_sub(a_start); b_index similarly
+    let a_index = ecs_mc_sat_sub(c.last_message_count, m.a_start);
+    let b_index = ecs_mc_sat_sub(c.last_message_count, m.b_start);
+
+    let it = ecs_mc_iter_empty();
+    it.is_mut = is_mut;
+    let w: i64 = 0;
+
+    // append A[a_index..]
+    let ai: i64 = a_index;
+    while ai < (m.a_len as i64) {
+        if w < 16 {
+            let payload = ecs_mc_a_get(m, ai as i32);
+            let mid = m.a_start + ai;
+            it = ecs_mc_iter_set_payload(it, w, payload, mid);
+            w = w + 1;
+        };
+        ai = ai + 1;
+    }
+
+    // append B[b_index..]
+    let bi: i64 = b_index;
+    while bi < (m.b_len as i64) {
+        if w < 16 {
+            let payload = ecs_mc_b_get(m, bi as i32);
+            let mid = m.b_start + bi;
+            it = ecs_mc_iter_set_payload(it, w, payload, mid);
+            w = w + 1;
+        };
+        bi = bi + 1;
+    }
+
+    it.unread = w;
+    it.pos = 0;
+    // clamp cursor: last = message_count - unread
+    c.last_message_count = m.message_count - w;
+    it.last_message_count = c.last_message_count;
+    return (c, it);
+}
+
+fn ecs_mc_read(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> (EcsMessageCursorDeep, EcsMessageReadIterDeep) {
+    return ecs_mc_read_with_id(c, m, false);
+}
+
+fn ecs_mc_read_mut(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> (EcsMessageCursorDeep, EcsMessageReadIterDeep) {
+    return ecs_mc_read_with_id(c, m, true);
+}
+
+fn ecs_mc_read_mut_with_id(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> (EcsMessageCursorDeep, EcsMessageReadIterDeep) {
+    return ecs_mc_read_with_id(c, m, true);
+}
+
+fn ecs_mc_iter_unread(it: EcsMessageReadIterDeep) -> i64 { return it.unread; }
+fn ecs_mc_iter_len(it: EcsMessageReadIterDeep) -> i64 {
+    // ExactSizeIterator::len == remaining unread from current pos
+    return it.unread;
+}
+fn ecs_mc_iter_is_mut(it: EcsMessageReadIterDeep) -> bool { return it.is_mut; }
+
+// next: returns (has, value, id, iter')
+fn ecs_mc_iter_next(it: EcsMessageReadIterDeep) -> (bool, i64, i64, EcsMessageReadIterDeep) {
+    if it.unread <= 0 {
+        return (false, 0, 0, it);
+    };
+    let value = ecs_mc_iter_get_payload(it, it.pos);
+    let id = ecs_mc_iter_get_id(it, it.pos);
+    it.pos = it.pos + 1;
+    it.unread = it.unread - 1;
+    it.last_message_count = it.last_message_count + 1;
+    return (true, value, id, it);
+}
+
+// without_id next: same but id discarded by caller
+fn ecs_mc_iter_next_value(it: EcsMessageReadIterDeep) -> (bool, i64, EcsMessageReadIterDeep) {
+    let r = ecs_mc_iter_next(it);
+    return (r.0, r.1, r.3);
+}
+
+// count: consume remaining, advance last by unread, return count
+fn ecs_mc_iter_count(it: EcsMessageReadIterDeep) -> (i64, EcsMessageReadIterDeep) {
+    let n = it.unread;
+    it.last_message_count = it.last_message_count + n;
+    it.pos = it.pos + n;
+    it.unread = 0;
+    return (n, it);
+}
+
+// last: skip to final item
+fn ecs_mc_iter_last(it: EcsMessageReadIterDeep) -> (bool, i64, i64, EcsMessageReadIterDeep) {
+    if it.unread <= 0 {
+        return (false, 0, 0, it);
+    };
+    let last_idx = it.pos + it.unread - 1;
+    let value = ecs_mc_iter_get_payload(it, last_idx);
+    let id = ecs_mc_iter_get_id(it, last_idx);
+    it.last_message_count = it.last_message_count + it.unread;
+    it.pos = last_idx + 1;
+    it.unread = 0;
+    return (true, value, id, it);
+}
+
+// nth: skip n then take one
+fn ecs_mc_iter_nth(it: EcsMessageReadIterDeep, n: i64) -> (bool, i64, i64, EcsMessageReadIterDeep) {
+    if n < 0 {
+        return (false, 0, 0, it);
+    };
+    if n >= it.unread {
+        // exhaust
+        it.last_message_count = it.last_message_count + it.unread;
+        it.pos = it.pos + it.unread;
+        it.unread = 0;
+        return (false, 0, 0, it);
+    };
+    // advance n, then take
+    it.pos = it.pos + n;
+    it.unread = it.unread - n;
+    it.last_message_count = it.last_message_count + n;
+    return ecs_mc_iter_next(it);
+}
+
+// Sync cursor from iterator after partial/full consume
+fn ecs_mc_cursor_from_iter(it: EcsMessageReadIterDeep) -> EcsMessageCursorDeep {
+    return EcsMessageCursorDeep { last_message_count: it.last_message_count };
+}
+
+// === par_read model ===
+// Returns unread length + default batching marker (no TaskPool).
+struct EcsMessageParIterDeep {
+    unread: i64,
+    is_mut: bool,
+    // BatchingStrategy stand-in: batches_per_thread default 1
+    batches_per_thread: i64,
+}
+
+fn ecs_mc_par_read(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> (EcsMessageCursorDeep, EcsMessageParIterDeep) {
+    // same clamp as serial read
+    let r = ecs_mc_read_with_id(c, m, false);
+    let par = EcsMessageParIterDeep {
+        unread: r.1.unread,
+        is_mut: false,
+        batches_per_thread: 1,
+    };
+    return (r.0, par);
+}
+
+fn ecs_mc_par_read_mut(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> (EcsMessageCursorDeep, EcsMessageParIterDeep) {
+    let r = ecs_mc_read_with_id(c, m, true);
+    let par = EcsMessageParIterDeep {
+        unread: r.1.unread,
+        is_mut: true,
+        batches_per_thread: 1,
+    };
+    return (r.0, par);
+}
+
+fn ecs_mc_par_unread(p: EcsMessageParIterDeep) -> i64 { return p.unread; }
+fn ecs_mc_par_is_mut(p: EcsMessageParIterDeep) -> bool { return p.is_mut; }
+
+// Drain all via serial read helper — convenience for tests
+fn ecs_mc_read_all_values(c: EcsMessageCursorDeep, m: EcsMessagesDeep) -> (EcsMessageCursorDeep, i64, i64) {
+    // returns (cursor', count, sum_of_values)
+    let r = ecs_mc_read(c, m);
+    c = r.0;
+    let it = r.1;
+    let count: i64 = 0;
+    let sum: i64 = 0;
+    let cont: bool = true;
+    while cont {
+        let n = ecs_mc_iter_next_value(it);
+        if n.0 != true {
+            cont = false;
+        };
+        if n.0 == true {
+            count = count + 1;
+            sum = sum + n.1;
+            it = n.2;
+        };
+    }
+    c = ecs_mc_cursor_from_iter(it);
+    return (c, count, sum);
+}

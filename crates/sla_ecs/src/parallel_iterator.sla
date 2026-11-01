@@ -1,0 +1,754 @@
+// Bevy bevy_tasks ParallelIterator-style consumers over batched Vec<i32>.
+// SLA has no generic Iterator/Fn traits, so these APIs use named function pointers.
+@import "parallel_runner.sla"
+@import "sa_std/vec.sa"
+@import "sa_std/thread.sa"
+
+struct EcsParallelI32IterStats {
+    count: i64,
+    sum: i32,
+    product: i32,
+    has_min: bool,
+    min_value: i32,
+    has_max: bool,
+    max_value: i32,
+    batch_count: i64,
+    used_threads: bool,
+}
+
+struct EcsParallelI32Optional {
+    has: bool,
+    value: i32,
+}
+
+struct EcsParallelI32CollectResult {
+    values: Vec<i32>,
+    batch_starts: Vec<i64>,
+    batch_lens: Vec<i64>,
+    batch_count: i64,
+    used_threads: bool,
+}
+
+struct EcsParallelI32PartitionResult {
+    left: Vec<i32>,
+    right: Vec<i32>,
+    batch_starts: Vec<i64>,
+    batch_lens: Vec<i64>,
+    batch_count: i64,
+    used_threads: bool,
+}
+
+struct EcsParallelI32PredicateResult {
+    all_match: bool,
+    any_match: bool,
+    position_found: bool,
+    position_index: i64,
+    batch_count: i64,
+    used_threads: bool,
+}
+
+struct EcsParallelI32InspectResult {
+    values: Vec<i32>,
+    inspected: Vec<i32>,
+}
+
+struct EcsParallelI32FuseState {
+    values: Vec<i32>,
+    batch_size: i64,
+    cursor: i64,
+    exhausted: bool,
+}
+
+struct EcsParallelI32NextBatchResult {
+    state: EcsParallelI32FuseState,
+    has_batch: bool,
+    batch: Vec<i32>,
+}
+
+fn ecs_parallel_i32_optional(has: bool, value: i32) -> EcsParallelI32Optional {
+    return EcsParallelI32Optional { has: has, value: value };
+}
+
+fn ecs_parallel_i32_iter_effective_batch_size(batch_size: i64) -> i64 {
+    if batch_size <= 0 { return 1; };
+    return batch_size;
+}
+
+fn ecs_parallel_i32_iter_batch_count(len: i64, batch_size: i64) -> i64 {
+    if len <= 0 { return 0; };
+    let size = ecs_parallel_i32_iter_effective_batch_size(batch_size);
+    return (len + size - 1) / size;
+}
+
+fn ecs_parallel_i32_iter_chunk(values: Vec<i32>, start: i64, chunk_len: i64) -> Vec<i32> {
+    let chunk: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < chunk_len {
+        chunk.push(values[start + i]);
+        i = i + 1;
+    }
+    return chunk;
+}
+
+fn ecs_parallel_i32_iter_stats_result(count: i64, sum: i32, product: i32, has_min: bool, min_value: i32, has_max: bool, max_value: i32, batch_count: i64, used_threads: bool) -> EcsParallelI32IterStats {
+    return EcsParallelI32IterStats { count: count, sum: sum, product: product, has_min: has_min, min_value: min_value, has_max: has_max, max_value: max_value, batch_count: batch_count, used_threads: used_threads };
+}
+
+fn ecs_parallel_i32_iter_collect_result(values: Vec<i32>, batch_starts: Vec<i64>, batch_lens: Vec<i64>, used_threads: bool) -> EcsParallelI32CollectResult {
+    return EcsParallelI32CollectResult { values: values, batch_starts: batch_starts, batch_lens: batch_lens, batch_count: len(batch_starts) as i64, used_threads: used_threads };
+}
+
+fn ecs_parallel_i32_iter_partition_result(left: Vec<i32>, right: Vec<i32>, batch_starts: Vec<i64>, batch_lens: Vec<i64>, used_threads: bool) -> EcsParallelI32PartitionResult {
+    return EcsParallelI32PartitionResult { left: left, right: right, batch_starts: batch_starts, batch_lens: batch_lens, batch_count: len(batch_starts) as i64, used_threads: used_threads };
+}
+
+fn ecs_parallel_i32_iter_predicate_result(all_match: bool, any_match: bool, position_found: bool, position_index: i64, batch_count: i64, used_threads: bool) -> EcsParallelI32PredicateResult {
+    return EcsParallelI32PredicateResult { all_match: all_match, any_match: any_match, position_found: position_found, position_index: position_index, batch_count: batch_count, used_threads: used_threads };
+}
+
+fn ecs_parallel_i32_iter_batch_stats(chunk: Vec<i32>) -> EcsParallelI32IterStats {
+    let count = len(chunk) as i64;
+    let sum: i32 = 0;
+    let product: i32 = 1;
+    let has_value = count > 0;
+    let min_value: i32 = 0;
+    let max_value: i32 = 0;
+    let i: i64 = 0;
+    while i < count {
+        let value = chunk[i];
+        sum = sum + value;
+        product = product * value;
+        if i == 0 {
+            min_value = value;
+            max_value = value;
+        } else {
+            if value < min_value { min_value = value; };
+            if value > max_value { max_value = value; };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_i32_iter_stats_result(count, sum, product, has_value, min_value, has_value, max_value, 1, false);
+}
+
+fn ecs_parallel_i32_iter_map_batch(chunk: Vec<i32>, mapper: fn(i32) -> i32) -> EcsParallelI32CollectResult {
+    let out: Vec<i32> = Vec::new();
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    while i < len(chunk) as i64 {
+        out.push(mapper(chunk[i]));
+        i = i + 1;
+    }
+    return ecs_parallel_i32_iter_collect_result(out, starts, lens, false);
+}
+
+fn ecs_parallel_i32_iter_partition_batch(chunk: Vec<i32>, predicate: fn(i32) -> bool) -> EcsParallelI32PartitionResult {
+    let left: Vec<i32> = Vec::new();
+    let right: Vec<i32> = Vec::new();
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    while i < len(chunk) as i64 {
+        let value = chunk[i];
+        if predicate(value) { left.push(value); } else { right.push(value); };
+        i = i + 1;
+    }
+    return ecs_parallel_i32_iter_partition_result(left, right, starts, lens, false);
+}
+
+fn ecs_parallel_i32_iter_fold_batch(chunk: Vec<i32>, init: i32, folder: fn(i32, i32) -> i32) -> i32 {
+    let acc = init;
+    let i: i64 = 0;
+    while i < len(chunk) as i64 {
+        acc = folder(acc, chunk[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn ecs_parallel_i32_iter_predicate_batch(start: i64, chunk: Vec<i32>, predicate: fn(i32) -> bool) -> EcsParallelI32PredicateResult {
+    let all_match = true;
+    let any_match = false;
+    let position_found = false;
+    let position_index: i64 = -1;
+    let i: i64 = 0;
+    while i < len(chunk) as i64 {
+        let matches = predicate(chunk[i]);
+        if matches {
+            any_match = true;
+            if position_found != true {
+                position_found = true;
+                position_index = start + i;
+            };
+        } else {
+            all_match = false;
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_i32_iter_predicate_result(all_match, any_match, position_found, position_index, 1, false);
+}
+
+fn ecs_parallel_i32_iter_stats(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> EcsParallelI32IterStats {
+    let size = ecs_parallel_i32_iter_effective_batch_size(batch_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let handles: Vec<JoinHandle<EcsParallelI32IterStats>> = Vec::new();
+    let count: i64 = 0;
+    let sum: i32 = 0;
+    let product: i32 = 1;
+    let has_min = false;
+    let min_value: i32 = 0;
+    let has_max = false;
+    let max_value: i32 = 0;
+    let batch_count: i64 = 0;
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_iter_chunk(values, start, current_len);
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_iter_batch_stats(chunk)));
+        } else {
+            let stats = ecs_parallel_i32_iter_batch_stats(chunk);
+            count = count + stats.count;
+            sum = sum + stats.sum;
+            product = product * stats.product;
+            if stats.has_min {
+                if has_min != true || stats.min_value < min_value { min_value = stats.min_value; };
+                has_min = true;
+            };
+            if stats.has_max {
+                if has_max != true || stats.max_value > max_value { max_value = stats.max_value; };
+                has_max = true;
+            };
+        };
+        batch_count = batch_count + 1;
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        let stats = handles[join_i].join().unwrap();
+        count = count + stats.count;
+        sum = sum + stats.sum;
+        product = product * stats.product;
+        if stats.has_min {
+            if has_min != true || stats.min_value < min_value { min_value = stats.min_value; };
+            has_min = true;
+        };
+        if stats.has_max {
+            if has_max != true || stats.max_value > max_value { max_value = stats.max_value; };
+            has_max = true;
+        };
+        join_i = join_i + 1;
+    }
+    return ecs_parallel_i32_iter_stats_result(count, sum, product, has_min, min_value, has_max, max_value, batch_count, len(handles) > 0);
+}
+
+fn ecs_parallel_i32_iter_count(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> i64 {
+    return ecs_parallel_i32_iter_stats(pool, values, batch_size).count;
+}
+
+fn ecs_parallel_i32_iter_sum(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> i32 {
+    return ecs_parallel_i32_iter_stats(pool, values, batch_size).sum;
+}
+
+fn ecs_parallel_i32_iter_product(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> i32 {
+    return ecs_parallel_i32_iter_stats(pool, values, batch_size).product;
+}
+
+fn ecs_parallel_i32_iter_min(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> EcsParallelI32Optional {
+    let stats = ecs_parallel_i32_iter_stats(pool, values, batch_size);
+    return ecs_parallel_i32_optional(stats.has_min, stats.min_value);
+}
+
+fn ecs_parallel_i32_iter_max(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> EcsParallelI32Optional {
+    let stats = ecs_parallel_i32_iter_stats(pool, values, batch_size);
+    return ecs_parallel_i32_optional(stats.has_max, stats.max_value);
+}
+
+fn ecs_parallel_i32_iter_collect(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64) -> EcsParallelI32CollectResult {
+    return ecs_parallel_i32_iter_map(pool, values, batch_size, ecs_parallel_i32_identity);
+}
+
+fn ecs_parallel_i32_iter_map(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, mapper: fn(i32) -> i32) -> EcsParallelI32CollectResult {
+    let size = ecs_parallel_i32_iter_effective_batch_size(batch_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let out: Vec<i32> = Vec::new();
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let handles: Vec<JoinHandle<EcsParallelI32CollectResult>> = Vec::new();
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_iter_chunk(values, start, current_len);
+        starts.push(start);
+        lens.push(current_len);
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_iter_map_batch(chunk, mapper)));
+        } else {
+            let part = ecs_parallel_i32_iter_map_batch(chunk, mapper);
+            let i: i64 = 0;
+            while i < len(part.values) as i64 {
+                out.push(part.values[i]);
+                i = i + 1;
+            }
+        };
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        let part = handles[join_i].join().unwrap();
+        let i: i64 = 0;
+        while i < len(part.values) as i64 {
+            out.push(part.values[i]);
+            i = i + 1;
+        }
+        join_i = join_i + 1;
+    }
+    return ecs_parallel_i32_iter_collect_result(out, starts, lens, len(handles) > 0);
+}
+
+fn ecs_parallel_i32_iter_partition(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, predicate: fn(i32) -> bool) -> EcsParallelI32PartitionResult {
+    let size = ecs_parallel_i32_iter_effective_batch_size(batch_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let left: Vec<i32> = Vec::new();
+    let right: Vec<i32> = Vec::new();
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let handles: Vec<JoinHandle<EcsParallelI32PartitionResult>> = Vec::new();
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_iter_chunk(values, start, current_len);
+        starts.push(start);
+        lens.push(current_len);
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_iter_partition_batch(chunk, predicate)));
+        } else {
+            let part = ecs_parallel_i32_iter_partition_batch(chunk, predicate);
+            let i: i64 = 0;
+            while i < len(part.left) as i64 { left.push(part.left[i]); i = i + 1; }
+            let j: i64 = 0;
+            while j < len(part.right) as i64 { right.push(part.right[j]); j = j + 1; }
+        };
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        let part = handles[join_i].join().unwrap();
+        let i: i64 = 0;
+        while i < len(part.left) as i64 { left.push(part.left[i]); i = i + 1; }
+        let j: i64 = 0;
+        while j < len(part.right) as i64 { right.push(part.right[j]); j = j + 1; }
+        join_i = join_i + 1;
+    }
+    return ecs_parallel_i32_iter_partition_result(left, right, starts, lens, len(handles) > 0);
+}
+
+fn ecs_parallel_i32_iter_fold(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, init: i32, folder: fn(i32, i32) -> i32) -> EcsParallelI32CollectResult {
+    let size = ecs_parallel_i32_iter_effective_batch_size(batch_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let out: Vec<i32> = Vec::new();
+    let starts: Vec<i64> = Vec::new();
+    let lens: Vec<i64> = Vec::new();
+    let handles: Vec<JoinHandle<i32>> = Vec::new();
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_iter_chunk(values, start, current_len);
+        starts.push(start);
+        lens.push(current_len);
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_iter_fold_batch(chunk, init, folder)));
+        } else {
+            out.push(ecs_parallel_i32_iter_fold_batch(chunk, init, folder));
+        };
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        out.push(handles[join_i].join().unwrap());
+        join_i = join_i + 1;
+    }
+    return ecs_parallel_i32_iter_collect_result(out, starts, lens, len(handles) > 0);
+}
+
+fn ecs_parallel_i32_iter_predicates(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, predicate: fn(i32) -> bool) -> EcsParallelI32PredicateResult {
+    let size = ecs_parallel_i32_iter_effective_batch_size(batch_size);
+    let n = len(values) as i64;
+    let use_threads = ecs_parallel_task_pool_worker_count(pool) > 0;
+    let all_match = true;
+    let any_match = false;
+    let position_found = false;
+    let position_index: i64 = -1;
+    let batch_count: i64 = 0;
+    let handles: Vec<JoinHandle<EcsParallelI32PredicateResult>> = Vec::new();
+    let start: i64 = 0;
+    while start < n {
+        let current_len = size;
+        let remaining = n - start;
+        if current_len > remaining { current_len = remaining; };
+        let chunk = ecs_parallel_i32_iter_chunk(values, start, current_len);
+        let task_start = start;
+        if use_threads {
+            handles.push(thread::spawn(^|| ecs_parallel_i32_iter_predicate_batch(task_start, chunk, predicate)));
+        } else {
+            let part = ecs_parallel_i32_iter_predicate_batch(task_start, chunk, predicate);
+            if part.all_match != true { all_match = false; };
+            if part.any_match { any_match = true; };
+            if position_found != true && part.position_found {
+                position_found = true;
+                position_index = part.position_index;
+            };
+        };
+        batch_count = batch_count + 1;
+        start = start + current_len;
+    }
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        let part = handles[join_i].join().unwrap();
+        if part.all_match != true { all_match = false; };
+        if part.any_match { any_match = true; };
+        if position_found != true && part.position_found {
+            position_found = true;
+            position_index = part.position_index;
+        };
+        join_i = join_i + 1;
+    }
+    return ecs_parallel_i32_iter_predicate_result(all_match, any_match, position_found, position_index, batch_count, len(handles) > 0);
+}
+
+fn ecs_parallel_i32_iter_all(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, predicate: fn(i32) -> bool) -> bool {
+    let result = ecs_parallel_i32_iter_predicates(pool, values, batch_size, predicate);
+    return result.all_match;
+}
+
+fn ecs_parallel_i32_iter_any(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, predicate: fn(i32) -> bool) -> bool {
+    let result = ecs_parallel_i32_iter_predicates(pool, values, batch_size, predicate);
+    return result.any_match;
+}
+
+fn ecs_parallel_i32_iter_position(pool: EcsParallelTaskPool, values: Vec<i32>, batch_size: i64, predicate: fn(i32) -> bool) -> EcsParallelI32Optional {
+    let result = ecs_parallel_i32_iter_predicates(pool, values, batch_size, predicate);
+    return ecs_parallel_i32_optional(result.position_found, result.position_index as i32);
+}
+
+fn ecs_parallel_i32_iter_append_all(out: Vec<i32>, values: Vec<i32>) -> Vec<i32> {
+    let i: i64 = 0;
+    while i < len(values) as i64 {
+        out.push(values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_iter_chain(left: Vec<i32>, right: Vec<i32>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    out = ecs_parallel_i32_iter_append_all(out, left);
+    out = ecs_parallel_i32_iter_append_all(out, right);
+    return out;
+}
+
+fn ecs_parallel_i32_iter_filter(values: Vec<i32>, predicate: fn(i32) -> bool) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < len(values) as i64 {
+        let value = values[i];
+        if predicate(value) { out.push(value); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_iter_filter_map(values: Vec<i32>, mapper: fn(i32) -> EcsParallelI32Optional) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < len(values) as i64 {
+        let mapped = mapper(values[i]);
+        if mapped.has { out.push(mapped.value); };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_iter_flat_map(values: Vec<i32>, mapper: fn(i32) -> Vec<i32>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < len(values) as i64 {
+        let mapped = mapper(values[i]);
+        out = ecs_parallel_i32_iter_append_all(out, mapped);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_iter_flatten(values: Vec<Vec<i32>>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < len(values) as i64 {
+        out = ecs_parallel_i32_iter_append_all(out, values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_iter_inspect(values: Vec<i32>, inspector: fn(i32) -> i32) -> EcsParallelI32InspectResult {
+    let out: Vec<i32> = Vec::new();
+    let inspected: Vec<i32> = Vec::new();
+    let i: i64 = 0;
+    while i < len(values) as i64 {
+        let value = values[i];
+        inspected.push(inspector(value));
+        out.push(value);
+        i = i + 1;
+    }
+    return EcsParallelI32InspectResult { values: out, inspected: inspected };
+}
+
+fn ecs_parallel_i32_iter_copied(values: Vec<i32>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    return ecs_parallel_i32_iter_append_all(out, values);
+}
+
+fn ecs_parallel_i32_iter_cloned(values: Vec<i32>) -> Vec<i32> {
+    return ecs_parallel_i32_iter_copied(values);
+}
+
+fn ecs_parallel_i32_iter_cycle_take(values: Vec<i32>, take_count: i64) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let n = len(values) as i64;
+    if n <= 0 { return out; };
+    let i: i64 = 0;
+    while i < take_count {
+        out.push(values[i % n]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_parallel_i32_iter_fuse_new(values: Vec<i32>, batch_size: i64) -> EcsParallelI32FuseState {
+    return EcsParallelI32FuseState { values: values, batch_size: ecs_parallel_i32_iter_effective_batch_size(batch_size), cursor: 0, exhausted: false };
+}
+
+fn ecs_parallel_i32_iter_next_batch(state: EcsParallelI32FuseState) -> EcsParallelI32NextBatchResult {
+    let empty: Vec<i32> = Vec::new();
+    if state.exhausted { return EcsParallelI32NextBatchResult { state: state, has_batch: false, batch: empty }; };
+    let n = len(state.values) as i64;
+    if state.cursor >= n {
+        state.exhausted = true;
+        return EcsParallelI32NextBatchResult { state: state, has_batch: false, batch: empty };
+    };
+    let current_len = state.batch_size;
+    let remaining = n - state.cursor;
+    if current_len > remaining { current_len = remaining; };
+    let batch = ecs_parallel_i32_iter_chunk(state.values, state.cursor, current_len);
+    state.cursor = state.cursor + current_len;
+    return EcsParallelI32NextBatchResult { state: state, has_batch: true, batch: batch };
+}
+
+fn ecs_parallel_i32_identity(value: i32) -> i32 { return value; }
+
+fn ecs_parallel_i32_double(value: i32) -> i32 { return value * 2; }
+
+fn ecs_parallel_i32_is_even(value: i32) -> bool { return value % 2 == 0; }
+
+fn ecs_parallel_i32_less_than_ten(value: i32) -> bool { return value < 10; }
+
+fn ecs_parallel_i32_accumulate(acc: i32, value: i32) -> i32 { return acc + value; }
+
+fn ecs_parallel_i32_filter_map_even_double(value: i32) -> EcsParallelI32Optional {
+    if value % 2 == 0 { return ecs_parallel_i32_optional(true, value * 2); };
+    return ecs_parallel_i32_optional(false, 0);
+}
+
+fn ecs_parallel_i32_flat_pair(value: i32) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    out.push(value);
+    out.push(value + 10);
+    return out;
+}
+
+fn ecs_parallel_i32_inspect_square(value: i32) -> i32 { return value * value; }
+
+fn ecs_parallel_iter_test_values() -> Vec<i32> {
+    let values: Vec<i32> = Vec::new();
+    values.push(3);
+    values.push(1);
+    values.push(4);
+    values.push(1);
+    values.push(5);
+    values.push(9);
+    return values;
+}
+
+fn ecs_parallel_iter_test_more_values() -> Vec<i32> {
+    let values: Vec<i32> = Vec::new();
+    values.push(2);
+    values.push(6);
+    return values;
+}
+
+fn ecs_parallel_iter_test_nested_values() -> Vec<Vec<i32>> {
+    let values: Vec<Vec<i32>> = Vec::new();
+    let a: Vec<i32> = Vec::new();
+    a.push(7);
+    a.push(8);
+    let b: Vec<i32> = Vec::new();
+    b.push(9);
+    values.push(a);
+    values.push(b);
+    return values;
+}
+
+@test "parallel iterator stats count sum product min max"() {
+    let pool = ecs_parallel_task_pool_new(3);
+    let stats = ecs_parallel_i32_iter_stats(pool, ecs_parallel_iter_test_values(), 2);
+    if stats.count != 6 { panic(31100); };
+    if stats.sum != 23 { panic(31101); };
+    if stats.product != 540 { panic(31102); };
+    if stats.has_min != true { panic(31103); };
+    if stats.min_value != 1 { panic(31104); };
+    if stats.has_max != true { panic(31105); };
+    if stats.max_value != 9 { panic(31106); };
+    if stats.batch_count != 3 { panic(31107); };
+    if stats.used_threads != true { panic(31108); };
+}
+
+@test "parallel iterator empty stats match iterator identities"() {
+    let pool = ecs_parallel_task_pool_new(2);
+    let values: Vec<i32> = Vec::new();
+    let stats = ecs_parallel_i32_iter_stats(pool, values, 3);
+    if stats.count != 0 { panic(31110); };
+    if stats.sum != 0 { panic(31111); };
+    if stats.product != 1 { panic(31112); };
+    if stats.has_min { panic(31113); };
+    if stats.has_max { panic(31114); };
+    if stats.batch_count != 0 { panic(31115); };
+    if stats.used_threads { panic(31116); };
+}
+
+@test "parallel iterator adapters chain filter filter map"() {
+    let chained = ecs_parallel_i32_iter_chain(ecs_parallel_iter_test_values(), ecs_parallel_iter_test_more_values());
+    if len(chained) != 8 { panic(31170); };
+    if chained[0] != 3 { panic(31171); };
+    if chained[6] != 2 { panic(31172); };
+    if chained[7] != 6 { panic(31173); };
+    let filtered = ecs_parallel_i32_iter_filter(chained, ecs_parallel_i32_is_even);
+    if len(filtered) != 3 { panic(31174); };
+    if filtered[0] != 4 { panic(31175); };
+    if filtered[1] != 2 { panic(31176); };
+    if filtered[2] != 6 { panic(31177); };
+    let mapped = ecs_parallel_i32_iter_filter_map(filtered, ecs_parallel_i32_filter_map_even_double);
+    if len(mapped) != 3 { panic(31178); };
+    if mapped[0] != 8 { panic(31179); };
+    if mapped[2] != 12 { panic(31180); };
+}
+
+@test "parallel iterator adapters flat map flatten inspect copy clone"() {
+    let source = ecs_parallel_iter_test_more_values();
+    let flat_mapped = ecs_parallel_i32_iter_flat_map(source, ecs_parallel_i32_flat_pair);
+    if len(flat_mapped) != 4 { panic(31190); };
+    if flat_mapped[0] != 2 { panic(31191); };
+    if flat_mapped[1] != 12 { panic(31192); };
+    if flat_mapped[3] != 16 { panic(31193); };
+    let flattened = ecs_parallel_i32_iter_flatten(ecs_parallel_iter_test_nested_values());
+    if len(flattened) != 3 { panic(31194); };
+    if flattened[0] != 7 { panic(31195); };
+    if flattened[2] != 9 { panic(31196); };
+    let inspected = ecs_parallel_i32_iter_inspect(flattened, ecs_parallel_i32_inspect_square);
+    if inspected.values[1] != 8 { panic(31197); };
+    if inspected.inspected[1] != 64 { panic(31198); };
+    let copied = ecs_parallel_i32_iter_copied(inspected.values);
+    if copied[2] != 9 { panic(31199); };
+    let cloned = ecs_parallel_i32_iter_cloned(copied);
+    if cloned[0] != 7 { panic(31200); };
+}
+
+@test "parallel iterator adapters cycle take and fuse next batch"() {
+    let cycled = ecs_parallel_i32_iter_cycle_take(ecs_parallel_iter_test_more_values(), 5);
+    if len(cycled) != 5 { panic(31210); };
+    if cycled[0] != 2 { panic(31211); };
+    if cycled[1] != 6 { panic(31212); };
+    if cycled[2] != 2 { panic(31213); };
+    if cycled[4] != 2 { panic(31214); };
+    let state0 = ecs_parallel_i32_iter_fuse_new(ecs_parallel_iter_test_values(), 4);
+    let first = ecs_parallel_i32_iter_next_batch(state0);
+    if first.has_batch != true { panic(31215); };
+    if len(first.batch) != 4 { panic(31216); };
+    if first.batch[2] != 4 { panic(31217); };
+    let second = ecs_parallel_i32_iter_next_batch(first.state);
+    if second.has_batch != true { panic(31218); };
+    if len(second.batch) != 2 { panic(31219); };
+    if second.batch[1] != 9 { panic(31220); };
+    let third = ecs_parallel_i32_iter_next_batch(second.state);
+    if third.has_batch { panic(31221); };
+    let fourth = ecs_parallel_i32_iter_next_batch(third.state);
+    if fourth.has_batch { panic(31222); };
+}
+
+@test "parallel iterator collect and map preserve batch order"() {
+    let pool = ecs_parallel_task_pool_new(4);
+    let collected = ecs_parallel_i32_iter_collect(pool, ecs_parallel_iter_test_values(), 4);
+    if collected.batch_count != 2 { panic(31120); };
+    if collected.values[0] != 3 { panic(31121); };
+    if collected.values[5] != 9 { panic(31122); };
+    if collected.batch_lens[1] != 2 { panic(31123); };
+    let mapped = ecs_parallel_i32_iter_map(pool, ecs_parallel_iter_test_values(), 2, ecs_parallel_i32_double);
+    if mapped.values[0] != 6 { panic(31124); };
+    if mapped.values[2] != 8 { panic(31125); };
+    if mapped.values[5] != 18 { panic(31126); };
+    if mapped.used_threads != true { panic(31127); };
+}
+
+@test "parallel iterator partition preserves per side order"() {
+    let pool = ecs_parallel_task_pool_new(3);
+    let result = ecs_parallel_i32_iter_partition(pool, ecs_parallel_iter_test_values(), 2, ecs_parallel_i32_is_even);
+    if result.batch_count != 3 { panic(31130); };
+    if len(result.left) != 1 { panic(31131); };
+    if result.left[0] != 4 { panic(31132); };
+    if len(result.right) != 5 { panic(31133); };
+    if result.right[0] != 3 { panic(31134); };
+    if result.right[4] != 9 { panic(31135); };
+}
+
+@test "parallel iterator fold returns one value per batch"() {
+    let pool = ecs_parallel_task_pool_new(2);
+    let result = ecs_parallel_i32_iter_fold(pool, ecs_parallel_iter_test_values(), 2, 10, ecs_parallel_i32_accumulate);
+    if result.batch_count != 3 { panic(31140); };
+    if len(result.values) != 3 { panic(31141); };
+    if result.values[0] != 14 { panic(31142); };
+    if result.values[1] != 15 { panic(31143); };
+    if result.values[2] != 24 { panic(31144); };
+}
+
+@test "parallel iterator all any position consume whole batches"() {
+    let pool = ecs_parallel_task_pool_new(3);
+    let result = ecs_parallel_i32_iter_predicates(pool, ecs_parallel_iter_test_values(), 2, ecs_parallel_i32_is_even);
+    if result.all_match { panic(31150); };
+    if result.any_match != true { panic(31151); };
+    if result.position_found != true { panic(31152); };
+    if result.position_index != 2 { panic(31153); };
+    let all_result = ecs_parallel_i32_iter_all(ecs_parallel_task_pool_new(3), ecs_parallel_iter_test_values(), 3, ecs_parallel_i32_less_than_ten);
+    if all_result != true { panic(31154); };
+    let pos = ecs_parallel_i32_iter_position(ecs_parallel_task_pool_new(3), ecs_parallel_iter_test_values(), 4, ecs_parallel_i32_is_even);
+    if pos.has != true { panic(31155); };
+    if pos.value != 2 { panic(31156); };
+}
+
+@test "parallel iterator zero worker runs inline"() {
+    let pool = ecs_parallel_task_pool_new(0);
+    let result = ecs_parallel_i32_iter_map(pool, ecs_parallel_iter_test_values(), 0, ecs_parallel_i32_double);
+    if result.batch_count != 6 { panic(31160); };
+    if result.used_threads { panic(31161); };
+    if result.values[4] != 10 { panic(31162); };
+}

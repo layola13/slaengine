@@ -1,0 +1,701 @@
+// Deepened Bevy ECS system::commands::entity_command surface.
+// Mirrors src/system/commands/entity_command.rs: EntityCommand trait apply,
+// EntityCommandError, with_entity -> Command, built-ins insert/remove/clear/
+// despawn/retain/clone/move/observe/log, InsertMode Keep vs Replace.
+// Shallow lib/entity_command.sla retained (constructors only).
+
+// === InsertMode ===
+const ECS_EC_DEEP_INSERT_REPLACE: i32 = 0; // InsertMode::Replace / Default
+const ECS_EC_DEEP_INSERT_KEEP: i32 = 1;    // InsertMode::Keep
+
+// === EntityCommandError ===
+const ECS_EC_DEEP_OK: i32 = 0;
+const ECS_EC_DEEP_ENTITY_FETCH: i32 = 1;   // EntityFetchError
+const ECS_EC_DEEP_COMMAND_FAILED: i32 = 2; // CommandFailed(E)
+
+// === command kinds ===
+const ECS_EC_DEEP_KIND_INSERT: i32 = 0;
+const ECS_EC_DEEP_KIND_INSERT_FROM_WORLD: i32 = 1;
+const ECS_EC_DEEP_KIND_INSERT_WITH: i32 = 2;
+const ECS_EC_DEEP_KIND_REMOVE: i32 = 3;
+const ECS_EC_DEEP_KIND_REMOVE_WITH_REQUIRES: i32 = 4;
+const ECS_EC_DEEP_KIND_REMOVE_BY_ID: i32 = 5;
+const ECS_EC_DEEP_KIND_CLEAR: i32 = 6;
+const ECS_EC_DEEP_KIND_RETAIN: i32 = 7;
+const ECS_EC_DEEP_KIND_DESPAWN: i32 = 8;
+const ECS_EC_DEEP_KIND_OBSERVE: i32 = 9;
+const ECS_EC_DEEP_KIND_CLONE_OPT_OUT: i32 = 10;
+const ECS_EC_DEEP_KIND_CLONE_OPT_IN: i32 = 11;
+const ECS_EC_DEEP_KIND_CLONE_COMPONENTS: i32 = 12;
+const ECS_EC_DEEP_KIND_MOVE_COMPONENTS: i32 = 13;
+const ECS_EC_DEEP_KIND_LOG: i32 = 14;
+const ECS_EC_DEEP_KIND_CUSTOM_FAIL: i32 = 15;
+
+// Fixed entity slots 0..7, component bits 0..7, value table for primary components
+struct EcsEntityCmdWorldDeep {
+    // occupancy
+    e0: bool, e1: bool, e2: bool, e3: bool,
+    e4: bool, e5: bool, e6: bool, e7: bool,
+    // component bitmasks
+    c0: i64, c1: i64, c2: i64, c3: i64,
+    c4: i64, c5: i64, c6: i64, c7: i64,
+    // primary value for component 0 (and general value map per entity for last written)
+    v0: i64, v1: i64, v2: i64, v3: i64,
+    v4: i64, v5: i64, v6: i64, v7: i64,
+    // required-component links: bit R means component R requires component (R+1)%8 modeled as require_mask[cid]
+    // simplified: each component requires next id bit if requires_enabled
+    requires_enabled: bool,
+    // observer attachment count / last observer id
+    observer_count: i64,
+    last_observer_id: i64,
+    // log_components last entity + component count
+    log_entity: i64,
+    log_component_count: i32,
+    last_error: i32,
+    last_command_failed_code: i64,
+    // FromWorld factory values keyed by component id (0..7) stored as f0..f7
+    f0: i64, f1: i64, f2: i64, f3: i64,
+    f4: i64, f5: i64, f6: i64, f7: i64,
+    from_world_calls: i64,
+}
+
+fn ecs_ec_deep_world_new() -> EcsEntityCmdWorldDeep {
+    return EcsEntityCmdWorldDeep {
+        e0: false, e1: false, e2: false, e3: false,
+        e4: false, e5: false, e6: false, e7: false,
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        c4: 0, c5: 0, c6: 0, c7: 0,
+        v0: 0, v1: 0, v2: 0, v3: 0,
+        v4: 0, v5: 0, v6: 0, v7: 0,
+        requires_enabled: true,
+        observer_count: 0,
+        last_observer_id: 0,
+        log_entity: 0,
+        log_component_count: 0,
+        last_error: ECS_EC_DEEP_OK,
+        last_command_failed_code: 0,
+        f0: 100, f1: 101, f2: 102, f3: 103,
+        f4: 104, f5: 105, f6: 106, f7: 107,
+        from_world_calls: 0,
+    };
+}
+
+fn ecs_ec_deep_last_error(w: EcsEntityCmdWorldDeep) -> i32 { return w.last_error; }
+fn ecs_ec_deep_last_command_failed(w: EcsEntityCmdWorldDeep) -> i64 { return w.last_command_failed_code; }
+fn ecs_ec_deep_observer_count(w: EcsEntityCmdWorldDeep) -> i64 { return w.observer_count; }
+fn ecs_ec_deep_last_observer_id(w: EcsEntityCmdWorldDeep) -> i64 { return w.last_observer_id; }
+fn ecs_ec_deep_log_entity(w: EcsEntityCmdWorldDeep) -> i64 { return w.log_entity; }
+fn ecs_ec_deep_log_component_count(w: EcsEntityCmdWorldDeep) -> i32 { return w.log_component_count; }
+fn ecs_ec_deep_from_world_calls(w: EcsEntityCmdWorldDeep) -> i64 { return w.from_world_calls; }
+
+fn ecs_ec_deep_set_requires_enabled(w: EcsEntityCmdWorldDeep, v: bool) -> EcsEntityCmdWorldDeep {
+    w.requires_enabled = v;
+    return w;
+}
+
+fn ecs_ec_deep_occupied(w: EcsEntityCmdWorldDeep, e: i64) -> bool {
+    if e == 0 { return w.e0; };
+    if e == 1 { return w.e1; };
+    if e == 2 { return w.e2; };
+    if e == 3 { return w.e3; };
+    if e == 4 { return w.e4; };
+    if e == 5 { return w.e5; };
+    if e == 6 { return w.e6; };
+    if e == 7 { return w.e7; };
+    return false;
+}
+
+fn ecs_ec_deep_set_occupied(w: EcsEntityCmdWorldDeep, e: i64, v: bool) -> EcsEntityCmdWorldDeep {
+    if e == 0 { w.e0 = v; };
+    if e == 1 { w.e1 = v; };
+    if e == 2 { w.e2 = v; };
+    if e == 3 { w.e3 = v; };
+    if e == 4 { w.e4 = v; };
+    if e == 5 { w.e5 = v; };
+    if e == 6 { w.e6 = v; };
+    if e == 7 { w.e7 = v; };
+    return w;
+}
+
+fn ecs_ec_deep_get_mask(w: EcsEntityCmdWorldDeep, e: i64) -> i64 {
+    if e == 0 { return w.c0; };
+    if e == 1 { return w.c1; };
+    if e == 2 { return w.c2; };
+    if e == 3 { return w.c3; };
+    if e == 4 { return w.c4; };
+    if e == 5 { return w.c5; };
+    if e == 6 { return w.c6; };
+    if e == 7 { return w.c7; };
+    return 0;
+}
+
+fn ecs_ec_deep_set_mask(w: EcsEntityCmdWorldDeep, e: i64, m: i64) -> EcsEntityCmdWorldDeep {
+    if e == 0 { w.c0 = m; };
+    if e == 1 { w.c1 = m; };
+    if e == 2 { w.c2 = m; };
+    if e == 3 { w.c3 = m; };
+    if e == 4 { w.c4 = m; };
+    if e == 5 { w.c5 = m; };
+    if e == 6 { w.c6 = m; };
+    if e == 7 { w.c7 = m; };
+    return w;
+}
+
+fn ecs_ec_deep_get_value(w: EcsEntityCmdWorldDeep, e: i64) -> i64 {
+    if e == 0 { return w.v0; };
+    if e == 1 { return w.v1; };
+    if e == 2 { return w.v2; };
+    if e == 3 { return w.v3; };
+    if e == 4 { return w.v4; };
+    if e == 5 { return w.v5; };
+    if e == 6 { return w.v6; };
+    if e == 7 { return w.v7; };
+    return 0;
+}
+
+fn ecs_ec_deep_set_value(w: EcsEntityCmdWorldDeep, e: i64, v: i64) -> EcsEntityCmdWorldDeep {
+    if e == 0 { w.v0 = v; };
+    if e == 1 { w.v1 = v; };
+    if e == 2 { w.v2 = v; };
+    if e == 3 { w.v3 = v; };
+    if e == 4 { w.v4 = v; };
+    if e == 5 { w.v5 = v; };
+    if e == 6 { w.v6 = v; };
+    if e == 7 { w.v7 = v; };
+    return w;
+}
+
+fn ecs_ec_deep_bit(cid: i64) -> i64 {
+    if cid < 0 || cid > 7 { return 0; };
+    let b: i64 = 1;
+    let i: i64 = 0;
+    while i < cid {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ecs_ec_deep_has(w: EcsEntityCmdWorldDeep, e: i64, cid: i64) -> bool {
+    if ecs_ec_deep_occupied(w, e) != true { return false; };
+    let m = ecs_ec_deep_get_mask(w, e);
+    let b = ecs_ec_deep_bit(cid);
+    return (m / b) % 2 == 1;
+}
+
+fn ecs_ec_deep_component_count(w: EcsEntityCmdWorldDeep, e: i64) -> i32 {
+    let m = ecs_ec_deep_get_mask(w, e);
+    let n: i32 = 0;
+    let cid: i64 = 0;
+    while cid < 8 {
+        let b = ecs_ec_deep_bit(cid);
+        if (m / b) % 2 == 1 { n = n + 1; };
+        cid = cid + 1;
+    }
+    return n;
+}
+
+fn ecs_ec_deep_spawn(w: EcsEntityCmdWorldDeep, e: i64) -> EcsEntityCmdWorldDeep {
+    w = ecs_ec_deep_set_occupied(w, e, true);
+    w = ecs_ec_deep_set_mask(w, e, 0);
+    w = ecs_ec_deep_set_value(w, e, 0);
+    w.last_error = ECS_EC_DEEP_OK;
+    return w;
+}
+
+fn ecs_ec_deep_seed(w: EcsEntityCmdWorldDeep, e: i64, cid: i64, value: i64) -> EcsEntityCmdWorldDeep {
+    w = ecs_ec_deep_spawn(w, e);
+    let m = ecs_ec_deep_bit(cid);
+    w = ecs_ec_deep_set_mask(w, e, m);
+    w = ecs_ec_deep_set_value(w, e, value);
+    return w;
+}
+
+fn ecs_ec_deep_from_world_value(w: EcsEntityCmdWorldDeep, cid: i64) -> i64 {
+    if cid == 0 { return w.f0; };
+    if cid == 1 { return w.f1; };
+    if cid == 2 { return w.f2; };
+    if cid == 3 { return w.f3; };
+    if cid == 4 { return w.f4; };
+    if cid == 5 { return w.f5; };
+    if cid == 6 { return w.f6; };
+    if cid == 7 { return w.f7; };
+    return 0;
+}
+
+// Command descriptor applied via apply / with_entity
+struct EcsEntityCommandDeep {
+    kind: i32,
+    component_id: i64,
+    value: i64,
+    mode: i32,
+    target: i64,
+    // for retain: bitmask of components to keep
+    retain_mask: i64,
+    // for clone opt-in allow mask / opt-out deny mask
+    filter_mask: i64,
+    // custom fail code when KIND_CUSTOM_FAIL
+    fail_code: i64,
+    caller_id: i64,
+}
+
+fn ecs_ec_deep_cmd_insert(component_id: i64, value: i64, mode: i32) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_INSERT,
+        component_id: component_id,
+        value: value,
+        mode: mode,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_insert_from_world(component_id: i64, mode: i32) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_INSERT_FROM_WORLD,
+        component_id: component_id,
+        value: 0,
+        mode: mode,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_insert_with(component_id: i64, value: i64, mode: i32) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_INSERT_WITH,
+        component_id: component_id,
+        value: value,
+        mode: mode,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_remove(component_id: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_REMOVE,
+        component_id: component_id,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_remove_with_requires(component_id: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_REMOVE_WITH_REQUIRES,
+        component_id: component_id,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_remove_by_id(component_id: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_REMOVE_BY_ID,
+        component_id: component_id,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_clear() -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_CLEAR,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_retain(retain_mask: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_RETAIN,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: retain_mask,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_despawn() -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_DESPAWN,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_observe(observer_id: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_OBSERVE,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: observer_id,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_clone_opt_out(target: i64, deny_mask: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_CLONE_OPT_OUT,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: target,
+        retain_mask: 0,
+        filter_mask: deny_mask,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_clone_opt_in(target: i64, allow_mask: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_CLONE_OPT_IN,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: target,
+        retain_mask: 0,
+        filter_mask: allow_mask,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_clone_components(target: i64, component_mask: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_CLONE_COMPONENTS,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: target,
+        retain_mask: 0,
+        filter_mask: component_mask,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_move_components(target: i64, component_mask: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_MOVE_COMPONENTS,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: target,
+        retain_mask: 0,
+        filter_mask: component_mask,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_log() -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_LOG,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: 0,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_custom_fail(fail_code: i64) -> EcsEntityCommandDeep {
+    return EcsEntityCommandDeep {
+        kind: ECS_EC_DEEP_KIND_CUSTOM_FAIL,
+        component_id: 0,
+        value: 0,
+        mode: 0,
+        target: 0,
+        retain_mask: 0,
+        filter_mask: 0,
+        fail_code: fail_code,
+        caller_id: 0,
+    };
+}
+
+fn ecs_ec_deep_cmd_with_caller(cmd: EcsEntityCommandDeep, caller_id: i64) -> EcsEntityCommandDeep {
+    cmd.caller_id = caller_id;
+    return cmd;
+}
+
+fn ecs_ec_deep_add_component(w: EcsEntityCmdWorldDeep, e: i64, cid: i64, value: i64, mode: i32) -> EcsEntityCmdWorldDeep {
+    if ecs_ec_deep_has(w, e, cid) {
+        if mode == ECS_EC_DEEP_INSERT_KEEP {
+            return w;
+        };
+    };
+    let m = ecs_ec_deep_get_mask(w, e);
+    let b = ecs_ec_deep_bit(cid);
+    if (m / b) % 2 == 0 {
+        m = m + b;
+    };
+    w = ecs_ec_deep_set_mask(w, e, m);
+    // store value on entity primary slot for any component write (simplified)
+    w = ecs_ec_deep_set_value(w, e, value);
+    return w;
+}
+
+fn ecs_ec_deep_remove_component(w: EcsEntityCmdWorldDeep, e: i64, cid: i64) -> EcsEntityCmdWorldDeep {
+    let m = ecs_ec_deep_get_mask(w, e);
+    let b = ecs_ec_deep_bit(cid);
+    if (m / b) % 2 == 1 {
+        m = m - b;
+    };
+    w = ecs_ec_deep_set_mask(w, e, m);
+    return w;
+}
+
+// required component of cid is (cid+1)%8 when requires_enabled
+fn ecs_ec_deep_required_of(cid: i64) -> i64 {
+    return (cid + 1) % 8;
+}
+
+fn ecs_ec_deep_remove_with_requires_impl(w: EcsEntityCmdWorldDeep, e: i64, cid: i64) -> EcsEntityCmdWorldDeep {
+    w = ecs_ec_deep_remove_component(w, e, cid);
+    if w.requires_enabled {
+        let req = ecs_ec_deep_required_of(cid);
+        w = ecs_ec_deep_remove_component(w, e, req);
+    };
+    return w;
+}
+
+fn ecs_ec_deep_or_masks(a: i64, b: i64) -> i64 {
+    // bit-or for 8 bits without bitwise ops: rebuild
+    let out: i64 = 0;
+    let i: i64 = 0;
+    while i < 8 {
+        let bit = ecs_ec_deep_bit(i);
+        let in_a = (a / bit) % 2 == 1;
+        let in_b = (b / bit) % 2 == 1;
+        if in_a || in_b {
+            out = out + bit;
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_ec_deep_and_masks(a: i64, b: i64) -> i64 {
+    let out: i64 = 0;
+    let i: i64 = 0;
+    while i < 8 {
+        let bit = ecs_ec_deep_bit(i);
+        let in_a = (a / bit) % 2 == 1;
+        let in_b = (b / bit) % 2 == 1;
+        if in_a && in_b {
+            out = out + bit;
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ecs_ec_deep_not_mask(m: i64) -> i64 {
+    let out: i64 = 0;
+    let i: i64 = 0;
+    while i < 8 {
+        let bit = ecs_ec_deep_bit(i);
+        if (m / bit) % 2 == 0 {
+            out = out + bit;
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// EntityCommand::apply — entity must be occupied
+fn ecs_ec_deep_apply(w: EcsEntityCmdWorldDeep, entity: i64, cmd: EcsEntityCommandDeep) -> EcsEntityCmdWorldDeep {
+    if ecs_ec_deep_occupied(w, entity) != true {
+        w.last_error = ECS_EC_DEEP_ENTITY_FETCH;
+        return w;
+    };
+    w.last_error = ECS_EC_DEEP_OK;
+    w.last_command_failed_code = 0;
+
+    if cmd.kind == ECS_EC_DEEP_KIND_INSERT {
+        w = ecs_ec_deep_add_component(w, entity, cmd.component_id, cmd.value, cmd.mode);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_INSERT_FROM_WORLD {
+        // FromWorld only invoked if insert will actually happen
+        let will_skip = false;
+        if cmd.mode == ECS_EC_DEEP_INSERT_KEEP {
+            if ecs_ec_deep_has(w, entity, cmd.component_id) {
+                will_skip = true;
+            };
+        };
+        if will_skip != true {
+            w.from_world_calls = w.from_world_calls + 1;
+            let v = ecs_ec_deep_from_world_value(w, cmd.component_id);
+            w = ecs_ec_deep_add_component(w, entity, cmd.component_id, v, cmd.mode);
+        };
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_INSERT_WITH {
+        let will_skip = false;
+        if cmd.mode == ECS_EC_DEEP_INSERT_KEEP {
+            if ecs_ec_deep_has(w, entity, cmd.component_id) {
+                will_skip = true;
+            };
+        };
+        if will_skip != true {
+            // value already produced by "fn" (cmd.value)
+            w = ecs_ec_deep_add_component(w, entity, cmd.component_id, cmd.value, cmd.mode);
+        };
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_REMOVE || cmd.kind == ECS_EC_DEEP_KIND_REMOVE_BY_ID {
+        w = ecs_ec_deep_remove_component(w, entity, cmd.component_id);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_REMOVE_WITH_REQUIRES {
+        w = ecs_ec_deep_remove_with_requires_impl(w, entity, cmd.component_id);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_CLEAR {
+        w = ecs_ec_deep_set_mask(w, entity, 0);
+        w = ecs_ec_deep_set_value(w, entity, 0);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_RETAIN {
+        let m = ecs_ec_deep_get_mask(w, entity);
+        let kept = ecs_ec_deep_and_masks(m, cmd.retain_mask);
+        w = ecs_ec_deep_set_mask(w, entity, kept);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_DESPAWN {
+        w = ecs_ec_deep_set_occupied(w, entity, false);
+        w = ecs_ec_deep_set_mask(w, entity, 0);
+        w = ecs_ec_deep_set_value(w, entity, 0);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_OBSERVE {
+        w.observer_count = w.observer_count + 1;
+        w.last_observer_id = cmd.target;
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_CLONE_OPT_OUT {
+        if ecs_ec_deep_occupied(w, cmd.target) != true {
+            // Bevy panics on missing target for some clone/move; model as command failed
+            w.last_error = ECS_EC_DEEP_COMMAND_FAILED;
+            w.last_command_failed_code = 1;
+            return w;
+        };
+        let src = ecs_ec_deep_get_mask(w, entity);
+        let deny = cmd.filter_mask;
+        let allow = ecs_ec_deep_and_masks(src, ecs_ec_deep_not_mask(deny));
+        let dst = ecs_ec_deep_get_mask(w, cmd.target);
+        let merged = ecs_ec_deep_or_masks(dst, allow);
+        w = ecs_ec_deep_set_mask(w, cmd.target, merged);
+        w = ecs_ec_deep_set_value(w, cmd.target, ecs_ec_deep_get_value(w, entity));
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_CLONE_OPT_IN || cmd.kind == ECS_EC_DEEP_KIND_CLONE_COMPONENTS {
+        if ecs_ec_deep_occupied(w, cmd.target) != true {
+            w.last_error = ECS_EC_DEEP_COMMAND_FAILED;
+            w.last_command_failed_code = 1;
+            return w;
+        };
+        let src = ecs_ec_deep_get_mask(w, entity);
+        let allow = ecs_ec_deep_and_masks(src, cmd.filter_mask);
+        let dst = ecs_ec_deep_get_mask(w, cmd.target);
+        let merged = ecs_ec_deep_or_masks(dst, allow);
+        w = ecs_ec_deep_set_mask(w, cmd.target, merged);
+        w = ecs_ec_deep_set_value(w, cmd.target, ecs_ec_deep_get_value(w, entity));
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_MOVE_COMPONENTS {
+        if ecs_ec_deep_occupied(w, cmd.target) != true {
+            w.last_error = ECS_EC_DEEP_COMMAND_FAILED;
+            w.last_command_failed_code = 1;
+            return w;
+        };
+        let src = ecs_ec_deep_get_mask(w, entity);
+        let move_m = ecs_ec_deep_and_masks(src, cmd.filter_mask);
+        let dst = ecs_ec_deep_get_mask(w, cmd.target);
+        let merged = ecs_ec_deep_or_masks(dst, move_m);
+        w = ecs_ec_deep_set_mask(w, cmd.target, merged);
+        w = ecs_ec_deep_set_value(w, cmd.target, ecs_ec_deep_get_value(w, entity));
+        // remove moved bits from source
+        let remain = ecs_ec_deep_and_masks(src, ecs_ec_deep_not_mask(move_m));
+        w = ecs_ec_deep_set_mask(w, entity, remain);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_LOG {
+        w.log_entity = entity;
+        w.log_component_count = ecs_ec_deep_component_count(w, entity);
+        return w;
+    };
+    if cmd.kind == ECS_EC_DEEP_KIND_CUSTOM_FAIL {
+        w.last_error = ECS_EC_DEEP_COMMAND_FAILED;
+        w.last_command_failed_code = cmd.fail_code;
+        return w;
+    };
+    return w;
+}
+
+// with_entity: EntityCommand -> Command on world for a fixed entity
+// returns world after command; fetch missing entity => EntityFetchError
+fn ecs_ec_deep_with_entity(w: EcsEntityCmdWorldDeep, entity: i64, cmd: EcsEntityCommandDeep) -> EcsEntityCmdWorldDeep {
+    return ecs_ec_deep_apply(w, entity, cmd);
+}
+
+// Closure-style EntityCommand: FnOnce(EntityWorldMut) modeled as custom apply of insert
+fn ecs_ec_deep_apply_fn_insert(w: EcsEntityCmdWorldDeep, entity: i64, component_id: i64, value: i64) -> EcsEntityCmdWorldDeep {
+    let cmd = ecs_ec_deep_cmd_insert(component_id, value, ECS_EC_DEEP_INSERT_REPLACE);
+    return ecs_ec_deep_apply(w, entity, cmd);
+}
+
+fn ecs_ec_deep_error_is_ok(code: i32) -> bool { return code == ECS_EC_DEEP_OK; }
+fn ecs_ec_deep_error_is_fetch(code: i32) -> bool { return code == ECS_EC_DEEP_ENTITY_FETCH; }
+fn ecs_ec_deep_error_is_failed(code: i32) -> bool { return code == ECS_EC_DEEP_COMMAND_FAILED; }

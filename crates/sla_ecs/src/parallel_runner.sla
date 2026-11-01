@@ -1,0 +1,2777 @@
+// Isolated mutable parallel runner (Bevy multi-threaded executor parity).
+//
+// Lives in its own module so the `Arc<*World>` + `thread::spawn` codegen does
+// not pay for the full ecs_world transitive import chain at the call site.
+// Mirrors Bevy's disjoint mutable parallel execution: two systems with
+// non-conflicting access run on threads sharing one world by raw pointer.
+@import "world_table_erased.sla"
+@import "table_erased_access.sla"
+@import "executor_multi_threaded.sla"
+@import "thread_executor.sla"
+@import "sa_std/core/arc.sa"
+@import "sa_std/thread.sa"
+
+struct EcsParallelReadyBatchRunResult {
+    plan: EcsExecutorRunPlan,
+    thread_sum: i32,
+    ran_count: i64,
+    skipped_count: i64,
+    used_threads: bool,
+    mismatch: bool,
+}
+
+struct EcsParallelCatalogReadySelection {
+    plan: EcsExecutorRunPlan,
+    batch: EcsExecutorReadyBatch,
+    skipped_count: i64,
+    mismatch: bool,
+}
+
+struct EcsParallelFnCatalog<R, M> {
+    system_indexes: Vec<i64>,
+    runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32>,
+    accesses: Vec<TableErasedSystemAccess>,
+}
+
+struct EcsParallelTaskPool {
+    worker_count: i64,
+    max_batch_width: i64,
+}
+
+struct EcsParallelTaskPoolLifecycleWorkerResult {
+    spawn_value: i32,
+    destroy_value: i32,
+}
+
+struct EcsParallelTaskPoolLifecycleResult {
+    worker_count: i64,
+    spawn_count: i64,
+    destroy_count: i64,
+    spawn_sum: i32,
+    destroy_sum: i32,
+    used_threads: bool,
+    mismatch: bool,
+}
+
+struct EcsParallelMainThreadExecutor {
+    executor: EcsThreadExecutor,
+}
+
+struct EcsParallelScopeOptions {
+    tick_task_pool_executor: bool,
+    use_external_executor: bool,
+    external_executor_is_scope: bool,
+}
+
+struct EcsParallelScopeRunResult {
+    thread_sum: i32,
+    result_values: Vec<i32>,
+    result_rounds: Vec<i64>,
+    result_lanes: Vec<i64>,
+    ran_count: i64,
+    local_count: i64,
+    external_count: i64,
+    wave_count: i64,
+    child_scope_count: i64,
+    child_scope_pool_count: i64,
+    child_scope_local_count: i64,
+    child_scope_external_count: i64,
+    child_scope_wave_count: i64,
+    child_scope_result_wave_count: i64,
+    child_scope_result_count: i64,
+    generated_task_count: i64,
+    recursive_depth: i64,
+    used_threads: bool,
+    ticked_pool_executor: bool,
+    ticked_scope_executor: bool,
+    ticked_external_executor: bool,
+    mismatch: bool,
+}
+
+struct EcsParallelScopedTaskSet<R, M> {
+    runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32>,
+    on_scope_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32>,
+    external_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32>,
+    child_scope_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>>,
+    child_scope_run_lanes: Vec<i64>,
+    child_scope_result_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32>,
+    child_scope_result_child_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>>,
+    child_scope_result_lanes: Vec<i64>,
+    run_order_positions: Vec<i64>,
+    on_scope_order_positions: Vec<i64>,
+    external_order_positions: Vec<i64>,
+}
+
+fn ecs_parallel_ready_batch_run_result(plan: EcsExecutorRunPlan, thread_sum: i32, ran_count: i64, skipped_count: i64, used_threads: bool, mismatch: bool) -> EcsParallelReadyBatchRunResult {
+    return EcsParallelReadyBatchRunResult { plan: plan, thread_sum: thread_sum, ran_count: ran_count, skipped_count: skipped_count, used_threads: used_threads, mismatch: mismatch };
+}
+
+fn ecs_parallel_catalog_ready_selection(plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped_count: i64, mismatch: bool) -> EcsParallelCatalogReadySelection {
+    return EcsParallelCatalogReadySelection { plan: plan, batch: batch, skipped_count: skipped_count, mismatch: mismatch };
+}
+
+fn ecs_parallel_task_pool_lifecycle_worker_result(spawn_value: i32, destroy_value: i32) -> EcsParallelTaskPoolLifecycleWorkerResult {
+    return EcsParallelTaskPoolLifecycleWorkerResult { spawn_value: spawn_value, destroy_value: destroy_value };
+}
+
+fn ecs_parallel_task_pool_lifecycle_result(worker_count: i64, spawn_count: i64, destroy_count: i64, spawn_sum: i32, destroy_sum: i32, used_threads: bool, mismatch: bool) -> EcsParallelTaskPoolLifecycleResult {
+    return EcsParallelTaskPoolLifecycleResult { worker_count: worker_count, spawn_count: spawn_count, destroy_count: destroy_count, spawn_sum: spawn_sum, destroy_sum: destroy_sum, used_threads: used_threads, mismatch: mismatch };
+}
+
+fn ecs_parallel_task_pool_lifecycle_worker_run(on_spawn: fn() -> i32, on_destroy: fn() -> i32) -> EcsParallelTaskPoolLifecycleWorkerResult {
+    let spawn_value = on_spawn();
+    let destroy_value = on_destroy();
+    return ecs_parallel_task_pool_lifecycle_worker_result(spawn_value, destroy_value);
+}
+
+fn ecs_parallel_main_thread_executor_new(owner_thread_id: i64) -> EcsParallelMainThreadExecutor {
+    return EcsParallelMainThreadExecutor { executor: ecs_thread_executor_new(owner_thread_id) };
+}
+
+fn ecs_parallel_main_thread_executor_new_with_id(owner_thread_id: i64, executor_id: i64) -> EcsParallelMainThreadExecutor {
+    return EcsParallelMainThreadExecutor { executor: ecs_thread_executor_new_with_id(owner_thread_id, executor_id) };
+}
+
+fn ecs_parallel_main_thread_executor_default() -> EcsParallelMainThreadExecutor {
+    return ecs_parallel_main_thread_executor_new(0);
+}
+
+fn ecs_parallel_main_thread_executor_owner_thread_id(main: EcsParallelMainThreadExecutor) -> i64 {
+    return main.executor.owner_thread_id;
+}
+
+fn ecs_parallel_main_thread_executor_id(main: EcsParallelMainThreadExecutor) -> i64 {
+    return main.executor.executor_id;
+}
+
+fn ecs_parallel_main_thread_executor_has_ticker(main: EcsParallelMainThreadExecutor, current_thread_id: i64) -> bool {
+    let ticker = ecs_thread_executor_ticker(main.executor, current_thread_id);
+    return ticker.has_ticker;
+}
+
+fn ecs_parallel_main_thread_executor_is_same_id(first: EcsParallelMainThreadExecutor, second: EcsParallelMainThreadExecutor) -> bool {
+    return ecs_thread_executor_is_same_id(first.executor, second.executor);
+}
+
+fn ecs_parallel_scope_options_default() -> EcsParallelScopeOptions {
+    return EcsParallelScopeOptions { tick_task_pool_executor: true, use_external_executor: false, external_executor_is_scope: true };
+}
+
+fn ecs_parallel_scope_options_with_executor(tick_task_pool_executor: bool, use_external_executor: bool) -> EcsParallelScopeOptions {
+    return EcsParallelScopeOptions { tick_task_pool_executor: tick_task_pool_executor, use_external_executor: use_external_executor, external_executor_is_scope: use_external_executor != true };
+}
+
+fn ecs_parallel_scope_options_with_external_identity(tick_task_pool_executor: bool, use_external_executor: bool, external_executor_is_scope: bool) -> EcsParallelScopeOptions {
+    return EcsParallelScopeOptions { tick_task_pool_executor: tick_task_pool_executor, use_external_executor: use_external_executor, external_executor_is_scope: external_executor_is_scope };
+}
+
+fn ecs_parallel_scope_options_with_main_thread_executor(main: EcsParallelMainThreadExecutor, current_thread_id: i64, scope_executor_id: i64, tick_task_pool_executor: bool) -> EcsParallelScopeOptions {
+    let ticker = ecs_thread_executor_ticker(main.executor, current_thread_id);
+    let same_scope = main.executor.executor_id == scope_executor_id;
+    return EcsParallelScopeOptions { tick_task_pool_executor: tick_task_pool_executor, use_external_executor: ticker.has_ticker, external_executor_is_scope: same_scope };
+}
+
+fn ecs_parallel_scope_run_result(thread_sum: i32, ran_count: i64, local_count: i64, external_count: i64, wave_count: i64, used_threads: bool, mismatch: bool) -> EcsParallelScopeRunResult {
+    let result_values: Vec<i32> = Vec::new();
+    let result_rounds: Vec<i64> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    return EcsParallelScopeRunResult { thread_sum: thread_sum, result_values: result_values, result_rounds: result_rounds, result_lanes: result_lanes, ran_count: ran_count, local_count: local_count, external_count: external_count, wave_count: wave_count, child_scope_count: 0, child_scope_pool_count: 0, child_scope_local_count: 0, child_scope_external_count: 0, child_scope_wave_count: 0, child_scope_result_wave_count: 0, child_scope_result_count: 0, generated_task_count: 0, recursive_depth: 0, used_threads: used_threads, ticked_pool_executor: used_threads, ticked_scope_executor: local_count > 0, ticked_external_executor: false, mismatch: mismatch };
+}
+
+fn ecs_parallel_scope_run_result_with_values(thread_sum: i32, result_values: Vec<i32>, ran_count: i64, local_count: i64, external_count: i64, wave_count: i64, used_threads: bool, mismatch: bool) -> EcsParallelScopeRunResult {
+    let result_rounds: Vec<i64> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    while i < len(result_values) as i64 {
+        result_rounds.push(0);
+        result_lanes.push(0);
+        i = i + 1;
+    }
+    return EcsParallelScopeRunResult { thread_sum: thread_sum, result_values: result_values, result_rounds: result_rounds, result_lanes: result_lanes, ran_count: ran_count, local_count: local_count, external_count: external_count, wave_count: wave_count, child_scope_count: 0, child_scope_pool_count: 0, child_scope_local_count: 0, child_scope_external_count: 0, child_scope_wave_count: 0, child_scope_result_wave_count: 0, child_scope_result_count: 0, generated_task_count: 0, recursive_depth: 0, used_threads: used_threads, ticked_pool_executor: used_threads, ticked_scope_executor: local_count > 0, ticked_external_executor: false, mismatch: mismatch };
+}
+
+fn ecs_parallel_scope_run_result_with_values_and_executor_flags(thread_sum: i32, result_values: Vec<i32>, ran_count: i64, local_count: i64, external_count: i64, wave_count: i64, used_threads: bool, ticked_pool_executor: bool, ticked_scope_executor: bool, ticked_external_executor: bool, mismatch: bool) -> EcsParallelScopeRunResult {
+    let result_rounds: Vec<i64> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let i: i64 = 0;
+    while i < len(result_values) as i64 {
+        result_rounds.push(0);
+        result_lanes.push(0);
+        i = i + 1;
+    }
+    return EcsParallelScopeRunResult { thread_sum: thread_sum, result_values: result_values, result_rounds: result_rounds, result_lanes: result_lanes, ran_count: ran_count, local_count: local_count, external_count: external_count, wave_count: wave_count, child_scope_count: 0, child_scope_pool_count: 0, child_scope_local_count: 0, child_scope_external_count: 0, child_scope_wave_count: 0, child_scope_result_wave_count: 0, child_scope_result_count: 0, generated_task_count: 0, recursive_depth: 0, used_threads: used_threads, ticked_pool_executor: ticked_pool_executor, ticked_scope_executor: ticked_scope_executor, ticked_external_executor: ticked_external_executor, mismatch: mismatch };
+}
+
+fn ecs_parallel_scope_run_result_with_metadata_and_executor_flags(thread_sum: i32, result_values: Vec<i32>, result_rounds: Vec<i64>, result_lanes: Vec<i64>, ran_count: i64, local_count: i64, external_count: i64, wave_count: i64, used_threads: bool, ticked_pool_executor: bool, ticked_scope_executor: bool, ticked_external_executor: bool, mismatch: bool) -> EcsParallelScopeRunResult {
+    return EcsParallelScopeRunResult { thread_sum: thread_sum, result_values: result_values, result_rounds: result_rounds, result_lanes: result_lanes, ran_count: ran_count, local_count: local_count, external_count: external_count, wave_count: wave_count, child_scope_count: 0, child_scope_pool_count: 0, child_scope_local_count: 0, child_scope_external_count: 0, child_scope_wave_count: 0, child_scope_result_wave_count: 0, child_scope_result_count: 0, generated_task_count: 0, recursive_depth: 0, used_threads: used_threads, ticked_pool_executor: ticked_pool_executor, ticked_scope_executor: ticked_scope_executor, ticked_external_executor: ticked_external_executor, mismatch: mismatch };
+}
+
+fn ecs_parallel_scope_run_result_recursive(thread_sum: i32, result_values: Vec<i32>, result_rounds: Vec<i64>, result_lanes: Vec<i64>, ran_count: i64, local_count: i64, external_count: i64, wave_count: i64, child_scope_count: i64, child_scope_pool_count: i64, child_scope_local_count: i64, child_scope_external_count: i64, child_scope_wave_count: i64, child_scope_result_wave_count: i64, child_scope_result_count: i64, generated_task_count: i64, recursive_depth: i64, used_threads: bool, ticked_pool_executor: bool, ticked_scope_executor: bool, ticked_external_executor: bool, mismatch: bool) -> EcsParallelScopeRunResult {
+    return EcsParallelScopeRunResult { thread_sum: thread_sum, result_values: result_values, result_rounds: result_rounds, result_lanes: result_lanes, ran_count: ran_count, local_count: local_count, external_count: external_count, wave_count: wave_count, child_scope_count: child_scope_count, child_scope_pool_count: child_scope_pool_count, child_scope_local_count: child_scope_local_count, child_scope_external_count: child_scope_external_count, child_scope_wave_count: child_scope_wave_count, child_scope_result_wave_count: child_scope_result_wave_count, child_scope_result_count: child_scope_result_count, generated_task_count: generated_task_count, recursive_depth: recursive_depth, used_threads: used_threads, ticked_pool_executor: ticked_pool_executor, ticked_scope_executor: ticked_scope_executor, ticked_external_executor: ticked_external_executor, mismatch: mismatch };
+}
+
+fn ecs_parallel_scope_run_result_len(result: EcsParallelScopeRunResult) -> i64 {
+    return len(result.result_values) as i64;
+}
+
+fn ecs_parallel_scope_run_result_at(result: EcsParallelScopeRunResult, index: i64) -> i32 {
+    return result.result_values[index];
+}
+
+fn ecs_parallel_scope_run_result_round_at(result: EcsParallelScopeRunResult, index: i64) -> i64 {
+    return result.result_rounds[index];
+}
+
+fn ecs_parallel_scope_run_result_lane_at(result: EcsParallelScopeRunResult, index: i64) -> i64 {
+    return result.result_lanes[index];
+}
+
+fn ecs_parallel_fn_catalog_new<R, M>() -> EcsParallelFnCatalog<R, M> {
+    let system_indexes: Vec<i64> = Vec::new();
+    let runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32> = Vec::new();
+    let accesses: Vec<TableErasedSystemAccess> = Vec::new();
+    return EcsParallelFnCatalog<R, M> { system_indexes: system_indexes, runs: runs, accesses: accesses };
+}
+
+fn ecs_parallel_fn_catalog_add<R, M>(catalog: EcsParallelFnCatalog<R, M>, system_index: i64, run: fn(Arc<*TableErasedWorld<R, M>>) -> i32, access: TableErasedSystemAccess) -> EcsParallelFnCatalog<R, M> {
+    catalog.system_indexes.push(system_index);
+    catalog.runs.push(run);
+    catalog.accesses.push(access);
+    return catalog;
+}
+
+fn ecs_parallel_fn_catalog_len<R, M>(catalog: EcsParallelFnCatalog<R, M>) -> i64 {
+    return len(catalog.system_indexes) as i64;
+}
+
+fn ecs_parallel_fn_catalog_find_slot<R, M>(catalog: EcsParallelFnCatalog<R, M>, system_index: i64) -> i64 {
+    let i: i64 = 0;
+    let n = ecs_parallel_fn_catalog_len<R, M>(catalog);
+    while i < n {
+        if catalog.system_indexes[i] == system_index { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_parallel_scoped_task_set_new<R, M>() -> EcsParallelScopedTaskSet<R, M> {
+    let runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32> = Vec::new();
+    let on_scope_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32> = Vec::new();
+    let external_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32> = Vec::new();
+    let child_scope_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>> = Vec::new();
+    let child_scope_run_lanes: Vec<i64> = Vec::new();
+    let child_scope_result_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> i32> = Vec::new();
+    let child_scope_result_child_runs: Vec<fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>> = Vec::new();
+    let child_scope_result_lanes: Vec<i64> = Vec::new();
+    let run_order_positions: Vec<i64> = Vec::new();
+    let on_scope_order_positions: Vec<i64> = Vec::new();
+    let external_order_positions: Vec<i64> = Vec::new();
+    return EcsParallelScopedTaskSet<R, M> { runs: runs, on_scope_runs: on_scope_runs, external_runs: external_runs, child_scope_runs: child_scope_runs, child_scope_run_lanes: child_scope_run_lanes, child_scope_result_runs: child_scope_result_runs, child_scope_result_child_runs: child_scope_result_child_runs, child_scope_result_lanes: child_scope_result_lanes, run_order_positions: run_order_positions, on_scope_order_positions: on_scope_order_positions, external_order_positions: external_order_positions };
+}
+
+fn ecs_parallel_scoped_task_set_spawn<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> i32) -> EcsParallelScopedTaskSet<R, M> {
+    let order_pos = ecs_parallel_scoped_task_set_len<R, M>(tasks);
+    tasks.runs.push(run);
+    tasks.run_order_positions.push(order_pos);
+    return tasks;
+}
+
+fn ecs_parallel_scoped_task_set_spawn_on_scope<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> i32) -> EcsParallelScopedTaskSet<R, M> {
+    let order_pos = ecs_parallel_scoped_task_set_len<R, M>(tasks);
+    tasks.on_scope_runs.push(run);
+    tasks.on_scope_order_positions.push(order_pos);
+    return tasks;
+}
+
+fn ecs_parallel_scoped_task_set_spawn_on_external<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> i32) -> EcsParallelScopedTaskSet<R, M> {
+    let order_pos = ecs_parallel_scoped_task_set_len<R, M>(tasks);
+    tasks.external_runs.push(run);
+    tasks.external_order_positions.push(order_pos);
+    return tasks;
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    return ecs_parallel_scoped_task_set_spawn_child_scope_with_lane<R, M>(tasks, run, 0);
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_with_lane<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>, lane: i64) -> EcsParallelScopedTaskSet<R, M> {
+    tasks.child_scope_runs.push(run);
+    tasks.child_scope_run_lanes.push(lane);
+    return tasks;
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_on_scope<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    return ecs_parallel_scoped_task_set_spawn_child_scope_with_lane<R, M>(tasks, run, 1);
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_on_external<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    return ecs_parallel_scoped_task_set_spawn_child_scope_with_lane<R, M>(tasks, run, 2);
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_with_result<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, result_run: fn(Arc<*TableErasedWorld<R, M>>) -> i32, child_run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    return ecs_parallel_scoped_task_set_spawn_child_scope_with_result_lane<R, M>(tasks, result_run, child_run, 0);
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_with_result_lane<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, result_run: fn(Arc<*TableErasedWorld<R, M>>) -> i32, child_run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>, lane: i64) -> EcsParallelScopedTaskSet<R, M> {
+    tasks.child_scope_result_runs.push(result_run);
+    tasks.child_scope_result_child_runs.push(child_run);
+    tasks.child_scope_result_lanes.push(lane);
+    return tasks;
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_with_result_on_scope<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, result_run: fn(Arc<*TableErasedWorld<R, M>>) -> i32, child_run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    return ecs_parallel_scoped_task_set_spawn_child_scope_with_result_lane<R, M>(tasks, result_run, child_run, 1);
+}
+
+fn ecs_parallel_scoped_task_set_spawn_child_scope_with_result_on_external<R, M>(tasks: EcsParallelScopedTaskSet<R, M>, result_run: fn(Arc<*TableErasedWorld<R, M>>) -> i32, child_run: fn(Arc<*TableErasedWorld<R, M>>) -> EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    return ecs_parallel_scoped_task_set_spawn_child_scope_with_result_lane<R, M>(tasks, result_run, child_run, 2);
+}
+
+fn ecs_parallel_scoped_task_set_len<R, M>(tasks: EcsParallelScopedTaskSet<R, M>) -> i64 {
+    return (len(tasks.runs) + len(tasks.on_scope_runs) + len(tasks.external_runs)) as i64;
+}
+
+fn ecs_parallel_scoped_task_set_threaded_len<R, M>(tasks: EcsParallelScopedTaskSet<R, M>) -> i64 {
+    return len(tasks.runs) as i64;
+}
+
+fn ecs_parallel_scoped_task_set_on_scope_len<R, M>(tasks: EcsParallelScopedTaskSet<R, M>) -> i64 {
+    return len(tasks.on_scope_runs) as i64;
+}
+
+fn ecs_parallel_scoped_task_set_external_len<R, M>(tasks: EcsParallelScopedTaskSet<R, M>) -> i64 {
+    return len(tasks.external_runs) as i64;
+}
+
+fn ecs_parallel_scoped_task_set_child_scope_len<R, M>(tasks: EcsParallelScopedTaskSet<R, M>) -> i64 {
+    return len(tasks.child_scope_runs) as i64;
+}
+
+fn ecs_parallel_scoped_task_set_child_scope_result_len<R, M>(tasks: EcsParallelScopedTaskSet<R, M>) -> i64 {
+    return len(tasks.child_scope_result_runs) as i64;
+}
+
+fn ecs_parallel_scoped_task_set_find_order_slot(positions: Vec<i64>, order_pos: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(positions) as i64;
+    while i < n {
+        if positions[i] == order_pos { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_parallel_scoped_task_set_extend<R, M>(parent: EcsParallelScopedTaskSet<R, M>, child: EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopedTaskSet<R, M> {
+    let order_pos: i64 = 0;
+    let total = ecs_parallel_scoped_task_set_len<R, M>(child);
+    while order_pos < total {
+        let threaded_slot = ecs_parallel_scoped_task_set_find_order_slot(child.run_order_positions, order_pos);
+        if threaded_slot >= 0 {
+            parent = ecs_parallel_scoped_task_set_spawn<R, M>(parent, child.runs[threaded_slot]);
+        } else {
+            let local_slot = ecs_parallel_scoped_task_set_find_order_slot(child.on_scope_order_positions, order_pos);
+            if local_slot >= 0 {
+                parent = ecs_parallel_scoped_task_set_spawn_on_scope<R, M>(parent, child.on_scope_runs[local_slot]);
+            } else {
+                let external_slot = ecs_parallel_scoped_task_set_find_order_slot(child.external_order_positions, order_pos);
+                if external_slot >= 0 {
+                    parent = ecs_parallel_scoped_task_set_spawn_on_external<R, M>(parent, child.external_runs[external_slot]);
+                };
+            };
+        };
+        order_pos = order_pos + 1;
+    }
+    let child_scope_i: i64 = 0;
+    let child_scope_n = ecs_parallel_scoped_task_set_child_scope_len<R, M>(child);
+    while child_scope_i < child_scope_n {
+        parent = ecs_parallel_scoped_task_set_spawn_child_scope_with_lane<R, M>(parent, child.child_scope_runs[child_scope_i], child.child_scope_run_lanes[child_scope_i]);
+        child_scope_i = child_scope_i + 1;
+    }
+    let child_scope_result_i: i64 = 0;
+    let child_scope_result_n = ecs_parallel_scoped_task_set_child_scope_result_len<R, M>(child);
+    while child_scope_result_i < child_scope_result_n {
+        parent = ecs_parallel_scoped_task_set_spawn_child_scope_with_result_lane<R, M>(parent, child.child_scope_result_runs[child_scope_result_i], child.child_scope_result_child_runs[child_scope_result_i], child.child_scope_result_lanes[child_scope_result_i]);
+        child_scope_result_i = child_scope_result_i + 1;
+    }
+    return parent;
+}
+
+fn ecs_parallel_task_pool_new(worker_count: i64) -> EcsParallelTaskPool {
+    let workers = worker_count;
+    if workers < 0 { workers = 0; };
+    let width = workers;
+    return EcsParallelTaskPool { worker_count: workers, max_batch_width: width };
+}
+
+fn ecs_parallel_task_pool_with_batch_width(worker_count: i64, max_batch_width: i64) -> EcsParallelTaskPool {
+    let workers = worker_count;
+    if workers < 0 { workers = 0; };
+    let width = max_batch_width;
+    if width < 0 { width = 0; };
+    if width > workers { width = workers; };
+    return EcsParallelTaskPool { worker_count: workers, max_batch_width: width };
+}
+
+fn ecs_parallel_task_pool_worker_count(pool: EcsParallelTaskPool) -> i64 {
+    return pool.worker_count;
+}
+
+fn ecs_parallel_task_pool_batch_width(pool: EcsParallelTaskPool) -> i64 {
+    return pool.max_batch_width;
+}
+
+fn ecs_parallel_task_pool_run_lifecycle_callbacks(pool: EcsParallelTaskPool, on_spawn: fn() -> i32, on_destroy: fn() -> i32) -> EcsParallelTaskPoolLifecycleResult {
+    if pool.worker_count <= 0 { return ecs_parallel_task_pool_lifecycle_result(pool.worker_count, 0, 0, 0, 0, false, false); };
+    let handles: Vec<JoinHandle<EcsParallelTaskPoolLifecycleWorkerResult>> = Vec::new();
+    let spawn_i: i64 = 0;
+    while spawn_i < pool.worker_count {
+        handles.push(thread::spawn(^|| ecs_parallel_task_pool_lifecycle_worker_run(on_spawn, on_destroy)));
+        spawn_i = spawn_i + 1;
+    }
+    let spawn_count: i64 = 0;
+    let destroy_count: i64 = 0;
+    let spawn_sum: i32 = 0;
+    let destroy_sum: i32 = 0;
+    let join_i: i64 = 0;
+    while join_i < len(handles) as i64 {
+        let worker_result = handles[join_i].join().unwrap();
+        spawn_count = spawn_count + 1;
+        destroy_count = destroy_count + 1;
+        spawn_sum = spawn_sum + worker_result.spawn_value;
+        destroy_sum = destroy_sum + worker_result.destroy_value;
+        join_i = join_i + 1;
+    }
+    let mismatch = spawn_count != pool.worker_count || destroy_count != pool.worker_count;
+    return ecs_parallel_task_pool_lifecycle_result(pool.worker_count, spawn_count, destroy_count, spawn_sum, destroy_sum, true, mismatch);
+}
+
+fn ecs_parallel_run_mut_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23010); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_triple_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23011); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23012); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23013); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_quad_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fourth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess, fourth_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23014); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23015); };
+    if table_erased_access_conflicts(first_access, fourth_access) { panic(23016); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23017); };
+    if table_erased_access_conflicts(second_access, fourth_access) { panic(23018); };
+    if table_erased_access_conflicts(third_access, fourth_access) { panic(23019); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let fourth_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    let fourth_handle = thread::spawn(^|| fourth(fourth_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap() + fourth_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_quint_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fourth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fifth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess, fourth_access: TableErasedSystemAccess, fifth_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23020); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23021); };
+    if table_erased_access_conflicts(first_access, fourth_access) { panic(23022); };
+    if table_erased_access_conflicts(first_access, fifth_access) { panic(23023); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23024); };
+    if table_erased_access_conflicts(second_access, fourth_access) { panic(23025); };
+    if table_erased_access_conflicts(second_access, fifth_access) { panic(23026); };
+    if table_erased_access_conflicts(third_access, fourth_access) { panic(23027); };
+    if table_erased_access_conflicts(third_access, fifth_access) { panic(23028); };
+    if table_erased_access_conflicts(fourth_access, fifth_access) { panic(23029); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let fourth_ptr = shared.clone();
+    let fifth_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    let fourth_handle = thread::spawn(^|| fourth(fourth_ptr));
+    let fifth_handle = thread::spawn(^|| fifth(fifth_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap() + fourth_handle.join().unwrap() + fifth_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_sext_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fourth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fifth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, sixth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess, fourth_access: TableErasedSystemAccess, fifth_access: TableErasedSystemAccess, sixth_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23030); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23031); };
+    if table_erased_access_conflicts(first_access, fourth_access) { panic(23032); };
+    if table_erased_access_conflicts(first_access, fifth_access) { panic(23033); };
+    if table_erased_access_conflicts(first_access, sixth_access) { panic(23034); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23035); };
+    if table_erased_access_conflicts(second_access, fourth_access) { panic(23036); };
+    if table_erased_access_conflicts(second_access, fifth_access) { panic(23037); };
+    if table_erased_access_conflicts(second_access, sixth_access) { panic(23038); };
+    if table_erased_access_conflicts(third_access, fourth_access) { panic(23039); };
+    if table_erased_access_conflicts(third_access, fifth_access) { panic(23040); };
+    if table_erased_access_conflicts(third_access, sixth_access) { panic(23041); };
+    if table_erased_access_conflicts(fourth_access, fifth_access) { panic(23042); };
+    if table_erased_access_conflicts(fourth_access, sixth_access) { panic(23043); };
+    if table_erased_access_conflicts(fifth_access, sixth_access) { panic(23044); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let fourth_ptr = shared.clone();
+    let fifth_ptr = shared.clone();
+    let sixth_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    let fourth_handle = thread::spawn(^|| fourth(fourth_ptr));
+    let fifth_handle = thread::spawn(^|| fifth(fifth_ptr));
+    let sixth_handle = thread::spawn(^|| sixth(sixth_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap() + fourth_handle.join().unwrap() + fifth_handle.join().unwrap() + sixth_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_sept_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fourth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fifth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, sixth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, seventh: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess, fourth_access: TableErasedSystemAccess, fifth_access: TableErasedSystemAccess, sixth_access: TableErasedSystemAccess, seventh_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23045); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23046); };
+    if table_erased_access_conflicts(first_access, fourth_access) { panic(23047); };
+    if table_erased_access_conflicts(first_access, fifth_access) { panic(23048); };
+    if table_erased_access_conflicts(first_access, sixth_access) { panic(23049); };
+    if table_erased_access_conflicts(first_access, seventh_access) { panic(23050); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23051); };
+    if table_erased_access_conflicts(second_access, fourth_access) { panic(23052); };
+    if table_erased_access_conflicts(second_access, fifth_access) { panic(23053); };
+    if table_erased_access_conflicts(second_access, sixth_access) { panic(23054); };
+    if table_erased_access_conflicts(second_access, seventh_access) { panic(23055); };
+    if table_erased_access_conflicts(third_access, fourth_access) { panic(23056); };
+    if table_erased_access_conflicts(third_access, fifth_access) { panic(23057); };
+    if table_erased_access_conflicts(third_access, sixth_access) { panic(23058); };
+    if table_erased_access_conflicts(third_access, seventh_access) { panic(23059); };
+    if table_erased_access_conflicts(fourth_access, fifth_access) { panic(23060); };
+    if table_erased_access_conflicts(fourth_access, sixth_access) { panic(23061); };
+    if table_erased_access_conflicts(fourth_access, seventh_access) { panic(23062); };
+    if table_erased_access_conflicts(fifth_access, sixth_access) { panic(23063); };
+    if table_erased_access_conflicts(fifth_access, seventh_access) { panic(23064); };
+    if table_erased_access_conflicts(sixth_access, seventh_access) { panic(23065); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let fourth_ptr = shared.clone();
+    let fifth_ptr = shared.clone();
+    let sixth_ptr = shared.clone();
+    let seventh_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    let fourth_handle = thread::spawn(^|| fourth(fourth_ptr));
+    let fifth_handle = thread::spawn(^|| fifth(fifth_ptr));
+    let sixth_handle = thread::spawn(^|| sixth(sixth_ptr));
+    let seventh_handle = thread::spawn(^|| seventh(seventh_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap() + fourth_handle.join().unwrap() + fifth_handle.join().unwrap() + sixth_handle.join().unwrap() + seventh_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_oct_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fourth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fifth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, sixth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, seventh: fn(Arc<*TableErasedWorld<R, M>>) -> i32, eighth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess, fourth_access: TableErasedSystemAccess, fifth_access: TableErasedSystemAccess, sixth_access: TableErasedSystemAccess, seventh_access: TableErasedSystemAccess, eighth_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23066); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23067); };
+    if table_erased_access_conflicts(first_access, fourth_access) { panic(23068); };
+    if table_erased_access_conflicts(first_access, fifth_access) { panic(23069); };
+    if table_erased_access_conflicts(first_access, sixth_access) { panic(23070); };
+    if table_erased_access_conflicts(first_access, seventh_access) { panic(23071); };
+    if table_erased_access_conflicts(first_access, eighth_access) { panic(23072); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23073); };
+    if table_erased_access_conflicts(second_access, fourth_access) { panic(23074); };
+    if table_erased_access_conflicts(second_access, fifth_access) { panic(23075); };
+    if table_erased_access_conflicts(second_access, sixth_access) { panic(23076); };
+    if table_erased_access_conflicts(second_access, seventh_access) { panic(23077); };
+    if table_erased_access_conflicts(second_access, eighth_access) { panic(23078); };
+    if table_erased_access_conflicts(third_access, fourth_access) { panic(23079); };
+    if table_erased_access_conflicts(third_access, fifth_access) { panic(23080); };
+    if table_erased_access_conflicts(third_access, sixth_access) { panic(23081); };
+    if table_erased_access_conflicts(third_access, seventh_access) { panic(23082); };
+    if table_erased_access_conflicts(third_access, eighth_access) { panic(23083); };
+    if table_erased_access_conflicts(fourth_access, fifth_access) { panic(23084); };
+    if table_erased_access_conflicts(fourth_access, sixth_access) { panic(23085); };
+    if table_erased_access_conflicts(fourth_access, seventh_access) { panic(23086); };
+    if table_erased_access_conflicts(fourth_access, eighth_access) { panic(23087); };
+    if table_erased_access_conflicts(fifth_access, sixth_access) { panic(23088); };
+    if table_erased_access_conflicts(fifth_access, seventh_access) { panic(23089); };
+    if table_erased_access_conflicts(fifth_access, eighth_access) { panic(23090); };
+    if table_erased_access_conflicts(sixth_access, seventh_access) { panic(23091); };
+    if table_erased_access_conflicts(sixth_access, eighth_access) { panic(23092); };
+    if table_erased_access_conflicts(seventh_access, eighth_access) { panic(23093); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let fourth_ptr = shared.clone();
+    let fifth_ptr = shared.clone();
+    let sixth_ptr = shared.clone();
+    let seventh_ptr = shared.clone();
+    let eighth_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    let fourth_handle = thread::spawn(^|| fourth(fourth_ptr));
+    let fifth_handle = thread::spawn(^|| fifth(fifth_ptr));
+    let sixth_handle = thread::spawn(^|| sixth(sixth_ptr));
+    let seventh_handle = thread::spawn(^|| seventh(seventh_ptr));
+    let eighth_handle = thread::spawn(^|| eighth(eighth_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap() + fourth_handle.join().unwrap() + fifth_handle.join().unwrap() + sixth_handle.join().unwrap() + seventh_handle.join().unwrap() + eighth_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_mut_nine_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fourth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, fifth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, sixth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, seventh: fn(Arc<*TableErasedWorld<R, M>>) -> i32, eighth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, ninth: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess, fourth_access: TableErasedSystemAccess, fifth_access: TableErasedSystemAccess, sixth_access: TableErasedSystemAccess, seventh_access: TableErasedSystemAccess, eighth_access: TableErasedSystemAccess, ninth_access: TableErasedSystemAccess) -> i32 {
+    if table_erased_access_conflicts(first_access, second_access) { panic(23094); };
+    if table_erased_access_conflicts(first_access, third_access) { panic(23095); };
+    if table_erased_access_conflicts(first_access, fourth_access) { panic(23096); };
+    if table_erased_access_conflicts(first_access, fifth_access) { panic(23097); };
+    if table_erased_access_conflicts(first_access, sixth_access) { panic(23098); };
+    if table_erased_access_conflicts(first_access, seventh_access) { panic(23099); };
+    if table_erased_access_conflicts(first_access, eighth_access) { panic(23100); };
+    if table_erased_access_conflicts(first_access, ninth_access) { panic(23101); };
+    if table_erased_access_conflicts(second_access, third_access) { panic(23102); };
+    if table_erased_access_conflicts(second_access, fourth_access) { panic(23103); };
+    if table_erased_access_conflicts(second_access, fifth_access) { panic(23104); };
+    if table_erased_access_conflicts(second_access, sixth_access) { panic(23105); };
+    if table_erased_access_conflicts(second_access, seventh_access) { panic(23106); };
+    if table_erased_access_conflicts(second_access, eighth_access) { panic(23107); };
+    if table_erased_access_conflicts(second_access, ninth_access) { panic(23108); };
+    if table_erased_access_conflicts(third_access, fourth_access) { panic(23109); };
+    if table_erased_access_conflicts(third_access, fifth_access) { panic(23110); };
+    if table_erased_access_conflicts(third_access, sixth_access) { panic(23111); };
+    if table_erased_access_conflicts(third_access, seventh_access) { panic(23112); };
+    if table_erased_access_conflicts(third_access, eighth_access) { panic(23113); };
+    if table_erased_access_conflicts(third_access, ninth_access) { panic(23114); };
+    if table_erased_access_conflicts(fourth_access, fifth_access) { panic(23115); };
+    if table_erased_access_conflicts(fourth_access, sixth_access) { panic(23116); };
+    if table_erased_access_conflicts(fourth_access, seventh_access) { panic(23117); };
+    if table_erased_access_conflicts(fourth_access, eighth_access) { panic(23118); };
+    if table_erased_access_conflicts(fourth_access, ninth_access) { panic(23119); };
+    if table_erased_access_conflicts(fifth_access, sixth_access) { panic(23120); };
+    if table_erased_access_conflicts(fifth_access, seventh_access) { panic(23121); };
+    if table_erased_access_conflicts(fifth_access, eighth_access) { panic(23122); };
+    if table_erased_access_conflicts(fifth_access, ninth_access) { panic(23123); };
+    if table_erased_access_conflicts(sixth_access, seventh_access) { panic(23124); };
+    if table_erased_access_conflicts(sixth_access, eighth_access) { panic(23125); };
+    if table_erased_access_conflicts(sixth_access, ninth_access) { panic(23126); };
+    if table_erased_access_conflicts(seventh_access, eighth_access) { panic(23127); };
+    if table_erased_access_conflicts(seventh_access, ninth_access) { panic(23128); };
+    if table_erased_access_conflicts(eighth_access, ninth_access) { panic(23129); };
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let third_ptr = shared.clone();
+    let fourth_ptr = shared.clone();
+    let fifth_ptr = shared.clone();
+    let sixth_ptr = shared.clone();
+    let seventh_ptr = shared.clone();
+    let eighth_ptr = shared.clone();
+    let ninth_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    let third_handle = thread::spawn(^|| third(third_ptr));
+    let fourth_handle = thread::spawn(^|| fourth(fourth_ptr));
+    let fifth_handle = thread::spawn(^|| fifth(fifth_ptr));
+    let sixth_handle = thread::spawn(^|| sixth(sixth_ptr));
+    let seventh_handle = thread::spawn(^|| seventh(seventh_ptr));
+    let eighth_handle = thread::spawn(^|| eighth(eighth_ptr));
+    let ninth_handle = thread::spawn(^|| ninth(ninth_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap() + third_handle.join().unwrap() + fourth_handle.join().unwrap() + fifth_handle.join().unwrap() + sixth_handle.join().unwrap() + seventh_handle.join().unwrap() + eighth_handle.join().unwrap() + ninth_handle.join().unwrap();
+}
+
+// Read-only parallel batch runner (Bevy read-only parallel execution). Two
+// read-only systems share the world by raw pointer in an Arc and run on
+// threads. Readonly + disjoint access is enforced by the caller (facade).
+fn ecs_parallel_run_readonly_batch<R, M>(world: TableErasedWorld<R, M>, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32) -> i32 {
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let first_ptr = shared.clone();
+    let second_ptr = shared.clone();
+    let first_handle = thread::spawn(^|| first(first_ptr));
+    let second_handle = thread::spawn(^|| second(second_ptr));
+    return first_handle.join().unwrap() + second_handle.join().unwrap();
+}
+
+fn ecs_parallel_run_single_batch<R, M>(world: TableErasedWorld<R, M>, run: fn(Arc<*TableErasedWorld<R, M>>) -> i32) -> i32 {
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    return run(shared);
+}
+
+fn ecs_parallel_run_ready_pair_batch<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, first_system_index: i64, second_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let taken = ecs_executor_run_plan_take_ready_batch(plan, 2);
+    let skipped = ecs_executor_ready_batch_skipped_count(taken.batch);
+    if ecs_executor_ready_batch_count(taken.batch) != 2 {
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    if ecs_executor_ready_batch_is_exclusive(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_at(taken.batch, 0) != first_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_at(taken.batch, 1) != second_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+
+    let sum = ecs_parallel_run_mut_batch<R, M>(world, first, second, first_access, second_access);
+    let plan2 = ecs_executor_run_plan_complete_ready_batch(taken.plan, taken.batch);
+    return ecs_parallel_ready_batch_run_result(plan2, sum, 2, skipped, true, false);
+}
+
+fn ecs_parallel_run_ready_triple_batch<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let taken = ecs_executor_run_plan_take_ready_batch(plan, 3);
+    let skipped = ecs_executor_ready_batch_skipped_count(taken.batch);
+    if ecs_executor_ready_batch_count(taken.batch) != 3 {
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    if ecs_executor_ready_batch_is_exclusive(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_at(taken.batch, 0) != first_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_at(taken.batch, 1) != second_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_at(taken.batch, 2) != third_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+
+    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, first, second, third, first_access, second_access, third_access);
+    let plan2 = ecs_executor_run_plan_complete_ready_batch(taken.plan, taken.batch);
+    return ecs_parallel_ready_batch_run_result(plan2, sum, 3, skipped, true, false);
+}
+
+fn ecs_parallel_run_ready_batch_up_to3<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, max_width: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, 0, false, true); };
+    if width > 3 { width = 3; };
+    let taken = ecs_executor_run_plan_take_ready_batch(plan, width);
+    let skipped = ecs_executor_ready_batch_skipped_count(taken.batch);
+    let count = ecs_executor_ready_batch_count(taken.batch);
+    if count == 0 {
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    if count == 1 {
+        if ecs_executor_ready_batch_at(taken.batch, 0) != first_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        let sum = ecs_parallel_run_single_batch<R, M>(world, first);
+        let plan2 = ecs_executor_run_plan_complete_ready_batch(taken.plan, taken.batch);
+        return ecs_parallel_ready_batch_run_result(plan2, sum, 1, skipped, false, false);
+    };
+    if count == 2 {
+        if ecs_executor_ready_batch_is_exclusive(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_is_local(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_at(taken.batch, 0) != first_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_at(taken.batch, 1) != second_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        let sum = ecs_parallel_run_mut_batch<R, M>(world, first, second, first_access, second_access);
+        let plan2 = ecs_executor_run_plan_complete_ready_batch(taken.plan, taken.batch);
+        return ecs_parallel_ready_batch_run_result(plan2, sum, 2, skipped, true, false);
+    };
+    if count == 3 {
+        if ecs_executor_ready_batch_is_exclusive(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_is_local(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_at(taken.batch, 0) != first_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_at(taken.batch, 1) != second_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        if ecs_executor_ready_batch_at(taken.batch, 2) != third_system_index { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+        let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, first, second, third, first_access, second_access, third_access);
+        let plan2 = ecs_executor_run_plan_complete_ready_batch(taken.plan, taken.batch);
+        return ecs_parallel_ready_batch_run_result(plan2, sum, 3, skipped, true, false);
+    };
+    return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_catalog_complete_batch(plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, sum: i32, ran_count: i64, skipped_count: i64, used_threads: bool) -> EcsParallelReadyBatchRunResult {
+    let plan2 = ecs_executor_run_plan_complete_ready_batch(plan, batch);
+    return ecs_parallel_ready_batch_run_result(plan2, sum, ran_count, skipped_count, used_threads, false);
+}
+
+fn ecs_parallel_catalog_index_known(system_index: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64) -> bool {
+    if system_index == first_system_index { return true; };
+    if system_index == second_system_index { return true; };
+    if system_index == third_system_index { return true; };
+    return false;
+}
+
+fn ecs_parallel_catalog_pair_conflicts(left_index: i64, right_index: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> bool {
+    if left_index == right_index { return true; };
+    if left_index == first_system_index {
+        if right_index == second_system_index { return table_erased_access_conflicts(first_access, second_access); };
+        if right_index == third_system_index { return table_erased_access_conflicts(first_access, third_access); };
+        return true;
+    };
+    if left_index == second_system_index {
+        if right_index == first_system_index { return table_erased_access_conflicts(second_access, first_access); };
+        if right_index == third_system_index { return table_erased_access_conflicts(second_access, third_access); };
+        return true;
+    };
+    if left_index == third_system_index {
+        if right_index == first_system_index { return table_erased_access_conflicts(third_access, first_access); };
+        if right_index == second_system_index { return table_erased_access_conflicts(third_access, second_access); };
+        return true;
+    };
+    return true;
+}
+
+fn ecs_parallel_catalog_conflicts_with_batch(batch: EcsExecutorReadyBatch, candidate_index: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> bool {
+    let i: i64 = 0;
+    let n = ecs_executor_ready_batch_count(batch);
+    while i < n {
+        let existing = ecs_executor_ready_batch_at(batch, i);
+        if ecs_parallel_catalog_pair_conflicts(existing, candidate_index, first_system_index, second_system_index, third_system_index, first_access, second_access, third_access) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_parallel_dynamic_catalog_pair_conflicts<R, M>(catalog: EcsParallelFnCatalog<R, M>, left_index: i64, right_index: i64) -> bool {
+    if left_index == right_index { return true; };
+    let left_slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, left_index);
+    if left_slot < 0 { return true; };
+    let right_slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, right_index);
+    if right_slot < 0 { return true; };
+    return table_erased_access_conflicts(catalog.accesses[left_slot], catalog.accesses[right_slot]);
+}
+
+fn ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog: EcsParallelFnCatalog<R, M>, batch: EcsExecutorReadyBatch, candidate_index: i64) -> bool {
+    let i: i64 = 0;
+    let n = ecs_executor_ready_batch_count(batch);
+    while i < n {
+        let existing = ecs_executor_ready_batch_at(batch, i);
+        if ecs_parallel_dynamic_catalog_pair_conflicts<R, M>(catalog, existing, candidate_index) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to3<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 3 { width = 3; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to3<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count == 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 1 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let sum = ecs_parallel_run_single_batch<R, M>(world, run_a);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 1, skipped, false);
+    };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 2 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let sum = ecs_parallel_run_mut_batch<R, M>(world, run_a, run_b, access_a, access_b);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+    };
+    if count == 3 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, run_a, run_b, run_c, access_a, access_b, access_c);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to3<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to3<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to3<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to3<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to3<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to4<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 4 { width = 4; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to4<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 3 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to3<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 4 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let d = ecs_executor_ready_batch_at(batch, 3);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sd = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, d);
+        if sd < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let run_d = catalog.runs[sd];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let access_d = catalog.accesses[sd];
+        let sum = ecs_parallel_run_mut_quad_batch<R, M>(world, run_a, run_b, run_c, run_d, access_a, access_b, access_c, access_d);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 4, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to4<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to4<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to4<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to4<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to4<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to5<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 5 { width = 5; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to5<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 4 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to4<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 5 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let d = ecs_executor_ready_batch_at(batch, 3);
+        let e = ecs_executor_ready_batch_at(batch, 4);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sd = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, d);
+        if sd < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let se = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, e);
+        if se < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let run_d = catalog.runs[sd];
+        let run_e = catalog.runs[se];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let access_d = catalog.accesses[sd];
+        let access_e = catalog.accesses[se];
+        let sum = ecs_parallel_run_mut_quint_batch<R, M>(world, run_a, run_b, run_c, run_d, run_e, access_a, access_b, access_c, access_d, access_e);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 5, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to5<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to5<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to5<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to5<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to5<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to6<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 6 { width = 6; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to6<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 5 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to5<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 6 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let d = ecs_executor_ready_batch_at(batch, 3);
+        let e = ecs_executor_ready_batch_at(batch, 4);
+        let f = ecs_executor_ready_batch_at(batch, 5);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sd = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, d);
+        if sd < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let se = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, e);
+        if se < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sf = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, f);
+        if sf < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let run_d = catalog.runs[sd];
+        let run_e = catalog.runs[se];
+        let run_f = catalog.runs[sf];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let access_d = catalog.accesses[sd];
+        let access_e = catalog.accesses[se];
+        let access_f = catalog.accesses[sf];
+        let sum = ecs_parallel_run_mut_sext_batch<R, M>(world, run_a, run_b, run_c, run_d, run_e, run_f, access_a, access_b, access_c, access_d, access_e, access_f);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 6, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to6<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to6<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to6<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to6<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to6<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to7<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 7 { width = 7; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to7<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 6 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to6<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 7 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let d = ecs_executor_ready_batch_at(batch, 3);
+        let e = ecs_executor_ready_batch_at(batch, 4);
+        let f = ecs_executor_ready_batch_at(batch, 5);
+        let g = ecs_executor_ready_batch_at(batch, 6);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sd = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, d);
+        if sd < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let se = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, e);
+        if se < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sf = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, f);
+        if sf < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sg = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, g);
+        if sg < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let run_d = catalog.runs[sd];
+        let run_e = catalog.runs[se];
+        let run_f = catalog.runs[sf];
+        let run_g = catalog.runs[sg];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let access_d = catalog.accesses[sd];
+        let access_e = catalog.accesses[se];
+        let access_f = catalog.accesses[sf];
+        let access_g = catalog.accesses[sg];
+        let sum = ecs_parallel_run_mut_sept_batch<R, M>(world, run_a, run_b, run_c, run_d, run_e, run_f, run_g, access_a, access_b, access_c, access_d, access_e, access_f, access_g);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 7, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to7<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to7<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to7<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to7<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to7<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to8<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 8 { width = 8; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to8<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 7 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to7<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 8 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let d = ecs_executor_ready_batch_at(batch, 3);
+        let e = ecs_executor_ready_batch_at(batch, 4);
+        let f = ecs_executor_ready_batch_at(batch, 5);
+        let g = ecs_executor_ready_batch_at(batch, 6);
+        let h = ecs_executor_ready_batch_at(batch, 7);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sd = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, d);
+        if sd < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let se = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, e);
+        if se < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sf = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, f);
+        if sf < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sg = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, g);
+        if sg < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sh = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, h);
+        if sh < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let run_d = catalog.runs[sd];
+        let run_e = catalog.runs[se];
+        let run_f = catalog.runs[sf];
+        let run_g = catalog.runs[sg];
+        let run_h = catalog.runs[sh];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let access_d = catalog.accesses[sd];
+        let access_e = catalog.accesses[se];
+        let access_f = catalog.accesses[sf];
+        let access_g = catalog.accesses[sg];
+        let access_h = catalog.accesses[sh];
+        let sum = ecs_parallel_run_mut_oct_batch<R, M>(world, run_a, run_b, run_c, run_d, run_e, run_f, run_g, run_h, access_a, access_b, access_c, access_d, access_e, access_f, access_g, access_h);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 8, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to8<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to8<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to8<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to8<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to8<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_up_to9<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 9 { width = 9; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_up_to9<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 8 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to8<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 9 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        let d = ecs_executor_ready_batch_at(batch, 3);
+        let e = ecs_executor_ready_batch_at(batch, 4);
+        let f = ecs_executor_ready_batch_at(batch, 5);
+        let g = ecs_executor_ready_batch_at(batch, 6);
+        let h = ecs_executor_ready_batch_at(batch, 7);
+        let n = ecs_executor_ready_batch_at(batch, 8);
+        let sa = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, a);
+        if sa < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sb = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, b);
+        if sb < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sc = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, c);
+        if sc < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sd = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, d);
+        if sd < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let se = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, e);
+        if se < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sf = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, f);
+        if sf < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sg = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, g);
+        if sg < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sh = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, h);
+        if sh < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let sn = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, n);
+        if sn < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        let run_a = catalog.runs[sa];
+        let run_b = catalog.runs[sb];
+        let run_c = catalog.runs[sc];
+        let run_d = catalog.runs[sd];
+        let run_e = catalog.runs[se];
+        let run_f = catalog.runs[sf];
+        let run_g = catalog.runs[sg];
+        let run_h = catalog.runs[sh];
+        let run_n = catalog.runs[sn];
+        let access_a = catalog.accesses[sa];
+        let access_b = catalog.accesses[sb];
+        let access_c = catalog.accesses[sc];
+        let access_d = catalog.accesses[sd];
+        let access_e = catalog.accesses[se];
+        let access_f = catalog.accesses[sf];
+        let access_g = catalog.accesses[sg];
+        let access_h = catalog.accesses[sh];
+        let access_n = catalog.accesses[sn];
+        let sum = ecs_parallel_run_mut_nine_batch<R, M>(world, run_a, run_b, run_c, run_d, run_e, run_f, run_g, run_h, run_n, access_a, access_b, access_c, access_d, access_e, access_f, access_g, access_h, access_n);
+        return ecs_parallel_catalog_complete_batch(plan, batch, sum, 9, skipped, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_up_to9<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_up_to9<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_up_to9<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_up_to9<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_up_to9<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_take_ready_dynamic_catalog_batch_unbounded<R, M>(p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, i);
+                        if slot < 0 {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_dynamic_catalog_conflicts_with_batch<R, M>(catalog, batch, i) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_dynamic_catalog_batch_unbounded<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count <= 9 { return ecs_parallel_run_selected_dynamic_catalog_batch_up_to9<R, M>(world, plan, batch, skipped, catalog); };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    let check: i64 = 0;
+    while check < count {
+        let system_index = ecs_executor_ready_batch_at(batch, check);
+        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, system_index);
+        if slot < 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+        check = check + 1;
+    }
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let handles: Vec<JoinHandle<i32>> = Vec::new();
+    let i: i64 = 0;
+    while i < count {
+        let system_index = ecs_executor_ready_batch_at(batch, i);
+        let slot = ecs_parallel_fn_catalog_find_slot<R, M>(catalog, system_index);
+        let run = catalog.runs[slot];
+        let task_world = shared.clone();
+        let handle = thread::spawn(^|| run(task_world));
+        handles.push(handle);
+        i = i + 1;
+    }
+    let sum: i32 = 0;
+    let j: i64 = 0;
+    while j < len(handles) as i64 {
+        sum = sum + handles[j].join().unwrap();
+        j = j + 1;
+    }
+    return ecs_parallel_catalog_complete_batch(plan, batch, sum, count, skipped, true);
+}
+
+fn ecs_parallel_run_ready_dynamic_catalog_batch_unbounded<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_dynamic_catalog_batch_unbounded<R, M>(plan, catalog, max_width);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_dynamic_catalog_batch_unbounded<R, M>(world, selected.plan, selected.batch, selected.skipped_count, catalog);
+}
+
+fn ecs_parallel_run_ready_all_dynamic_catalog_unbounded<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>, max_width: i64) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_dynamic_catalog_batch_unbounded<R, M>(world, p, catalog, max_width);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_task_pool_run_ready_dynamic_catalog_batch<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    return ecs_parallel_run_ready_dynamic_catalog_batch_unbounded<R, M>(world, plan, catalog, pool.max_batch_width);
+}
+
+fn ecs_parallel_task_pool_run_ready_all_dynamic_catalog<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    return ecs_parallel_run_ready_all_dynamic_catalog_unbounded<R, M>(world, plan, catalog, pool.max_batch_width);
+}
+
+fn ecs_parallel_task_pool_scope_run_ready_dynamic_catalog_batch<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    return ecs_parallel_task_pool_run_ready_dynamic_catalog_batch<R, M>(pool, world, plan, catalog);
+}
+
+fn ecs_parallel_task_pool_scope_run_ready_all_dynamic_catalog<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, catalog: EcsParallelFnCatalog<R, M>) -> EcsParallelReadyBatchRunResult {
+    return ecs_parallel_task_pool_run_ready_all_dynamic_catalog<R, M>(pool, world, plan, catalog);
+}
+
+fn ecs_parallel_task_pool_scope_run_tasks<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, tasks: EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopeRunResult {
+    return ecs_parallel_task_pool_scope_run_tasks_with_options<R, M>(pool, world, tasks, ecs_parallel_scope_options_default());
+}
+
+fn ecs_parallel_task_pool_scope_run_tasks_with_options<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, tasks: EcsParallelScopedTaskSet<R, M>, options: EcsParallelScopeOptions) -> EcsParallelScopeRunResult {
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    return ecs_parallel_task_pool_scope_run_tasks_shared<R, M>(pool, shared, tasks, options);
+}
+
+fn ecs_parallel_task_pool_scope_run_tasks_shared_serial<R, M>(shared: Arc<*TableErasedWorld<R, M>>, tasks: EcsParallelScopedTaskSet<R, M>, options: EcsParallelScopeOptions) -> EcsParallelScopeRunResult {
+    let count = ecs_parallel_scoped_task_set_threaded_len<R, M>(tasks);
+    let local_count = ecs_parallel_scoped_task_set_on_scope_len<R, M>(tasks);
+    let external_count = ecs_parallel_scoped_task_set_external_len<R, M>(tasks);
+    let total_count = count + local_count + external_count;
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let result_values: Vec<i32> = Vec::new();
+    let result_rounds: Vec<i64> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let value_i: i64 = 0;
+    while value_i < total_count {
+        result_values.push(0);
+        result_rounds.push(0);
+        result_lanes.push(0);
+        value_i = value_i + 1;
+    }
+    let serial_i: i64 = 0;
+    while serial_i < count {
+        let run = tasks.runs[serial_i];
+        let task_world = shared.clone();
+        let value = run(task_world);
+        let order_pos = tasks.run_order_positions[serial_i];
+        result_values[order_pos] = value;
+        result_rounds[order_pos] = 0;
+        result_lanes[order_pos] = 0;
+        total_sum = total_sum + value;
+        total_ran = total_ran + 1;
+        serial_i = serial_i + 1;
+    }
+    let local_i: i64 = 0;
+    while local_i < local_count {
+        let run = tasks.on_scope_runs[local_i];
+        let task_world = shared.clone();
+        let value = run(task_world);
+        let order_pos = tasks.on_scope_order_positions[local_i];
+        result_values[order_pos] = value;
+        result_rounds[order_pos] = 0;
+        result_lanes[order_pos] = 1;
+        total_sum = total_sum + value;
+        total_ran = total_ran + 1;
+        local_i = local_i + 1;
+    }
+    let external_i: i64 = 0;
+    while external_i < external_count {
+        let run = tasks.external_runs[external_i];
+        let task_world = shared.clone();
+        let value = run(task_world);
+        let order_pos = tasks.external_order_positions[external_i];
+        result_values[order_pos] = value;
+        result_rounds[order_pos] = 0;
+        result_lanes[order_pos] = 2;
+        total_sum = total_sum + value;
+        total_ran = total_ran + 1;
+        external_i = external_i + 1;
+    }
+    return ecs_parallel_scope_run_result_with_metadata_and_executor_flags(total_sum, result_values, result_rounds, result_lanes, total_ran, local_count, external_count, 0, false, count > 0, local_count > 0 || (external_count > 0 && options.external_executor_is_scope), external_count > 0 && options.use_external_executor && options.external_executor_is_scope != true, false);
+}
+
+fn ecs_parallel_task_pool_scope_run_tasks_shared<R, M>(pool: EcsParallelTaskPool, shared: Arc<*TableErasedWorld<R, M>>, tasks: EcsParallelScopedTaskSet<R, M>, options: EcsParallelScopeOptions) -> EcsParallelScopeRunResult {
+    let count = ecs_parallel_scoped_task_set_threaded_len<R, M>(tasks);
+    let local_count = ecs_parallel_scoped_task_set_on_scope_len<R, M>(tasks);
+    let external_count = ecs_parallel_scoped_task_set_external_len<R, M>(tasks);
+    let total_count = count + local_count + external_count;
+    if total_count == 0 { return ecs_parallel_scope_run_result(0, 0, 0, 0, 0, false, false); };
+    let width = pool.max_batch_width;
+    if width <= 0 { return ecs_parallel_task_pool_scope_run_tasks_shared_serial<R, M>(shared, tasks, options); };
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let waves: i64 = 0;
+    let result_values: Vec<i32> = Vec::new();
+    let result_rounds: Vec<i64> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let value_i: i64 = 0;
+    while value_i < total_count {
+        result_values.push(0);
+        result_rounds.push(0);
+        result_lanes.push(0);
+        value_i = value_i + 1;
+    }
+    let offset: i64 = 0;
+    while offset < count {
+        let batch_count = width;
+        let remaining = count - offset;
+        if batch_count > remaining { batch_count = remaining; };
+        let handles: Vec<JoinHandle<i32>> = Vec::new();
+        let i: i64 = 0;
+        while i < batch_count {
+            let run = tasks.runs[offset + i];
+            let task_world = shared.clone();
+            let handle = thread::spawn(^|| run(task_world));
+            handles.push(handle);
+            i = i + 1;
+        }
+        let j: i64 = 0;
+        while j < len(handles) as i64 {
+            let value = handles[j].join().unwrap();
+            let order_pos = tasks.run_order_positions[offset + j];
+            result_values[order_pos] = value;
+            result_rounds[order_pos] = 0;
+            result_lanes[order_pos] = 0;
+            total_sum = total_sum + value;
+            j = j + 1;
+        }
+        total_ran = total_ran + batch_count;
+        waves = waves + 1;
+        offset = offset + batch_count;
+    }
+    let local_i: i64 = 0;
+    while local_i < local_count {
+        let run = tasks.on_scope_runs[local_i];
+        let task_world = shared.clone();
+        let value = run(task_world);
+        let order_pos = tasks.on_scope_order_positions[local_i];
+        result_values[order_pos] = value;
+        result_rounds[order_pos] = 0;
+        result_lanes[order_pos] = 1;
+        total_sum = total_sum + value;
+        total_ran = total_ran + 1;
+        local_i = local_i + 1;
+    }
+    let external_i: i64 = 0;
+    while external_i < external_count {
+        let run = tasks.external_runs[external_i];
+        let task_world = shared.clone();
+        let value = run(task_world);
+        let order_pos = tasks.external_order_positions[external_i];
+        result_values[order_pos] = value;
+        result_rounds[order_pos] = 0;
+        result_lanes[order_pos] = 2;
+        total_sum = total_sum + value;
+        total_ran = total_ran + 1;
+        external_i = external_i + 1;
+    }
+    return ecs_parallel_scope_run_result_with_metadata_and_executor_flags(total_sum, result_values, result_rounds, result_lanes, total_ran, local_count, external_count, waves, count > 0, count > 0 && options.tick_task_pool_executor, local_count > 0 || (external_count > 0 && options.external_executor_is_scope), external_count > 0 && options.use_external_executor && options.external_executor_is_scope != true, false);
+}
+
+fn ecs_parallel_task_pool_scope_run_tasks_recursive<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, tasks: EcsParallelScopedTaskSet<R, M>) -> EcsParallelScopeRunResult {
+    return ecs_parallel_task_pool_scope_run_tasks_recursive_with_options<R, M>(pool, world, tasks, ecs_parallel_scope_options_default());
+}
+
+fn ecs_parallel_task_pool_scope_run_tasks_recursive_with_options<R, M>(pool: EcsParallelTaskPool, world: TableErasedWorld<R, M>, tasks: EcsParallelScopedTaskSet<R, M>, options: EcsParallelScopeOptions) -> EcsParallelScopeRunResult {
+    let world_box = Box::new(world);
+    let world_ptr = Box::into_raw(world_box);
+    let shared = Arc::new(world_ptr);
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_local: i64 = 0;
+    let total_external: i64 = 0;
+    let total_waves: i64 = 0;
+    let total_child_scopes: i64 = 0;
+    let total_child_scope_pool: i64 = 0;
+    let total_child_scope_local: i64 = 0;
+    let total_child_scope_external: i64 = 0;
+    let total_child_scope_waves: i64 = 0;
+    let total_child_scope_result_waves: i64 = 0;
+    let total_child_scope_results: i64 = 0;
+    let total_generated_tasks: i64 = 0;
+    let depth: i64 = 0;
+    let any_threads = false;
+    let ticked_pool = false;
+    let ticked_scope = false;
+    let ticked_external = false;
+    let result_values: Vec<i32> = Vec::new();
+    let result_rounds: Vec<i64> = Vec::new();
+    let result_lanes: Vec<i64> = Vec::new();
+    let guard: i64 = 0;
+
+    let root_direct_count = ecs_parallel_scoped_task_set_len<R, M>(tasks);
+    let root_child_scope_count = ecs_parallel_scoped_task_set_child_scope_len<R, M>(tasks);
+    let root_child_scope_result_count = ecs_parallel_scoped_task_set_child_scope_result_len<R, M>(tasks);
+    if root_direct_count == 0 {
+        if root_child_scope_count == 0 {
+            if root_child_scope_result_count == 0 { return ecs_parallel_scope_run_result_recursive(total_sum, result_values, result_rounds, result_lanes, total_ran, total_local, total_external, total_waves, total_child_scopes, total_child_scope_pool, total_child_scope_local, total_child_scope_external, total_child_scope_waves, total_child_scope_result_waves, total_child_scope_results, total_generated_tasks, depth, any_threads, ticked_pool, ticked_scope, ticked_external, false); };
+        };
+    };
+    let pending = ecs_parallel_scoped_task_set_new<R, M>();
+    let root_child_i: i64 = 0;
+    while root_child_i < root_child_scope_count {
+        let child_lane = tasks.child_scope_run_lanes[root_child_i];
+        let child_run = tasks.child_scope_runs[root_child_i];
+        if child_lane == 0 {
+            if pool.max_batch_width > 0 {
+                let handles: Vec<JoinHandle<EcsParallelScopedTaskSet<R, M>>> = Vec::new();
+                let batch_count: i64 = 0;
+                while root_child_i + batch_count < root_child_scope_count {
+                    if batch_count >= pool.max_batch_width { break; };
+                    if tasks.child_scope_run_lanes[root_child_i + batch_count] != 0 { break; };
+                    let wave_run = tasks.child_scope_runs[root_child_i + batch_count];
+                    let child_world = shared.clone();
+                    handles.push(thread::spawn(^|| wave_run(child_world)));
+                    batch_count = batch_count + 1;
+                }
+                let join_i: i64 = 0;
+                while join_i < len(handles) as i64 {
+                    let generated_tasks = handles[join_i].join().unwrap();
+                    pending = ecs_parallel_scoped_task_set_extend<R, M>(pending, generated_tasks);
+                    total_child_scopes = total_child_scopes + 1;
+                    total_child_scope_pool = total_child_scope_pool + 1;
+                    join_i = join_i + 1;
+                }
+                total_child_scope_waves = total_child_scope_waves + 1;
+                any_threads = true;
+                if options.tick_task_pool_executor { ticked_pool = true; };
+                root_child_i = root_child_i + batch_count;
+            } else {
+                let child_world = shared.clone();
+                let generated_tasks = child_run(child_world);
+                pending = ecs_parallel_scoped_task_set_extend<R, M>(pending, generated_tasks);
+                ticked_pool = true;
+                total_child_scopes = total_child_scopes + 1;
+                total_child_scope_pool = total_child_scope_pool + 1;
+                root_child_i = root_child_i + 1;
+            };
+        } else {
+            let child_world = shared.clone();
+            let generated_tasks = child_run(child_world);
+            pending = ecs_parallel_scoped_task_set_extend<R, M>(pending, generated_tasks);
+            total_child_scopes = total_child_scopes + 1;
+            if child_lane == 1 {
+                total_child_scope_local = total_child_scope_local + 1;
+                ticked_scope = true;
+            };
+            if child_lane == 2 {
+                total_child_scope_external = total_child_scope_external + 1;
+                if options.external_executor_is_scope { ticked_scope = true; };
+                if options.use_external_executor && options.external_executor_is_scope != true { ticked_external = true; };
+            };
+            root_child_i = root_child_i + 1;
+        };
+    }
+    let root_child_result_i: i64 = 0;
+    while root_child_result_i < root_child_scope_result_count {
+        let child_lane = tasks.child_scope_result_lanes[root_child_result_i];
+        let result_run = tasks.child_scope_result_runs[root_child_result_i];
+        if child_lane == 0 {
+            if pool.max_batch_width > 0 {
+                let result_handles: Vec<JoinHandle<i32>> = Vec::new();
+                let batch_count: i64 = 0;
+                while root_child_result_i + batch_count < root_child_scope_result_count {
+                    if batch_count >= pool.max_batch_width { break; };
+                    if tasks.child_scope_result_lanes[root_child_result_i + batch_count] != 0 { break; };
+                    let wave_result_run = tasks.child_scope_result_runs[root_child_result_i + batch_count];
+                    let result_world = shared.clone();
+                    result_handles.push(thread::spawn(^|| wave_result_run(result_world)));
+                    batch_count = batch_count + 1;
+                }
+                let result_join_i: i64 = 0;
+                while result_join_i < len(result_handles) as i64 {
+                    let result_value = result_handles[result_join_i].join().unwrap();
+                    result_values.push(result_value);
+                    result_rounds.push(depth);
+                    result_lanes.push(3);
+                    total_sum = total_sum + result_value;
+                    total_ran = total_ran + 1;
+                    total_child_scope_results = total_child_scope_results + 1;
+                    result_join_i = result_join_i + 1;
+                }
+                let child_handles: Vec<JoinHandle<EcsParallelScopedTaskSet<R, M>>> = Vec::new();
+                let child_spawn_i: i64 = 0;
+                while child_spawn_i < batch_count {
+                    let wave_child_run = tasks.child_scope_result_child_runs[root_child_result_i + child_spawn_i];
+                    let child_world = shared.clone();
+                    child_handles.push(thread::spawn(^|| wave_child_run(child_world)));
+                    child_spawn_i = child_spawn_i + 1;
+                }
+                let child_join_i: i64 = 0;
+                while child_join_i < len(child_handles) as i64 {
+                    let generated_tasks = child_handles[child_join_i].join().unwrap();
+                    pending = ecs_parallel_scoped_task_set_extend<R, M>(pending, generated_tasks);
+                    total_child_scopes = total_child_scopes + 1;
+                    total_child_scope_pool = total_child_scope_pool + 1;
+                    child_join_i = child_join_i + 1;
+                }
+                total_child_scope_result_waves = total_child_scope_result_waves + 1;
+                any_threads = true;
+                if options.tick_task_pool_executor { ticked_pool = true; };
+                root_child_result_i = root_child_result_i + batch_count;
+            } else {
+                let result_world = shared.clone();
+                let result_value = result_run(result_world);
+                result_values.push(result_value);
+                result_rounds.push(depth);
+                result_lanes.push(3);
+                total_sum = total_sum + result_value;
+                total_ran = total_ran + 1;
+                total_child_scope_results = total_child_scope_results + 1;
+                let child_run = tasks.child_scope_result_child_runs[root_child_result_i];
+                let child_world = shared.clone();
+                let generated_tasks = child_run(child_world);
+                pending = ecs_parallel_scoped_task_set_extend<R, M>(pending, generated_tasks);
+                ticked_pool = true;
+                total_child_scopes = total_child_scopes + 1;
+                total_child_scope_pool = total_child_scope_pool + 1;
+                root_child_result_i = root_child_result_i + 1;
+            };
+        } else {
+            let result_world = shared.clone();
+            let result_value = result_run(result_world);
+            result_values.push(result_value);
+            result_rounds.push(depth);
+            result_lanes.push(3);
+            total_sum = total_sum + result_value;
+            total_ran = total_ran + 1;
+            total_child_scope_results = total_child_scope_results + 1;
+            let child_run = tasks.child_scope_result_child_runs[root_child_result_i];
+            let child_world = shared.clone();
+            let generated_tasks = child_run(child_world);
+            pending = ecs_parallel_scoped_task_set_extend<R, M>(pending, generated_tasks);
+            total_child_scopes = total_child_scopes + 1;
+            if child_lane == 1 {
+                total_child_scope_local = total_child_scope_local + 1;
+                ticked_scope = true;
+            };
+            if child_lane == 2 {
+                total_child_scope_external = total_child_scope_external + 1;
+                if options.external_executor_is_scope { ticked_scope = true; };
+                if options.use_external_executor && options.external_executor_is_scope != true { ticked_external = true; };
+            };
+            root_child_result_i = root_child_result_i + 1;
+        };
+    }
+    if root_direct_count > 0 {
+        let pass_result = ecs_parallel_task_pool_scope_run_tasks_shared<R, M>(pool, shared.clone(), tasks, options);
+        if pass_result.mismatch { return ecs_parallel_scope_run_result_recursive(total_sum + pass_result.thread_sum, result_values, result_rounds, result_lanes, total_ran + pass_result.ran_count, total_local + pass_result.local_count, total_external + pass_result.external_count, total_waves + pass_result.wave_count, total_child_scopes, total_child_scope_pool, total_child_scope_local, total_child_scope_external, total_child_scope_waves, total_child_scope_result_waves, total_child_scope_results, total_generated_tasks, depth + 1, any_threads || pass_result.used_threads, ticked_pool || pass_result.ticked_pool_executor, ticked_scope || pass_result.ticked_scope_executor, ticked_external || pass_result.ticked_external_executor, true); };
+        total_sum = total_sum + pass_result.thread_sum;
+        total_ran = total_ran + pass_result.ran_count;
+        total_local = total_local + pass_result.local_count;
+        total_external = total_external + pass_result.external_count;
+        total_waves = total_waves + pass_result.wave_count;
+        if pass_result.used_threads { any_threads = true; };
+        if pass_result.ticked_pool_executor { ticked_pool = true; };
+        if pass_result.ticked_scope_executor { ticked_scope = true; };
+        if pass_result.ticked_external_executor { ticked_external = true; };
+        let root_value_i: i64 = 0;
+        while root_value_i < ecs_parallel_scope_run_result_len(pass_result) {
+            result_values.push(ecs_parallel_scope_run_result_at(pass_result, root_value_i));
+            result_rounds.push(depth);
+            result_lanes.push(ecs_parallel_scope_run_result_lane_at(pass_result, root_value_i));
+            root_value_i = root_value_i + 1;
+        }
+    };
+    depth = depth + 1;
+    guard = guard + 1;
+
+    while guard < 64 {
+        let direct_count = ecs_parallel_scoped_task_set_len<R, M>(pending);
+        let child_scope_count = ecs_parallel_scoped_task_set_child_scope_len<R, M>(pending);
+        let child_scope_result_count = ecs_parallel_scoped_task_set_child_scope_result_len<R, M>(pending);
+        if direct_count == 0 {
+            if child_scope_count == 0 {
+                if child_scope_result_count == 0 { return ecs_parallel_scope_run_result_recursive(total_sum, result_values, result_rounds, result_lanes, total_ran, total_local, total_external, total_waves, total_child_scopes, total_child_scope_pool, total_child_scope_local, total_child_scope_external, total_child_scope_waves, total_child_scope_result_waves, total_child_scope_results, total_generated_tasks, depth, any_threads, ticked_pool, ticked_scope, ticked_external, false); };
+            };
+        };
+        let next = ecs_parallel_scoped_task_set_new<R, M>();
+        let child_i: i64 = 0;
+        while child_i < child_scope_count {
+            let child_lane = pending.child_scope_run_lanes[child_i];
+            let child_run = pending.child_scope_runs[child_i];
+            if child_lane == 0 {
+                if pool.max_batch_width > 0 {
+                    let handles: Vec<JoinHandle<EcsParallelScopedTaskSet<R, M>>> = Vec::new();
+                    let batch_count: i64 = 0;
+                    while child_i + batch_count < child_scope_count {
+                        if batch_count >= pool.max_batch_width { break; };
+                        if pending.child_scope_run_lanes[child_i + batch_count] != 0 { break; };
+                        let wave_run = pending.child_scope_runs[child_i + batch_count];
+                        let child_world = shared.clone();
+                        handles.push(thread::spawn(^|| wave_run(child_world)));
+                        batch_count = batch_count + 1;
+                    }
+                    let join_i: i64 = 0;
+                    while join_i < len(handles) as i64 {
+                        let generated_tasks = handles[join_i].join().unwrap();
+                        next = ecs_parallel_scoped_task_set_extend<R, M>(next, generated_tasks);
+                        total_child_scopes = total_child_scopes + 1;
+                        total_child_scope_pool = total_child_scope_pool + 1;
+                        join_i = join_i + 1;
+                    }
+                    total_child_scope_waves = total_child_scope_waves + 1;
+                    any_threads = true;
+                    if options.tick_task_pool_executor { ticked_pool = true; };
+                    child_i = child_i + batch_count;
+                } else {
+                    let child_world = shared.clone();
+                    let generated_tasks = child_run(child_world);
+                    next = ecs_parallel_scoped_task_set_extend<R, M>(next, generated_tasks);
+                    ticked_pool = true;
+                    total_child_scopes = total_child_scopes + 1;
+                    total_child_scope_pool = total_child_scope_pool + 1;
+                    child_i = child_i + 1;
+                };
+            } else {
+                let child_world = shared.clone();
+                let generated_tasks = child_run(child_world);
+                next = ecs_parallel_scoped_task_set_extend<R, M>(next, generated_tasks);
+                total_child_scopes = total_child_scopes + 1;
+                if child_lane == 1 {
+                    total_child_scope_local = total_child_scope_local + 1;
+                    ticked_scope = true;
+                };
+                if child_lane == 2 {
+                    total_child_scope_external = total_child_scope_external + 1;
+                    if options.external_executor_is_scope { ticked_scope = true; };
+                    if options.use_external_executor && options.external_executor_is_scope != true { ticked_external = true; };
+                };
+                child_i = child_i + 1;
+            };
+        }
+        let child_result_i: i64 = 0;
+        while child_result_i < child_scope_result_count {
+            let child_lane = pending.child_scope_result_lanes[child_result_i];
+            let result_run = pending.child_scope_result_runs[child_result_i];
+            if child_lane == 0 {
+                if pool.max_batch_width > 0 {
+                    let result_handles: Vec<JoinHandle<i32>> = Vec::new();
+                    let batch_count: i64 = 0;
+                    while child_result_i + batch_count < child_scope_result_count {
+                        if batch_count >= pool.max_batch_width { break; };
+                        if pending.child_scope_result_lanes[child_result_i + batch_count] != 0 { break; };
+                        let wave_result_run = pending.child_scope_result_runs[child_result_i + batch_count];
+                        let result_world = shared.clone();
+                        result_handles.push(thread::spawn(^|| wave_result_run(result_world)));
+                        batch_count = batch_count + 1;
+                    }
+                    let result_join_i: i64 = 0;
+                    while result_join_i < len(result_handles) as i64 {
+                        let result_value = result_handles[result_join_i].join().unwrap();
+                        result_values.push(result_value);
+                        result_rounds.push(depth);
+                        result_lanes.push(3);
+                        total_sum = total_sum + result_value;
+                        total_ran = total_ran + 1;
+                        total_child_scope_results = total_child_scope_results + 1;
+                        result_join_i = result_join_i + 1;
+                    }
+                    let child_handles: Vec<JoinHandle<EcsParallelScopedTaskSet<R, M>>> = Vec::new();
+                    let child_spawn_i: i64 = 0;
+                    while child_spawn_i < batch_count {
+                        let wave_child_run = pending.child_scope_result_child_runs[child_result_i + child_spawn_i];
+                        let child_world = shared.clone();
+                        child_handles.push(thread::spawn(^|| wave_child_run(child_world)));
+                        child_spawn_i = child_spawn_i + 1;
+                    }
+                    let child_join_i: i64 = 0;
+                    while child_join_i < len(child_handles) as i64 {
+                        let generated_tasks = child_handles[child_join_i].join().unwrap();
+                        next = ecs_parallel_scoped_task_set_extend<R, M>(next, generated_tasks);
+                        total_child_scopes = total_child_scopes + 1;
+                        total_child_scope_pool = total_child_scope_pool + 1;
+                        child_join_i = child_join_i + 1;
+                    }
+                    total_child_scope_result_waves = total_child_scope_result_waves + 1;
+                    any_threads = true;
+                    if options.tick_task_pool_executor { ticked_pool = true; };
+                    child_result_i = child_result_i + batch_count;
+                } else {
+                    let result_world = shared.clone();
+                    let result_value = result_run(result_world);
+                    result_values.push(result_value);
+                    result_rounds.push(depth);
+                    result_lanes.push(3);
+                    total_sum = total_sum + result_value;
+                    total_ran = total_ran + 1;
+                    total_child_scope_results = total_child_scope_results + 1;
+                    let child_run = pending.child_scope_result_child_runs[child_result_i];
+                    let child_world = shared.clone();
+                    let generated_tasks = child_run(child_world);
+                    next = ecs_parallel_scoped_task_set_extend<R, M>(next, generated_tasks);
+                    ticked_pool = true;
+                    total_child_scopes = total_child_scopes + 1;
+                    total_child_scope_pool = total_child_scope_pool + 1;
+                    child_result_i = child_result_i + 1;
+                };
+            } else {
+                let result_world = shared.clone();
+                let result_value = result_run(result_world);
+                result_values.push(result_value);
+                result_rounds.push(depth);
+                result_lanes.push(3);
+                total_sum = total_sum + result_value;
+                total_ran = total_ran + 1;
+                total_child_scope_results = total_child_scope_results + 1;
+                let child_run = pending.child_scope_result_child_runs[child_result_i];
+                let child_world = shared.clone();
+                let generated_tasks = child_run(child_world);
+                next = ecs_parallel_scoped_task_set_extend<R, M>(next, generated_tasks);
+                total_child_scopes = total_child_scopes + 1;
+                if child_lane == 1 {
+                    total_child_scope_local = total_child_scope_local + 1;
+                    ticked_scope = true;
+                };
+                if child_lane == 2 {
+                    total_child_scope_external = total_child_scope_external + 1;
+                    if options.external_executor_is_scope { ticked_scope = true; };
+                    if options.use_external_executor && options.external_executor_is_scope != true { ticked_external = true; };
+                };
+                child_result_i = child_result_i + 1;
+            };
+        }
+        if direct_count > 0 {
+            let pass_result = ecs_parallel_task_pool_scope_run_tasks_shared<R, M>(pool, shared.clone(), pending, options);
+            if pass_result.mismatch { return ecs_parallel_scope_run_result_recursive(total_sum + pass_result.thread_sum, result_values, result_rounds, result_lanes, total_ran + pass_result.ran_count, total_local + pass_result.local_count, total_external + pass_result.external_count, total_waves + pass_result.wave_count, total_child_scopes, total_child_scope_pool, total_child_scope_local, total_child_scope_external, total_child_scope_waves, total_child_scope_result_waves, total_child_scope_results, total_generated_tasks + pass_result.ran_count, depth + 1, any_threads || pass_result.used_threads, ticked_pool || pass_result.ticked_pool_executor, ticked_scope || pass_result.ticked_scope_executor, ticked_external || pass_result.ticked_external_executor, true); };
+            total_sum = total_sum + pass_result.thread_sum;
+            total_ran = total_ran + pass_result.ran_count;
+            total_generated_tasks = total_generated_tasks + pass_result.ran_count;
+            total_local = total_local + pass_result.local_count;
+            total_external = total_external + pass_result.external_count;
+            total_waves = total_waves + pass_result.wave_count;
+            if pass_result.used_threads { any_threads = true; };
+            if pass_result.ticked_pool_executor { ticked_pool = true; };
+            if pass_result.ticked_scope_executor { ticked_scope = true; };
+            if pass_result.ticked_external_executor { ticked_external = true; };
+            let value_i: i64 = 0;
+            while value_i < ecs_parallel_scope_run_result_len(pass_result) {
+                result_values.push(ecs_parallel_scope_run_result_at(pass_result, value_i));
+                result_rounds.push(depth);
+                result_lanes.push(ecs_parallel_scope_run_result_lane_at(pass_result, value_i));
+                value_i = value_i + 1;
+            }
+        };
+        let next_parent = ecs_parallel_scoped_task_set_new<R, M>();
+        pending = ecs_parallel_scoped_task_set_extend<R, M>(next_parent, next);
+        depth = depth + 1;
+        guard = guard + 1;
+    }
+    return ecs_parallel_scope_run_result_recursive(total_sum, result_values, result_rounds, result_lanes, total_ran, total_local, total_external, total_waves, total_child_scopes, total_child_scope_pool, total_child_scope_local, total_child_scope_external, total_child_scope_waves, total_child_scope_result_waves, total_child_scope_results, total_generated_tasks, depth, any_threads, ticked_pool, ticked_scope, ticked_external, true);
+}
+
+fn ecs_parallel_take_ready_nonconflicting_catalog_batch_up_to3(p: EcsExecutorRunPlan, max_width: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelCatalogReadySelection {
+    let batch = ecs_executor_ready_batch_new();
+    let skipped_count: i64 = 0;
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+    if width > 3 { width = 3; };
+    let i: i64 = 0;
+    let cnt = p.executor.state.system_count;
+    while i < cnt {
+        if ecs_executor_ready_batch_count(batch) >= width { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false); };
+        if ecs_executor_state_is_ready(p.executor.state, i) {
+            if ecs_executor_state_is_completed(p.executor.state, i) != true {
+                if ecs_executor_state_is_running(p.executor.state, i) != true {
+                    let spec = ecs_executor_run_plan_spec_at(p, i);
+                    if spec.should_run != true {
+                        p = ecs_executor_run_plan_skip_ready(p, i);
+                        batch.skipped.push(i);
+                        skipped_count = skipped_count + 1;
+                    } else {
+                        if ecs_parallel_catalog_index_known(i, first_system_index, second_system_index, third_system_index) != true {
+                            if ecs_executor_ready_batch_count(batch) == 0 { return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, true); };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if spec.is_exclusive || spec.is_local {
+                            if ecs_executor_ready_batch_count(batch) == 0 {
+                                batch.systems.push(i);
+                                batch.is_exclusive = spec.is_exclusive;
+                                batch.is_local = spec.is_local;
+                            };
+                            return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+                        };
+                        if ecs_parallel_catalog_conflicts_with_batch(batch, i, first_system_index, second_system_index, third_system_index, first_access, second_access, third_access) != true {
+                            batch.systems.push(i);
+                        };
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return ecs_parallel_catalog_ready_selection(p, batch, skipped_count, false);
+}
+
+fn ecs_parallel_run_selected_catalog_batch_up_to3<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, batch: EcsExecutorReadyBatch, skipped: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let count = ecs_executor_ready_batch_count(batch);
+    if count == 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 1 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        if a == first_system_index {
+            let sum = ecs_parallel_run_single_batch<R, M>(world, first);
+            return ecs_parallel_catalog_complete_batch(plan, batch, sum, 1, skipped, false);
+        };
+        if a == second_system_index {
+            let sum = ecs_parallel_run_single_batch<R, M>(world, second);
+            return ecs_parallel_catalog_complete_batch(plan, batch, sum, 1, skipped, false);
+        };
+        if a == third_system_index {
+            let sum = ecs_parallel_run_single_batch<R, M>(world, third);
+            return ecs_parallel_catalog_complete_batch(plan, batch, sum, 1, skipped, false);
+        };
+        return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+    };
+    if ecs_executor_ready_batch_is_exclusive(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(batch) { return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true); };
+    if count == 2 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        if a == first_system_index {
+            if b == second_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, first, second, first_access, second_access);
+                return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+            };
+            if b == third_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, first, third, first_access, third_access);
+                return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+            };
+        };
+        if a == second_system_index {
+            if b == first_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, second, first, second_access, first_access);
+                return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+            };
+            if b == third_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, second, third, second_access, third_access);
+                return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+            };
+        };
+        if a == third_system_index {
+            if b == first_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, third, first, third_access, first_access);
+                return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+            };
+            if b == second_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, third, second, third_access, second_access);
+                return ecs_parallel_catalog_complete_batch(plan, batch, sum, 2, skipped, true);
+            };
+        };
+        return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+    };
+    if count == 3 {
+        let a = ecs_executor_ready_batch_at(batch, 0);
+        let b = ecs_executor_ready_batch_at(batch, 1);
+        let c = ecs_executor_ready_batch_at(batch, 2);
+        if a == first_system_index {
+            if b == second_system_index {
+                if c == third_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, first, second, third, first_access, second_access, third_access);
+                    return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+                };
+            };
+            if b == third_system_index {
+                if c == second_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, first, third, second, first_access, third_access, second_access);
+                    return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+                };
+            };
+        };
+        if a == second_system_index {
+            if b == first_system_index {
+                if c == third_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, second, first, third, second_access, first_access, third_access);
+                    return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+                };
+            };
+            if b == third_system_index {
+                if c == first_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, second, third, first, second_access, third_access, first_access);
+                    return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+                };
+            };
+        };
+        if a == third_system_index {
+            if b == first_system_index {
+                if c == second_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, third, first, second, third_access, first_access, second_access);
+                    return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+                };
+            };
+            if b == second_system_index {
+                if c == first_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, third, second, first, third_access, second_access, first_access);
+                    return ecs_parallel_catalog_complete_batch(plan, batch, sum, 3, skipped, true);
+                };
+            };
+        };
+        return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+    };
+    return ecs_parallel_ready_batch_run_result(plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_catalog_batch_up_to3<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, max_width: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let width = max_width;
+    if width <= 0 { return ecs_parallel_ready_batch_run_result(plan, 0, 0, 0, false, true); };
+    if width > 3 { width = 3; };
+    let taken = ecs_executor_run_plan_take_ready_batch(plan, width);
+    let skipped = ecs_executor_ready_batch_skipped_count(taken.batch);
+    let count = ecs_executor_ready_batch_count(taken.batch);
+    if count == 0 {
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    if count == 1 {
+        let a = ecs_executor_ready_batch_at(taken.batch, 0);
+        if a == first_system_index {
+            let sum = ecs_parallel_run_single_batch<R, M>(world, first);
+            return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 1, skipped, false);
+        };
+        if a == second_system_index {
+            let sum = ecs_parallel_run_single_batch<R, M>(world, second);
+            return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 1, skipped, false);
+        };
+        if a == third_system_index {
+            let sum = ecs_parallel_run_single_batch<R, M>(world, third);
+            return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 1, skipped, false);
+        };
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    if ecs_executor_ready_batch_is_exclusive(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if ecs_executor_ready_batch_is_local(taken.batch) { return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true); };
+    if count == 2 {
+        let a = ecs_executor_ready_batch_at(taken.batch, 0);
+        let b = ecs_executor_ready_batch_at(taken.batch, 1);
+        if a == first_system_index {
+            if b == second_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, first, second, first_access, second_access);
+                return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 2, skipped, true);
+            };
+            if b == third_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, first, third, first_access, third_access);
+                return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 2, skipped, true);
+            };
+            return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+        };
+        if a == second_system_index {
+            if b == first_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, second, first, second_access, first_access);
+                return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 2, skipped, true);
+            };
+            if b == third_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, second, third, second_access, third_access);
+                return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 2, skipped, true);
+            };
+            return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+        };
+        if a == third_system_index {
+            if b == first_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, third, first, third_access, first_access);
+                return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 2, skipped, true);
+            };
+            if b == second_system_index {
+                let sum = ecs_parallel_run_mut_batch<R, M>(world, third, second, third_access, second_access);
+                return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 2, skipped, true);
+            };
+            return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+        };
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    if count == 3 {
+        let a = ecs_executor_ready_batch_at(taken.batch, 0);
+        let b = ecs_executor_ready_batch_at(taken.batch, 1);
+        let c = ecs_executor_ready_batch_at(taken.batch, 2);
+        if a == first_system_index {
+            if b == second_system_index {
+                if c == third_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, first, second, third, first_access, second_access, third_access);
+                    return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 3, skipped, true);
+                };
+            };
+            if b == third_system_index {
+                if c == second_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, first, third, second, first_access, third_access, second_access);
+                    return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 3, skipped, true);
+                };
+            };
+            return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+        };
+        if a == second_system_index {
+            if b == first_system_index {
+                if c == third_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, second, first, third, second_access, first_access, third_access);
+                    return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 3, skipped, true);
+                };
+            };
+            if b == third_system_index {
+                if c == first_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, second, third, first, second_access, third_access, first_access);
+                    return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 3, skipped, true);
+                };
+            };
+            return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+        };
+        if a == third_system_index {
+            if b == first_system_index {
+                if c == second_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, third, first, second, third_access, first_access, second_access);
+                    return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 3, skipped, true);
+                };
+            };
+            if b == second_system_index {
+                if c == first_system_index {
+                    let sum = ecs_parallel_run_mut_triple_batch<R, M>(world, third, second, first, third_access, second_access, first_access);
+                    return ecs_parallel_catalog_complete_batch(taken.plan, taken.batch, sum, 3, skipped, true);
+                };
+            };
+            return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+        };
+        return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+    };
+    return ecs_parallel_ready_batch_run_result(taken.plan, 0, 0, skipped, false, true);
+}
+
+fn ecs_parallel_run_ready_nonconflicting_catalog_batch_up_to3<R, M>(world: TableErasedWorld<R, M>, plan: EcsExecutorRunPlan, max_width: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let selected = ecs_parallel_take_ready_nonconflicting_catalog_batch_up_to3(plan, max_width, first_system_index, second_system_index, third_system_index, first_access, second_access, third_access);
+    if selected.mismatch { return ecs_parallel_ready_batch_run_result(selected.plan, 0, 0, selected.skipped_count, false, true); };
+    return ecs_parallel_run_selected_catalog_batch_up_to3<R, M>(world, selected.plan, selected.batch, selected.skipped_count, first_system_index, second_system_index, third_system_index, first, second, third, first_access, second_access, third_access);
+}
+
+fn ecs_parallel_run_ready_all_up_to3<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, max_width: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_catalog_batch_up_to3<R, M>(world, p, max_width, first_system_index, second_system_index, third_system_index, first, second, third, first_access, second_access, third_access);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}
+
+fn ecs_parallel_run_ready_all_nonconflicting_up_to3<R, M>(world: TableErasedWorld<R, M>, p: EcsExecutorRunPlan, max_width: i64, first_system_index: i64, second_system_index: i64, third_system_index: i64, first: fn(Arc<*TableErasedWorld<R, M>>) -> i32, second: fn(Arc<*TableErasedWorld<R, M>>) -> i32, third: fn(Arc<*TableErasedWorld<R, M>>) -> i32, first_access: TableErasedSystemAccess, second_access: TableErasedSystemAccess, third_access: TableErasedSystemAccess) -> EcsParallelReadyBatchRunResult {
+    let total_sum: i32 = 0;
+    let total_ran: i64 = 0;
+    let total_skipped: i64 = 0;
+    let any_threads = false;
+    let guard: i64 = 0;
+    let limit = p.executor.state.system_count * 2 + 1;
+    while guard < limit {
+        if ecs_executor_state_completed_count(p.executor.state) >= p.executor.state.system_count {
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, false);
+        };
+        let before = ecs_executor_state_completed_count(p.executor.state);
+        let result = ecs_parallel_run_ready_nonconflicting_catalog_batch_up_to3<R, M>(world, p, max_width, first_system_index, second_system_index, third_system_index, first, second, third, first_access, second_access, third_access);
+        p = result.plan;
+        if result.used_threads { any_threads = true; };
+        total_sum = total_sum + result.thread_sum;
+        total_ran = total_ran + result.ran_count;
+        total_skipped = total_skipped + result.skipped_count;
+        if result.mismatch {
+            if ecs_executor_state_completed_count(p.executor.state) < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        let after = ecs_executor_state_completed_count(p.executor.state);
+        if after == before {
+            if after < p.executor.state.system_count { p.stalled = true; };
+            return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+        };
+        guard = guard + 1;
+    }
+    p.stalled = true;
+    return ecs_parallel_ready_batch_run_result(p, total_sum, total_ran, total_skipped, any_threads, true);
+}

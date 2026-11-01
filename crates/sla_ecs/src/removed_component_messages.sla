@@ -1,0 +1,278 @@
+// Bevy ECS RemovedComponentMessages — world-level storage of removal events per component.
+//
+// Mirrors src/lifecycle.rs RemovedComponentMessages: a SparseSet<ComponentId, Messages<RemovedComponentEntity>>
+// with new/update/iter/get/write. Our model collapses the SparseSet to a flat Vec of per-component
+// removal-event buckets. RemovedComponentEntity wraps an Entity; we model it as the entity-id i32.
+//
+// Bevy semantics:
+//   - new(): empty storage (SparseSet::default()).
+//   - update(): for each bucket, swap the event buffers and clear the oldest (default is a 2-deep
+//     ring of Messages); our model collapses to a no-op staging swap since we have a single linear
+//     queue per id (no double-buffer) — recorded for API parity as returning the same model.
+//   - iter(): yields (&ComponentId, &Messages) pairs. Modelled as a count + get_pair(idx) -> (id, len).
+//   - get(component_id) -> Option<&Messages>: modelled as RcmGetResult { has, count, capacity, first_entity_at_head }.
+//   - write(component_id, entity): record a removal; builder-style returns the mutated model.
+//
+// Multi-value returns are surface as dedicated single-field-accessor result structs to avoid the
+// SA-backend scalar-tuple ".1 slot" corruption per the project rules.
+
+// === Result structs (single-field accessors) ===
+struct RcmGet {
+    has: i32,
+    count: i32,
+    first_entity: i32,
+}
+
+fn ecs_rcm_get_has(r: RcmGet) -> i32 {
+    return r.has;
+}
+
+fn ecs_rcm_get_count(r: RcmGet) -> i32 {
+    return r.count;
+}
+
+fn ecs_rcm_get_first_entity(r: RcmGet) -> i32 {
+    return r.first_entity;
+}
+
+struct RcmIterPair {
+    component_id: i32,
+    count: i32,
+}
+
+fn ecs_rcm_pair_component_id(r: RcmIterPair) -> i32 {
+    return r.component_id;
+}
+
+fn ecs_rcm_pair_count(r: RcmIterPair) -> i32 {
+    return r.count;
+}
+
+// === Model: RemovedComponentMessages = a Vec of buckets, each tracking (component_id, entity-queue head) ===
+struct EcsRemovedComponentMessages {
+    keys: Vec<i32>,
+    // per-bucket removal entity queue (parallel to keys)
+    queues: Vec<Vec<i32>>,
+}
+
+fn ecs_removed_component_messages_new() -> EcsRemovedComponentMessages {
+    let s = EcsRemovedComponentMessages { keys: Vec::new(), queues: Vec::new() };
+    return s;
+}
+
+// internal: find bucket index for component_id, or -1.
+fn _ecs_rcm_bucket_index(s: EcsRemovedComponentMessages, component_id: i32) -> i32 {
+    let n: i32 = len(s.keys) as i32;
+    let i: i32 = 0;
+    while i < n {
+        if s.keys[i] == component_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// internal: get-or-insert a bucket; returns the bucket index. Mutates s in place.
+fn _ecs_rcm_bucket_get_or_insert(s: EcsRemovedComponentMessages, component_id: i32) -> (EcsRemovedComponentMessages, i32) {
+    let existing = _ecs_rcm_bucket_index(s, component_id);
+    if existing >= 0 {
+        return (s, existing);
+    };
+    let before: i32 = len(s.keys) as i32;
+    s.keys.push(component_id);
+    let empty_q = Vec::new();
+    s.queues.push(empty_q);
+    return (s, before);
+}
+
+// count_buckets: number of distinct component ids with a removal-event queue.
+fn ecs_removed_component_messages_buckets(s: EcsRemovedComponentMessages) -> i32 {
+    return len(s.keys) as i32;
+}
+
+// update(): Bevy swaps the event buffers and clears the oldest per bucket. Collapsed to a no-op
+// (no double-buffer in this model) — returns the same model for API parity.
+fn ecs_removed_component_messages_update(s: EcsRemovedComponentMessages) -> EcsRemovedComponentMessages {
+    return s;
+}
+
+// iter(): Bevy yields (&ComponentId, &Messages) pairs. We expose iter_count + iter_pair(idx).
+fn ecs_removed_component_messages_iter_count(s: EcsRemovedComponentMessages) -> i32 {
+    return ecs_removed_component_messages_buckets(s);
+}
+
+fn ecs_removed_component_messages_iter_pair(s: EcsRemovedComponentMessages, idx: i32) -> RcmIterPair {
+    let n: i32 = len(s.keys) as i32;
+    if idx < 0 || idx >= n {
+        let empty = RcmIterPair { component_id: -1, count: 0 };
+        return empty;
+    };
+    let cid = s.keys[idx];
+    let q = s.queues[idx];
+    let p = RcmIterPair { component_id: cid, count: len(q) as i32 };
+    return p;
+}
+
+// get(component_id) -> Option<&Messages>: model with RcmGet { has: 0|1, count, first_entity }.
+fn ecs_removed_component_messages_get(s: EcsRemovedComponentMessages, component_id: i32) -> RcmGet {
+    let idx = _ecs_rcm_bucket_index(s, component_id);
+    if idx < 0 {
+        let none = RcmGet { has: 0, count: 0, first_entity: -1 };
+        return none;
+    };
+    let q = s.queues[idx];
+    let m: i32 = len(q) as i32;
+    if m == 0 {
+        let empty = RcmGet { has: 1, count: 0, first_entity: -1 };
+        return empty;
+    };
+    let first = q[0];
+    let some = RcmGet { has: 1, count: m, first_entity: first };
+    return some;
+}
+
+// write(component_id, entity): record a removal. Builder-style — returns the MUTATED model.
+fn ecs_removed_component_messages_write(s: EcsRemovedComponentMessages, component_id: i32, entity: i32) -> EcsRemovedComponentMessages {
+    let (s2, idx) = _ecs_rcm_bucket_get_or_insert(s, component_id);
+    s2.queues[idx].push(entity);
+    return s2;
+}
+
+// additional accessor: bucket capacity (max entities recorded so far) for a component_id — for API parity helpers
+fn ecs_removed_component_messages_bucket_count(s: EcsRemovedComponentMessages, component_id: i32) -> i32 {
+    let idx = _ecs_rcm_bucket_index(s, component_id);
+    if idx < 0 { return 0; };
+    let q = s.queues[idx];
+    return len(q) as i32;
+}
+
+// entity_at(component_id, pos): look up the entity written at queue index `pos`. Returns -1 if absent.
+fn ecs_removed_component_messages_entity_at(s: EcsRemovedComponentMessages, component_id: i32, pos: i32) -> i32 {
+    let idx = _ecs_rcm_bucket_index(s, component_id);
+    if idx < 0 { return -1; };
+    let q = s.queues[idx];
+    let m: i32 = len(q) as i32;
+    if pos < 0 || pos >= m { return -1; };
+    return q[pos];
+}
+
+// === RemovedComponentReader — MessageCursor mirror ===
+// Bevy: RemovedComponentReader<T> wraps a MessageCursor<RemovedComponentEntity>. We model it as
+// (component_id, cursor, drained_count) so tests can simulate read()/read_with_id() draining the queue.
+struct EcsRemovedComponentReader {
+    component_id: i32,
+    cursor: i32,
+    drained: i32,
+}
+
+fn ecs_removed_component_reader_new(component_id: i32) -> EcsRemovedComponentReader {
+    let r = EcsRemovedComponentReader { component_id: component_id, cursor: 0, drained: 0 };
+    return r;
+}
+
+fn ecs_removed_component_reader_component_id(r: EcsRemovedComponentReader) -> i32 {
+    return r.component_id;
+}
+
+fn ecs_removed_component_reader_cursor(r: EcsRemovedComponentReader) -> i32 {
+    return r.cursor;
+}
+
+fn ecs_removed_component_reader_drained(r: EcsRemovedComponentReader) -> i32 {
+    return r.drained;
+}
+
+// read(s, reader): pop next unread entity from the queue; returns (had, entity, new_reader).
+// Result struct form to avoid tuple ".1 slot" corruption.
+struct RcrRead {
+    had: i32,
+    entity: i32,
+    cursor: i32,
+    drained: i32,
+}
+
+fn ecs_rcr_read_had(r: RcrRead) -> i32 {
+    return r.had;
+}
+
+fn ecs_rcr_read_entity(r: RcrRead) -> i32 {
+    return r.entity;
+}
+
+fn ecs_rcr_read_cursor(r: RcrRead) -> i32 {
+    return r.cursor;
+}
+
+fn ecs_rcr_read_drained(r: RcrRead) -> i32 {
+    return r.drained;
+}
+
+fn ecs_removed_component_reader_read(s: EcsRemovedComponentMessages, reader: EcsRemovedComponentReader) -> (RcrRead, EcsRemovedComponentReader) {
+    let bucket_count = ecs_removed_component_messages_bucket_count(s, reader.component_id);
+    let cur_cursor = reader.cursor;
+    let cur_drained = reader.drained;
+    if cur_cursor >= bucket_count {
+        let none = RcrRead { had: 0, entity: -1, cursor: cur_cursor, drained: cur_drained };
+        return (none, reader);
+    };
+    let e = ecs_removed_component_messages_entity_at(s, reader.component_id, cur_cursor);
+    reader.cursor = cur_cursor + 1;
+    reader.drained = cur_drained + 1;
+    let some = RcrRead { had: 1, entity: e, cursor: reader.cursor, drained: reader.drained };
+    return (some, reader);
+}
+
+// read_with_id: yields (had, entity, message_id, cursor). message_id is modelled as the cursor
+// position before advancing (matches Bevy's per-message MessageId).
+struct RcrReadWithId {
+    had: i32,
+    entity: i32,
+    message_id: i32,
+}
+
+fn ecs_rcr_read_with_id_had(r: RcrReadWithId) -> i32 {
+    return r.had;
+}
+
+fn ecs_rcr_read_with_id_entity(r: RcrReadWithId) -> i32 {
+    return r.entity;
+}
+
+fn ecs_rcr_read_with_id_msg_id(r: RcrReadWithId) -> i32 {
+    return r.message_id;
+}
+
+fn ecs_removed_component_reader_read_with_id(s: EcsRemovedComponentMessages, reader: EcsRemovedComponentReader) -> (RcrReadWithId, EcsRemovedComponentReader) {
+    let bucket_count = ecs_removed_component_messages_bucket_count(s, reader.component_id);
+    let cur_cursor = reader.cursor;
+    if cur_cursor >= bucket_count {
+        let none = RcrReadWithId { had: 0, entity: -1, message_id: -1 };
+        return (none, reader);
+    };
+    let msg_id = cur_cursor;
+    let e = ecs_removed_component_messages_entity_at(s, reader.component_id, cur_cursor);
+    reader.cursor = cur_cursor + 1;
+    let some = RcrReadWithId { had: 1, entity: e, message_id: msg_id };
+    return (some, reader);
+}
+
+// len(s, reader): number of remaining unread messages; matches Bevy `reader.len(messages)`.
+fn ecs_removed_component_reader_len(s: EcsRemovedComponentMessages, reader: EcsRemovedComponentReader) -> i32 {
+    let total = ecs_removed_component_messages_bucket_count(s, reader.component_id);
+    if total <= reader.cursor { return 0; };
+    return total - reader.cursor;
+}
+
+// is_empty(s, reader): mirrors Bevy `reader.is_empty(messages)`.
+fn ecs_removed_component_reader_is_empty(s: EcsRemovedComponentMessages, reader: EcsRemovedComponentReader) -> bool {
+    return ecs_removed_component_reader_len(s, reader) == 0;
+}
+
+// clear(s, reader): advances the cursor to consume all messages (matches Bevy reader.clear(messages)).
+fn ecs_removed_component_reader_clear(s: EcsRemovedComponentMessages, reader: EcsRemovedComponentReader) -> EcsRemovedComponentReader {
+    let total = ecs_removed_component_messages_bucket_count(s, reader.component_id);
+    let advanced = total - reader.cursor;
+    let new_drained = reader.drained + advanced;
+    reader.cursor = total;
+    reader.drained = new_drained;
+    return reader;
+}

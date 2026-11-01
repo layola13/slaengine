@@ -1,0 +1,390 @@
+// Deepened Bevy ECS change_detection params surface.
+// Mirrors src/change_detection/params.rs:
+//   Ref / Mut / MutUntyped / Res / ResMut / NonSendMut
+//   DetectChanges + DetectChangesMut ops, into_inner, reborrow, map_unchanged,
+//   bypass_change_detection, set_if_neq, as_ref (Mut→Ref)
+// Tick comparisons use MAX_CHANGE_AGE-aware is_newer_than (u32 wrap model).
+// Shallow lib/change_detection_params.sla retained.
+
+const ECS_CDP_U32_MOD: i64 = 4294967296;
+const ECS_CDP_MAX_AGE: i64 = 3258167296;
+
+fn ecs_cdp_wrap(x: i64) -> i64 {
+    let m = ECS_CDP_U32_MOD;
+    let r = x % m;
+    if r < 0 { return r + m; };
+    return r;
+}
+
+fn ecs_cdp_min(a: i64, b: i64) -> i64 {
+    if a < b { return a; };
+    return b;
+}
+
+fn ecs_cdp_is_newer_than(tick: i64, last_run: i64, this_run: i64) -> bool {
+    let since_insert = ecs_cdp_wrap(this_run - tick);
+    let since_system = ecs_cdp_wrap(this_run - last_run);
+    let a = ecs_cdp_min(since_insert, ECS_CDP_MAX_AGE);
+    let b = ecs_cdp_min(since_system, ECS_CDP_MAX_AGE);
+    return b > a;
+}
+
+// Shared pointer payload
+struct EcsCdpPtrDeep {
+    value: i64,
+    added: i64,
+    changed: i64,
+    last_run: i64,
+    this_run: i64,
+    changed_by: i64,
+    has_caller: bool,
+}
+
+fn ecs_cdp_ptr_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpPtrDeep {
+    return EcsCdpPtrDeep {
+        value: value,
+        added: ecs_cdp_wrap(added),
+        changed: ecs_cdp_wrap(changed),
+        last_run: ecs_cdp_wrap(last_run),
+        this_run: ecs_cdp_wrap(this_run),
+        changed_by: 0,
+        has_caller: false,
+    };
+}
+
+fn ecs_cdp_ptr_value(p: EcsCdpPtrDeep) -> i64 { return p.value; }
+fn ecs_cdp_ptr_added(p: EcsCdpPtrDeep) -> i64 { return p.added; }
+fn ecs_cdp_ptr_changed(p: EcsCdpPtrDeep) -> i64 { return p.changed; }
+fn ecs_cdp_ptr_last_run(p: EcsCdpPtrDeep) -> i64 { return p.last_run; }
+fn ecs_cdp_ptr_this_run(p: EcsCdpPtrDeep) -> i64 { return p.this_run; }
+fn ecs_cdp_ptr_changed_by(p: EcsCdpPtrDeep) -> i64 { return p.changed_by; }
+fn ecs_cdp_ptr_has_caller(p: EcsCdpPtrDeep) -> bool { return p.has_caller; }
+
+fn ecs_cdp_ptr_is_added(p: EcsCdpPtrDeep) -> bool {
+    return ecs_cdp_is_newer_than(p.added, p.last_run, p.this_run);
+}
+fn ecs_cdp_ptr_is_changed(p: EcsCdpPtrDeep) -> bool {
+    return ecs_cdp_is_newer_than(p.changed, p.last_run, p.this_run);
+}
+fn ecs_cdp_ptr_is_added_after(p: EcsCdpPtrDeep, other: i64) -> bool {
+    return ecs_cdp_is_newer_than(p.added, other, p.this_run);
+}
+fn ecs_cdp_ptr_is_changed_after(p: EcsCdpPtrDeep, other: i64) -> bool {
+    return ecs_cdp_is_newer_than(p.changed, other, p.this_run);
+}
+
+// === Ref ===
+fn ecs_cdp_ref_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpPtrDeep {
+    return ecs_cdp_ptr_new(value, added, changed, last_run, this_run);
+}
+fn ecs_cdp_ref_into_inner(p: EcsCdpPtrDeep) -> i64 { return p.value; }
+fn ecs_cdp_ref_as_ref(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep { return p; }
+
+// === Mut ===
+fn ecs_cdp_mut_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpPtrDeep {
+    return ecs_cdp_ptr_new(value, added, changed, last_run, this_run);
+}
+
+fn ecs_cdp_mut_set_changed(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep {
+    let this_run = p.this_run;
+    let value = p.value;
+    let added = p.added;
+    let last_run = p.last_run;
+    let by = p.changed_by;
+    let hc = p.has_caller;
+    return EcsCdpPtrDeep {
+        value: value,
+        added: added,
+        changed: this_run,
+        last_run: last_run,
+        this_run: this_run,
+        changed_by: by,
+        has_caller: hc,
+    };
+}
+
+fn ecs_cdp_mut_set_changed_with_caller(p: EcsCdpPtrDeep, caller: i64) -> EcsCdpPtrDeep {
+    p = ecs_cdp_mut_set_changed(p);
+    let this_run = p.this_run;
+    let value = p.value;
+    let added = p.added;
+    let changed = p.changed;
+    let last_run = p.last_run;
+    return EcsCdpPtrDeep {
+        value: value,
+        added: added,
+        changed: changed,
+        last_run: last_run,
+        this_run: this_run,
+        changed_by: caller,
+        has_caller: true,
+    };
+}
+
+fn ecs_cdp_mut_set_added(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep {
+    let this_run = p.this_run;
+    let value = p.value;
+    let last_run = p.last_run;
+    let by = p.changed_by;
+    let hc = p.has_caller;
+    return EcsCdpPtrDeep {
+        value: value,
+        added: this_run,
+        changed: this_run,
+        last_run: last_run,
+        this_run: this_run,
+        changed_by: by,
+        has_caller: hc,
+    };
+}
+
+fn ecs_cdp_mut_set_last_changed(p: EcsCdpPtrDeep, tick: i64) -> EcsCdpPtrDeep {
+    let value = p.value;
+    let added = p.added;
+    let last_run = p.last_run;
+    let this_run = p.this_run;
+    let by = p.changed_by;
+    let hc = p.has_caller;
+    return EcsCdpPtrDeep {
+        value: value,
+        added: added,
+        changed: ecs_cdp_wrap(tick),
+        last_run: last_run,
+        this_run: this_run,
+        changed_by: by,
+        has_caller: hc,
+    };
+}
+
+fn ecs_cdp_mut_set_last_added(p: EcsCdpPtrDeep, tick: i64) -> EcsCdpPtrDeep {
+    let t = ecs_cdp_wrap(tick);
+    let value = p.value;
+    let last_run = p.last_run;
+    let this_run = p.this_run;
+    let by = p.changed_by;
+    let hc = p.has_caller;
+    return EcsCdpPtrDeep {
+        value: value,
+        added: t,
+        changed: t,
+        last_run: last_run,
+        this_run: this_run,
+        changed_by: by,
+        has_caller: hc,
+    };
+}
+
+fn ecs_cdp_mut_bypass(p: EcsCdpPtrDeep, value: i64) -> EcsCdpPtrDeep {
+    let added = p.added;
+    let changed = p.changed;
+    let last_run = p.last_run;
+    let this_run = p.this_run;
+    let by = p.changed_by;
+    let hc = p.has_caller;
+    return EcsCdpPtrDeep {
+        value: value,
+        added: added,
+        changed: changed,
+        last_run: last_run,
+        this_run: this_run,
+        changed_by: by,
+        has_caller: hc,
+    };
+}
+
+fn ecs_cdp_mut_deref_mut(p: EcsCdpPtrDeep, value: i64) -> EcsCdpPtrDeep {
+    p = ecs_cdp_mut_bypass(p, value);
+    return ecs_cdp_mut_set_changed(p);
+}
+
+fn ecs_cdp_mut_set_if_neq(p: EcsCdpPtrDeep, value: i64) -> (EcsCdpPtrDeep, bool) {
+    if p.value == value {
+        return (p, false);
+    };
+    p = ecs_cdp_mut_bypass(p, value);
+    p = ecs_cdp_mut_set_changed(p);
+    return (p, true);
+}
+
+fn ecs_cdp_mut_map_unchanged(p: EcsCdpPtrDeep, new_value: i64) -> EcsCdpPtrDeep {
+    // map_unchanged: transform pointer without flagging change
+    return ecs_cdp_mut_bypass(p, new_value);
+}
+
+fn ecs_cdp_mut_reborrow(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep {
+    // reborrow shortens lifetime; same payload
+    return p;
+}
+
+fn ecs_cdp_mut_as_ref(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep {
+    return p;
+}
+
+fn ecs_cdp_mut_into_inner(p: EcsCdpPtrDeep) -> i64 { return p.value; }
+
+// === MutUntyped ===
+// no added tick in shallow; deep keeps added for is_added parity with MutUntyped DetectChanges
+fn ecs_cdp_mut_untyped_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpPtrDeep {
+    return ecs_cdp_ptr_new(value, added, changed, last_run, this_run);
+}
+
+fn ecs_cdp_mut_untyped_into_inner(p: EcsCdpPtrDeep) -> i64 { return p.value; }
+fn ecs_cdp_mut_untyped_reborrow(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep { return p; }
+fn ecs_cdp_mut_untyped_as_ref(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep { return p; }
+fn ecs_cdp_mut_untyped_map_unchanged(p: EcsCdpPtrDeep, new_value: i64) -> EcsCdpPtrDeep {
+    return ecs_cdp_mut_bypass(p, new_value);
+}
+fn ecs_cdp_mut_untyped_set_changed(p: EcsCdpPtrDeep) -> EcsCdpPtrDeep {
+    return ecs_cdp_mut_set_changed(p);
+}
+fn ecs_cdp_mut_untyped_bypass(p: EcsCdpPtrDeep, value: i64) -> EcsCdpPtrDeep {
+    return ecs_cdp_mut_bypass(p, value);
+}
+
+// === Res / ResMut / NonSendMut (same pointer model; kind tag) ===
+const ECS_CDP_KIND_RES: i32 = 0;
+const ECS_CDP_KIND_RES_MUT: i32 = 1;
+const ECS_CDP_KIND_NON_SEND_MUT: i32 = 2;
+const ECS_CDP_KIND_REF: i32 = 3;
+const ECS_CDP_KIND_MUT: i32 = 4;
+const ECS_CDP_KIND_MUT_UNTYPED: i32 = 5;
+
+struct EcsCdpParamDeep {
+    kind: i32,
+    ptr: EcsCdpPtrDeep,
+}
+
+fn ecs_cdp_res_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpParamDeep {
+    return EcsCdpParamDeep {
+        kind: ECS_CDP_KIND_RES,
+        ptr: ecs_cdp_ptr_new(value, added, changed, last_run, this_run),
+    };
+}
+
+fn ecs_cdp_res_mut_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpParamDeep {
+    return EcsCdpParamDeep {
+        kind: ECS_CDP_KIND_RES_MUT,
+        ptr: ecs_cdp_ptr_new(value, added, changed, last_run, this_run),
+    };
+}
+
+fn ecs_cdp_nonsend_mut_new(value: i64, added: i64, changed: i64, last_run: i64, this_run: i64) -> EcsCdpParamDeep {
+    return EcsCdpParamDeep {
+        kind: ECS_CDP_KIND_NON_SEND_MUT,
+        ptr: ecs_cdp_ptr_new(value, added, changed, last_run, this_run),
+    };
+}
+
+fn ecs_cdp_param_kind(p: EcsCdpParamDeep) -> i32 { return p.kind; }
+fn ecs_cdp_param_ptr(p: EcsCdpParamDeep) -> EcsCdpPtrDeep { return p.ptr; }
+fn ecs_cdp_param_value(p: EcsCdpParamDeep) -> i64 { return p.ptr.value; }
+fn ecs_cdp_param_is_added(p: EcsCdpParamDeep) -> bool { return ecs_cdp_ptr_is_added(p.ptr); }
+fn ecs_cdp_param_is_changed(p: EcsCdpParamDeep) -> bool { return ecs_cdp_ptr_is_changed(p.ptr); }
+
+fn ecs_cdp_param_set_changed(p: EcsCdpParamDeep) -> EcsCdpParamDeep {
+    let kind = p.kind;
+    let ptr = ecs_cdp_mut_set_changed(p.ptr);
+    return EcsCdpParamDeep { kind: kind, ptr: ptr };
+}
+
+fn ecs_cdp_param_bypass(p: EcsCdpParamDeep, value: i64) -> EcsCdpParamDeep {
+    let kind = p.kind;
+    let ptr = ecs_cdp_mut_bypass(p.ptr, value);
+    return EcsCdpParamDeep { kind: kind, ptr: ptr };
+}
+
+fn ecs_cdp_param_set_if_neq(p: EcsCdpParamDeep, value: i64) -> (EcsCdpParamDeep, bool) {
+    let kind = p.kind;
+    let r = ecs_cdp_mut_set_if_neq(p.ptr, value);
+    return (EcsCdpParamDeep { kind: kind, ptr: r.0 }, r.1);
+}
+
+fn ecs_cdp_param_into_inner(p: EcsCdpParamDeep) -> i64 { return p.ptr.value; }
+
+fn ecs_cdp_res_into_inner(p: EcsCdpParamDeep) -> i64 { return ecs_cdp_param_into_inner(p); }
+fn ecs_cdp_res_mut_into_inner(p: EcsCdpParamDeep) -> i64 { return ecs_cdp_param_into_inner(p); }
+
+// Contiguous ticks slice model (fixed 4)
+struct EcsCdpContigDeep {
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    c0: i64, c1: i64, c2: i64, c3: i64,
+    len: i32,
+    last_run: i64,
+    this_run: i64,
+}
+
+fn ecs_cdp_contig_new(last_run: i64, this_run: i64) -> EcsCdpContigDeep {
+    return EcsCdpContigDeep {
+        a0: 0, a1: 0, a2: 0, a3: 0,
+        c0: 0, c1: 0, c2: 0, c3: 0,
+        len: 0,
+        last_run: ecs_cdp_wrap(last_run),
+        this_run: ecs_cdp_wrap(this_run),
+    };
+}
+
+fn ecs_cdp_contig_push(c: EcsCdpContigDeep, added: i64, changed: i64) -> EcsCdpContigDeep {
+    let n = c.len;
+    let a0 = c.a0; let a1 = c.a1; let a2 = c.a2; let a3 = c.a3;
+    let c0 = c.c0; let c1 = c.c1; let c2 = c.c2; let c3 = c.c3;
+    let lr = c.last_run; let tr = c.this_run;
+    let ad = ecs_cdp_wrap(added);
+    let ch = ecs_cdp_wrap(changed);
+    if n == 0 {
+        return EcsCdpContigDeep { a0: ad, a1: a1, a2: a2, a3: a3, c0: ch, c1: c1, c2: c2, c3: c3, len: 1, last_run: lr, this_run: tr };
+    };
+    if n == 1 {
+        return EcsCdpContigDeep { a0: a0, a1: ad, a2: a2, a3: a3, c0: c0, c1: ch, c2: c2, c3: c3, len: 2, last_run: lr, this_run: tr };
+    };
+    if n == 2 {
+        return EcsCdpContigDeep { a0: a0, a1: a1, a2: ad, a3: a3, c0: c0, c1: c1, c2: ch, c3: c3, len: 3, last_run: lr, this_run: tr };
+    };
+    if n == 3 {
+        return EcsCdpContigDeep { a0: a0, a1: a1, a2: a2, a3: ad, c0: c0, c1: c1, c2: c2, c3: ch, len: 4, last_run: lr, this_run: tr };
+    };
+    return c;
+}
+
+fn ecs_cdp_contig_len(c: EcsCdpContigDeep) -> i32 { return c.len; }
+
+fn ecs_cdp_contig_is_added_at(c: EcsCdpContigDeep, idx: i32) -> bool {
+    let ad = 0;
+    if idx == 0 { ad = c.a0; };
+    if idx == 1 { ad = c.a1; };
+    if idx == 2 { ad = c.a2; };
+    if idx == 3 { ad = c.a3; };
+    return ecs_cdp_is_newer_than(ad, c.last_run, c.this_run);
+}
+
+fn ecs_cdp_contig_is_changed_at(c: EcsCdpContigDeep, idx: i32) -> bool {
+    let ch = 0;
+    if idx == 0 { ch = c.c0; };
+    if idx == 1 { ch = c.c1; };
+    if idx == 2 { ch = c.c2; };
+    if idx == 3 { ch = c.c3; };
+    return ecs_cdp_is_newer_than(ch, c.last_run, c.this_run);
+}
+
+fn ecs_cdp_contig_mark_changed_at(c: EcsCdpContigDeep, idx: i32) -> EcsCdpContigDeep {
+    let tr = c.this_run;
+    let a0 = c.a0; let a1 = c.a1; let a2 = c.a2; let a3 = c.a3;
+    let c0 = c.c0; let c1 = c.c1; let c2 = c.c2; let c3 = c.c3;
+    let n = c.len; let lr = c.last_run;
+    if idx == 0 {
+        return EcsCdpContigDeep { a0: a0, a1: a1, a2: a2, a3: a3, c0: tr, c1: c1, c2: c2, c3: c3, len: n, last_run: lr, this_run: tr };
+    };
+    if idx == 1 {
+        return EcsCdpContigDeep { a0: a0, a1: a1, a2: a2, a3: a3, c0: c0, c1: tr, c2: c2, c3: c3, len: n, last_run: lr, this_run: tr };
+    };
+    if idx == 2 {
+        return EcsCdpContigDeep { a0: a0, a1: a1, a2: a2, a3: a3, c0: c0, c1: c1, c2: tr, c3: c3, len: n, last_run: lr, this_run: tr };
+    };
+    if idx == 3 {
+        return EcsCdpContigDeep { a0: a0, a1: a1, a2: a2, a3: a3, c0: c0, c1: c1, c2: c2, c3: tr, len: n, last_run: lr, this_run: tr };
+    };
+    return c;
+}
+
+fn ecs_cdp_kind_res() -> i32 { return ECS_CDP_KIND_RES; }
+fn ecs_cdp_kind_res_mut() -> i32 { return ECS_CDP_KIND_RES_MUT; }
+fn ecs_cdp_kind_nonsend_mut() -> i32 { return ECS_CDP_KIND_NON_SEND_MUT; }

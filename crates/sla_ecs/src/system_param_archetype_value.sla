@@ -1,0 +1,328 @@
+// SA-native system parameter adapters for ArchetypeValueWorld<T, R, M>.
+// These adapters inject query/resource/message parameters into system
+// functions and then write results back to the world, moving beyond only
+// hand-written fn(World) -> World systems.
+@import "schedule_archetype_value.sla"
+
+struct ArchetypeValueResourceMessageParam<R, M> {
+    resource: R,
+    message: M,
+    should_write_message: bool,
+}
+
+struct ArchetypeValueResMutMessageReadParam<R, M> {
+    resource: ResMut<R>,
+    read: MessageRead<M>,
+}
+
+struct ArchetypeValueCommandsParam<T, R, M> {
+    world: ArchetypeValueWorld<T, R, M>,
+    commands: ArchetypeValueCommands<T, R, M>,
+}
+
+struct ArchetypeValueQueryResourceParam<T, R> {
+    query: Query<EntityItem<T>>,
+    resource: R,
+}
+
+fn archetype_value_resource_message_param<R, M>(resource: R, message: M, should_write_message: bool) -> ArchetypeValueResourceMessageParam<R, M> {
+    return ArchetypeValueResourceMessageParam<R, M> { resource: resource, message: message, should_write_message: should_write_message };
+}
+
+fn archetype_value_resmut_message_read_param<R, M>(resource: ResMut<R>, read: MessageRead<M>) -> ArchetypeValueResMutMessageReadParam<R, M> {
+    return ArchetypeValueResMutMessageReadParam<R, M> { resource: resource, read: read };
+}
+
+fn archetype_value_commands_param_new<T, R, M>(world: ArchetypeValueWorld<T, R, M>) -> ArchetypeValueCommandsParam<T, R, M> {
+    return ArchetypeValueCommandsParam<T, R, M> { world: world, commands: archetype_value_commands_new<T, R, M>() };
+}
+
+fn archetype_value_commands_param_reserve_entity<T, R, M>(param: ArchetypeValueCommandsParam<T, R, M>) -> (ArchetypeValueCommandsParam<T, R, M>, Entity) {
+    let (world, commands, entity) = archetype_value_commands_reserve_entity<T, R, M>(param.world, param.commands);
+    return (ArchetypeValueCommandsParam<T, R, M> { world: world, commands: commands }, entity);
+}
+
+fn archetype_value_commands_param_insert<T, R, M>(param: ArchetypeValueCommandsParam<T, R, M>, entity: Entity, component_id: i32, value: T) -> ArchetypeValueCommandsParam<T, R, M> {
+    return ArchetypeValueCommandsParam<T, R, M> { world: param.world, commands: archetype_value_commands_insert<T, R, M>(param.commands, entity, component_id, value) };
+}
+
+fn archetype_value_commands_param_despawn<T, R, M>(param: ArchetypeValueCommandsParam<T, R, M>, entity: Entity) -> ArchetypeValueCommandsParam<T, R, M> {
+    return ArchetypeValueCommandsParam<T, R, M> { world: param.world, commands: archetype_value_commands_despawn<T, R, M>(param.commands, entity) };
+}
+
+fn archetype_value_commands_param_insert_resource<T, R, M>(param: ArchetypeValueCommandsParam<T, R, M>, value: R) -> ArchetypeValueCommandsParam<T, R, M> {
+    return ArchetypeValueCommandsParam<T, R, M> { world: param.world, commands: archetype_value_commands_insert_resource<T, R, M>(param.commands, value) };
+}
+
+fn archetype_value_commands_param_write_message<T, R, M>(param: ArchetypeValueCommandsParam<T, R, M>, value: M) -> ArchetypeValueCommandsParam<T, R, M> {
+    return ArchetypeValueCommandsParam<T, R, M> { world: param.world, commands: archetype_value_commands_write_message<T, R, M>(param.commands, value) };
+}
+
+fn archetype_value_query_resource_param<T, R>(query: Query<EntityItem<T>>, resource: R) -> ArchetypeValueQueryResourceParam<T, R> {
+    return ArchetypeValueQueryResourceParam<T, R> { query: query, resource: resource };
+}
+
+fn archetype_value_run_pair_mut_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, first_component_id: i32, second_component_id: i32, run: fn(Query<ArchetypeValuePairMut<T>>) -> Query<ArchetypeValuePairMut<T>>) -> ArchetypeValueWorld<T, R, M> {
+    let query = archetype_value_world_query_pair_mut_first<T, R, M>(world, first_component_id, second_component_id);
+    let updated = run(query);
+    let i: i64 = 0;
+    let cnt = len(updated.items) as i64;
+    while i < cnt {
+        let item = updated.items[i];
+        world = archetype_value_world_pair_write_first<T, R, M>(world, item, item.first.value);
+        i = i + 1;
+    }
+    return world;
+}
+
+fn archetype_value_run_resource_message_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, default_message: M, run: fn(ArchetypeValueResourceMessageParam<R, M>) -> ArchetypeValueResourceMessageParam<R, M>) -> ArchetypeValueWorld<T, R, M> {
+    let param0 = archetype_value_resource_message_param<R, M>(archetype_value_world_get_resource<T, R, M>(world), default_message, false);
+    let param1 = run(param0);
+    world = archetype_value_world_insert_resource<T, R, M>(world, param1.resource);
+    if param1.should_write_message {
+        world = archetype_value_world_write_message<T, R, M>(world, param1.message);
+    };
+    return world;
+}
+
+fn archetype_value_run_res_mut_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, run: fn(ResMut<R>) -> ResMut<R>) -> ArchetypeValueWorld<T, R, M> {
+    let param0 = archetype_value_world_res_mut<T, R, M>(world);
+    let param1 = run(param0);
+    return archetype_value_world_res_mut_write<T, R, M>(world, param1, param1.value);
+}
+
+fn archetype_value_run_message_reader_res_mut_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, reader: MessageReader, default_message: M, run: fn(ArchetypeValueResMutMessageReadParam<R, M>) -> ArchetypeValueResMutMessageReadParam<R, M>) -> (ArchetypeValueWorld<T, R, M>, MessageReader) {
+    let read = archetype_value_world_read_message<T, R, M>(world, reader, default_message);
+    let param0 = archetype_value_resmut_message_read_param<R, M>(archetype_value_world_res_mut<T, R, M>(world), read);
+    let param1 = run(param0);
+    world = archetype_value_world_res_mut_write<T, R, M>(world, param1.resource, param1.resource.value);
+    return (world, param1.read.reader);
+}
+
+fn archetype_value_run_commands_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, run: fn(ArchetypeValueCommandsParam<T, R, M>) -> ArchetypeValueCommandsParam<T, R, M>) -> ArchetypeValueWorld<T, R, M> {
+    let param0 = archetype_value_commands_param_new<T, R, M>(world);
+    let param1 = run(param0);
+    let (world2, cleared) = archetype_value_commands_apply<T, R, M>(param1.world, param1.commands);
+    return world2;
+}
+
+fn archetype_value_run_message_writer_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, run: fn(MessageWriter<M>) -> MessageWriter<M>) -> ArchetypeValueWorld<T, R, M> {
+    let writer0 = message_writer_new<M>();
+    let writer1 = run(writer0);
+    world.messages = messages_apply_writer<M>(world.messages, writer1);
+    return world;
+}
+
+fn archetype_value_run_without_query_resource_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, without_component_id: i32, run: fn(ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueWorld<T, R, M> {
+    let query = archetype_value_world_query_without<T, R, M>(world, component_id, without_component_id);
+    let param0 = archetype_value_query_resource_param<T, R>(query, archetype_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return archetype_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+fn archetype_value_run_with_query_resource_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, with_component_id: i32, run: fn(ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueWorld<T, R, M> {
+    let query = archetype_value_world_query_with<T, R, M>(world, component_id, with_component_id);
+    let param0 = archetype_value_query_resource_param<T, R>(query, archetype_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return archetype_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+fn archetype_value_run_added_query_resource_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, since_tick: i32, run: fn(ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueWorld<T, R, M> {
+    let query = archetype_value_world_query_added<T, R, M>(world, component_id, since_tick);
+    let param0 = archetype_value_query_resource_param<T, R>(query, archetype_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return archetype_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+fn archetype_value_run_changed_query_resource_system<T, R, M>(world: ArchetypeValueWorld<T, R, M>, component_id: i32, since_tick: i32, run: fn(ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueQueryResourceParam<T, R>) -> ArchetypeValueWorld<T, R, M> {
+    let query = archetype_value_world_query_changed<T, R, M>(world, component_id, since_tick);
+    let param0 = archetype_value_query_resource_param<T, R>(query, archetype_value_world_get_resource<T, R, M>(world));
+    let param1 = run(param0);
+    return archetype_value_world_insert_resource<T, R, M>(world, param1.resource);
+}
+
+struct ArchetypeParamData { amount: i32 }
+struct ArchetypeParamTime { tick: i32 }
+struct ArchetypeParamEvent { amount: i32 }
+
+fn archetype_param_time_default() -> ArchetypeParamTime { return ArchetypeParamTime { tick: 0 }; }
+fn archetype_param_event_default() -> ArchetypeParamEvent { return ArchetypeParamEvent { amount: 0 }; }
+
+fn archetype_param_world_new() -> ArchetypeValueWorld<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent> {
+    return archetype_value_world_new<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(archetype_param_time_default(), archetype_param_event_default());
+}
+
+fn archetype_param_movement_system(query: Query<ArchetypeValuePairMut<ArchetypeParamData>>) -> Query<ArchetypeValuePairMut<ArchetypeParamData>> {
+    let i: i64 = 0;
+    let cnt = len(query.items) as i64;
+    while i < cnt {
+        query.items[i].first.value = ArchetypeParamData { amount: query.items[i].first.value.amount + query.items[i].second.amount };
+        i = i + 1;
+    }
+    return query;
+}
+
+fn archetype_param_time_message_system(param: ArchetypeValueResourceMessageParam<ArchetypeParamTime, ArchetypeParamEvent>) -> ArchetypeValueResourceMessageParam<ArchetypeParamTime, ArchetypeParamEvent> {
+    return archetype_value_resource_message_param<ArchetypeParamTime, ArchetypeParamEvent>(ArchetypeParamTime { tick: param.resource.tick + 1 }, ArchetypeParamEvent { amount: param.resource.tick + 4 }, true);
+}
+
+fn archetype_param_res_mut_system(res: ResMut<ArchetypeParamTime>) -> ResMut<ArchetypeParamTime> {
+    return ResMut<ArchetypeParamTime> { value: ArchetypeParamTime { tick: res.value.tick + 2 }, added_tick: res.added_tick, changed_tick: res.changed_tick };
+}
+
+fn archetype_param_reader_resmut_system(param: ArchetypeValueResMutMessageReadParam<ArchetypeParamTime, ArchetypeParamEvent>) -> ArchetypeValueResMutMessageReadParam<ArchetypeParamTime, ArchetypeParamEvent> {
+    if param.read.has_value {
+        param.resource.value = ArchetypeParamTime { tick: param.resource.value.tick + param.read.value.amount };
+    };
+    return param;
+}
+
+fn archetype_param_commands_system(param: ArchetypeValueCommandsParam<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>) -> ArchetypeValueCommandsParam<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent> {
+    let (param1, entity) = archetype_value_commands_param_reserve_entity<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(param);
+    let param2 = archetype_value_commands_param_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(param1, entity, 1, ArchetypeParamData { amount: 12 });
+    let param3 = archetype_value_commands_param_insert_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(param2, ArchetypeParamTime { tick: 7 });
+    return archetype_value_commands_param_write_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(param3, ArchetypeParamEvent { amount: 4 });
+}
+
+fn archetype_param_writer_system(writer: MessageWriter<ArchetypeParamEvent>) -> MessageWriter<ArchetypeParamEvent> {
+    let writer1 = message_writer_send<ArchetypeParamEvent>(writer, ArchetypeParamEvent { amount: 2 });
+    return message_writer_send<ArchetypeParamEvent>(writer1, ArchetypeParamEvent { amount: 8 });
+}
+
+fn archetype_param_count_query_system(param: ArchetypeValueQueryResourceParam<ArchetypeParamData, ArchetypeParamTime>) -> ArchetypeValueQueryResourceParam<ArchetypeParamData, ArchetypeParamTime> {
+    return archetype_value_query_resource_param<ArchetypeParamData, ArchetypeParamTime>(param.query, ArchetypeParamTime { tick: len(param.query.items) as i32 });
+}
+
+fn archetype_param_pair_adapter_system(world: ArchetypeValueWorld<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>) -> ArchetypeValueWorld<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent> {
+    return archetype_value_run_pair_mut_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(world, 1, 2, archetype_param_movement_system);
+}
+
+fn archetype_param_resource_adapter_system(world: ArchetypeValueWorld<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>) -> ArchetypeValueWorld<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent> {
+    return archetype_value_run_resource_message_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(world, archetype_param_event_default(), archetype_param_time_message_system);
+}
+
+@test "archetype value pair query system param writes back"() {
+    let w0 = archetype_param_world_new();
+    let (w1, position) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0);
+    let (w2, velocity) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1);
+    let (w3, entity) = archetype_value_world_spawn<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2);
+    let w4 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3, entity, position.id, ArchetypeParamData { amount: 8 });
+    let w5 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w4, entity, velocity.id, ArchetypeParamData { amount: 3 });
+    let before = w5.archetypes.registry.change_tick;
+    let group_before = archetype_value_world_entity_archetype_id<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w5, entity);
+    let row_before = archetype_value_world_entity_row<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w5, entity);
+    let w6 = archetype_value_run_pair_mut_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w5, position.id, velocity.id, archetype_param_movement_system);
+    let out = archetype_value_world_get<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w6, entity, position.id);
+    if out.amount != 11 { panic(10000); };
+    if archetype_value_world_entity_archetype_id<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w6, entity) != group_before { panic(10001); };
+    if archetype_value_world_entity_row<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w6, entity) != row_before { panic(10002); };
+    if archetype_value_world_changed_since<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w6, entity, position.id, before - 1) != true { panic(10003); };
+}
+
+@test "archetype value resource message system param writes back"() {
+    let w0 = archetype_param_world_new();
+    let w1 = archetype_value_world_insert_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0, ArchetypeParamTime { tick: 5 });
+    let w2 = archetype_value_run_resource_message_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1, archetype_param_event_default(), archetype_param_time_message_system);
+    let time = archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2);
+    let event = archetype_value_world_read_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2, message_reader_new(), archetype_param_event_default());
+    if time.tick != 6 { panic(10010); };
+    if event.has_value != true { panic(10011); };
+    if event.value.amount != 9 { panic(10012); };
+}
+
+@test "archetype value resmut system param tracks changes"() {
+    let w0 = archetype_param_world_new();
+    let w1 = archetype_value_world_insert_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0, ArchetypeParamTime { tick: 4 });
+    let before = w1.archetypes.registry.change_tick;
+    let w2 = archetype_value_world_increment_tick<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1);
+    let w3 = archetype_value_run_res_mut_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2, archetype_param_res_mut_system);
+    let out = archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3);
+    if out.tick != 6 { panic(10013); };
+    if archetype_value_world_resource_added_since<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3, before) != false { panic(10014); };
+    if archetype_value_world_resource_changed_since<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3, before) != true { panic(10015); };
+}
+
+@test "archetype value message reader and resmut params advance cursor"() {
+    let w0 = archetype_param_world_new();
+    let w1 = archetype_value_world_insert_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0, ArchetypeParamTime { tick: 1 });
+    let w2 = archetype_value_world_write_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1, ArchetypeParamEvent { amount: 5 });
+    let reader0 = message_reader_new();
+    let (w3, reader1) = archetype_value_run_message_reader_res_mut_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2, reader0, archetype_param_event_default(), archetype_param_reader_resmut_system);
+    let out1 = archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3);
+    if out1.tick != 6 { panic(10016); };
+    let (w4, reader2) = archetype_value_run_message_reader_res_mut_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3, reader1, archetype_param_event_default(), archetype_param_reader_resmut_system);
+    let out2 = archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w4);
+    if out2.tick != 6 { panic(10017); };
+    if reader2.cursor != 1 { panic(10018); };
+}
+
+@test "archetype value commands system param applies deferred mutations"() {
+    let w0 = archetype_param_world_new();
+    let (w1, health) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0);
+    if health.id != 1 { panic(10040); };
+    let w2 = archetype_value_run_commands_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1, archetype_param_commands_system);
+    let query = archetype_value_world_query<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2, health.id);
+    let time = archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2);
+    let event = archetype_value_world_read_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2, message_reader_new(), archetype_param_event_default());
+    if len(query.items) != 1 { panic(10041); };
+    if query.items[0].value.amount != 12 { panic(10042); };
+    if time.tick != 7 { panic(10043); };
+    if event.value.amount != 4 { panic(10044); };
+}
+
+@test "archetype value message writer system param batches messages"() {
+    let w0 = archetype_param_world_new();
+    let w1 = archetype_value_run_message_writer_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0, archetype_param_writer_system);
+    let read1 = archetype_value_world_read_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1, message_reader_new(), archetype_param_event_default());
+    let read2 = archetype_value_world_read_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1, read1.reader, archetype_param_event_default());
+    if read1.value.amount != 2 { panic(10045); };
+    if read2.value.amount != 8 { panic(10046); };
+}
+
+@test "archetype value filtered query params update resource"() {
+    let w0 = archetype_param_world_new();
+    let (w1, health) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0);
+    let (w2, selected) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1);
+    let (w3, e1) = archetype_value_world_spawn<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2);
+    let (w4, e2) = archetype_value_world_spawn<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3);
+    let w5 = archetype_value_world_insert_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w4, ArchetypeParamTime { tick: 0 });
+    let before_add = w5.archetypes.registry.change_tick;
+    let w5a = archetype_value_world_increment_tick<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w5);
+    let w6 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w5a, e1, health.id, ArchetypeParamData { amount: 5 });
+    let w7 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w6, e2, health.id, ArchetypeParamData { amount: 7 });
+    let w8 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w7, e2, selected.id, ArchetypeParamData { amount: 1 });
+    let w8a = archetype_value_run_with_query_resource_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w8, health.id, selected.id, archetype_param_count_query_system);
+    if archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w8a).tick != 1 { panic(10050); };
+    let w9 = archetype_value_run_without_query_resource_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w8a, health.id, selected.id, archetype_param_count_query_system);
+    if archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w9).tick != 1 { panic(10047); };
+    let w10 = archetype_value_run_added_query_resource_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w9, health.id, before_add, archetype_param_count_query_system);
+    if archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w10).tick != 2 { panic(10048); };
+    let before_change = w10.archetypes.registry.change_tick;
+    let w11 = archetype_value_world_increment_tick<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w10);
+    let item = archetype_value_world_query_mut<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w11, health.id).items[0];
+    let w12 = archetype_value_world_write<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w11, item, ArchetypeParamData { amount: 9 });
+    let w13 = archetype_value_run_changed_query_resource_system<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w12, health.id, before_change, archetype_param_count_query_system);
+    if archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w13).tick != 1 { panic(10049); };
+}
+
+@test "archetype value system param adapters run inside schedule"() {
+    let w0 = archetype_param_world_new();
+    let (w1, position) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w0);
+    let (w2, velocity) = archetype_value_world_register_table<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w1);
+    let (w3, entity) = archetype_value_world_spawn<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w2);
+    let w4 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w3, entity, position.id, ArchetypeParamData { amount: 1 });
+    let w5 = archetype_value_world_insert<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w4, entity, velocity.id, ArchetypeParamData { amount: 4 });
+    let w6 = archetype_value_world_insert_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w5, ArchetypeParamTime { tick: 2 });
+    let move_access = archetype_value_access_read_component(archetype_value_access_write_component(archetype_value_system_access_none(), position.id), velocity.id);
+    let resource_access = archetype_value_access_write_messages(archetype_value_access_write_resource(archetype_value_system_access_none()));
+    let s0 = archetype_value_schedule_default<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>();
+    let s1 = archetype_value_schedule_add_systems<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(s0, archetype_value_system_new<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(archetype_param_pair_adapter_system, move_access));
+    let s2 = archetype_value_schedule_add_systems<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(s1, archetype_value_system_new<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(archetype_param_resource_adapter_system, resource_access));
+    let w7 = archetype_value_schedule_run<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(s2, w6);
+    let out = archetype_value_world_get<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w7, entity, position.id);
+    let time = archetype_value_world_get_resource<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w7);
+    let event = archetype_value_world_read_message<ArchetypeParamData, ArchetypeParamTime, ArchetypeParamEvent>(w7, message_reader_new(), archetype_param_event_default());
+    if out.amount != 5 { panic(10020); };
+    if time.tick != 3 { panic(10021); };
+    if event.value.amount != 6 { panic(10022); };
+}

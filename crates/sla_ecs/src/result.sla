@@ -1,0 +1,132 @@
+// Result<T> type for error handling
+// Simplified version using i32 error codes
+
+struct Result<T> {
+    is_ok: bool,
+    ok_value: T,
+    err_code: i32
+}
+
+fn result_ok<T>(value: T) -> Result<T> {
+    return Result<T> { is_ok: true, ok_value: value, err_code: 0 };
+}
+
+fn result_err<T>(error_code: i32, default_value: T) -> Result<T> {
+    return Result<T> { is_ok: false, ok_value: default_value, err_code: error_code };
+}
+
+fn result_is_ok<T>(result: Result<T>) -> bool {
+    return result.is_ok;
+}
+
+fn result_is_err<T>(result: Result<T>) -> bool {
+    return result.is_ok != true;
+}
+
+fn result_unwrap<T>(result: Result<T>) -> T {
+    if result.is_ok != true { panic(16001); };
+    return result.ok_value;
+}
+
+fn result_error_code<T>(result: Result<T>) -> i32 {
+    return result.err_code;
+}
+
+fn result_unwrap_or<T>(result: Result<T>, default: T) -> T {
+    if result.is_ok { return result.ok_value; };
+    return default;
+}
+
+// Standard ECS error codes
+fn ERR_ENTITY_NOT_FOUND() -> i32 { return 16100; }
+fn ERR_COMPONENT_NOT_FOUND() -> i32 { return 16101; }
+fn ERR_RESOURCE_NOT_FOUND() -> i32 { return 16102; }
+fn ERR_QUERY_NO_MATCH() -> i32 { return 16103; }
+fn ERR_QUERY_MULTIPLE_MATCH() -> i32 { return 16104; }
+
+@test "result ok stores value and unwraps"() {
+    let r = result_ok<i32>(42);
+    if result_is_ok<i32>(r) != true { panic(16201); };
+    if result_is_err<i32>(r) != false { panic(16202); };
+    if result_unwrap<i32>(r) != 42 { panic(16203); };
+}
+
+@test "result err stores error code"() {
+    let r = result_err<i32>(ERR_ENTITY_NOT_FOUND(), -1);
+    if result_is_ok<i32>(r) != false { panic(16204); };
+    if result_is_err<i32>(r) != true { panic(16205); };
+    if result_error_code<i32>(r) != ERR_ENTITY_NOT_FOUND() { panic(16206); };
+}
+
+@test "result unwrap or returns default on error"() {
+    let r = result_err<i32>(99, -1);
+    if result_unwrap_or<i32>(r, 123) != 123 { panic(16207); };
+    
+    let r2 = result_ok<i32>(456);
+    if result_unwrap_or<i32>(r2, 123) != 456 { panic(16208); };
+}
+
+// ============================================================================
+// Typed error enums (Bevy bevy_ecs::world::error + query::error parity)
+//
+// Bevy uses concrete error enums (EntityComponentError, ResourceFetchError,
+// QueryEntityError, QuerySingleError) returned by try_* APIs. SLA has enums
+// with data, so we model them directly. The flat i32 error codes above remain
+// for the simple Result<T> path; these typed enums give 1:1 Bevy error info.
+
+// Bevy EntityComponentError: MissingComponent(ComponentId) | AliasedMutability(ComponentId)
+enum EcsEntityComponentError {
+    MissingComponent { component_id: i32 },
+    AliasedMutability { component_id: i32 },
+}
+
+// Bevy ResourceFetchError: NotRegistered | DoesNotExist(ComponentId) | NoResourceAccess(ComponentId) | Immutable(ComponentId)
+enum EcsResourceFetchError {
+    NotRegistered,
+    DoesNotExist { component_id: i32 },
+    NoResourceAccess { component_id: i32 },
+    Immutable { component_id: i32 },
+}
+
+// Bevy QueryEntityError: NoSuchEntity(Entity) | AliasedMutability(Entity)
+enum EcsQueryEntityError {
+    NoSuchEntity { entity: Entity },
+    AliasedMutability { entity: Entity },
+}
+
+// Bevy QuerySingleError: NoEntities([]) | MultipleEntities([])
+enum EcsQuerySingleError {
+    NoEntities,
+    MultipleEntities,
+}
+
+// Bevy EntityMutableFetchError: NotSpawned | AliasedMutability(Entity)
+enum EcsEntityMutableFetchError {
+    NotSpawned { entity: Entity },
+    AliasedMutability { entity: Entity },
+}
+
+// Discriminant helpers: classify a typed error into the flat i32 code used by
+// Result<T>, so the two error models interoperate.
+fn ecs_entity_component_error_code(err: EcsEntityComponentError) -> i32 {
+    match err {
+        EcsEntityComponentError::MissingComponent { component_id } => { return ERR_COMPONENT_NOT_FOUND(); },
+        EcsEntityComponentError::AliasedMutability { component_id } => { return ERR_QUERY_MULTIPLE_MATCH(); },
+    };
+}
+
+fn ecs_resource_fetch_error_code(err: EcsResourceFetchError) -> i32 {
+    match err {
+        EcsResourceFetchError::NotRegistered => { return ERR_RESOURCE_NOT_FOUND(); },
+        EcsResourceFetchError::DoesNotExist { component_id } => { return ERR_RESOURCE_NOT_FOUND(); },
+        EcsResourceFetchError::NoResourceAccess { component_id } => { return ERR_RESOURCE_NOT_FOUND(); },
+        EcsResourceFetchError::Immutable { component_id } => { return ERR_RESOURCE_NOT_FOUND(); },
+    };
+}
+
+fn ecs_query_single_error_code(err: EcsQuerySingleError) -> i32 {
+    match err {
+        EcsQuerySingleError::NoEntities => { return ERR_QUERY_NO_MATCH(); },
+        EcsQuerySingleError::MultipleEntities => { return ERR_QUERY_MULTIPLE_MATCH(); },
+    };
+}

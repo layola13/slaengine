@@ -1,0 +1,245 @@
+// Deepened Bevy ECS error composite facade.
+// Mirrors src/error/bevy_error.rs + handler.rs (+ command_handling lite):
+//   Severity levels
+//   BevyError + ErrorContext
+//   FallbackErrorHandler policy
+//   CommandOutput / EntityCommandOutput result mapping
+// Shallow lib/error.sla retained. error_command_handling_deep remains.
+
+const ECS_ERR_SEV_IGNORE: i32 = 0;
+const ECS_ERR_SEV_TRACE: i32 = 1;
+const ECS_ERR_SEV_DEBUG: i32 = 2;
+const ECS_ERR_SEV_INFO: i32 = 3;
+const ECS_ERR_SEV_WARNING: i32 = 4;
+const ECS_ERR_SEV_ERROR: i32 = 5;
+const ECS_ERR_SEV_PANIC: i32 = 6;
+
+fn ecs_err_sev_ignore() -> i32 { return ECS_ERR_SEV_IGNORE; }
+fn ecs_err_sev_trace() -> i32 { return ECS_ERR_SEV_TRACE; }
+fn ecs_err_sev_debug() -> i32 { return ECS_ERR_SEV_DEBUG; }
+fn ecs_err_sev_info() -> i32 { return ECS_ERR_SEV_INFO; }
+fn ecs_err_sev_warning() -> i32 { return ECS_ERR_SEV_WARNING; }
+fn ecs_err_sev_error() -> i32 { return ECS_ERR_SEV_ERROR; }
+fn ecs_err_sev_panic() -> i32 { return ECS_ERR_SEV_PANIC; }
+
+fn ecs_err_sev_is_error(sev: i32) -> bool {
+    if sev == ECS_ERR_SEV_ERROR { return true; };
+    if sev == ECS_ERR_SEV_PANIC { return true; };
+    return false;
+}
+
+fn ecs_err_sev_is_warning(sev: i32) -> bool {
+    return sev == ECS_ERR_SEV_WARNING;
+}
+
+fn ecs_err_sev_is_info(sev: i32) -> bool {
+    return sev == ECS_ERR_SEV_INFO;
+}
+
+fn ecs_err_sev_ge(a: i32, b: i32) -> bool {
+    return a >= b;
+}
+
+// BevyError
+struct EcsErrDeep {
+    code: i32,
+    severity: i32,
+    message_id: i64,
+    context_id: i64,
+    has_context: bool,
+}
+
+fn ecs_err_new(code: i32, severity: i32, message_id: i64) -> EcsErrDeep {
+    return EcsErrDeep {
+        code: code, severity: severity, message_id: message_id, context_id: 0, has_context: false,
+    };
+}
+
+fn ecs_err_code(e: EcsErrDeep) -> i32 { return e.code; }
+fn ecs_err_severity(e: EcsErrDeep) -> i32 { return e.severity; }
+fn ecs_err_message_id(e: EcsErrDeep) -> i64 { return e.message_id; }
+fn ecs_err_context_id(e: EcsErrDeep) -> i64 { return e.context_id; }
+fn ecs_err_has_context(e: EcsErrDeep) -> bool { return e.has_context; }
+
+fn ecs_err_with_context(e: EcsErrDeep, context_id: i64) -> EcsErrDeep {
+    return EcsErrDeep {
+        code: e.code, severity: e.severity, message_id: e.message_id,
+        context_id: context_id, has_context: true,
+    };
+}
+
+fn ecs_err_is_panic(e: EcsErrDeep) -> bool {
+    return e.severity == ECS_ERR_SEV_PANIC;
+}
+
+fn ecs_err_is_error_level(e: EcsErrDeep) -> bool {
+    return ecs_err_sev_is_error(e.severity);
+}
+
+// ErrorContext
+const ECS_ERR_CTX_SYSTEM: i32 = 0;
+const ECS_ERR_CTX_COMMAND: i32 = 1;
+const ECS_ERR_CTX_OBSERVER: i32 = 2;
+const ECS_ERR_CTX_HOOK: i32 = 3;
+
+struct EcsErrCtxDeep {
+    kind: i32,
+    name_id: i64,
+    entity: i64,
+    has_entity: bool,
+}
+
+fn ecs_err_ctx_system(name_id: i64) -> EcsErrCtxDeep {
+    return EcsErrCtxDeep { kind: ECS_ERR_CTX_SYSTEM, name_id: name_id, entity: 0, has_entity: false };
+}
+
+fn ecs_err_ctx_command(name_id: i64) -> EcsErrCtxDeep {
+    return EcsErrCtxDeep { kind: ECS_ERR_CTX_COMMAND, name_id: name_id, entity: 0, has_entity: false };
+}
+
+fn ecs_err_ctx_observer(name_id: i64, entity: i64) -> EcsErrCtxDeep {
+    return EcsErrCtxDeep { kind: ECS_ERR_CTX_OBSERVER, name_id: name_id, entity: entity, has_entity: true };
+}
+
+fn ecs_err_ctx_hook(name_id: i64, entity: i64) -> EcsErrCtxDeep {
+    return EcsErrCtxDeep { kind: ECS_ERR_CTX_HOOK, name_id: name_id, entity: entity, has_entity: true };
+}
+
+fn ecs_err_ctx_kind(c: EcsErrCtxDeep) -> i32 { return c.kind; }
+fn ecs_err_ctx_name(c: EcsErrCtxDeep) -> i64 { return c.name_id; }
+fn ecs_err_ctx_entity(c: EcsErrCtxDeep) -> i64 { return c.entity; }
+fn ecs_err_ctx_has_entity(c: EcsErrCtxDeep) -> bool { return c.has_entity; }
+
+// Fallback handler policy
+const ECS_ERR_HANDLER_IGNORE: i32 = 0;
+const ECS_ERR_HANDLER_WARN: i32 = 1;
+const ECS_ERR_HANDLER_ERROR: i32 = 2;
+const ECS_ERR_HANDLER_PANIC: i32 = 3;
+
+struct EcsErrHandlerDeep {
+    policy: i32,
+    min_severity: i32,
+    handled_count: i64,
+    ignored_count: i64,
+    last_code: i32,
+    last_severity: i32,
+}
+
+fn ecs_err_handler_new(policy: i32, min_severity: i32) -> EcsErrHandlerDeep {
+    return EcsErrHandlerDeep {
+        policy: policy, min_severity: min_severity, handled_count: 0, ignored_count: 0,
+        last_code: 0, last_severity: 0,
+    };
+}
+
+fn ecs_err_handler_policy(h: EcsErrHandlerDeep) -> i32 { return h.policy; }
+fn ecs_err_handler_min(h: EcsErrHandlerDeep) -> i32 { return h.min_severity; }
+fn ecs_err_handler_handled(h: EcsErrHandlerDeep) -> i64 { return h.handled_count; }
+fn ecs_err_handler_ignored(h: EcsErrHandlerDeep) -> i64 { return h.ignored_count; }
+fn ecs_err_handler_last_code(h: EcsErrHandlerDeep) -> i32 { return h.last_code; }
+fn ecs_err_handler_last_sev(h: EcsErrHandlerDeep) -> i32 { return h.last_severity; }
+
+fn ecs_err_handler_rebuild(
+    policy: i32, min_severity: i32, handled_count: i64, ignored_count: i64,
+    last_code: i32, last_severity: i32
+) -> EcsErrHandlerDeep {
+    return EcsErrHandlerDeep {
+        policy: policy, min_severity: min_severity, handled_count: handled_count,
+        ignored_count: ignored_count, last_code: last_code, last_severity: last_severity,
+    };
+}
+
+struct EcsErrHandleDeep {
+    should_panic: bool,
+    handled: bool,
+    ignored: bool,
+    handler: EcsErrHandlerDeep,
+}
+
+fn ecs_err_handle_should_panic(r: EcsErrHandleDeep) -> bool { return r.should_panic; }
+fn ecs_err_handle_handled(r: EcsErrHandleDeep) -> bool { return r.handled; }
+fn ecs_err_handle_ignored(r: EcsErrHandleDeep) -> bool { return r.ignored; }
+fn ecs_err_handle_handler(r: EcsErrHandleDeep) -> EcsErrHandlerDeep { return r.handler; }
+
+fn ecs_err_handler_handle(h: EcsErrHandlerDeep, e: EcsErrDeep) -> EcsErrHandleDeep {
+    if e.severity < h.min_severity {
+        let h2 = ecs_err_handler_rebuild(h.policy, h.min_severity, h.handled_count, h.ignored_count + 1, e.code, e.severity);
+        return EcsErrHandleDeep { should_panic: false, handled: false, ignored: true, handler: h2 };
+    };
+    if h.policy == ECS_ERR_HANDLER_IGNORE {
+        let h2 = ecs_err_handler_rebuild(h.policy, h.min_severity, h.handled_count, h.ignored_count + 1, e.code, e.severity);
+        return EcsErrHandleDeep { should_panic: false, handled: false, ignored: true, handler: h2 };
+    };
+    if h.policy == ECS_ERR_HANDLER_PANIC {
+        let h2 = ecs_err_handler_rebuild(h.policy, h.min_severity, h.handled_count + 1, h.ignored_count, e.code, e.severity);
+        return EcsErrHandleDeep { should_panic: true, handled: true, ignored: false, handler: h2 };
+    };
+    // warn/error: handle without panic unless error itself is panic sev
+    if e.severity == ECS_ERR_SEV_PANIC {
+        let h2 = ecs_err_handler_rebuild(h.policy, h.min_severity, h.handled_count + 1, h.ignored_count, e.code, e.severity);
+        return EcsErrHandleDeep { should_panic: true, handled: true, ignored: false, handler: h2 };
+    };
+    let h2 = ecs_err_handler_rebuild(h.policy, h.min_severity, h.handled_count + 1, h.ignored_count, e.code, e.severity);
+    return EcsErrHandleDeep { should_panic: false, handled: true, ignored: false, handler: h2 };
+}
+
+// CommandOutput lite
+const ECS_ERR_OUT_OK: i32 = 0;
+const ECS_ERR_OUT_ERR: i32 = 1;
+const ECS_ERR_OUT_NEVER: i32 = 2;
+
+struct EcsErrOutDeep {
+    kind: i32,
+    err_code: i32,
+}
+
+fn ecs_err_out_ok() -> EcsErrOutDeep {
+    return EcsErrOutDeep { kind: ECS_ERR_OUT_OK, err_code: 0 };
+}
+
+fn ecs_err_out_err(code: i32) -> EcsErrOutDeep {
+    return EcsErrOutDeep { kind: ECS_ERR_OUT_ERR, err_code: code };
+}
+
+fn ecs_err_out_never() -> EcsErrOutDeep {
+    return EcsErrOutDeep { kind: ECS_ERR_OUT_NEVER, err_code: 0 };
+}
+
+fn ecs_err_out_is_ok(o: EcsErrOutDeep) -> bool { return o.kind == ECS_ERR_OUT_OK; }
+fn ecs_err_out_is_err(o: EcsErrOutDeep) -> bool { return o.kind == ECS_ERR_OUT_ERR; }
+fn ecs_err_out_is_never(o: EcsErrOutDeep) -> bool { return o.kind == ECS_ERR_OUT_NEVER; }
+fn ecs_err_out_code(o: EcsErrOutDeep) -> i32 { return o.err_code; }
+
+fn ecs_err_out_to_err(o: EcsErrOutDeep) -> EcsErrDeep {
+    if o.kind == ECS_ERR_OUT_OK {
+        return ecs_err_new(0, ECS_ERR_SEV_IGNORE, 0);
+    };
+    if o.kind == ECS_ERR_OUT_NEVER {
+        return ecs_err_new(-1, ECS_ERR_SEV_PANIC, 0);
+    };
+    return ecs_err_new(o.err_code, ECS_ERR_SEV_ERROR, 0);
+}
+
+// EntityCommandOutput
+struct EcsErrEOutDeep {
+    ok: bool,
+    err_code: i32,
+    entity: i64,
+}
+
+fn ecs_err_eout_ok(entity: i64) -> EcsErrEOutDeep {
+    return EcsErrEOutDeep { ok: true, err_code: 0, entity: entity };
+}
+
+fn ecs_err_eout_err(entity: i64, code: i32) -> EcsErrEOutDeep {
+    return EcsErrEOutDeep { ok: false, err_code: code, entity: entity };
+}
+
+fn ecs_err_eout_is_ok(o: EcsErrEOutDeep) -> bool { return o.ok; }
+fn ecs_err_eout_code(o: EcsErrEOutDeep) -> i32 { return o.err_code; }
+fn ecs_err_eout_entity(o: EcsErrEOutDeep) -> i64 { return o.entity; }
+
+fn ecs_err_eout_into_result(o: EcsErrEOutDeep) -> EcsErrOutDeep {
+    if o.ok { return ecs_err_out_ok(); };
+    return ecs_err_out_err(o.err_code);
+}

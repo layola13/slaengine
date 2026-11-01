@@ -1,0 +1,306 @@
+// Explicit Bevy ECS reflection runtime consumer over SLA ids/handles.
+//
+// This connects the descriptor registry in app_type_registry.sla with the
+// ReflectComponent / ReflectResource / ReflectCommand handle models. It is not
+// a Rust TypeId/dyn Any runtime: callers pass stable SLA type ids and reflected
+// integer payload handles explicitly.
+@import "app_type_registry.sla"
+@import "reflect_component.sla"
+@import "reflect_resource.sla"
+@import "reflect_type_data.sla"
+
+struct EcsReflectRuntimeStore {
+    registry: EcsAppTypeRegistry,
+    component_type_ids: Vec<i64>,
+    components: Vec<EcsReflectComponent>,
+    resource_type_ids: Vec<i64>,
+    resource_component_ids: Vec<i32>,
+    resources: EcsReflectResource,
+    event_type_ids: Vec<i64>,
+    event_trigger_counts: Vec<i64>,
+    message_type_ids: Vec<i64>,
+    message_send_counts: Vec<i64>,
+}
+
+struct EcsReflectRuntimeOpResult {
+    store: EcsReflectRuntimeStore,
+    ok: bool,
+    found_type: bool,
+    value: i64,
+}
+
+fn ecs_reflect_runtime_store_new() -> EcsReflectRuntimeStore {
+    let component_type_ids: Vec<i64> = Vec::new();
+    let components: Vec<EcsReflectComponent> = Vec::new();
+    let resource_type_ids: Vec<i64> = Vec::new();
+    let resource_component_ids: Vec<i32> = Vec::new();
+    let event_type_ids: Vec<i64> = Vec::new();
+    let event_trigger_counts: Vec<i64> = Vec::new();
+    let message_type_ids: Vec<i64> = Vec::new();
+    let message_send_counts: Vec<i64> = Vec::new();
+    return EcsReflectRuntimeStore { registry: ecs_app_type_registry_new(), component_type_ids: component_type_ids, components: components, resource_type_ids: resource_type_ids, resource_component_ids: resource_component_ids, resources: ecs_reflect_resource_new(), event_type_ids: event_type_ids, event_trigger_counts: event_trigger_counts, message_type_ids: message_type_ids, message_send_counts: message_send_counts };
+}
+
+fn ecs_reflect_runtime_op_result(store: EcsReflectRuntimeStore, ok: bool, found_type: bool, value: i64) -> EcsReflectRuntimeOpResult {
+    return EcsReflectRuntimeOpResult { store: store, ok: ok, found_type: found_type, value: value };
+}
+
+fn ecs_reflect_runtime_find_component_slot(store: EcsReflectRuntimeStore, type_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(store.component_type_ids) as i64;
+    while i < n {
+        if store.component_type_ids[i] == type_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_reflect_runtime_find_resource_slot(store: EcsReflectRuntimeStore, type_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(store.resource_type_ids) as i64;
+    while i < n {
+        if store.resource_type_ids[i] == type_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_reflect_runtime_find_event_slot(store: EcsReflectRuntimeStore, type_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(store.event_type_ids) as i64;
+    while i < n {
+        if store.event_type_ids[i] == type_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_reflect_runtime_find_message_slot(store: EcsReflectRuntimeStore, type_id: i64) -> i64 {
+    let i: i64 = 0;
+    let n = len(store.message_type_ids) as i64;
+    while i < n {
+        if store.message_type_ids[i] == type_id { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ecs_reflect_runtime_register_descriptor(store: EcsReflectRuntimeStore, descriptor: EcsAppTypeDescriptor) -> EcsReflectRuntimeStore {
+    store.registry = ecs_app_type_registry_register_or_replace(store.registry, descriptor);
+    if descriptor.has_component {
+        let slot = ecs_reflect_runtime_find_component_slot(store, descriptor.type_id);
+        if slot < 0 {
+            store.component_type_ids.push(descriptor.type_id);
+            store.components.push(ecs_reflect_component_new(descriptor.component_data as i32));
+        } else {
+            store.components[slot] = ecs_reflect_component_new(descriptor.component_data as i32);
+        };
+    };
+    if descriptor.has_resource {
+        let slot = ecs_reflect_runtime_find_resource_slot(store, descriptor.type_id);
+        if slot < 0 {
+            store.resource_type_ids.push(descriptor.type_id);
+            store.resource_component_ids.push(descriptor.resource_data as i32);
+        } else {
+            store.resource_component_ids[slot] = descriptor.resource_data as i32;
+        };
+        store.resources = ecs_reflect_resource_register(store.resources, descriptor.resource_data as i32);
+    };
+    if descriptor.has_event {
+        let slot = ecs_reflect_runtime_find_event_slot(store, descriptor.type_id);
+        if slot < 0 {
+            store.event_type_ids.push(descriptor.type_id);
+            store.event_trigger_counts.push(0);
+        };
+    };
+    if descriptor.has_message {
+        let slot = ecs_reflect_runtime_find_message_slot(store, descriptor.type_id);
+        if slot < 0 {
+            store.message_type_ids.push(descriptor.type_id);
+            store.message_send_counts.push(0);
+        };
+    };
+    return store;
+}
+
+fn ecs_reflect_runtime_register_type_data(store: EcsReflectRuntimeStore, type_id: i64, type_path: i64, short_type_path: i64, kind: i32, data: i64) -> EcsReflectRuntimeStore {
+    let found = ecs_app_type_registry_get(store.registry, type_id);
+    let descriptor = ecs_app_type_descriptor_new(type_id, type_path, short_type_path);
+    if found.has { descriptor = found.descriptor; };
+    descriptor = ecs_app_type_descriptor_with_type_data(descriptor, kind, data);
+    return ecs_reflect_runtime_register_descriptor(store, descriptor);
+}
+
+fn ecs_reflect_runtime_component_insert(store: EcsReflectRuntimeStore, type_id: i64, entity: i64, value: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_component_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    store.components[slot] = ecs_reflect_component_insert(store.components[slot], entity, value);
+    return ecs_reflect_runtime_op_result(store, true, true, value);
+}
+
+fn ecs_reflect_runtime_component_apply(store: EcsReflectRuntimeStore, type_id: i64, entity: i64, value: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_component_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    store.components[slot] = ecs_reflect_component_apply_or_insert_mapped(store.components[slot], entity, value);
+    return ecs_reflect_runtime_op_result(store, true, true, value);
+}
+
+fn ecs_reflect_runtime_component_reflect(store: EcsReflectRuntimeStore, type_id: i64, entity: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_component_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    let reflected = ecs_reflect_component_reflect(store.components[slot], entity);
+    if reflected.0 != true { return ecs_reflect_runtime_op_result(store, false, true, 0); };
+    return ecs_reflect_runtime_op_result(store, true, true, reflected.1);
+}
+
+fn ecs_reflect_runtime_component_remove(store: EcsReflectRuntimeStore, type_id: i64, entity: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_component_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    let removed = ecs_reflect_component_remove(store.components[slot], entity);
+    store.components[slot] = removed.0;
+    return ecs_reflect_runtime_op_result(store, removed.1, true, 0);
+}
+
+fn ecs_reflect_runtime_component_take(store: EcsReflectRuntimeStore, type_id: i64, entity: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_component_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    let taken = ecs_reflect_component_take(store.components[slot], entity);
+    store.components[slot] = taken.0;
+    return ecs_reflect_runtime_op_result(store, taken.1, true, taken.2);
+}
+
+fn ecs_reflect_runtime_resource_component_id(store: EcsReflectRuntimeStore, type_id: i64) -> i32 {
+    let slot = ecs_reflect_runtime_find_resource_slot(store, type_id);
+    if slot < 0 { return -1; };
+    return store.resource_component_ids[slot];
+}
+
+fn ecs_reflect_runtime_resource_insert(store: EcsReflectRuntimeStore, type_id: i64) -> EcsReflectRuntimeOpResult {
+    let component_id = ecs_reflect_runtime_resource_component_id(store, type_id);
+    if component_id < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    store.resources = ecs_reflect_resource_insert(store.resources, component_id);
+    return ecs_reflect_runtime_op_result(store, true, true, ecs_reflect_resource_insert_count(store.resources, component_id));
+}
+
+fn ecs_reflect_runtime_resource_get(store: EcsReflectRuntimeStore, type_id: i64) -> EcsReflectRuntimeOpResult {
+    let component_id = ecs_reflect_runtime_resource_component_id(store, type_id);
+    if component_id < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    let got = ecs_reflect_resource_get(store.resources, component_id);
+    return ecs_reflect_runtime_op_result(store, got.0, true, got.1);
+}
+
+fn ecs_reflect_runtime_resource_remove(store: EcsReflectRuntimeStore, type_id: i64) -> EcsReflectRuntimeOpResult {
+    let component_id = ecs_reflect_runtime_resource_component_id(store, type_id);
+    if component_id < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    let before = ecs_reflect_resource_get(store.resources, component_id);
+    store.resources = ecs_reflect_resource_remove(store.resources, component_id);
+    return ecs_reflect_runtime_op_result(store, before.0, true, before.1);
+}
+
+fn ecs_reflect_runtime_event_trigger(store: EcsReflectRuntimeStore, type_id: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_event_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    store.event_trigger_counts[slot] = store.event_trigger_counts[slot] + 1;
+    return ecs_reflect_runtime_op_result(store, true, true, store.event_trigger_counts[slot]);
+}
+
+fn ecs_reflect_runtime_message_send(store: EcsReflectRuntimeStore, type_id: i64) -> EcsReflectRuntimeOpResult {
+    let slot = ecs_reflect_runtime_find_message_slot(store, type_id);
+    if slot < 0 { return ecs_reflect_runtime_op_result(store, false, false, 0); };
+    store.message_send_counts[slot] = store.message_send_counts[slot] + 1;
+    return ecs_reflect_runtime_op_result(store, true, true, store.message_send_counts[slot]);
+}
+
+fn ecs_reflect_runtime_apply_command(store: EcsReflectRuntimeStore, entity: i64, command: EcsReflectCommand) -> EcsReflectRuntimeOpResult {
+    let type_id = ecs_reflect_command_type_path(command);
+    if ecs_reflect_command_is_insert(command) {
+        return ecs_reflect_runtime_component_insert(store, type_id, entity, ecs_reflect_command_component(command));
+    };
+    if ecs_reflect_command_is_remove(command) {
+        return ecs_reflect_runtime_component_remove(store, type_id, entity);
+    };
+    if ecs_reflect_command_is_take(command) {
+        return ecs_reflect_runtime_component_take(store, type_id, entity);
+    };
+    return ecs_reflect_runtime_op_result(store, false, false, 0);
+}
+
+@test "reflect runtime registers descriptor backed component handle"() {
+    let store0 = ecs_reflect_runtime_store_new();
+    let descriptor0 = ecs_app_type_descriptor_new(1001, 501, 51);
+    let descriptor1 = ecs_app_type_descriptor_with_type_data(descriptor0, ECS_APP_TYPE_DATA_COMPONENT, 77);
+    let store1 = ecs_reflect_runtime_register_descriptor(store0, descriptor1);
+    if ecs_app_type_registry_contains(store1.registry, 1001) != true { panic(32110); };
+    if len(store1.component_type_ids) != 1 { panic(32111); };
+    let inserted = ecs_reflect_runtime_component_insert(store1, 1001, 42, 900);
+    if inserted.ok != true { panic(32112); };
+    let reflected = ecs_reflect_runtime_component_reflect(inserted.store, 1001, 42);
+    if reflected.ok != true { panic(32113); };
+    if reflected.value != 900 { panic(32114); };
+}
+
+@test "reflect runtime component remove and take by type id"() {
+    let store0 = ecs_reflect_runtime_store_new();
+    let store1 = ecs_reflect_runtime_register_type_data(store0, 1002, 502, 52, ECS_APP_TYPE_DATA_COMPONENT, 78);
+    let inserted = ecs_reflect_runtime_component_insert(store1, 1002, 7, 33);
+    let taken = ecs_reflect_runtime_component_take(inserted.store, 1002, 7);
+    if taken.ok != true { panic(32120); };
+    if taken.value != 33 { panic(32121); };
+    let reflected = ecs_reflect_runtime_component_reflect(taken.store, 1002, 7);
+    if reflected.ok { panic(32122); };
+    if reflected.found_type != true { panic(32123); };
+    let removed = ecs_reflect_runtime_component_remove(taken.store, 1002, 7);
+    if removed.ok { panic(32124); };
+}
+
+@test "reflect runtime resource insert get remove by registered descriptor"() {
+    let store0 = ecs_reflect_runtime_store_new();
+    let store1 = ecs_reflect_runtime_register_type_data(store0, 2001, 601, 61, ECS_APP_TYPE_DATA_RESOURCE, 88);
+    let inserted1 = ecs_reflect_runtime_resource_insert(store1, 2001);
+    let inserted2 = ecs_reflect_runtime_resource_insert(inserted1.store, 2001);
+    let got = ecs_reflect_runtime_resource_get(inserted2.store, 2001);
+    if got.ok != true { panic(32130); };
+    if got.value != 2 { panic(32131); };
+    let removed = ecs_reflect_runtime_resource_remove(got.store, 2001);
+    if removed.ok != true { panic(32132); };
+    if removed.value != 2 { panic(32133); };
+    let got2 = ecs_reflect_runtime_resource_get(removed.store, 2001);
+    if got2.value != 1 { panic(32134); };
+}
+
+@test "reflect runtime event and message counters by type id"() {
+    let store0 = ecs_reflect_runtime_store_new();
+    let store1 = ecs_reflect_runtime_register_type_data(store0, 3001, 701, 71, ECS_APP_TYPE_DATA_EVENT, 91);
+    let store2 = ecs_reflect_runtime_register_type_data(store1, 4001, 801, 81, ECS_APP_TYPE_DATA_MESSAGE, 92);
+    let event1 = ecs_reflect_runtime_event_trigger(store2, 3001);
+    let event2 = ecs_reflect_runtime_event_trigger(event1.store, 3001);
+    if event2.value != 2 { panic(32140); };
+    let message = ecs_reflect_runtime_message_send(event2.store, 4001);
+    if message.ok != true { panic(32141); };
+    if message.value != 1 { panic(32142); };
+}
+
+@test "reflect runtime applies ReflectCommand insert remove take"() {
+    let store0 = ecs_reflect_runtime_store_new();
+    let store1 = ecs_reflect_runtime_register_type_data(store0, 5001, 901, 91, ECS_APP_TYPE_DATA_COMPONENT, 99);
+    let insert_cmd = ecs_reflect_command_insert(5001, 444);
+    let inserted = ecs_reflect_runtime_apply_command(store1, 10, insert_cmd);
+    if inserted.ok != true { panic(32150); };
+    let reflected = ecs_reflect_runtime_component_reflect(inserted.store, 5001, 10);
+    if reflected.value != 444 { panic(32151); };
+    let remove_cmd = ecs_reflect_command_remove(5001);
+    let removed = ecs_reflect_runtime_apply_command(reflected.store, 10, remove_cmd);
+    if removed.ok != true { panic(32152); };
+    let insert2 = ecs_reflect_runtime_apply_command(removed.store, 10, insert_cmd);
+    let take_cmd = ecs_reflect_command_take(5001);
+    let taken = ecs_reflect_runtime_apply_command(insert2.store, 10, take_cmd);
+    if taken.ok != true { panic(32153); };
+    if taken.value != 444 { panic(32154); };
+}
+
+@test "reflect runtime reports missing type distinctly"() {
+    let store = ecs_reflect_runtime_store_new();
+    let inserted = ecs_reflect_runtime_component_insert(store, 9999, 1, 2);
+    if inserted.ok { panic(32160); };
+    if inserted.found_type { panic(32161); };
+}

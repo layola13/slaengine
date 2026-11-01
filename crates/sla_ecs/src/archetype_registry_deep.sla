@@ -1,0 +1,1029 @@
+// Deepened Bevy ECS archetype registry / entity-archetype location mapping (Batch 383).
+//
+// Mirror of the shallow `lib/archetype_registry.sla` `RegistryArchetypeWorld` surface on
+// fixed-cap storage (no Vec, no `while`, no `let mut` i32 rebind, no test tuple-return
+// destructuring, no `let w = fn(w,...)` chained rebinds). Self-contained -- the world
+// carries its own cap-16 entity generation/alive bit registry and cap-8 component-storage
+// table so we never need `@import "world_registry.sla"` (the shallow file does, which would
+// couple the deep to the whole registry world frame per the Batch 382 plan notes).
+//
+// Storage:
+//   - cap-8  archetypes        (EcsArchWorldDeep.a0..a7 + arch_count)
+//   - cap-16 entities-per-arch (EcsArchArchDeep.e0..e15 + ent_count)
+//   - cap-6  component-ids-per-arch (EcsArchArchDeep.c0..c7 + comp_count) -- one slot per component id registered
+//   - cap-16 location records  (EcsArchWorldDeep.loc0..loc15 + loc_count)
+//   - cap-16 entity generation + alive bit (EcsArchWorldDeep.g0..g15 + alive0..alive15 + next_entity)
+//   - cap-8  component storage tags (EcsArchWorldDeep.comp0..comp7 + comp_count) -- 0 = table, 1 = sparse_set
+//
+// Wrapper structs (Batch 373 rule -- no test tuple destructuring):
+//   EcsArchInfoDeep   { id: i32, storage: i32 }                      -- register_table / register_sparse_set result
+//   EcsArchSpawnDeep  { world: EcsArchWorldDeep, entity: i32 }     -- spawn result (test uses _spawn_world / _spawn_entity)
+//   EcsArchSlotDeep   { world: EcsArchWorldDeep, archetype_id: i32 } -- get_or_create_archetype result
+//   EcsArchSignDeep   { cap0..cap7: i32, count: i32 }             -- entity signature
+//   EcsArchQueryDeep  { found: bool, count: i32, e0..e15: i32, g0..g15: i32, cap: i32 } -- query_component result
+
+const ECS_AREG_ARCH_CAP: i32 = 8;
+const ECS_AREG_ENT_CAP: i32 = 16;
+const ECS_AREG_COMP_CAP: i32 = 8;
+const ECS_AREG_LOC_CAP: i32 = 16;
+const ECS_AREG_STORAGE_TABLE: i32 = 0;
+const ECS_AREG_STORAGE_SPARSE: i32 = 1;
+
+// ── Archetype record (cap-16 entities-per-arch slot x cap-8 component-ids) ───
+struct EcsArchArchDeep {
+    id: i32,
+    c0: i32, c1: i32, c2: i32, c3: i32, c4: i32, c5: i32, c6: i32, c7: i32,
+    comp_count: i32,
+    e0: i32, e1: i32, e2: i32, e3: i32, e4: i32, e5: i32, e6: i32, e7: i32,
+    e8: i32, e9: i32, e10: i32, e11: i32, e12: i32, e13: i32, e14: i32, e15: i32,
+    ent_count: i32,
+}
+
+// ── Entity location record (one per entity slot) ─────────────────────────────
+struct EcsArchLocationDeep {
+    entity_id: i32,
+    archetype_id: i32,
+    row: i32,
+}
+
+// ── World (cap-8 archetypes + cap-16 locations + cap-16 entity registry) ───
+struct EcsArchWorldDeep {
+    a0: EcsArchArchDeep, a1: EcsArchArchDeep, a2: EcsArchArchDeep, a3: EcsArchArchDeep,
+    a4: EcsArchArchDeep, a5: EcsArchArchDeep, a6: EcsArchArchDeep, a7: EcsArchArchDeep,
+    arch_count: i32,
+    loc0: EcsArchLocationDeep, loc1: EcsArchLocationDeep, loc2: EcsArchLocationDeep, loc3: EcsArchLocationDeep,
+    loc4: EcsArchLocationDeep, loc5: EcsArchLocationDeep, loc6: EcsArchLocationDeep, loc7: EcsArchLocationDeep,
+    loc8: EcsArchLocationDeep, loc9: EcsArchLocationDeep, loc10: EcsArchLocationDeep, loc11: EcsArchLocationDeep,
+    loc12: EcsArchLocationDeep, loc13: EcsArchLocationDeep, loc14: EcsArchLocationDeep, loc15: EcsArchLocationDeep,
+    loc_count: i32,
+    g0: i32, g1: i32, g2: i32, g3: i32, g4: i32, g5: i32, g6: i32, g7: i32,
+    g8: i32, g9: i32, g10: i32, g11: i32, g12: i32, g13: i32, g14: i32, g15: i32,
+    alive0: i32, alive1: i32, alive2: i32, alive3: i32, alive4: i32, alive5: i32, alive6: i32, alive7: i32,
+    alive8: i32, alive9: i32, alive10: i32, alive11: i32, alive12: i32, alive13: i32, alive14: i32, alive15: i32,
+    comp0: i32, comp1: i32, comp2: i32, comp3: i32, comp4: i32, comp5: i32, comp6: i32, comp7: i32,
+    comp_count: i32,
+    next_entity: i32,
+    // per-entity attached-component bitset: cap-16 entities x cap-8 component bits -> 2 sets of 8 i32 bitwords.
+    // Each entity slot k stores component-attachment bitword at attach_bits0..attach_bits15 (one i32 per entity).
+    attach0: i32, attach1: i32, attach2: i32, attach3: i32, attach4: i32, attach5: i32, attach6: i32, attach7: i32,
+    attach8: i32, attach9: i32, attach10: i32, attach11: i32, attach12: i32, attach13: i32, attach14: i32, attach15: i32,
+}
+
+// ── Wrapper structs (Batch 373 rule -- no test tuple destructuring) ──────────
+struct EcsArchInfoDeep { id: i32, storage: i32 }
+struct EcsArchSpawnDeep { world: EcsArchWorldDeep, entity: i32 }
+struct EcsArchSlotDeep { world: EcsArchWorldDeep, archetype_id: i32 }
+struct EcsArchSignDeep { c0: i32, c1: i32, c2: i32, c3: i32, c4: i32, c5: i32, c6: i32, c7: i32, count: i32 }
+struct EcsArchQueryDeep {
+    found: bool,
+    count: i32,
+    e0: i32, e1: i32, e2: i32, e3: i32, e4: i32, e5: i32, e6: i32, e7: i32,
+    e8: i32, e9: i32, e10: i32, e11: i32, e12: i32, e13: i32, e14: i32, e15: i32,
+    g0: i32, g1: i32, g2: i32, g3: i32, g4: i32, g5: i32, g6: i32, g7: i32,
+    g8: i32, g9: i32, g10: i32, g11: i32, g12: i32, g13: i32, g14: i32, g15: i32,
+}
+
+fn ecs_arch_world_deep_info_id(r: EcsArchInfoDeep) -> i32 { return r.id; }
+fn ecs_arch_world_deep_info_storage(r: EcsArchInfoDeep) -> i32 { return r.storage; }
+
+struct EcsArchRegisterDeep { world: EcsArchWorldDeep, info: EcsArchInfoDeep }
+fn ecs_arch_world_deep_register_world(r: EcsArchRegisterDeep) -> EcsArchWorldDeep { return r.world; }
+fn ecs_arch_world_deep_register_info(r: EcsArchRegisterDeep) -> EcsArchInfoDeep { return r.info; }
+
+fn ecs_arch_world_deep_register_table_w(w0: EcsArchWorldDeep) -> EcsArchRegisterDeep {
+    if w0.comp_count >= ECS_AREG_COMP_CAP {
+        return _ecs_arch_register_wrap(w0, _ecs_arch_info(w0.comp_count - 1, ECS_AREG_STORAGE_TABLE));
+    };
+    let cid = w0.comp_count;
+    let w1 = _ecs_arch_world_deep_register_component(w0, ECS_AREG_STORAGE_TABLE);
+    return _ecs_arch_register_wrap(w1, _ecs_arch_info(cid, ECS_AREG_STORAGE_TABLE));
+}
+
+fn ecs_arch_world_deep_register_sparse_set_w(w0: EcsArchWorldDeep) -> EcsArchRegisterDeep {
+    if w0.comp_count >= ECS_AREG_COMP_CAP {
+        return _ecs_arch_register_wrap(w0, _ecs_arch_info(w0.comp_count - 1, ECS_AREG_STORAGE_SPARSE));
+    };
+    let cid = w0.comp_count;
+    let w1 = _ecs_arch_world_deep_register_component(w0, ECS_AREG_STORAGE_SPARSE);
+    return _ecs_arch_register_wrap(w1, _ecs_arch_info(cid, ECS_AREG_STORAGE_SPARSE));
+}
+
+fn _ecs_arch_register_wrap(world: EcsArchWorldDeep, info: EcsArchInfoDeep) -> EcsArchRegisterDeep {
+    let r = EcsArchRegisterDeep { world: world, info: info };
+    return r;
+}
+
+fn ecs_arch_world_deep_spawn_world(r: EcsArchSpawnDeep) -> EcsArchWorldDeep { return r.world; }
+fn ecs_arch_world_deep_spawn_entity(r: EcsArchSpawnDeep) -> i32 { return r.entity; }
+
+fn ecs_arch_world_deep_slot_world(r: EcsArchSlotDeep) -> EcsArchWorldDeep { return r.world; }
+fn ecs_arch_world_deep_slot_id(r: EcsArchSlotDeep) -> i32 { return r.archetype_id; }
+
+fn ecs_arch_world_deep_sign_count(r: EcsArchSignDeep) -> i32 { return r.count; }
+fn ecs_arch_world_deep_sign_at(r: EcsArchSignDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.c0; };
+    if idx == 1 { return r.c1; };
+    if idx == 2 { return r.c2; };
+    if idx == 3 { return r.c3; };
+    if idx == 4 { return r.c4; };
+    if idx == 5 { return r.c5; };
+    if idx == 6 { return r.c6; };
+    if idx == 7 { return r.c7; };
+    return -1;
+}
+
+fn ecs_arch_world_deep_query_found(r: EcsArchQueryDeep) -> bool { return r.found; }
+fn ecs_arch_world_deep_query_count(r: EcsArchQueryDeep) -> i32 { return r.count; }
+fn ecs_arch_world_deep_query_entity_id(r: EcsArchQueryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.e0; };
+    if idx == 1 { return r.e1; };
+    if idx == 2 { return r.e2; };
+    if idx == 3 { return r.e3; };
+    if idx == 4 { return r.e4; };
+    if idx == 5 { return r.e5; };
+    if idx == 6 { return r.e6; };
+    if idx == 7 { return r.e7; };
+    if idx == 8 { return r.e8; };
+    if idx == 9 { return r.e9; };
+    if idx == 10 { return r.e10; };
+    if idx == 11 { return r.e11; };
+    if idx == 12 { return r.e12; };
+    if idx == 13 { return r.e13; };
+    if idx == 14 { return r.e14; };
+    if idx == 15 { return r.e15; };
+    return -1;
+}
+fn ecs_arch_world_deep_query_generation(r: EcsArchQueryDeep, idx: i32) -> i32 {
+    if idx == 0 { return r.g0; };
+    if idx == 1 { return r.g1; };
+    if idx == 2 { return r.g2; };
+    if idx == 3 { return r.g3; };
+    if idx == 4 { return r.g4; };
+    if idx == 5 { return r.g5; };
+    if idx == 6 { return r.g6; };
+    if idx == 7 { return r.g7; };
+    if idx == 8 { return r.g8; };
+    if idx == 9 { return r.g9; };
+    if idx == 10 { return r.g10; };
+    if idx == 11 { return r.g11; };
+    if idx == 12 { return r.g12; };
+    if idx == 13 { return r.g13; };
+    if idx == 14 { return r.g14; };
+    if idx == 15 { return r.g15; };
+    return 0;
+}
+
+// ── empty archetype record helpers ────────────────────────────────────────────
+fn ecs_arch_arch_deep_empty(arch_id: i32) -> EcsArchArchDeep {
+    let a = EcsArchArchDeep {
+        id: arch_id,
+        c0: -1, c1: -1, c2: -1, c3: -1, c4: -1, c5: -1, c6: -1, c7: -1,
+        comp_count: 0,
+        e0: -1, e1: -1, e2: -1, e3: -1, e4: -1, e5: -1, e6: -1, e7: -1,
+        e8: -1, e9: -1, e10: -1, e11: -1, e12: -1, e13: -1, e14: -1, e15: -1,
+        ent_count: 0,
+    };
+    return a;
+}
+
+fn ecs_arch_arch_deep_component_at(a: EcsArchArchDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.c0; };
+    if idx == 1 { return a.c1; };
+    if idx == 2 { return a.c2; };
+    if idx == 3 { return a.c3; };
+    if idx == 4 { return a.c4; };
+    if idx == 5 { return a.c5; };
+    if idx == 6 { return a.c6; };
+    if idx == 7 { return a.c7; };
+    return -1;
+}
+
+// Set the component-id at slot k (cascade-of-return, Batch 377 shape).
+fn _ecs_arch_arch_deep_set_component_at(a0: EcsArchArchDeep, k: i32, v: i32) -> EcsArchArchDeep {
+    if k == 0 { a0.c0 = v; return a0; };
+    if k == 1 { a0.c1 = v; return a0; };
+    if k == 2 { a0.c2 = v; return a0; };
+    if k == 3 { a0.c3 = v; return a0; };
+    if k == 4 { a0.c4 = v; return a0; };
+    if k == 5 { a0.c5 = v; return a0; };
+    if k == 6 { a0.c6 = v; return a0; };
+    a0.c7 = v;
+    return a0;
+}
+
+// Set the entity-id at row k (cascade-of-return).
+fn _ecs_arch_arch_deep_set_entity_at(a0: EcsArchArchDeep, k: i32, v: i32) -> EcsArchArchDeep {
+    if k == 0 { a0.e0 = v; return a0; };
+    if k == 1 { a0.e1 = v; return a0; };
+    if k == 2 { a0.e2 = v; return a0; };
+    if k == 3 { a0.e3 = v; return a0; };
+    if k == 4 { a0.e4 = v; return a0; };
+    if k == 5 { a0.e5 = v; return a0; };
+    if k == 6 { a0.e6 = v; return a0; };
+    if k == 7 { a0.e7 = v; return a0; };
+    if k == 8 { a0.e8 = v; return a0; };
+    if k == 9 { a0.e9 = v; return a0; };
+    if k == 10 { a0.e10 = v; return a0; };
+    if k == 11 { a0.e11 = v; return a0; };
+    if k == 12 { a0.e12 = v; return a0; };
+    if k == 13 { a0.e13 = v; return a0; };
+    if k == 14 { a0.e14 = v; return a0; };
+    a0.e15 = v;
+    return a0;
+}
+
+fn ecs_arch_arch_deep_entity_at(a: EcsArchArchDeep, idx: i32) -> i32 {
+    if idx == 0 { return a.e0; };
+    if idx == 1 { return a.e1; };
+    if idx == 2 { return a.e2; };
+    if idx == 3 { return a.e3; };
+    if idx == 4 { return a.e4; };
+    if idx == 5 { return a.e5; };
+    if idx == 6 { return a.e6; };
+    if idx == 7 { return a.e7; };
+    if idx == 8 { return a.e8; };
+    if idx == 9 { return a.e9; };
+    if idx == 10 { return a.e10; };
+    if idx == 11 { return a.e11; };
+    if idx == 12 { return a.e12; };
+    if idx == 13 { return a.e13; };
+    if idx == 14 { return a.e14; };
+    if idx == 15 { return a.e15; };
+    return -1;
+}
+
+fn _ecs_arch_arch_deep_set_comp_count(a0: EcsArchArchDeep, v: i32) -> EcsArchArchDeep { a0.comp_count = v; return a0; }
+fn _ecs_arch_arch_deep_set_ent_count(a0: EcsArchArchDeep, v: i32) -> EcsArchArchDeep { a0.ent_count = v; return a0; }
+
+// Get-or-grow the archetype record at `arch_id`, returning it untouched.
+// Shallow uses Vec indexing; here we have a cap-8 fixed array.
+fn _ecs_arch_world_deep_arch_at(w: EcsArchWorldDeep, idx: i32) -> EcsArchArchDeep {
+    if idx == 0 { return w.a0; };
+    if idx == 1 { return w.a1; };
+    if idx == 2 { return w.a2; };
+    if idx == 3 { return w.a3; };
+    if idx == 4 { return w.a4; };
+    if idx == 5 { return w.a5; };
+    if idx == 6 { return w.a6; };
+    return w.a7;
+}
+
+// Set the archetype record at slot idx (cascade-of-return).
+fn _ecs_arch_world_deep_set_arch(w0: EcsArchWorldDeep, idx: i32, a: EcsArchArchDeep) -> EcsArchWorldDeep {
+    if idx == 0 { w0.a0 = a; return w0; };
+    if idx == 1 { w0.a1 = a; return w0; };
+    if idx == 2 { w0.a2 = a; return w0; };
+    if idx == 3 { w0.a3 = a; return w0; };
+    if idx == 4 { w0.a4 = a; return w0; };
+    if idx == 5 { w0.a5 = a; return w0; };
+    if idx == 6 { w0.a6 = a; return w0; };
+    w0.a7 = a;
+    return w0;
+}
+
+fn _ecs_arch_arch_deep_set_id(a0: EcsArchArchDeep, v: i32) -> EcsArchArchDeep { a0.id = v; return a0; }
+
+// Append a component-id to an archetype under construction (cap-8 reject silent).
+// Returns the updated archetype with comp_count bumped.
+fn _ecs_arch_arch_deep_push_component(a0: EcsArchArchDeep, v: i32) -> EcsArchArchDeep {
+    if a0.comp_count >= ECS_AREG_COMP_CAP { return a0; };
+    let a1 = _ecs_arch_arch_deep_set_component_at(a0, a0.comp_count, v);
+    a1.comp_count = a1.comp_count + 1;
+    return a1;
+}
+
+// ── Location accessors / setters (cap-16 full table) ───────────────────────
+fn _ecs_arch_world_deep_location_at(w: EcsArchWorldDeep, idx: i32) -> EcsArchLocationDeep {
+    if idx == 0 { return w.loc0; };
+    if idx == 1 { return w.loc1; };
+    if idx == 2 { return w.loc2; };
+    if idx == 3 { return w.loc3; };
+    if idx == 4 { return w.loc4; };
+    if idx == 5 { return w.loc5; };
+    if idx == 6 { return w.loc6; };
+    if idx == 7 { return w.loc7; };
+    if idx == 8 { return w.loc8; };
+    if idx == 9 { return w.loc9; };
+    if idx == 10 { return w.loc10; };
+    if idx == 11 { return w.loc11; };
+    if idx == 12 { return w.loc12; };
+    if idx == 13 { return w.loc13; };
+    if idx == 14 { return w.loc14; };
+    return w.loc15;
+}
+
+fn _ecs_arch_world_deep_set_location(w0: EcsArchWorldDeep, idx: i32, loc: EcsArchLocationDeep) -> EcsArchWorldDeep {
+    if idx == 0 { w0.loc0 = loc; return w0; };
+    if idx == 1 { w0.loc1 = loc; return w0; };
+    if idx == 2 { w0.loc2 = loc; return w0; };
+    if idx == 3 { w0.loc3 = loc; return w0; };
+    if idx == 4 { w0.loc4 = loc; return w0; };
+    if idx == 5 { w0.loc5 = loc; return w0; };
+    if idx == 6 { w0.loc6 = loc; return w0; };
+    if idx == 7 { w0.loc7 = loc; return w0; };
+    if idx == 8 { w0.loc8 = loc; return w0; };
+    if idx == 9 { w0.loc9 = loc; return w0; };
+    if idx == 10 { w0.loc10 = loc; return w0; };
+    if idx == 11 { w0.loc11 = loc; return w0; };
+    if idx == 12 { w0.loc12 = loc; return w0; };
+    if idx == 13 { w0.loc13 = loc; return w0; };
+    if idx == 14 { w0.loc14 = loc; return w0; };
+    w0.loc15 = loc;
+    return w0;
+}
+
+fn _ecs_arch_world_deep_location_set_archetype_id(loc0: EcsArchLocationDeep, v: i32) -> EcsArchLocationDeep {
+    loc0.archetype_id = v;
+    return loc0;
+}
+fn _ecs_arch_world_deep_location_set_row(loc0: EcsArchLocationDeep, v: i32) -> EcsArchLocationDeep {
+    loc0.row = v;
+    return loc0;
+}
+
+// ── Per-entity registry (alive + generation + attached-component bitword) ────
+fn _ecs_arch_world_deep_alive_at(w: EcsArchWorldDeep, k: i32) -> i32 {
+    if k == 0 { return w.alive0; };
+    if k == 1 { return w.alive1; };
+    if k == 2 { return w.alive2; };
+    if k == 3 { return w.alive3; };
+    if k == 4 { return w.alive4; };
+    if k == 5 { return w.alive5; };
+    if k == 6 { return w.alive6; };
+    if k == 7 { return w.alive7; };
+    if k == 8 { return w.alive8; };
+    if k == 9 { return w.alive9; };
+    if k == 10 { return w.alive10; };
+    if k == 11 { return w.alive11; };
+    if k == 12 { return w.alive12; };
+    if k == 13 { return w.alive13; };
+    if k == 14 { return w.alive14; };
+    if k == 15 { return w.alive15; };
+    return 0;
+}
+
+fn _ecs_arch_world_deep_set_alive(w0: EcsArchWorldDeep, k: i32, v: i32) -> EcsArchWorldDeep {
+    if k == 0 { w0.alive0 = v; return w0; };
+    if k == 1 { w0.alive1 = v; return w0; };
+    if k == 2 { w0.alive2 = v; return w0; };
+    if k == 3 { w0.alive3 = v; return w0; };
+    if k == 4 { w0.alive4 = v; return w0; };
+    if k == 5 { w0.alive5 = v; return w0; };
+    if k == 6 { w0.alive6 = v; return w0; };
+    if k == 7 { w0.alive7 = v; return w0; };
+    if k == 8 { w0.alive8 = v; return w0; };
+    if k == 9 { w0.alive9 = v; return w0; };
+    if k == 10 { w0.alive10 = v; return w0; };
+    if k == 11 { w0.alive11 = v; return w0; };
+    if k == 12 { w0.alive12 = v; return w0; };
+    if k == 13 { w0.alive13 = v; return w0; };
+    if k == 14 { w0.alive14 = v; return w0; };
+    w0.alive15 = v;
+    return w0;
+}
+
+fn _ecs_arch_world_deep_generation_at(w: EcsArchWorldDeep, k: i32) -> i32 {
+    if k == 0 { return w.g0; };
+    if k == 1 { return w.g1; };
+    if k == 2 { return w.g2; };
+    if k == 3 { return w.g3; };
+    if k == 4 { return w.g4; };
+    if k == 5 { return w.g5; };
+    if k == 6 { return w.g6; };
+    if k == 7 { return w.g7; };
+    if k == 8 { return w.g8; };
+    if k == 9 { return w.g9; };
+    if k == 10 { return w.g10; };
+    if k == 11 { return w.g11; };
+    if k == 12 { return w.g12; };
+    if k == 13 { return w.g13; };
+    if k == 14 { return w.g14; };
+    if k == 15 { return w.g15; };
+    return 0;
+}
+
+fn _ecs_arch_world_deep_set_generation(w0: EcsArchWorldDeep, k: i32, v: i32) -> EcsArchWorldDeep {
+    if k == 0 { w0.g0 = v; return w0; };
+    if k == 1 { w0.g1 = v; return w0; };
+    if k == 2 { w0.g2 = v; return w0; };
+    if k == 3 { w0.g3 = v; return w0; };
+    if k == 4 { w0.g4 = v; return w0; };
+    if k == 5 { w0.g5 = v; return w0; };
+    if k == 6 { w0.g6 = v; return w0; };
+    if k == 7 { w0.g7 = v; return w0; };
+    if k == 8 { w0.g8 = v; return w0; };
+    if k == 9 { w0.g9 = v; return w0; };
+    if k == 10 { w0.g10 = v; return w0; };
+    if k == 11 { w0.g11 = v; return w0; };
+    if k == 12 { w0.g12 = v; return w0; };
+    if k == 13 { w0.g13 = v; return w0; };
+    if k == 14 { w0.g14 = v; return w0; };
+    w0.g15 = v;
+    return w0;
+}
+
+fn _ecs_arch_world_deep_attach_at(w: EcsArchWorldDeep, k: i32) -> i32 {
+    if k == 0 { return w.attach0; };
+    if k == 1 { return w.attach1; };
+    if k == 2 { return w.attach2; };
+    if k == 3 { return w.attach3; };
+    if k == 4 { return w.attach4; };
+    if k == 5 { return w.attach5; };
+    if k == 6 { return w.attach6; };
+    if k == 7 { return w.attach7; };
+    if k == 8 { return w.attach8; };
+    if k == 9 { return w.attach9; };
+    if k == 10 { return w.attach10; };
+    if k == 11 { return w.attach11; };
+    if k == 12 { return w.attach12; };
+    if k == 13 { return w.attach13; };
+    if k == 14 { return w.attach14; };
+    if k == 15 { return w.attach15; };
+    return 0;
+}
+
+fn _ecs_arch_world_deep_set_attach(w0: EcsArchWorldDeep, k: i32, v: i32) -> EcsArchWorldDeep {
+    if k == 0 { w0.attach0 = v; return w0; };
+    if k == 1 { w0.attach1 = v; return w0; };
+    if k == 2 { w0.attach2 = v; return w0; };
+    if k == 3 { w0.attach3 = v; return w0; };
+    if k == 4 { w0.attach4 = v; return w0; };
+    if k == 5 { w0.attach5 = v; return w0; };
+    if k == 6 { w0.attach6 = v; return w0; };
+    if k == 7 { w0.attach7 = v; return w0; };
+    if k == 8 { w0.attach8 = v; return w0; };
+    if k == 9 { w0.attach9 = v; return w0; };
+    if k == 10 { w0.attach10 = v; return w0; };
+    if k == 11 { w0.attach11 = v; return w0; };
+    if k == 12 { w0.attach12 = v; return w0; };
+    if k == 13 { w0.attach13 = v; return w0; };
+    if k == 14 { w0.attach14 = v; return w0; };
+    w0.attach15 = v;
+    return w0;
+}
+
+// ── component storage registry (cap-8) ───────────────────────────────────────
+fn _ecs_arch_world_deep_comp_storage(w: EcsArchWorldDeep, cid: i32) -> i32 {
+    if cid == 0 { return w.comp0; };
+    if cid == 1 { return w.comp1; };
+    if cid == 2 { return w.comp2; };
+    if cid == 3 { return w.comp3; };
+    if cid == 4 { return w.comp4; };
+    if cid == 5 { return w.comp5; };
+    if cid == 6 { return w.comp6; };
+    if cid == 7 { return w.comp7; };
+    return -1;
+}
+
+fn _ecs_arch_world_deep_set_comp_storage(w0: EcsArchWorldDeep, cid: i32, v: i32) -> EcsArchWorldDeep {
+    if cid == 0 { w0.comp0 = v; return w0; };
+    if cid == 1 { w0.comp1 = v; return w0; };
+    if cid == 2 { w0.comp2 = v; return w0; };
+    if cid == 3 { w0.comp3 = v; return w0; };
+    if cid == 4 { w0.comp4 = v; return w0; };
+    if cid == 5 { w0.comp5 = v; return w0; };
+    if cid == 6 { w0.comp6 = v; return w0; };
+    w0.comp7 = v;
+    return w0;
+}
+
+// ── Public new / register_table / register_sparse_set / arch_count ──────────
+fn ecs_arch_world_deep_new() -> EcsArchWorldDeep {
+    let w = EcsArchWorldDeep {
+        a0: ecs_arch_arch_deep_empty(0), a1: ecs_arch_arch_deep_empty(1),
+        a2: ecs_arch_arch_deep_empty(2), a3: ecs_arch_arch_deep_empty(3),
+        a4: ecs_arch_arch_deep_empty(4), a5: ecs_arch_arch_deep_empty(5),
+        a6: ecs_arch_arch_deep_empty(6), a7: ecs_arch_arch_deep_empty(7),
+        arch_count: 1,  // archetype 0 = the empty-archetype (signature-of-zero-components)
+        loc0: _ecs_arch_location_empty(0), loc1: _ecs_arch_location_empty(1),
+        loc2: _ecs_arch_location_empty(2), loc3: _ecs_arch_location_empty(3),
+        loc4: _ecs_arch_location_empty(4), loc5: _ecs_arch_location_empty(5),
+        loc6: _ecs_arch_location_empty(6), loc7: _ecs_arch_location_empty(7),
+        loc8: _ecs_arch_location_empty(8), loc9: _ecs_arch_location_empty(9),
+        loc10: _ecs_arch_location_empty(10), loc11: _ecs_arch_location_empty(11),
+        loc12: _ecs_arch_location_empty(12), loc13: _ecs_arch_location_empty(13),
+        loc14: _ecs_arch_location_empty(14), loc15: _ecs_arch_location_empty(15),
+        loc_count: 0,
+        g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0,
+        g8: 0, g9: 0, g10: 0, g11: 0, g12: 0, g13: 0, g14: 0, g15: 0,
+        alive0: 0, alive1: 0, alive2: 0, alive3: 0, alive4: 0, alive5: 0, alive6: 0, alive7: 0,
+        alive8: 0, alive9: 0, alive10: 0, alive11: 0, alive12: 0, alive13: 0, alive14: 0, alive15: 0,
+        comp0: -1, comp1: -1, comp2: -1, comp3: -1, comp4: -1, comp5: -1, comp6: -1, comp7: -1,
+        comp_count: 0,
+        next_entity: 0,
+        attach0: 0, attach1: 0, attach2: 0, attach3: 0, attach4: 0, attach5: 0, attach6: 0, attach7: 0,
+        attach8: 0, attach9: 0, attach10: 0, attach11: 0, attach12: 0, attach13: 0, attach14: 0, attach15: 0,
+    };
+    return w;
+}
+
+fn _ecs_arch_location_empty(entity_id: i32) -> EcsArchLocationDeep {
+    let loc = EcsArchLocationDeep { entity_id: entity_id, archetype_id: -1, row: -1 };
+    return loc;
+}
+
+fn ecs_arch_world_deep_register_table(w0: EcsArchWorldDeep) -> EcsArchInfoDeep {
+    let w1 = _ecs_arch_world_deep_register_component(w0, ECS_AREG_STORAGE_TABLE);
+    return _ecs_arch_info(w1.comp_count - 1, ECS_AREG_STORAGE_TABLE);
+}
+
+fn ecs_arch_world_deep_register_sparse_set(w0: EcsArchWorldDeep) -> EcsArchInfoDeep {
+    let w1 = _ecs_arch_world_deep_register_component(w0, ECS_AREG_STORAGE_SPARSE);
+    return _ecs_arch_info(w1.comp_count - 1, ECS_AREG_STORAGE_SPARSE);
+}
+
+// append a new component id slot with the given storage tag (cap-8 reject silent).
+fn _ecs_arch_world_deep_register_component(w0: EcsArchWorldDeep, storage: i32) -> EcsArchWorldDeep {
+    if w0.comp_count >= ECS_AREG_COMP_CAP { return w0; };
+    let w1 = _ecs_arch_world_deep_set_comp_storage(w0, w0.comp_count, storage);
+    w1.comp_count = w1.comp_count + 1;
+    return w1;
+}
+
+fn _ecs_arch_info(id: i32, storage: i32) -> EcsArchInfoDeep {
+    let r = EcsArchInfoDeep { id: id, storage: storage };
+    return r;
+}
+
+fn ecs_arch_world_deep_archetype_count(w: EcsArchWorldDeep) -> i32 { return w.arch_count; }
+fn ecs_arch_world_deep_comp_count(w: EcsArchWorldDeep) -> i32 { return w.comp_count; }
+
+// ── signature helpers ────────────────────────────────────────────────────────
+// Build the per-entity component signature by scanning the cap-8 component slots
+// and checking the entity's attach bitword for bit `cid` set (signature sorted ascending -- mirror shallow order).
+// cap-8 components per entity signature.
+fn _ecs_arch_world_deep_signature_for_entity(w0: EcsArchWorldDeep, entity_id: i32) -> EcsArchSignDeep {
+    let bits = _ecs_arch_world_deep_attach_at(w0, entity_id);
+    let s0 = _ecs_arch_world_deep_sign_step(w0, 0, bits, _ecs_arch_world_deep_sign_empty());
+    let s1 = _ecs_arch_world_deep_sign_step(w0, 1, bits, s0);
+    let s2 = _ecs_arch_world_deep_sign_step(w0, 2, bits, s1);
+    let s3 = _ecs_arch_world_deep_sign_step(w0, 3, bits, s2);
+    let s4 = _ecs_arch_world_deep_sign_step(w0, 4, bits, s3);
+    let s5 = _ecs_arch_world_deep_sign_step(w0, 5, bits, s4);
+    let s6 = _ecs_arch_world_deep_sign_step(w0, 6, bits, s5);
+    let s7 = _ecs_arch_world_deep_sign_step(w0, 7, bits, s6);
+    return s7;
+}
+
+fn _ecs_arch_world_deep_sign_empty() -> EcsArchSignDeep {
+    let r = EcsArchSignDeep { c0: -1, c1: -1, c2: -1, c3: -1, c4: -1, c5: -1, c6: -1, c7: -1, count: 0 };
+    return r;
+}
+
+// If bit `cid` is set in `bits`, push cid onto the signature.
+fn _ecs_arch_world_deep_sign_step(w: EcsArchWorldDeep, cid: i32, bits: i32, sig: EcsArchSignDeep) -> EcsArchSignDeep {
+    let attached = _ecs_arch_bits_has(bits, cid);
+    if attached != 1 { return sig; };
+    return _ecs_arch_world_deep_sign_push(sig, cid);
+}
+
+// Push component id onto the signature (assumes component ids are scanned ascending; signature stays sorted).
+// cap-8 reject silent.
+fn _ecs_arch_world_deep_sign_push(sig0: EcsArchSignDeep, cid: i32) -> EcsArchSignDeep {
+    if sig0.count >= ECS_AREG_COMP_CAP { return sig0; };
+    return _ecs_arch_world_deep_sign_set(sig0, sig0.count, cid);
+}
+
+fn _ecs_arch_world_deep_sign_set(sig0: EcsArchSignDeep, k: i32, v: i32) -> EcsArchSignDeep {
+    if k == 0 { sig0.c0 = v; sig0.count = sig0.count + 1; return sig0; };
+    if k == 1 { sig0.c1 = v; sig0.count = sig0.count + 1; return sig0; };
+    if k == 2 { sig0.c2 = v; sig0.count = sig0.count + 1; return sig0; };
+    if k == 3 { sig0.c3 = v; sig0.count = sig0.count + 1; return sig0; };
+    if k == 4 { sig0.c4 = v; sig0.count = sig0.count + 1; return sig0; };
+    if k == 5 { sig0.c5 = v; sig0.count = sig0.count + 1; return sig0; };
+    if k == 6 { sig0.c6 = v; sig0.count = sig0.count + 1; return sig0; };
+    sig0.c7 = v;
+    sig0.count = sig0.count + 1;
+    return sig0;
+}
+
+// Read signature component at idx (or -1 if absent).
+fn _ecs_arch_world_deep_sign_at(sig: EcsArchSignDeep, idx: i32) -> i32 {
+    return ecs_arch_world_deep_sign_at(sig, idx);
+}
+
+// bitword helpers for per-entity attach set (cap-8 components -> bit 1<<cid).
+fn _ecs_arch_bits_set(bits: i32, cid: i32) -> i32 {
+    if cid == 0 { return bits | 1; };
+    if cid == 1 { return bits | 2; };
+    if cid == 2 { return bits | 4; };
+    if cid == 3 { return bits | 8; };
+    if cid == 4 { return bits | 16; };
+    if cid == 5 { return bits | 32; };
+    if cid == 6 { return bits | 64; };
+    if cid == 7 { return bits | 128; };
+    return bits;
+}
+
+fn _ecs_arch_bits_has(bits: i32, cid: i32) -> i32 {
+    if cid == 0 { if (bits & 1) != 0 { return 1; }; return 0; };
+    if cid == 1 { if (bits & 2) != 0 { return 1; }; return 0; };
+    if cid == 2 { if (bits & 4) != 0 { return 1; }; return 0; };
+    if cid == 3 { if (bits & 8) != 0 { return 1; }; return 0; };
+    if cid == 4 { if (bits & 16) != 0 { return 1; }; return 0; };
+    if cid == 5 { if (bits & 32) != 0 { return 1; }; return 0; };
+    if cid == 6 { if (bits & 64) != 0 { return 1; }; return 0; };
+    if cid == 7 { if (bits & 128) != 0 { return 1; }; return 0; };
+    return 0;
+}
+
+fn _ecs_arch_bits_clear(bits: i32, cid: i32) -> i32 {
+    if cid == 0 { return bits & (-2); };
+    if cid == 1 { return bits & (-3); };
+    if cid == 2 { return bits & (-5); };
+    if cid == 3 { return bits & (-9); };
+    if cid == 4 { return bits & (-17); };
+    if cid == 5 { return bits & (-33); };
+    if cid == 6 { return bits & (-65); };
+    if cid == 7 { return bits & (-129); };
+    return bits;
+}
+
+// ── find_archetype: search cap-8 archetypes for matching signature ──────────
+// Equal when comp_count and `c0..c_count-1` all match (signatures are sorted-ascending).
+fn ecs_arch_world_deep_find_archetype(w: EcsArchWorldDeep, sig: EcsArchSignDeep) -> i32 {
+    return _ecs_arch_world_deep_find_scan(w, 0, w.arch_count, sig);
+}
+
+// Recursive read-only scan over cap-8 archetype slots (Batch 381 pattern -- pure i32 recursion).
+fn _ecs_arch_world_deep_find_scan(w: EcsArchWorldDeep, k: i32, cnt: i32, sig: EcsArchSignDeep) -> i32 {
+    if k >= cnt { return -1; };
+    let a = _ecs_arch_world_deep_arch_at(w, k);
+    if _ecs_arch_world_deep_sig_matches_arch(a, sig) == 1 { return k; };
+    return _ecs_arch_world_deep_find_scan(w, k + 1, cnt, sig);
+}
+
+// Return 1 if signature (sorted-ascending) matches archetype's component_ids (sorted ascending).
+fn _ecs_arch_world_deep_sig_matches_arch(a: EcsArchArchDeep, sig: EcsArchSignDeep) -> i32 {
+    if a.comp_count != sig.count { return 0; };
+    let ok0 = _ecs_arch_eq_slot(a, sig, 0);
+    if ok0 == 0 { return 0; };
+    let ok1 = _ecs_arch_eq_slot(a, sig, 1);
+    if ok1 == 0 { return 0; };
+    let ok2 = _ecs_arch_eq_slot(a, sig, 2);
+    if ok2 == 0 { return 0; };
+    let ok3 = _ecs_arch_eq_slot(a, sig, 3);
+    if ok3 == 0 { return 0; };
+    let ok4 = _ecs_arch_eq_slot(a, sig, 4);
+    if ok4 == 0 { return 0; };
+    let ok5 = _ecs_arch_eq_slot(a, sig, 5);
+    if ok5 == 0 { return 0; };
+    let ok6 = _ecs_arch_eq_slot(a, sig, 6);
+    if ok6 == 0 { return 0; };
+    let ok7 = _ecs_arch_eq_slot(a, sig, 7);
+    if ok7 == 0 { return 0; };
+    return 1;
+}
+
+// Compare slot k of archetype component-ids vs signature (only if k < sig.count).
+fn _ecs_arch_eq_slot(a: EcsArchArchDeep, sig: EcsArchSignDeep, k: i32) -> i32 {
+    if k >= sig.count { return 1; };
+    let av = ecs_arch_arch_deep_component_at(a, k);
+    let sv = _ecs_arch_world_deep_sign_at(sig, k);
+    if av != sv { return 0; };
+    return 1;
+}
+
+// ── get_or_create_archetype: find or create a new archetype slot for sig ────
+// Returns (EcsArchWorldDeep, archetype_id). Wrapper struct EcsArchSlotDeep.
+fn ecs_arch_world_deep_get_or_create_archetype(w0: EcsArchWorldDeep, sig: EcsArchSignDeep) -> EcsArchSlotDeep {
+    let existing = ecs_arch_world_deep_find_archetype(w0, sig);
+    if existing >= 0 { return _ecs_arch_slot_wrap(w0, existing); };
+    if w0.arch_count >= ECS_AREG_ARCH_CAP { return _ecs_arch_slot_wrap(w0, -1); };
+    let slot = w0.arch_count;
+    let a0 = ecs_arch_arch_deep_empty(slot);
+    // Copy the signature (sorted ascending) into c0..c_count-1; bump comp_count.
+    let a1 = _ecs_arch_world_deep_arch_copy_signature(a0, sig, 0);
+    let w1 = _ecs_arch_world_deep_set_arch(w0, slot, a1);
+    w1.arch_count = w1.arch_count + 1;
+    return _ecs_arch_slot_wrap(w1, slot);
+}
+
+// Recursively copy signature component ids into archetype c0..c_count-1; bump comp_count once at the end.
+fn _ecs_arch_world_deep_arch_copy_signature(a0: EcsArchArchDeep, sig: EcsArchSignDeep, k: i32) -> EcsArchArchDeep {
+    if k >= sig.count {
+        a0.comp_count = sig.count;
+        return a0;
+    };
+    let v = _ecs_arch_world_deep_sign_at(sig, k);
+    let a1 = _ecs_arch_arch_deep_set_component_at(a0, k, v);
+    return _ecs_arch_world_deep_arch_copy_signature(a1, sig, k + 1);
+}
+
+fn _ecs_arch_slot_wrap(world: EcsArchWorldDeep, archetype_id: i32) -> EcsArchSlotDeep {
+    let r = EcsArchSlotDeep { world: world, archetype_id: archetype_id };
+    return r;
+}
+
+// ── spawn: allocate next entity slot, mark alive, ensure_location, attach to empty-archetype 0 ──
+// Returns wrapper EcsArchSpawnDeep { world, entity }. cap-16 reject silent.
+fn ecs_arch_world_deep_spawn(w0: EcsArchWorldDeep) -> EcsArchSpawnDeep {
+    if w0.next_entity >= ECS_AREG_ENT_CAP { return _ecs_arch_spawn_wrap(w0, -1); };
+    let eid = w0.next_entity;
+    let w1 = w0;
+    w1.next_entity = w1.next_entity + 1;
+    let w2 = _ecs_arch_world_deep_set_alive(w1, eid, 1);
+    // Empty signature -> attach to archetype 0.
+    let sig_empty = _ecs_arch_world_deep_sign_empty();
+    let w3 = _ecs_arch_world_deep_attach(w2, eid, sig_empty);
+    return _ecs_arch_spawn_wrap(w3, eid);
+}
+
+fn _ecs_arch_spawn_wrap(world: EcsArchWorldDeep, entity: i32) -> EcsArchSpawnDeep {
+    let r = EcsArchSpawnDeep { world: world, entity: entity };
+    return r;
+}
+
+// ── ensure_location: ensure cap-16 location slot is populated for entity_id ──
+// shallow: grows locations until len == entity_id + 1; on a cap-16 fixed table,
+// slot for entity_id is present by construction at entity_id (if in cap-16).
+// We just set loc_count = max(loc_count, eid+1).
+fn _ecs_arch_world_deep_ensure_location(w0: EcsArchWorldDeep, entity_id: i32) -> EcsArchWorldDeep {
+    if entity_id >= ECS_AREG_LOC_CAP { return w0; };
+    if entity_id < 0 { return w0; };
+    let want = entity_id + 1;
+    if want > w0.loc_count {
+        w0.loc_count = want;
+        return w0;
+    };
+    return w0;
+}
+
+// ── attach: place entity into the archetype at the tail row + record location ─
+fn _ecs_arch_world_deep_attach(w0: EcsArchWorldDeep, entity_id: i32, sig: EcsArchSignDeep) -> EcsArchWorldDeep {
+    let w1 = _ecs_arch_world_deep_ensure_location(w0, entity_id);
+    let slot = ecs_arch_world_deep_get_or_create_archetype(w1, sig);
+    let w2 = ecs_arch_world_deep_slot_world(slot);
+    let arch_id = ecs_arch_world_deep_slot_id(slot);
+    if arch_id < 0 { return w2; };
+    let a = _ecs_arch_world_deep_arch_at(w2, arch_id);
+    if a.ent_count >= ECS_AREG_ENT_CAP { return w2; };
+    let row = a.ent_count;
+    let a1 = _ecs_arch_arch_deep_set_entity_at(a, row, entity_id);
+    a1.ent_count = a1.ent_count + 1;
+    let w3 = _ecs_arch_world_deep_set_arch(w2, arch_id, a1);
+    // Record/update location: loc[entity_id].archetype_id = arch_id, .row = row.
+    let loc0 = _ecs_arch_world_deep_location_at(w3, entity_id);
+    let loc1 = _ecs_arch_world_deep_location_set_archetype_id(loc0, arch_id);
+    let loc2 = _ecs_arch_world_deep_location_set_row(loc1, row);
+    let w4 = _ecs_arch_world_deep_set_location(w3, entity_id, loc2);
+    return w4;
+}
+
+// ── detach: swap-remove entity from its current archetype's entity_ids list ──
+fn _ecs_arch_world_deep_detach(w0: EcsArchWorldDeep, entity_id: i32) -> EcsArchWorldDeep {
+    if entity_id < 0 { return w0; };
+    if entity_id >= ECS_AREG_LOC_CAP { return w0; };
+    let loc = _ecs_arch_world_deep_location_at(w0, entity_id);
+    if loc.archetype_id < 0 { return w0; };
+    let arch_id = loc.archetype_id;
+    let row = loc.row;
+    let a = _ecs_arch_world_deep_arch_at(w0, arch_id);
+    let last = a.ent_count - 1;
+    // If row != last, swap last into row + update the entity_id at `last` to point at `row`.
+    let w1 = _ecs_arch_world_deep_detach_swap_in(w0, a, entity_id, arch_id, row, last, row == last);
+    let w2 = _ecs_arch_world_deep_set_arch_entity_at(w1, arch_id, last, -1);
+    let a_after = _ecs_arch_world_deep_arch_at(w2, arch_id);
+    let a2 = _ecs_arch_arch_deep_set_ent_count(a_after, a_after.ent_count - 1);
+    let w3 = _ecs_arch_world_deep_set_arch(w2, arch_id, a2);
+    // Mark location for entity_id as detached.
+    let loc_after = _ecs_arch_world_deep_location_at(w3, entity_id);
+    let loc_cleared_arch = _ecs_arch_world_deep_location_set_archetype_id(loc_after, -1);
+    let loc_cleared_row = _ecs_arch_world_deep_location_set_row(loc_cleared_arch, -1);
+    let w4 = _ecs_arch_world_deep_set_location(w3, entity_id, loc_cleared_row);
+    return w4;
+}
+
+// If row != last, copy entity_id of `last` into `row`+ update that entity_id's location.row = row.
+// Returns the world updated (entity_ids[ last ] still needs clearing by the caller -- _set_arch_entity_at(..., last, -1)).
+fn _ecs_arch_world_deep_detach_swap_in(w0: EcsArchWorldDeep, a: EcsArchArchDeep, target_eid: i32, arch_id: i32, row: i32, last: i32, same_row: bool) -> EcsArchWorldDeep {
+    if same_row {
+        return w0;
+    };
+    let moved_eid = ecs_arch_arch_deep_entity_at(a, last);
+    let a1 = _ecs_arch_arch_deep_set_entity_at(a, row, moved_eid);
+    let w1 = _ecs_arch_world_deep_set_arch(w0, arch_id, a1);
+    // Update the moved entity's location.row -> row.
+    let loc0 = _ecs_arch_world_deep_location_at(w1, moved_eid);
+    let loc1 = _ecs_arch_world_deep_location_set_row(loc0, row);
+    let w2 = _ecs_arch_world_deep_set_location(w1, moved_eid, loc1);
+    return w2;
+}
+
+// Set entity_id at row k in archetype arch_id (cascade-of-return).
+fn _ecs_arch_world_deep_set_arch_entity_at(w0: EcsArchWorldDeep, arch_id: i32, k: i32, v: i32) -> EcsArchWorldDeep {
+    let a = _ecs_arch_world_deep_arch_at(w0, arch_id);
+    let a1 = _ecs_arch_arch_deep_set_entity_at(a, k, v);
+    return _ecs_arch_world_deep_set_arch(w0, arch_id, a1);
+}
+
+// ── sync_entity: recompute signature + attach/detach so entity lives under correct archetype ──
+fn ecs_arch_world_deep_sync_entity(w0: EcsArchWorldDeep, entity_id: i32) -> EcsArchWorldDeep {
+    let w1 = _ecs_arch_world_deep_ensure_location(w0, entity_id);
+    let w2 = _ecs_arch_world_deep_detach(w1, entity_id);
+    let sig = _ecs_arch_world_deep_signature_for_entity(w2, entity_id);
+    let w3 = _ecs_arch_world_deep_attach(w2, entity_id, sig);
+    return w3;
+}
+
+// ── insert_component / remove_component / despawn ───────────────────────────
+fn ecs_arch_world_deep_insert_component(w0: EcsArchWorldDeep, entity_id: i32, comp_id: i32) -> EcsArchWorldDeep {
+    if comp_id < 0 { return w0; };
+    if comp_id >= ECS_AREG_COMP_CAP { return w0; };
+    if entity_id < 0 { return w0; };
+    if entity_id >= ECS_AREG_ENT_CAP { return w0; };
+    // mark entity-alive-id for comp_id (bitword).
+    let bits0 = _ecs_arch_world_deep_attach_at(w0, entity_id);
+    let bits1 = _ecs_arch_bits_set(bits0, comp_id);
+    let w1 = _ecs_arch_world_deep_set_attach(w0, entity_id, bits1);
+    return ecs_arch_world_deep_sync_entity(w1, entity_id);
+}
+
+fn ecs_arch_world_deep_remove_component(w0: EcsArchWorldDeep, entity_id: i32, comp_id: i32) -> EcsArchWorldDeep {
+    if comp_id < 0 { return w0; };
+    if comp_id >= ECS_AREG_COMP_CAP { return w0; };
+    if entity_id < 0 { return w0; };
+    if entity_id >= ECS_AREG_ENT_CAP { return w0; };
+    let bits0 = _ecs_arch_world_deep_attach_at(w0, entity_id);
+    let bits1 = _ecs_arch_bits_clear(bits0, comp_id);
+    let w1 = _ecs_arch_world_deep_set_attach(w0, entity_id, bits1);
+    return ecs_arch_world_deep_sync_entity(w1, entity_id);
+}
+
+fn ecs_arch_world_deep_despawn(w0: EcsArchWorldDeep, entity_id: i32) -> EcsArchWorldDeep {
+    if entity_id < 0 { return w0; };
+    if entity_id >= ECS_AREG_ENT_CAP { return w0; };
+    if _ecs_arch_world_deep_alive_at(w0, entity_id) != 1 { return w0; };
+    let w1 = _ecs_arch_world_deep_detach(w0, entity_id);
+    let w2 = _ecs_arch_world_deep_set_alive(w1, entity_id, 0);
+    // Bump generation so a future spawn at this slot reuses with incremented gen.
+    let g = _ecs_arch_world_deep_generation_at(w2, entity_id);
+    let w3 = _ecs_arch_world_deep_set_generation(w2, entity_id, g + 1);
+    // Clear attaches so future spawn in this slot starts with no components.
+    let w4 = _ecs_arch_world_deep_set_attach(w3, entity_id, 0);
+    return w4;
+}
+
+// ── is_alive / entity_archetype_id / entity_row / archetype_entity_count ─────
+fn ecs_arch_world_deep_is_alive(w: EcsArchWorldDeep, entity_id: i32) -> bool {
+    if entity_id < 0 { return false; };
+    if entity_id >= ECS_AREG_ENT_CAP { return false; };
+    return _ecs_arch_world_deep_alive_at(w, entity_id) == 1;
+}
+
+fn ecs_arch_world_deep_entity_archetype_id(w: EcsArchWorldDeep, entity_id: i32) -> i32 {
+    if entity_id < 0 { return -1; };
+    if entity_id >= ECS_AREG_LOC_CAP { return -1; };
+    if _ecs_arch_world_deep_alive_at(w, entity_id) != 1 { return -1; };
+    return _ecs_arch_world_deep_location_at(w, entity_id).archetype_id;
+}
+
+fn ecs_arch_world_deep_entity_row(w: EcsArchWorldDeep, entity_id: i32) -> i32 {
+    if entity_id < 0 { return -1; };
+    if entity_id >= ECS_AREG_LOC_CAP { return -1; };
+    if _ecs_arch_world_deep_alive_at(w, entity_id) != 1 { return -1; };
+    return _ecs_arch_world_deep_location_at(w, entity_id).row;
+}
+
+fn ecs_arch_world_deep_archetype_entity_count(w: EcsArchWorldDeep, archetype_id: i32) -> i32 {
+    if archetype_id < 0 { return 0; };
+    if archetype_id >= w.arch_count { return 0; };
+    let a = _ecs_arch_world_deep_arch_at(w, archetype_id);
+    return a.ent_count;
+}
+
+fn ecs_arch_world_deep_archetype_id_for_entity(w: EcsArchWorldDeep, entity_id: i32) -> i32 {
+    return ecs_arch_world_deep_entity_archetype_id(w, entity_id);
+}
+
+// ── query_component: walk all archetypes that have `comp_id` in their signature,
+// then walk every entity_ids row in those archetypes, collecting alive entities ──
+// Returns EcsArchQueryDeep { found, count: i32, e0..e15, g0..g15 }.
+fn ecs_arch_world_deep_query_component(w0: EcsArchWorldDeep, comp_id: i32) -> EcsArchQueryDeep {
+    let acc0 = _ecs_arch_query_acc_new();
+    let acc1 = _ecs_arch_query_walk_archetype(w0, 0, w0.arch_count, comp_id, acc0);
+    return _ecs_arch_query_acc_finalize(acc1);
+}
+
+// Internal accumulator for the query walk (cap-8 e+g pairs)
+struct EcsArchQueryAcc { count: i32, e0: i32, e1: i32, e2: i32, e3: i32, e4: i32, e5: i32, e6: i32, e7: i32, e8: i32, e9: i32, e10: i32, e11: i32, e12: i32, e13: i32, e14: i32, e15: i32, g0: i32, g1: i32, g2: i32, g3: i32, g4: i32, g5: i32, g6: i32, g7: i32, g8: i32, g9: i32, g10: i32, g11: i32, g12: i32, g13: i32, g14: i32, g15: i32 }
+
+fn _ecs_arch_query_acc_new() -> EcsArchQueryAcc {
+    let a = EcsArchQueryAcc {
+        count: 0, e0: -1, e1: -1, e2: -1, e3: -1, e4: -1, e5: -1, e6: -1, e7: -1,
+        e8: -1, e9: -1, e10: -1, e11: -1, e12: -1, e13: -1, e14: -1, e15: -1,
+        g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0,
+        g8: 0, g9: 0, g10: 0, g11: 0, g12: 0, g13: 0, g14: 0, g15: 0,
+    };
+    return a;
+}
+
+// Recurse over cap-8 archetype slots; within each matching archetype, walk cap-16 rows via a per-arch accumulator walk.
+fn _ecs_arch_query_walk_archetype(w0: EcsArchWorldDeep, k: i32, cnt: i32, comp_id: i32, acc0: EcsArchQueryAcc) -> EcsArchQueryAcc {
+    if k >= cnt { return acc0; };
+    let a = _ecs_arch_world_deep_arch_at(w0, k);
+    let sig_has = _ecs_arch_arch_deep_sig_has(a, comp_id);
+    let acc1 = _ecs_arch_query_walk_arch_if(w0, k, sig_has, comp_id, acc0);
+    return _ecs_arch_query_walk_archetype(w0, k + 1, cnt, comp_id, acc1);
+}
+
+fn _ecs_arch_query_walk_arch_if(w0: EcsArchWorldDeep, k: i32, sig_has: i32, comp_id: i32, acc0: EcsArchQueryAcc) -> EcsArchQueryAcc {
+    if sig_has != 1 { return acc0; };
+    let a = _ecs_arch_world_deep_arch_at(w0, k);
+    return _ecs_arch_query_walk_row(w0, a, 0, a.ent_count, acc0);
+}
+
+// Recurse over cap-16 rows in one archetype, capturing alive entities + their generation.
+fn _ecs_arch_query_walk_row(w0: EcsArchWorldDeep, a: EcsArchArchDeep, r: i32, cnt: i32, acc0: EcsArchQueryAcc) -> EcsArchQueryAcc {
+    if r >= cnt { return acc0; };
+    if acc0.count >= ECS_AREG_LOC_CAP { return acc0; };
+    let eid = ecs_arch_arch_deep_entity_at(a, r);
+    if _ecs_arch_world_deep_alive_at(w0, eid) == 1 {
+        let g = _ecs_arch_world_deep_generation_at(w0, eid);
+        let acc1 = _ecs_arch_query_push(acc0, eid, g);
+        return _ecs_arch_query_walk_row(w0, a, r + 1, cnt, acc1);
+    };
+    return _ecs_arch_query_walk_row(w0, a, r + 1, cnt, acc0);
+}
+
+// does the archetype's signature contain `comp_id`?
+fn _ecs_arch_arch_deep_sig_has(a: EcsArchArchDeep, comp_id: i32) -> i32 {
+    let m0 = _ecs_arch_arch_deep_sig_has_slot(a, 0, comp_id);
+    if m0 == 1 { return 1; };
+    let m1 = _ecs_arch_arch_deep_sig_has_slot(a, 1, comp_id);
+    if m1 == 1 { return 1; };
+    let m2 = _ecs_arch_arch_deep_sig_has_slot(a, 2, comp_id);
+    if m2 == 1 { return 1; };
+    let m3 = _ecs_arch_arch_deep_sig_has_slot(a, 3, comp_id);
+    if m3 == 1 { return 1; };
+    let m4 = _ecs_arch_arch_deep_sig_has_slot(a, 4, comp_id);
+    if m4 == 1 { return 1; };
+    let m5 = _ecs_arch_arch_deep_sig_has_slot(a, 5, comp_id);
+    if m5 == 1 { return 1; };
+    let m6 = _ecs_arch_arch_deep_sig_has_slot(a, 6, comp_id);
+    if m6 == 1 { return 1; };
+    let m7 = _ecs_arch_arch_deep_sig_has_slot(a, 7, comp_id);
+    return m7;
+}
+
+fn _ecs_arch_arch_deep_sig_has_slot(a: EcsArchArchDeep, k: i32, comp_id: i32) -> i32 {
+    if k >= a.comp_count { return 0; };
+    if ecs_arch_arch_deep_component_at(a, k) == comp_id { return 1; };
+    return 0;
+}
+
+// Append (eid, gen) to the accumulator (cap-16 silent reject).
+fn _ecs_arch_query_push(acc0: EcsArchQueryAcc, eid: i32, g: i32) -> EcsArchQueryAcc {
+    if acc0.count >= ECS_AREG_LOC_CAP { return acc0; };
+    let k = acc0.count;
+    return _ecs_arch_query_set_pair(acc0, k, eid, g);
+}
+
+fn _ecs_arch_query_set_pair(acc0: EcsArchQueryAcc, k: i32, eid: i32, g: i32) -> EcsArchQueryAcc {
+    if k == 0 { acc0.e0 = eid; acc0.g0 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 1 { acc0.e1 = eid; acc0.g1 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 2 { acc0.e2 = eid; acc0.g2 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 3 { acc0.e3 = eid; acc0.g3 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 4 { acc0.e4 = eid; acc0.g4 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 5 { acc0.e5 = eid; acc0.g5 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 6 { acc0.e6 = eid; acc0.g6 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 7 { acc0.e7 = eid; acc0.g7 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 8 { acc0.e8 = eid; acc0.g8 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 9 { acc0.e9 = eid; acc0.g9 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 10 { acc0.e10 = eid; acc0.g10 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 11 { acc0.e11 = eid; acc0.g11 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 12 { acc0.e12 = eid; acc0.g12 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 13 { acc0.e13 = eid; acc0.g13 = g; acc0.count = acc0.count + 1; return acc0; };
+    if k == 14 { acc0.e14 = eid; acc0.g14 = g; acc0.count = acc0.count + 1; return acc0; };
+    acc0.e15 = eid;
+    acc0.g15 = g;
+    acc0.count = acc0.count + 1;
+    return acc0;
+}
+
+// Wrap accumulator into the EcsArchQueryDeep result.
+fn _ecs_arch_query_acc_finalize(acc: EcsArchQueryAcc) -> EcsArchQueryDeep {
+    let r = EcsArchQueryDeep {
+        found: acc.count > 0,
+        count: acc.count,
+        e0: acc.e0, e1: acc.e1, e2: acc.e2, e3: acc.e3, e4: acc.e4, e5: acc.e5, e6: acc.e6, e7: acc.e7,
+        e8: acc.e8, e9: acc.e9, e10: acc.e10, e11: acc.e11, e12: acc.e12, e13: acc.e13, e14: acc.e14, e15: acc.e15,
+        g0: acc.g0, g1: acc.g1, g2: acc.g2, g3: acc.g3, g4: acc.g4, g5: acc.g5, g6: acc.g6, g7: acc.g7,
+        g8: acc.g8, g9: acc.g9, g10: acc.g10, g11: acc.g11, g12: acc.g12, g13: acc.g13, g14: acc.g14, g15: acc.g15,
+    };
+    return r;
+}
+
+// ── signature-assume helpers used by tests: build a single-component signature ──
+fn ecs_arch_world_deep_single_sign(comp_id: i32) -> EcsArchSignDeep {
+    let s0 = _ecs_arch_world_deep_sign_empty();
+    return _ecs_arch_world_deep_sign_push(s0, comp_id);
+}
+
+// ── accessors for use by tests: info on the empty / archetype-of-zero ─────────
+fn ecs_arch_world_deep_arch_components_count(w: EcsArchWorldDeep, arch_id: i32) -> i32 {
+    if arch_id < 0 { return 0; };
+    if arch_id >= w.arch_count { return 0; };
+    let a = _ecs_arch_world_deep_arch_at(w, arch_id);
+    return a.comp_count;
+}
