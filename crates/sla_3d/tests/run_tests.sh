@@ -24,6 +24,21 @@ for d in math time input color transform; do
     *) unset SA_PLUGINS_PATH ;;
   esac
   echo "== sa test $t =="
-  if "$SA" test "$t"; then echo "PASS $d"; else echo "FAIL $d"; fail=1; fi
+  # Verdict caliber: PASS requires BOTH exit code 0 AND the host's
+  # result line reporting ok with 0 failed — an exit code alone is
+  # not trusted (the host is on record returning rc=0 for some
+  # failed launches). The host prints one "[PASS] <name>" /
+  # "[FAIL] <name>" line per test and a "test result:" summary;
+  # the full output stays visible in this script's output.
+  out=$("$SA" test "$t" 2>&1)
+  rc=$?
+  printf '%s\n' "$out"
+  rline=$(printf '%s\n' "$out" | grep -m1 "test result:" || true)
+  if [ "$rc" -eq 0 ] && printf '%s' "$rline" | grep -q "test result: ok" && printf '%s' "$rline" | grep -q " 0 failed"; then
+    echo "PASS $d"
+  else
+    echo "FAIL $d"
+    fail=1
+  fi
 done
 exit $fail
