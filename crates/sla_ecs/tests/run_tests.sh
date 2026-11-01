@@ -69,8 +69,11 @@ for f in $LIST; do
   if [ "$rc" -eq 0 ] && echo "$rline" | grep -q "test result: ok"; then
     passed=$((passed+1))
   else
-    # Named failing tests, when the runner prints them.
-    grep -E "^test .+ \.\.\. FAILED" "$log" | sed 's/^test //; s/ \.\.\. FAILED$//' | \
+    # Named failing tests: the SA host executor prints one
+    # "[FAIL] <test name>" line per failing test (verified against
+    # real output on the rig, 2026-11-01; an earlier rust-style
+    # pattern matched nothing and is removed).
+    grep -E "^\[FAIL\] " "$log" | sed 's/^\[FAIL\] //' | \
       while IFS= read -r tname; do printf '%s :: %s\n' "$f" "$tname" >> "$OUT/names.txt"; done
     if ! grep -qF "$f :: " "$OUT/names.txt"; then
       printf '%s :: <file-level>\n' "$f" >> "$OUT/names.txt"
