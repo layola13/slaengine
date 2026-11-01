@@ -21,6 +21,7 @@ crates/
   sla_3d/               sa_plugin_3dengines port seat         [reserved]
   sla_webgl/            render backend seat, priority 1       [reserved]
   sla_gpu/              render backend seat, priority 2       [reserved]
+  sla_physics/          physics seat (native SLA clean-room)  [active]
 examples/smoke/         umbrella composition smoke
 ```
 
