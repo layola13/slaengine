@@ -277,5 +277,186 @@ compiled 模式读回，同一校验器复检——两形同裁判由此是结�
    否则 `Sax3dUnresolvedReference`（clip 通道与 sampler 分别为
    `Sax3dClipTargetMissing` / `Sax3dClipSamplerMissing`）。
 3. 字节适配：每段长度 ≥ 其用途所需（通道 = 顶点数 × 元素长；
-   索引 = count × 元素长；inv
-...[truncated 10203 chars]
+   索引 = count × 元素长；inverse_bind = 关节数 × 64；
+   动画 input = count × 4、output = count × 元素长），不足 →
+   `Sax3dSectionOverflow`。raw 图像段为例外：逐字相等（规则 9）。
+4. 封闭值集：一切枚举与定值字段出闭集即 `Sax3dInvalidValue`——
+   mesh topology（校验器闭集与 §5.2 文法有一处出入，见恢复说明
+   文件差异表 D-文码-1，本批不裁）、vertices 为 0 或未声明、indices
+   类型非 u16/u32、mesh 无 primitive、image format 出闭集、
+   color_space 非 srgb/linear（必填、永不猜测）、sampler 各字段
+   值集（§5.4）、material state alpha 非 opaque/mask/blend、
+   clip interpolation 与 channel path 出闭集、skeleton 缺
+   inverse_bind 段、node 的 material 覆盖或 skin 未伴 mesh。
+5. 通道律：`channel` 名出规范角色词表 → `Sax3dUnknownChannel`
+   （自定义通道走 `attr`）；角色元素类型与 §5.2 钉死表不符 →
+   `Sax3dChannelTypeMismatch`；元素类型不在 §4.4 类型表 →
+   `Sax3dUnknownElemType`；`attr` 名占用保留角色名 →
+   `Sax3dAttrNameReserved`；morph 通道非 position/normal/tangent
+   增量 → `Sax3dMorphChannelInvalid`；`joints0` 与 `weights0`
+   不成对 → `Sax3dChannelPairing`。
+6. 骨骼律：joint parent 必须是本骨骼关节（规则 2）；父链成环 →
+   `Sax3dJointCycle`。
+7. 关节-节点对应律：每个 joint 必须有同名 node 存在于某 scene，
+   否则 `Sax3dSkinJointNotNode`；该 node 的最近关节祖先必须等于
+   joint 声明的 parent（无关节祖先 ⇔ parent 为 none），否则
+   `Sax3dJointParentMismatch`；挂 skin 的 node 其 mesh 必须具备
+   joints0/weights0 通道，否则 `Sax3dSkinChannelMissing`。
+8. 段用途律：同一段被以两种 kind 使用 → `Sax3dSectionKindConflict`
+   （§4.3）；未被任何声明引用的段指派为 blob 保留、不丢弃。
+9. 图像与采样器律：raw 格式图像声明 size 与段长必须逐字相等
+   （w × h × bpp，raw-rgba8 为 4、raw-rgba16f 为 8），否则
+   `Sax3dRawImageSizeMismatch`；texture 的 sampler 块缺失或
+   mag/min/mipmap/wrap_u/wrap_v 五字段任一缺失 →
+   `Sax3dMissingSamplerState`（D-4）；wrap_w 出现时同样验值集。
+10. 材质绑定律（对 §9 接口表）：shader 无接口表供给 →
+    `Sax3dMissingInterfaceFixture`；param 名不在接口 params →
+    `Sax3dUndeclaredParam`；字面量类型与接口类型不符 →
+    `Sax3dParamTypeMismatch`；接口 param 未被赋值且无默认值 →
+    `Sax3dUnboundParam`（不许静默零值）；纹理绑定名不是接口
+    sampler 参数、或 tex_transform 指向未绑定的名字 →
+    `Sax3dUndeclaredTextureBinding`；接口 sampler 参数漏绑 →
+    `Sax3dUnboundSamplerParam`。param 与纹理绑定在材质内重名
+    亦按规则 1 判 `Sax3dDuplicateName`。
+11. 装配律：node 同时写 transform 与 matrix →
+    `Sax3dTransformConflict`；material 覆盖的 mesh 不是恰 1 个
+    primitive → `Sax3dMaterialOverrideAmbiguous`。
+12. 动画律：sampler input 元素类型必须 f32，否则
+    `Sax3dChannelTypeMismatch`；channel path 对 output 的类型律
+    （§5.7）违犯同码；计数律（output = input × 每键分量数 ×
+    cubic-spline 的 3 倍因子）违犯 → `Sax3dAnimCountMismatch`。
+    时间轴单调性属数据级检查，归 §10.2（D-8），不在声明级判。
+13. 输入喂养律：被 mesh 的 primitive 材质所用 shader 的每个
+    input，必须有规范映射（§9）对应的通道喂养，否则
+    `Sax3dInputNotFed`；接口 input 类型与规范类型、或通道元素
+    类型与 input 的相容性违犯 → `Sax3dChannelTypeMismatch`。
+14. 文法与夹具律：asset 头缺失或重复（每文件恰一份，D-6）、
+    字段/条目出文法 → `Sax3dParseError`；未知顶层声明 →
+    `Sax3dUnknownDeclaration`；编译形名字索引越出名表 →
+    `Sax3dCompiledNameRef`；接口表夹具条目格式错误 →
+    `Sax3dFixtureError`（§9）。
+15. 二进制面律（读入/回读面，与 §4.1/§4.5 对应）：魔数不符 →
+    `Sax3dBadMagic`；version_major ≠ 1 → `Sax3dUnsupportedVersion`；
+    flags 非零 → `Sax3dBadFlags`；文件小于头/段表/段载荷/名表
+    所需 → `Sax3dTruncatedFile`；name_off 不能在名表内解析 →
+    `Sax3dNameTableMismatch`。段集与声明的一致性归 §10.1。
+
+## 8. 算例（恢复文本，见文末恢复说明）
+
+立方体例（24 顶点、1 primitive、1 材质、1 纹理、1 shader 引用、
+1 旋转 clip）拆分形的段布局——载荷基址 = 头 32B + 段表 7×32B
+= 256，其后紧密累计：
+
+| 段 | kind | 偏移 | 长 | 内容核算 |
+|---|---|---|---|---|
+| positions | channel | 256 | 288 | 24 × f32x3（12B） |
+| normals | channel | 544 | 288 | 24 × f32x3 |
+| uvs | channel | 832 | 192 | 24 × f32x2（8B） |
+| indices | index | 1024 | 72 | 36 × u16 |
+| checker | image_raw | 1096 | 16 | raw-rgba8 2×2 = 16B |
+| spin_times | anim_input | 1112 | 8 | 2 × f32 |
+| spin_rots | anim_output | 1120 | 32 | 2 × quat（16B） |
+
+载荷终点 1152（总长口径见 D-2：名表追加于尾，拆分形文件总长
+1211 = 1152 + 名表 59B）。indices 段终于 1096、非 16 对齐——
+紧密律优先于 align 的实例（§4.2）。材质绑定对账：接口 params
+= {base_color: vec4, roughness: f32, metallic: f32 = 0.0}，材质
+赋 base_color（[f32;4] ↔ vec4）、roughness（标量 ↔ f32），
+metallic 走默认值；textures = {base_color_map: sampler2D} 由
+材质绑定；inputs = {position: vec3, normal: vec3, uv: vec2} 由
+通道 position/normal/uv0 按 §9 规范映射喂入。
+
+（存疑：第二例 hero（蒙皮动画例）在原 §8 中是否同列，无直接
+证据；其实测布局见恢复说明所引 REPORT §2.3，此处不冒充原文。）
+
+## 9. shader 接口表（绑定契约）（恢复文本，见文末恢复说明）
+
+资产编译期依赖的契约物是 shader 的**接口表**：SLASL 编译器核心
+的产物（合并/DCE 后的清单，同源生成、禁手写、可哈希规范形；
+DCE 消除项自接口表消失）。依赖方向单向：资产侧消费接口表，
+SLASL 不感知资产。接口表含三组：
+
+| 组 | 内容 |
+|---|---|
+| params | 名 → 类型 + 可选默认值（带默认者材质可省略赋值） |
+| textures | 名 → sampler 类型（材质纹理绑定的命名空间） |
+| inputs | 名 → 类型（mesh 通道喂养的命名空间） |
+
+绑定裁判见 §7 规则 10 与规则 13，要点：param 逐项按名 + 按型
+命中（字面量类型对应：f32 ↔ 标量、vec2/3/4 ↔ 数组字面量）；
+纹理绑定名必须是 textures 组的 sampler 参数名且不得漏绑；
+params 未赋值且无默认 = 响亮拒绝，不许静默零值。通道 → input
+的规范映射由格式钉死：position→position、normal→normal、
+tangent→tangent、uv0→uv、uv1→uv1、uv2→uv2、uv3→uv3、
+color0→color、joints0→joints、weights0→weights；规范 input
+类型：position/normal 为 vec3、tangent 为 vec4、uv 家族为
+vec2、color 为 vec4、joints 为 uvec4、weights 为 vec4。
+
+v1 处置（GAP-1）：真实接口表 artefact 格式未定形前，以手工
+文本夹具代演——三段式（`== params ==` / `== textures ==` /
+`== inputs ==`），每行 `名: 类型`，params 行可后缀 `= 默认值`；
+以 `block` 开头的布局头行跳过；条目出段或格式错误 →
+`Sax3dFixtureError`。材质所用 shader 无夹具供给 →
+`Sax3dMissingInterfaceFixture`。
+
+## 10. 工具链义务：构建与打包（恢复文本，见文末恢复说明）
+
+校验不过一律具名诊断 + 非零退出，绝不带病产出文件。
+
+### 10.1 打包（pack：拆分 → 合并）
+
+- 输入拆分形二进制与组装文本声明必须双向一致：文本声明的段
+  在二进制中缺失、或长度不符、或二进制多带未声明段（不许
+  静默丢弃），均 → `Sax3dSectionMismatch`；读入面的魔数/截断/
+  名表解析按 §7 规则 15。
+- 路径源图像内嵌为段（段名 = 图像名，按 image 声明序追加，
+  §4.6）；与既有段名冲突 → `Sax3dPackNameCollision`（§6.2）。
+- 内嵌变换后以同一校验器复检，复检不过不产出。
+- 段序：拆分段序 + 内嵌图像段 + 组装段居尾（§4.6）。
+- **确定性**：同输入逐字节同输出；名表按 §4.5 规范构建序
+  生成（名字恰出现一次、索引按首次出现）。
+
+### 10.2 构建（build：组装文本 + 载荷 → 拆分形二进制）
+
+- 无 binary 块的资产无可写出 → `Sax3dInvalidValue`。
+- 段载荷文件约定：`<payload-dir>/<段名>.bin`，无头裸字节
+  （§2）；文件不可读 → `Sax3dPayloadMissing`；长度与声明
+  逐字不符 → `Sax3dPayloadLengthMismatch`，拒绝产出。
+- 数据级检查（D-8）：kind 为 anim_input 的段，其 f32 时间轴
+  必须单调不减，违犯 → `Sax3dAnimInputNotMonotonic`。
+
+## 11. 偏差变更日志（与研究稿 DESIGN.md 的差异）（恢复文本，见文末恢复说明）
+
+- D-1 头 reserved 细化为 nametab 指针：§4.1 的 nametab_off /
+  nametab_len 两字段占原 reserved 区（偏移/总长不变）。
+- D-2 §8 总长口径定版：1152 = 载荷终点，名表追加于尾；
+  文件总长 = 载荷终点 + 名表长（拆分形立方体例 1211B）。
+- D-3 合并形机制 = 编译形组装段（F-2 修订落地，§6）：
+  assembly 段恰一段、居尾（§4.3/§4.6）。
+- D-4 sampler 五字段必填收严（§5.4）：sampler 块必填，
+  mag/min/mipmap/wrap_u/wrap_v 五字段必填。
+- D-5 角色/接口类型钉死：tangent f32x4、joints0 u16x4 /
+  接口侧 joints uvec4、weights0 f32x4 等（§5.2/§5.7/§9）。
+- D-6 asset 头恰一份强制（§5/§7 规则 14）：空文件缺 asset
+  头曾假绿，实测发现后补此规则。
+- D-7 bind/bounds/tex_transform 数值全保真入模型：解析保留
+  数值本体，不再「只跳过不校验」。
+- D-8 动画时间轴单调性归 build 数据级检查（§10.2）：
+  声明级校验器无载荷数据，单调性在 build 读载荷后验。
+
+## 恢复说明（2026-11-01 文档修复批，非格式内容）
+
+本文件曾于 §7 规则 3 中途截断（文件尾留有字面截断标记，
+工具截断视图回写落盘所致），§7 规则 3 后半起至 §11 全部
+丢失，且无完好副本存世。2026-11-01 修复批据现存证据恢复：
+规则执行体（实现代码 src/*.zig 的具名诊断与检查点）、实施
+终报（sax3d-impl-local/REPORT.md，§2.2 算例与 §5 偏差清单
+为逐字出处）、研究稿（sa3d-mesh-local/DESIGN.md）与本文件
+存续正文的交叉引用（§9 接口表、§10 打包/§10.2 载荷复核、
+§8 算例均被存续正文引用）。逐段证据对照、44 个 Sax3d*
+诊断名 → 规则映射表、文/码双向差异表与存疑清单见同批的
+恢复说明
+文件（RECOVERY.md）。恢复纪律：恢复不等于修订——格式实质
+一字未改；证据不足以定字句处已标「存疑」（§8 第二例、
+§10 子节次序与各节原标题、§7 规则 4 起的原编号均属之，
+恢复编号为新编）。§1–§7 规则 3 前半为原文存续。
