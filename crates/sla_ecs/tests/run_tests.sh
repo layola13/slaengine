@@ -22,9 +22,11 @@
 # Outputs in outdir: per-file logs under logs/, results.tsv
 # (relpath, rc, result-line) and names.txt — the failing-name set:
 # one "relpath :: test-name" line per named failing test, or
-# "relpath :: <file-level rc=N>" when the file failed before naming
-# tests (compile/import errors, timeouts). Exit code is 1 iff
-# names.txt is non-empty.
+# "relpath :: <file-level>" when the file failed before naming tests
+# (compile/import errors, timeouts). Exit code is 1 iff names.txt is
+# non-empty. (File-level entries deliberately carry no rc: the set is
+# compared across trees, and rc is environment metadata — it is kept
+# per file in results.tsv.)
 set -u
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TREE=${1:-$(dirname "$SCRIPT_DIR")}
@@ -71,7 +73,7 @@ for f in $LIST; do
     grep -E "^test .+ \.\.\. FAILED" "$log" | sed 's/^test //; s/ \.\.\. FAILED$//' | \
       while IFS= read -r tname; do printf '%s :: %s\n' "$f" "$tname" >> "$OUT/names.txt"; done
     if ! grep -qF "$f :: " "$OUT/names.txt"; then
-      printf '%s :: <file-level rc=%s>\n' "$f" "$rc" >> "$OUT/names.txt"
+      printf '%s :: <file-level>\n' "$f" >> "$OUT/names.txt"
     fi
   fi
 done
