@@ -1,0 +1,227 @@
+// iface.sla  SLASL  (iface.zig )
+// Zig HashMap put ; 
+// Zig parseFloat  (inf/nan/ )
+
+@import "model.sla"
+
+//  span  set  (  set )
+fn trim_span(x: &X, off: i32, len: i32, c1: u8, c2: i32, c3: i32) -> Span2 {
+    let s = off;
+    let e = off + len;
+    while s < e {
+        let c = x_byte(x, s);
+        if c == c1 || (c2 >= 0 && c == (c2 as u8)) || (c3 >= 0 && c == (c3 as u8)) {
+            s = s + 1;
+        } else {
+            break;
+        };
+    }
+    while e > s {
+        let c = x_byte(x, e - 1);
+        if c == c1 || (c2 >= 0 && c == (c2 as u8)) || (c3 >= 0 && c == (c3 as u8)) {
+            e = e - 1;
+        } else {
+            break;
+        };
+    }
+    return Span2 { off: s, len: e - s };
+}
+
+fn trim_ws(x: &X, off: i32, len: i32) -> Span2 {
+    return trim_span(x, off, len, 32, 9, 13);
+}
+
+fn trim_sp(x: &X, off: i32, len: i32) -> Span2 {
+    return trim_span(x, off, len, 32, -1, -1);
+}
+
+fn span_index_of(x: &X, off: i32, len: i32, c: u8) -> i32 {
+    let i: i32 = 0;
+    while i < len {
+        if x_byte(x, off + i) == c {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// (  -1)
+fn iface_find(x: &X, n_off: i32, n_len: i32) -> i32 {
+    let i: i32 = 0;
+    let n = x.ifaces.len() as i32;
+    while i < n {
+        if x.if_names_len[i as usize] == n_len && x_eq(x, x.if_names_off[i as usize], n_len, n_off, n_len) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ifparam_find(f: &Iface, x: &X, n_off: i32, n_len: i32) -> i32 {
+    let i: i32 = 0;
+    let n = f.params.len() as i32;
+    while i < n {
+        let e = f.params[i as usize];
+        if e.n_len == n_len && x_eq(x, e.n_off, e.n_len, n_off, n_len) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ifent_find(list: &Vec<IfEnt>, x: &X, n_off: i32, n_len: i32) -> i32 {
+    let i: i32 = 0;
+    let n = list.len() as i32;
+    while i < n {
+        let e = list[i as usize];
+        if e.n_len == n_len && x_eq(x, e.n_off, e.n_len, n_off, n_len) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// GAP-PORT-5 shape: the entry arrives as scalar fields and the record
+// literal is constructed inside this fn, at the push/set site. Passing
+// a built struct by value into a helper that pushes it corrupts the
+// stored entries (probes v_map7/v_map9; inlined form v_map10 clean).
+fn ifparam_put(f: &Iface, x: &X, n_off: i32, n_len: i32, t_off: i32, t_len: i32, has_def: i32, has_ds: i32, ds: f64) {
+    let i = ifparam_find(f, x, n_off, n_len);
+    if i >= 0 {
+        f.params[i as usize] = IfParam { n_off: n_off, n_len: n_len, t_off: t_off, t_len: t_len, has_def: has_def, has_ds: has_ds, ds: ds };
+        return;
+    };
+    f.params.push(IfParam { n_off: n_off, n_len: n_len, t_off: t_off, t_len: t_len, has_def: has_def, has_ds: has_ds, ds: ds });
+}
+
+fn ifent_put(list: &Vec<IfEnt>, x: &X, n_off: i32, n_len: i32, t_off: i32, t_len: i32) {
+    let i = ifent_find(list, x, n_off, n_len);
+    if i >= 0 {
+        list[i as usize] = IfEnt { n_off: n_off, n_len: n_len, t_off: t_off, t_len: t_len };
+        return;
+    };
+    list.push(IfEnt { n_off: n_off, n_len: n_len, t_off: t_off, t_len: t_len });
+}
+
+//  src  shader  x.ifaces(  )
+fn iface_parse(x: &X, src_off: i32, src_len: i32, sh_off: i32, sh_len: i32) {
+    let f = Iface { params: Vec::new(), texs: Vec::new(), inputs: Vec::new() };
+    let mode: i32 = 0;
+    let pos: i32 = 0;
+    while pos <= src_len {
+        //  (splitScalar '\n':  )
+        let line_start = pos;
+        let line_len: i32 = 0;
+        while pos < src_len && x_byte(x, src_off + pos) != 10 {
+            pos = pos + 1;
+            line_len = line_len + 1;
+        }
+        pos = pos + 1; //  '\n'(  )
+        let raw = Span2 { off: src_off + line_start, len: line_len };
+        let line = trim_ws(x, raw.off, raw.len);
+        if line.len == 0 {
+            if pos > src_len {
+                break;
+            };
+            continue;
+        };
+        if x_eq_lit(x, line.off, line.len, STR_PTR("== params =="), STR_LEN("== params ==")) {
+            mode = 1;
+        } else {
+            if x_eq_lit(x, line.off, line.len, STR_PTR("== textures =="), STR_LEN("== textures ==")) {
+                mode = 2;
+            } else {
+                if x_eq_lit(x, line.off, line.len, STR_PTR("== inputs =="), STR_LEN("== inputs ==")) {
+                    mode = 3;
+                } else {
+                    if line.len >= 5 && x_eq_lit(x, line.off, 5, STR_PTR("block"), STR_LEN("block")) {
+                        //  SLASL  , 
+                    } else {
+                        if mode == 0 {
+                            mb_clear(x);
+                            mb_lit(x, STR_PTR("iface for shader '"), STR_LEN("iface for shader '"));
+                            mb_span(x, sh_off, sh_len);
+                            mb_lit(x, STR_PTR("': entry outside any section: '"), STR_LEN("': entry outside any section: '"));
+                            mb_span(x, line.off, line.len);
+                            mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+                            diag_commit(x, STR_PTR("Sax3dFixtureError"), STR_LEN("Sax3dFixtureError"));
+                        } else {
+                            iface_parse_entry(x, &f, mode, line, sh_off, sh_len);
+                        };
+                    };
+                };
+            };
+        };
+        if pos > src_len {
+            break;
+        };
+    }
+    //  (HashMap.put )
+    let ex = iface_find(x, sh_off, sh_len);
+    if ex >= 0 {
+        // GAP-PORT-4 shape: rebuild the record from f's Vec fields at the
+        // assignment site; assigning the long-lived local f directly can
+        // store a stale image of its Vec headers.
+        x.ifaces[ex as usize] = Iface { params: f.params, texs: f.texs, inputs: f.inputs };
+        return;
+    };
+    x.if_names_off.push(sh_off);
+    x.if_names_len.push(sh_len);
+    x.ifaces.push(f);
+    let li = (x.ifaces.len() as i32) - 1;
+    x.ifaces[li as usize] = Iface { params: f.params, texs: f.texs, inputs: f.inputs };
+}
+
+fn iface_parse_entry(x: &X, f: &Iface, mode: i32, line: Span2, sh_off: i32, sh_len: i32) {
+    let colon = span_index_of(x, line.off, line.len, 58);
+    if colon < 0 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("iface for shader '"), STR_LEN("iface for shader '"));
+        mb_span(x, sh_off, sh_len);
+        mb_lit(x, STR_PTR("': malformed entry '"), STR_LEN("': malformed entry '"));
+        mb_span(x, line.off, line.len);
+        mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+        diag_commit(x, STR_PTR("Sax3dFixtureError"), STR_LEN("Sax3dFixtureError"));
+        return;
+    };
+    let nm = trim_sp(x, line.off, colon);
+    let rest0 = trim_sp(x, line.off + colon + 1, line.len - colon - 1);
+    let has_def: i32 = 0;
+    let has_ds: i32 = 0;
+    let ds: f64 = 0.0;
+    let eq = span_index_of(x, rest0.off, rest0.len, 61);
+    if eq >= 0 {
+        // has_default = true; default = parseFloat 
+        let dflt = trim_sp(x, rest0.off + eq + 1, rest0.len - eq - 1);
+        let okc = malloc(8);
+        let v = nf_parse_f64_json(x_ptr(x, dflt.off), dflt.len as u64, okc as ptr);
+        let good = sx_cell_u64(okc as ptr) != 0;
+        free(okc);
+        //  (has_def ,)
+        iface_put_entry(x, f, mode, nm, trim_sp(x, rest0.off, eq), 1, good, v);
+        return;
+    };
+    iface_put_entry(x, f, mode, nm, rest0, has_def, has_ds != 0, ds);
+}
+
+fn iface_put_entry(x: &X, f: &Iface, mode: i32, nm: Span2, ty: Span2, has_def: i32, good: bool, dv: f64) {
+    if mode == 1 {
+        let has_ds: i32 = 0;
+        if good {
+            // default_scalar = v
+            ifparam_put(f, x, nm.off, nm.len, ty.off, ty.len, has_def, 1, dv);
+            return;
+        };
+        ifparam_put(f, x, nm.off, nm.len, ty.off, ty.len, has_def, has_ds, 0.0);
+        return;
+    };
+    if mode == 2 {
+        ifent_put(&f.texs, x, nm.off, nm.len, ty.off, ty.len);
+        return;
+    };
+    ifent_put(&f.inputs, x, nm.off, nm.len, ty.off, ty.len);
+}

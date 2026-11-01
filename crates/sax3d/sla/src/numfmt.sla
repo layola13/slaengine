@@ -1,0 +1,637 @@
+// numfmt.sla  / Zig std.fmt 
+//
+// std  sa_fmt_f64  {d:.precision}  Zig {d} 
+//  0.8  0.80000000000000004
+// 
+//   1) / v f64 
+//   2)  k=1..17 k 
+//       v
+//      (v-/2, v+/2) 
+//       k  Zig
+//      formatFloatDecimal
+//   3)  Zig {d} 
+//  sa_parse_float Zig std.fmt.parseFloat
+// / Zig parseFloat 
+
+@import "core.sla"
+
+// ------------------------------------------------------------------
+//  scratch 
+// ------------------------------------------------------------------
+
+// store helpers: a float store through a deref in the SAME function consumes
+// the pointer register (SA verifier UseAfterMove; CodegenError via imports),
+// while passing the pointer to a helper does not. Keep store/load separated.
+fn nf_store_f64(p: ptr, v: f64) {
+    unsafe { *(p as *f64) = v; };
+}
+
+fn nf_store_f32(p: ptr, v: f32) {
+    unsafe { *(p as *f32) = v; };
+}
+
+fn nf_f64_bits(v: f64) -> u64 {
+    let cell = malloc(8);
+    nf_store_f64(cell as ptr, v);
+    let r = sx_rd_u64(cell as ptr, 0);
+    free(cell);
+    return r;
+}
+
+fn nf_f64_from_bits(bits: u64) -> f64 {
+    let cell = malloc(8);
+    sx_wr_u64_from(cell, bits);
+    let v: f64 = unsafe { *(cell as *f64) };
+    free(cell);
+    return v;
+}
+
+fn nf_f32_bits(v: f32) -> u32 {
+    let cell = malloc(4);
+    nf_store_f32(cell as ptr, v);
+    let r = sx_rd_u32(cell as ptr, 0);
+    free(cell);
+    return r;
+}
+
+fn nf_f32_from_bits(bits: u32) -> f32 {
+    let cell = malloc(4);
+    sx_wr_u32_at(cell, bits);
+    let v: f32 = unsafe { *(cell as *f32) };
+    free(cell);
+    return v;
+}
+
+//  u64 cell  SBuf 
+fn sx_wr_u64_from(cell: *u8, v: u64) {
+    let x: u64 = v;
+    let i: u64 = 0;
+    while i < 8 {
+        sx_write_byte(cell, i, (x % 256) as u8);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+fn sx_wr_u32_at(cell: *u8, v: u32) {
+    let x: u32 = v;
+    let i: u64 = 0;
+    while i < 4 {
+        sx_write_byte(cell, i, (x % 256) as u8);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+// ------------------------------------------------------------------
+//  u32 96  = 3072  5^1074 
+// ------------------------------------------------------------------
+
+struct Big {
+    limbs: [u32; 96],
+    n: i32,
+}
+
+fn big_zero() -> Big {
+    let r = Big { limbs: [0u32; 96], n: 1 };
+    return r;
+}
+
+fn big_from_u64(v: u64) -> Big {
+    let r = big_zero();
+    r.limbs[0] = (v % 4294967296) as u32;
+    r.limbs[1] = (v / 4294967296) as u32;
+    if r.limbs[1] != 0 {
+        r.n = 2;
+    } else {
+        if r.limbs[0] != 0 { r.n = 1; } else { r.n = 1; };
+    };
+    return r;
+}
+
+fn big_clone(a: &Big) -> Big {
+    let r = big_zero();
+    r.n = a.n;
+    let i: i32 = 0;
+    while i < a.n {
+        r.limbs[i] = a.limbs[i];
+        i = i + 1;
+    }
+    return r;
+}
+
+fn big_norm(a: &Big) {
+    while a.n > 1 && a.limbs[a.n - 1] == 0 {
+        a.n = a.n - 1;
+    }
+}
+
+fn big_is_zero(a: &Big) -> bool {
+    return a.n == 1 && a.limbs[0] == 0;
+}
+
+fn big_mul_u32(a: &Big, m: u32) {
+    if m == 0 {
+        a.n = 1;
+        a.limbs[0] = 0;
+        return;
+    };
+    let carry: u64 = 0;
+    let i: i32 = 0;
+    while i < a.n {
+        let cur = (a.limbs[i] as u64) * (m as u64) + carry;
+        a.limbs[i] = (cur % 4294967296) as u32;
+        carry = cur / 4294967296;
+        i = i + 1;
+    }
+    while carry > 0 {
+        a.limbs[a.n] = (carry % 4294967296) as u32;
+        a.n = a.n + 1;
+        carry = carry / 4294967296;
+    }
+}
+
+// a *= 10^kk>=0 10^9 
+fn big_mul_pow10(a: &Big, k: i32) {
+    let rem = k;
+    while rem >= 9 {
+        big_mul_u32(a, 1000000000);
+        rem = rem - 9;
+    }
+    let m: u32 = 1;
+    let j: i32 = 0;
+    while j < rem {
+        m = m * 10;
+        j = j + 1;
+    }
+    if m != 1 {
+        big_mul_u32(a, m);
+    };
+}
+
+// a *= 5^kk>=0 5^13=1220703125 
+fn big_mul_pow5(a: &Big, k: i32) {
+    let rem = k;
+    while rem >= 13 {
+        big_mul_u32(a, 1220703125);
+        rem = rem - 13;
+    }
+    let m: u32 = 1;
+    let j: i32 = 0;
+    while j < rem {
+        m = m * 5;
+        j = j + 1;
+    }
+    if m != 1 {
+        big_mul_u32(a, m);
+    };
+}
+
+// a <<= bits + 
+fn big_shl2(a: &Big, bits: i32) {
+    if bits <= 0 || big_is_zero(a) {
+        return;
+    };
+    let ls = bits / 32;
+    let bs = bits % 32;
+    // 
+    let i: i32 = a.n - 1;
+    while i >= 0 {
+        a.limbs[i + ls] = a.limbs[i];
+        i = i - 1;
+    }
+    let j: i32 = 0;
+    while j < ls {
+        a.limbs[j] = 0;
+        j = j + 1;
+    }
+    a.n = a.n + ls;
+    if bs > 0 {
+        let carry: u32 = 0;
+        let k: i32 = 0;
+        while k < a.n {
+            let cur = a.limbs[k];
+            a.limbs[k] = (cur << (bs as u32)) | carry;
+            carry = cur >> ((32 - bs) as u32);
+            k = k + 1;
+        }
+        if carry != 0 {
+            a.limbs[a.n] = carry;
+            a.n = a.n + 1;
+        };
+    };
+    big_norm(a);
+}
+
+fn big_add(a: &Big, b: &Big) {
+    let n = if a.n > b.n { a.n } else { b.n };
+    let carry: u64 = 0;
+    let i: i32 = 0;
+    while i < n {
+        let av: u64 = if i < a.n { a.limbs[i] as u64 } else { 0 };
+        let bv: u64 = if i < b.n { b.limbs[i] as u64 } else { 0 };
+        let cur = av + bv + carry;
+        a.limbs[i] = (cur % 4294967296) as u32;
+        carry = cur / 4294967296;
+        i = i + 1;
+    }
+    a.n = n;
+    if carry > 0 {
+        a.limbs[a.n] = carry as u32;
+        a.n = a.n + 1;
+    };
+}
+
+// a -= b a >= b
+fn big_sub(a: &Big, b: &Big) {
+    let borrow: i64 = 0;
+    let i: i32 = 0;
+    while i < a.n {
+        let bv: i64 = if i < b.n { b.limbs[i] as i64 } else { 0 };
+        let cur: i64 = (a.limbs[i] as i64) - bv - borrow;
+        if cur < 0 {
+            a.limbs[i] = (cur + 4294967296) as u32;
+            borrow = 1;
+        } else {
+            a.limbs[i] = cur as u32;
+            borrow = 0;
+        };
+        i = i + 1;
+    }
+    big_norm(a);
+}
+
+fn big_cmp(a: &Big, b: &Big) -> i32 {
+    if a.n != b.n {
+        return if a.n > b.n { 1 } else { -1 };
+    };
+    let i: i32 = a.n - 1;
+    while i >= 0 {
+        if a.limbs[i] != b.limbs[i] {
+            return if a.limbs[i] > b.limbs[i] { 1 } else { -1 };
+        };
+        i = i - 1;
+    }
+    return 0;
+}
+
+// a mod dd  u32a  a
+fn big_divmod_u32(a: &Big, d: u32) -> u32 {
+    let rem: u64 = 0;
+    let i: i32 = a.n - 1;
+    while i >= 0 {
+        let cur = rem * 4294967296 + (a.limbs[i] as u64);
+        a.limbs[i] = (cur / (d as u64)) as u32;
+        rem = cur % (d as u64);
+        i = i - 1;
+    }
+    big_norm(a);
+    return rem as u32;
+}
+
+// ------------------------------------------------------------------
+// f64  digitsASCII  E
+//  v = 0.digits x 10^Edigits v 
+// ------------------------------------------------------------------
+
+struct DecExp {
+    digits: [u8; 800],
+    n: i32,
+    exp10: i32,
+}
+
+fn nf_expand(f: u64, e: i32) -> DecExp {
+    // N  t  v = N x 10^t
+    let nbig = big_from_u64(f);
+    let t: i32 = 0;
+    if e >= 0 {
+        big_shl2(&nbig, e);
+    } else {
+        big_mul_pow5(&nbig, -e);
+        t = e;
+    };
+    //  10^9 
+    let groups: [u32; 96] = [0u32; 96];
+    let ng: i32 = 0;
+    let tmp = big_clone(&nbig);
+    if big_is_zero(&tmp) {
+        let r = DecExp { digits: [0u8; 800], n: 1, exp10: 0 };
+        r.digits[0] = 48;
+        return r;
+    };
+    while !big_is_zero(&tmp) {
+        groups[ng] = big_divmod_u32(&tmp, 1000000000);
+        ng = ng + 1;
+    }
+    let r = DecExp { digits: [0u8; 800], n: 0, exp10: 0 };
+    //  9 
+    let pos: i32 = 0;
+    let gi: i32 = ng - 1;
+    while gi >= 0 {
+        let gv = groups[gi];
+        let gd: [u8; 9] = [0u8; 9];
+        let x = gv;
+        let k: i32 = 8;
+        while k >= 0 {
+            gd[k] = (48 + (x % 10)) as u8;
+            x = x / 10;
+            k = k - 1;
+        }
+        // 
+        let start: i32 = 0;
+        if gi == ng - 1 {
+            while start < 8 && gd[start] == 48 {
+                start = start + 1;
+            }
+        };
+        let s2: i32 = start;
+        while s2 < 9 {
+            r.digits[pos] = gd[s2];
+            pos = pos + 1;
+            s2 = s2 + 1;
+        }
+        gi = gi - 1;
+    }
+    r.n = pos;
+    r.exp10 = t + pos;
+    return r;
+}
+
+// ------------------------------------------------------------------
+//  C x 10^tc  B x 2^(e-2) 
+// B  u644f2/4f-1 -1/0/1
+// ------------------------------------------------------------------
+
+fn nf_cmp_cand(cbig: &Big, tc: i32, bval: u64, e: i32) -> i32 {
+    //  = C x 2^tc x 5^tc = B x 2^(e-2)
+    let l2 = tc;
+    let l5 = tc;
+    let r2 = e - 2;
+    let m2 = if l2 < r2 { l2 } else { r2 };
+    let m5 = if l5 < 0 { l5 } else { 0 };
+    let l = big_clone(cbig);
+    big_shl2(&l, l2 - m2);
+    big_mul_pow5(&l, l5 - m5);
+    let r = big_from_u64(bval);
+    big_shl2(&r, r2 - m2);
+    big_mul_pow5(&r, 0 - m5);
+    return big_cmp(&l, &r);
+}
+
+// ------------------------------------------------------------------
+// nf_push_f64  Zig {d} 
+// ------------------------------------------------------------------
+
+fn nf_push_f64(b: &SBuf, v: f64) {
+    let bits = nf_f64_bits(v);
+    let neg = (bits / sx_two63()) != 0;
+    let expf = ((bits / 4503599627370496) % 2048) as i32;
+    let frac = bits % 4503599627370496;
+    if expf == 2047 {
+        if frac != 0 {
+            sb_push_lit(b, STR_PTR("nan"), STR_LEN("nan"));
+            return;
+        };
+        if neg {
+            sb_push_byte(b, 45);
+        };
+        sb_push_lit(b, STR_PTR("inf"), STR_LEN("inf"));
+        return;
+    };
+    if expf == 0 && frac == 0 {
+        if neg {
+            sb_push_byte(b, 45);
+        };
+        sb_push_byte(b, 48);
+        return;
+    };
+    let f: u64 = 0;
+    let e: i32 = 0;
+    let bottom: bool = false;
+    if expf == 0 {
+        f = frac;
+        e = -1074;
+    } else {
+        f = frac + 4503599627370496;
+        e = expf - 1075;
+        if frac == 0 && expf > 1 {
+            bottom = true;
+        };
+    };
+    let dec = nf_expand(f, e);
+    //  2^(e-2)v=4f 4f+2 4f-2binade  4f-1
+    let bhi: u64 = 4 * f + 2;
+    let blo: u64 = if bottom { 4 * f - 1 } else { 4 * f - 2 };
+    let even = (f % 2) == 0;
+    //  k  + 
+    let digits: [u8; 24] = [0u8; 24];
+    let ndig: i32 = 0;
+    let eout: i32 = dec.exp10;
+    let found: bool = false;
+    let k: i32 = 1;
+    while k <= 17 && !found {
+        //  dec.digits  k 
+        let kk = if k > dec.n { dec.n } else { k };
+        let i: i32 = 0;
+        while i < kk {
+            digits[i] = dec.digits[i];
+            i = i + 1;
+        }
+        let e_k = dec.exp10;
+        if dec.n > kk {
+            let dnext = dec.digits[kk];
+            let up: bool = false;
+            if dnext > 53 {
+                up = true;
+            } else {
+                if dnext == 53 {
+                    //  ->  -> 
+                    let rest_nz: bool = false;
+                    let j: i32 = kk + 1;
+                    while j < dec.n {
+                        if dec.digits[j] != 48 {
+                            rest_nz = true;
+                        };
+                        j = j + 1;
+                    }
+                    if rest_nz {
+                        up = true;
+                    } else {
+                        if (digits[kk - 1] - 48) % 2 == 1 {
+                            up = true;
+                        };
+                    };
+                };
+            };
+            if up {
+                // 
+                let ci: i32 = kk - 1;
+                let carry: bool = true;
+                while ci >= 0 && carry {
+                    if digits[ci] == 57 {
+                        digits[ci] = 48;
+                        ci = ci - 1;
+                    } else {
+                        digits[ci] = digits[ci] + 1;
+                        carry = false;
+                    }
+                }
+                if carry {
+                    digits[0] = 49;
+                    let z: i32 = 1;
+                    while z < kk {
+                        digits[z] = 48;
+                        z = z + 1;
+                    }
+                    e_k = e_k + 1;
+                };
+            };
+        };
+        //  Ckk 
+        let cbig = big_zero();
+        let ci2: i32 = 0;
+        while ci2 < kk {
+            big_mul_u32(&cbig, 10);
+            let dgt = big_from_u64((digits[ci2] - 48) as u64);
+            big_add(&cbig, &dgt);
+            ci2 = ci2 + 1;
+        }
+        let tc = e_k - kk;
+        let cmp_hi = nf_cmp_cand(&cbig, tc, bhi, e);
+        let cmp_lo = nf_cmp_cand(&cbig, tc, blo, e);
+        let below_hi = cmp_hi < 0 || (cmp_hi == 0 && even);
+        let above_lo = cmp_lo > 0 || (cmp_lo == 0 && even);
+        if below_hi && above_lo {
+            found = true;
+            ndig = kk;
+            eout = e_k;
+        };
+        k = k + 1;
+    }
+    // value = 0.digits x 10^eout
+    if neg {
+        sb_push_byte(b, 45);
+    };
+    if eout <= 0 {
+        sb_push_lit(b, STR_PTR("0."), STR_LEN("0."));
+        let z: i32 = 0;
+        while z < -eout {
+            sb_push_byte(b, 48);
+            z = z + 1;
+        }
+        let i: i32 = 0;
+        while i < ndig {
+            sb_push_byte(b, digits[i]);
+            i = i + 1;
+        }
+    } else {
+        if eout >= ndig {
+            let i: i32 = 0;
+            while i < ndig {
+                sb_push_byte(b, digits[i]);
+                i = i + 1;
+            }
+            let z: i32 = 0;
+            while z < eout - ndig {
+                sb_push_byte(b, 48);
+                z = z + 1;
+            }
+        } else {
+            let i: i32 = 0;
+            while i < eout {
+                sb_push_byte(b, digits[i]);
+                i = i + 1;
+            }
+            sb_push_byte(b, 46);
+            let j: i32 = eout;
+            while j < ndig {
+                sb_push_byte(b, digits[j]);
+                j = j + 1;
+            }
+        };
+    };
+}
+
+// ------------------------------------------------------------------
+// sa_parse_float  + 
+// ------------------------------------------------------------------
+
+// sax3d  number [-]digits[.digits]
+//  -> 309  ->  Zig
+// parseFloat  error.Overflow  PORT_REPORT 
+fn nf_parse_f64_span(p: ptr, n: u64, ok_out: ptr) -> f64 {
+    sx_cell_put_u64(ok_out, 0);
+    let i: u64 = 0;
+    if n > 0 && PTR_BYTE_AT(p, 0) == 45 {
+        i = 1;
+    };
+    if i >= n {
+        return 0.0;
+    };
+    let dots: i32 = 0;
+    let int_digits: u64 = 0;
+    let seen_dot: bool = false;
+    let first17: [u8; 17] = [0u8; 17];
+    let nf17: i32 = 0;
+    while i < n {
+        let c = PTR_BYTE_AT(p, i);
+        if c == 46 {
+            dots = dots + 1;
+            seen_dot = true;
+            if dots > 1 {
+                return 0.0;
+            };
+        } else {
+            if c < 48 || c > 57 {
+                return 0.0;
+            };
+            if !seen_dot {
+                if int_digits > 0 || c != 48 {
+                    int_digits = int_digits + 1;
+                    if nf17 < 17 {
+                        first17[nf17] = c;
+                        nf17 = nf17 + 1;
+                    };
+                };
+            };
+        };
+        i = i + 1;
+    }
+    if int_digits > 309 {
+        return 0.0;
+    };
+    if int_digits == 309 && nf17 == 17 {
+        //  17976931348623158f64  17 
+        let thr: [u8; 17] = [49u8, 55, 57, 55, 54, 57, 51, 49, 51, 52, 56, 54, 50, 51, 49, 53, 56];
+        let cmp: i32 = 0;
+        let j: i32 = 0;
+        while j < 17 {
+            if first17[j] != thr[j] {
+                cmp = if first17[j] > thr[j] { 1 } else { -1 };
+                j = 17;
+            } else {
+                j = j + 1;
+            };
+        }
+        if cmp > 0 {
+            return 0.0;
+        };
+    };
+    let v = sa_parse_float(p, n);
+    sx_cell_put_u64(ok_out, 1);
+    return v;
+}
+
+// JSON  json  JSON 
+//  inf std.json 
+fn nf_parse_f64_json(p: ptr, n: u64, ok_out: ptr) -> f64 {
+    sx_cell_put_u64(ok_out, 0);
+    let v = sa_parse_float(p, n);
+    let bits = nf_f64_bits(v);
+    let expf = ((bits / 4503599627370496) % 2048) as i32;
+    if expf == 2047 {
+        return 0.0;
+    };
+    sx_cell_put_u64(ok_out, 1);
+    return v;
+}

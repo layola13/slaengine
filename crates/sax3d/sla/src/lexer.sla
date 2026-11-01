@@ -1,0 +1,128 @@
+// lexer.sla  sax3d  lexer.zig arena 
+
+@import "model.sla"
+
+// token 
+// 0 ident, 1 number, 2 string, 3 nameref, 4 punct
+struct Tok {
+    kind: i32,
+    off: i32,
+    len: i32,
+    line: i32,
+    col: i32,
+}
+
+fn lex_is_ws(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 13 || c == 10;
+}
+
+fn lex_is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn lex_is_alpha(c: u8) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+fn lex_is_ident_char(c: u8) -> bool {
+    return lex_is_alpha(c) || lex_is_digit(c) || c == 45;
+}
+
+// Returns the token list. Pushing through a &Vec parameter inside a loop
+// fails SA verification (PhiStateConflict; probe v_push.sla, 2026-11-01):
+// an owned local Vec filled in the loop and returned verifies fine, as do
+// pushes into struct fields. (Rule R-7 in GAPS_LEDGER.)
+fn lex_tokenize(x: &X, src_off: i32, src_len: i32) -> Vec<Tok> {
+    let toks: Vec<Tok> = Vec::new();
+    let p: ptr = x.ar.data as ptr;
+    let base = src_off as u64;
+    let n = src_len as u64;
+    let i: u64 = 0;
+    let line: i32 = 1;
+    let line_start: u64 = 0;
+    while i < n {
+        let c = PTR_BYTE_AT(p, base + i);
+        if lex_is_ws(c) {
+            if c == 10 {
+                line = line + 1;
+                line_start = i + 1;
+            };
+            i = i + 1;
+            continue;
+        };
+        if c == 47 && i + 1 < n && PTR_BYTE_AT(p, base + i + 1) == 47 {
+            // 
+            while i < n && PTR_BYTE_AT(p, base + i) != 10 {
+                i = i + 1;
+            }
+            continue;
+        };
+        let col = (i - line_start + 1) as i32;
+        if lex_is_alpha(c) {
+            let s = i;
+            i = i + 1;
+            while i < n && lex_is_ident_char(PTR_BYTE_AT(p, base + i)) {
+                i = i + 1;
+            }
+            toks.push(Tok { kind: 0, off: (src_off as u64 + s) as i32, len: (i - s) as i32, line: line, col: col });
+            continue;
+        };
+        if lex_is_digit(c) || (c == 45 && i + 1 < n && lex_is_digit(PTR_BYTE_AT(p, base + i + 1))) {
+            let s = i;
+            i = i + 1;
+            while i < n {
+                let d = PTR_BYTE_AT(p, base + i);
+                if lex_is_digit(d) || d == 46 {
+                    i = i + 1;
+                } else {
+                    break;
+                };
+            }
+            toks.push(Tok { kind: 1, off: (src_off as u64 + s) as i32, len: (i - s) as i32, line: line, col: col });
+            continue;
+        };
+        if c == 34 {
+            //  token Zig 
+            let s = i + 1;
+            i = i + 1;
+            while i < n {
+                let d = PTR_BYTE_AT(p, base + i);
+                if d == 34 || d == 10 {
+                    break;
+                };
+                i = i + 1;
+            }
+            toks.push(Tok { kind: 2, off: (src_off as u64 + s) as i32, len: (i - s) as i32, line: line, col: col });
+            if i < n && PTR_BYTE_AT(p, base + i) == 34 {
+                i = i + 1;
+            };
+            continue;
+        };
+        if c == 35 {
+            let s = i + 1;
+            i = i + 1;
+            let ds = i;
+            while i < n && lex_is_digit(PTR_BYTE_AT(p, base + i)) {
+                i = i + 1;
+            }
+            if i > ds {
+                toks.push(Tok { kind: 3, off: (src_off as u64 + s) as i32, len: (i - s) as i32, line: line, col: col });
+                continue;
+            };
+            toks.push(Tok { kind: 4, off: (src_off as u64 + s - 1) as i32, len: 1, line: line, col: col });
+            continue;
+        };
+        toks.push(Tok { kind: 4, off: (src_off as u64 + i) as i32, len: 1, line: line, col: col });
+        i = i + 1;
+    }
+    return toks;
+}
+
+// token 
+fn tok_eq(x: &X, t: Tok, lp: ptr, ll: u64) -> bool {
+    return x_eq_lit(x, t.off, t.len, lp, ll);
+}
+
+fn tok_is_punct(x: &X, t: Tok, c: u8) -> bool {
+    return t.kind == 4 && t.len == 1 && x_byte(x, t.off) == c;
+}

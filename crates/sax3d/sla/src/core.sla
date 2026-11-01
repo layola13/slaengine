@@ -1,0 +1,690 @@
+// core.sla  SAX3D SLA  Zig  std.mem/std.Io 
+//  slasl  String  format()
+//  (off,len)  PTR_BYTE_AT/
+//  IO  sa_std fs/io extern Zig
+// @errorName  sx_io_err_name
+
+@import "sa_std/env.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/io.sai"
+@import "sa_std/string.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+
+// NOTE: no extern "C" block here. malloc/free are compiler-prelude @extern
+// symbols; an extern block inside an IMPORTED module gets the module prefix
+// (core__malloc) and fails to link. Entry files may declare them if needed.
+
+// ------------------------------------------------------------------
+// 
+// ------------------------------------------------------------------
+
+struct SBuf {
+    data: *u8,
+    len: u64,
+    cap: u64,
+}
+
+fn sb_new() -> SBuf {
+    let d = malloc(256);
+    return SBuf { data: d, len: 0, cap: 256 };
+}
+
+fn sb_new_cap(cap: u64) -> SBuf {
+    let c: u64 = cap;
+    if c < 16 { c = 16; };
+    let d = malloc(c as usize);
+    return SBuf { data: d, len: 0, cap: c };
+}
+
+fn sx_write_byte(p: *u8, off: u64, x: u8) {
+    unsafe { *(p.add(off as usize)) = x; };
+}
+
+fn sx_ptr_add(p: ptr, i: u64) -> ptr {
+    return (p as *u8).add(i as usize) as ptr;
+}
+
+fn sb_reserve(b: &SBuf, extra: u64) {
+    if b.len + extra <= b.cap {
+        return;
+    };
+    let ncap: u64 = b.cap * 2;
+    if ncap < b.len + extra {
+        ncap = b.len + extra + 64;
+    };
+    let nd = malloc(ncap as usize);
+    let bp: ptr = b.data as ptr;
+    let i: u64 = 0;
+    while i < b.len {
+        sx_write_byte(nd, i, PTR_BYTE_AT(bp, i));
+        i = i + 1;
+    }
+    free(b.data);
+    b.data = nd;
+    b.cap = ncap;
+}
+
+fn sb_clear(b: &SBuf) {
+    b.len = 0;
+}
+
+fn sb_push_byte(b: &SBuf, x: u8) {
+    sb_reserve(b, 1);
+    sx_write_byte(b.data, b.len, x);
+    b.len = b.len + 1;
+}
+
+fn sb_push_span(b: &SBuf, p: ptr, n: u64) {
+    sb_reserve(b, n);
+    let i: u64 = 0;
+    while i < n {
+        sx_write_byte(b.data, b.len + i, PTR_BYTE_AT(p, i));
+        i = i + 1;
+    }
+    b.len = b.len + n;
+}
+
+fn sb_push_lit(b: &SBuf, p: ptr, n: u64) {
+    sb_push_span(b, p, n);
+}
+
+fn sb_push_bytes(b: &SBuf, src: &SBuf, off: u64, n: u64) {
+    sb_reserve(b, n);
+    let sp: ptr = src.data as ptr;
+    let i: u64 = 0;
+    while i < n {
+        sx_write_byte(b.data, b.len + i, PTR_BYTE_AT(sp, off + i));
+        i = i + 1;
+    }
+    b.len = b.len + n;
+}
+
+fn sb_byte(b: &SBuf, i: u64) -> u8 {
+    return PTR_BYTE_AT(b.data as ptr, i);
+}
+
+fn sb_push_u64(b: &SBuf, v: u64) {
+    if v == 0 {
+        sb_push_byte(b, 48);
+        return;
+    };
+    let tmp: [u8; 20] = [0u8; 20];
+    let n: u64 = 0;
+    let x: u64 = v;
+    while x > 0 {
+        tmp[n] = (48 + (x % 10)) as u8;
+        n = n + 1;
+        x = x / 10;
+    }
+    let i: u64 = 0;
+    while i < n {
+        sb_push_byte(b, tmp[n - 1 - i]);
+        i = i + 1;
+    }
+}
+
+fn sb_push_i64(b: &SBuf, v: i64) {
+    if v < 0 {
+        sb_push_byte(b, 45);
+        sb_push_u64(b, (0 - v) as u64);
+        return;
+    };
+    sb_push_u64(b, v as u64);
+}
+
+// Zig {x} 0 -> "0"
+fn sb_push_hex_u64(b: &SBuf, v: u64) {
+    if v == 0 {
+        sb_push_byte(b, 48);
+        return;
+    };
+    let tmp: [u8; 16] = [0u8; 16];
+    let n: u64 = 0;
+    let x: u64 = v;
+    while x > 0 {
+        let d = x % 16;
+        if d < 10 { tmp[n] = (48 + d) as u8; } else { tmp[n] = (87 + d) as u8; };
+        n = n + 1;
+        x = x / 16;
+    }
+    let i: u64 = 0;
+    while i < n {
+        sb_push_byte(b, tmp[n - 1 - i]);
+        i = i + 1;
+    }
+}
+
+//  b  [off, off+n) 
+fn sb_span_eq_lit(b: &SBuf, off: u64, n: u64, lp: ptr, ll: u64) -> bool {
+    if n != ll {
+        return false;
+    };
+    let bp: ptr = b.data as ptr;
+    let i: u64 = 0;
+    while i < ll {
+        if PTR_BYTE_AT(bp, off + i) != PTR_BYTE_AT(lp, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// 
+fn sx_spans_eq(p1: ptr, n1: u64, p2: ptr, n2: u64) -> bool {
+    if n1 != n2 {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < n1 {
+        if PTR_BYTE_AT(p1, i) != PTR_BYTE_AT(p2, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sx_starts_with(p: ptr, n: u64, lp: ptr, ll: u64) -> bool {
+    if n < ll {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < ll {
+        if PTR_BYTE_AT(p, i) != PTR_BYTE_AT(lp, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sx_ends_with(p: ptr, n: u64, lp: ptr, ll: u64) -> bool {
+    if n < ll {
+        return false;
+    };
+    let base = n - ll;
+    let i: u64 = 0;
+    while i < ll {
+        if PTR_BYTE_AT(p, base + i) != PTR_BYTE_AT(lp, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+//  -1
+fn sx_index_of_byte(p: ptr, n: u64, byte: u8) -> i64 {
+    let i: u64 = 0;
+    while i < n {
+        if PTR_BYTE_AT(p, i) == byte {
+            return i as i64;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn sx_last_index_of_byte(p: ptr, n: u64, byte: u8) -> i64 {
+    let i: u64 = n;
+    while i > 0 {
+        i = i - 1;
+        if PTR_BYTE_AT(p, i) == byte {
+            return i as i64;
+        };
+    }
+    return -1;
+}
+
+fn sx_index_of_span(p: ptr, n: u64, np: ptr, nn: u64) -> i64 {
+    if nn == 0 {
+        return 0;
+    };
+    if n < nn {
+        return -1;
+    };
+    let i: u64 = 0;
+    while i + nn <= n {
+    let q: ptr = sx_ptr_add(p, i);
+        if sx_spans_eq(q, nn, np, nn) {
+            return i as i64;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ------------------------------------------------------------------
+// extern out 
+// ------------------------------------------------------------------
+
+fn sx_cell_u64(p: ptr) -> u64 {
+    let v: u64 = 0;
+    let mul: u64 = 1;
+    let i: u64 = 0;
+    while i < 8 {
+        let b: u8 = PTR_BYTE_AT(p, i);
+        v = v + (b as u64) * mul;
+        mul = mul * 256;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn sx_cell_put_u64(p: ptr, v: u64) {
+    let x: u64 = v;
+    let i: u64 = 0;
+    while i < 8 {
+        sx_write_byte(p as *u8, i, (x % 256) as u8);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+// binio 
+fn sx_rd_u16(p: ptr, off: u64) -> u32 {
+    let b0: u8 = PTR_BYTE_AT(p, off);
+    let b1: u8 = PTR_BYTE_AT(p, off + 1);
+    return (b0 as u32) + (b1 as u32) * 256;
+}
+
+fn sx_rd_u32(p: ptr, off: u64) -> u32 {
+    let v: u32 = 0;
+    let mul: u32 = 1;
+    let i: u64 = 0;
+    while i < 4 {
+        let bb: u8 = PTR_BYTE_AT(p, off + i);
+        v = v + (bb as u32) * mul;
+        mul = mul * 256;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn sx_rd_u64(p: ptr, off: u64) -> u64 {
+    let v: u64 = 0;
+    let mul: u64 = 1;
+    let i: u64 = 0;
+    while i < 8 {
+        let bb: u8 = PTR_BYTE_AT(p, off + i);
+        v = v + (bb as u64) * mul;
+        mul = mul * 256;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn sx_wr_u16(b: &SBuf, off: u64, v: u32) {
+    sx_write_byte(b.data, off, (v % 256) as u8);
+    sx_write_byte(b.data, off + 1, ((v / 256) % 256) as u8);
+}
+
+fn sx_wr_u32(b: &SBuf, off: u64, v: u32) {
+    let x: u32 = v;
+    let i: u64 = 0;
+    while i < 4 {
+        sx_write_byte(b.data, off + i, (x % 256) as u8);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+fn sx_wr_u64(b: &SBuf, off: u64, v: u64) {
+    let x: u64 = v;
+    let i: u64 = 0;
+    while i < 8 {
+        sx_write_byte(b.data, off + i, (x % 256) as u8);
+        x = x / 256;
+        i = i + 1;
+    }
+}
+
+// ------------------------------------------------------------------
+// stdout/stderr  Zig  stderr
+// readback  convert  stdout
+// ------------------------------------------------------------------
+
+fn sx_out(p: ptr, n: u64) {
+    let r = sa_io_write_all(sa_io_stdout(), p, n);
+}
+
+fn sx_err(p: ptr, n: u64) {
+    let r = sa_io_write_all(sa_io_stderr(), p, n);
+}
+
+fn sx_out_buf(b: &SBuf) {
+    sx_out(b.data as ptr, b.len);
+}
+
+fn sx_err_buf(b: &SBuf) {
+    sx_err(b.data as ptr, b.len);
+}
+
+fn sx_err_lit(p: ptr, n: u64) {
+    sx_err(p, n);
+}
+
+// ------------------------------------------------------------------
+//  IO true  0 false
+//  st_out u64 3=NOT_FOUND 
+// ------------------------------------------------------------------
+
+// SA  -> Zig @errorNamereadFileAlloc 
+// FileNotFound Unexpected
+fn sx_io_err_name(st: u64, out: &SBuf) {
+    if st == 3 {
+        sb_push_lit(out, STR_PTR("FileNotFound"), STR_LEN("FileNotFound"));
+        return;
+    };
+    if st == 4 || st == 10 {
+        sb_push_lit(out, STR_PTR("AccessDenied"), STR_LEN("AccessDenied"));
+        return;
+    };
+    if st == 9 {
+        sb_push_lit(out, STR_PTR("StreamTooLong"), STR_LEN("StreamTooLong"));
+        return;
+    };
+    sb_push_lit(out, STR_PTR("Unexpected"), STR_LEN("Unexpected"));
+}
+
+//  outlimit  Zig readFileAlloc .limited(1<<28) 
+//  9 open 
+fn sx_read_file(pp: ptr, plen: u64, out: &SBuf, st_out: ptr) -> bool {
+    let lcell = malloc(8);
+    let rc = sa_std_fs_len(pp, plen, lcell as ptr);
+    if rc != 0 {
+        sx_cell_put_u64(st_out, rc as u64);
+        free(lcell);
+        return false;
+    };
+    let flen = sx_cell_u64(lcell as ptr);
+    free(lcell);
+    if flen > 268435456 {
+        sx_cell_put_u64(st_out, 9);
+        return false;
+    };
+    let hcell = malloc(8);
+    let rc2 = sa_std_fs_open_read(pp, plen, hcell as ptr);
+    if rc2 != 0 {
+        sx_cell_put_u64(st_out, rc2 as u64);
+        free(hcell);
+        return false;
+    };
+    let handle = sx_cell_u64(hcell as ptr);
+    free(hcell);
+    let base = out.len;
+    sb_reserve(out, flen);
+    let off: u64 = 0;
+    while off < flen {
+        let rcell = malloc(8);
+        let rc3 = sa_std_fs_file_read(handle, (out.data.add((base + off) as usize)) as ptr, flen - off, rcell as ptr);
+        if rc3 != 0 {
+            sx_cell_put_u64(st_out, rc3 as u64);
+            free(rcell);
+            let cr = sa_fs_file_close(handle);
+            out.len = base;
+            return false;
+        };
+        let nread = sx_cell_u64(rcell as ptr);
+        free(rcell);
+        if nread == 0 {
+            sx_cell_put_u64(st_out, 6);
+            let cr = sa_fs_file_close(handle);
+            out.len = base;
+            return false;
+        };
+        off = off + nread;
+    }
+    let cr = sa_fs_file_close(handle);
+    out.len = base + flen;
+    sx_cell_put_u64(st_out, 0);
+    return true;
+}
+
+fn sx_write_file(pp: ptr, plen: u64, data: ptr, dlen: u64) -> i32 {
+    return sa_fs_write_file(pp, plen, data, dlen);
+}
+
+fn sx_mkdir_p(pp: ptr, plen: u64) {
+    let rc = sa_fs_mkdir_p(pp, plen);
+}
+
+// ------------------------------------------------------------------
+//  Zig std.fmt.parseInt(u64, s, 10)
+//  '+'// -> '-'  u64 
+//  (ok, value) ok 
+// ------------------------------------------------------------------
+
+// 2^63: the SLA lexer parses integer literals as i64, so the u64 sign-bit
+// constant cannot be written as a literal (GAP-PORT-1); exact arithmetic form.
+fn sx_two63() -> u64 {
+    return 9223372036854775807 + 1;
+}
+
+fn sx_parse_u64(p: ptr, n: u64, ok_out: ptr) -> u64 {
+    sx_cell_put_u64(ok_out, 0);
+    let i: u64 = 0;
+    if n > 0 && PTR_BYTE_AT(p, 0) == 43 {
+        i = 1;
+    };
+    if i >= n {
+        return 0;
+    };
+    let v: u64 = 0;
+    while i < n {
+        let c = PTR_BYTE_AT(p, i);
+        if c < 48 || c > 57 {
+            return 0;
+        };
+        let d = (c - 48) as u64;
+        // v*10+d > u64max
+        if v > 1844674407370955161 || (v == 1844674407370955161 && d > 5) {
+            return 0;
+        };
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    sx_cell_put_u64(ok_out, 1);
+    return v;
+}
+
+// parseInt(i64, s, 10) '+'/'-'
+fn sx_parse_i64(p: ptr, n: u64, ok_out: ptr) -> i64 {
+    sx_cell_put_u64(ok_out, 0);
+    let i: u64 = 0;
+    let neg: bool = false;
+    if n > 0 && (PTR_BYTE_AT(p, 0) == 43 || PTR_BYTE_AT(p, 0) == 45) {
+        neg = PTR_BYTE_AT(p, 0) == 45;
+        i = 1;
+    };
+    if i >= n {
+        return 0;
+    };
+    let v: u64 = 0;
+    while i < n {
+        let c = PTR_BYTE_AT(p, i);
+        if c < 48 || c > 57 {
+            return 0;
+        };
+        let d = (c - 48) as u64;
+        if v > 1844674407370955161 || (v == 1844674407370955161 && d > 6) {
+            return 0;
+        };
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    // i64 range check (see sx_two63 note)
+    if !neg && v > 9223372036854775807 {
+        return 0;
+    };
+    sx_cell_put_u64(ok_out, 1);
+    if neg {
+        if v == sx_two63() {
+            return -9223372036854775807 - 1;
+        };
+        return 0 - (v as i64);
+    };
+    return v as i64;
+}
+
+// ------------------------------------------------------------------
+// sa_env_args_json  slasl 
+// ------------------------------------------------------------------
+
+fn sx_arg_eq(abuf: &SBuf, off: i32, len: i32, lp: ptr, ll: u64) -> bool {
+    if (len as u64) != ll {
+        return false;
+    };
+    let bp: ptr = abuf.data as ptr;
+    let i: u64 = 0;
+    while i < ll {
+        if PTR_BYTE_AT(bp, (off as u64) + i) != PTR_BYTE_AT(lp, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sx_parse_argv(jh: u64, abuf: &SBuf, offs: &Vec<i32>, lens: &Vec<i32>) -> bool {
+    let jp: ptr = sa_env_buffer_data(jh);
+    let jlen = sa_env_buffer_len(jh);
+    let i: u64 = 0;
+    let scanning: bool = true;
+    while scanning && i < jlen {
+        let ch = PTR_BYTE_AT(jp, i);
+        if ch == 91 {
+            scanning = false;
+            i = i + 1;
+        } else {
+            if ch == 32 || ch == 10 || ch == 9 || ch == 13 {
+                i = i + 1;
+            } else {
+                return false;
+            };
+        };
+    }
+    let more: bool = true;
+    while more {
+        while i < jlen {
+            let ch = PTR_BYTE_AT(jp, i);
+            if ch == 32 || ch == 10 || ch == 9 || ch == 13 {
+                i = i + 1;
+            } else {
+                break;
+            };
+        }
+        if i >= jlen {
+            return false;
+        };
+        let ch = PTR_BYTE_AT(jp, i);
+        if ch == 93 {
+            more = false;
+        } else {
+            if ch != 34 {
+                return false;
+            };
+            i = i + 1;
+            let start = abuf.len;
+            let instr: bool = true;
+            while instr && i < jlen {
+                let c2 = PTR_BYTE_AT(jp, i);
+                if c2 == 34 {
+                    instr = false;
+                    i = i + 1;
+                } else {
+                    if c2 == 92 && i + 1 < jlen {
+                        let esc = PTR_BYTE_AT(jp, i + 1);
+                        i = i + 2;
+                        if esc == 110 { sb_push_byte(abuf, 10); };
+                        if esc == 116 { sb_push_byte(abuf, 9); };
+                        if esc == 114 { sb_push_byte(abuf, 13); };
+                        if esc == 34 { sb_push_byte(abuf, 34); };
+                        if esc == 92 { sb_push_byte(abuf, 92); };
+                        if esc == 47 { sb_push_byte(abuf, 47); };
+                        if esc == 98 { sb_push_byte(abuf, 8); };
+                        if esc == 102 { sb_push_byte(abuf, 12); };
+                        if esc == 117 {
+                            i = i + 4;
+                            sb_push_byte(abuf, 63);
+                        };
+                    } else {
+                        sb_push_byte(abuf, c2);
+                        i = i + 1;
+                    };
+                };
+            }
+            offs.push(start as i32);
+            lens.push((abuf.len - start) as i32);
+            while i < jlen {
+                let c3 = PTR_BYTE_AT(jp, i);
+                if c3 == 32 || c3 == 10 || c3 == 9 || c3 == 13 {
+                    i = i + 1;
+                } else {
+                    break;
+                };
+            }
+            if i < jlen && PTR_BYTE_AT(jp, i) == 44 {
+                i = i + 1;
+            };
+        };
+    }
+    return true;
+}
+
+// ------------------------------------------------------------------
+// std.fs.path 
+// dirname:  '/'  -1"/x" -> 0 "/"  1 
+//  dirname  1 -1
+// ------------------------------------------------------------------
+
+fn sx_dirname_len(p: ptr, n: u64) -> i64 {
+    // Zig std.fs.path.dirname '/' '/'
+    let end: u64 = n;
+    while end > 1 && PTR_BYTE_AT(p, end - 1) == 47 {
+        end = end - 1;
+    }
+    let i: u64 = end;
+    while i > 0 {
+        i = i - 1;
+        if PTR_BYTE_AT(p, i) == 47 {
+            if i == 0 {
+                return 1; // 
+            };
+            //  '/' dirname("a//b") == "a" 
+            let e2: u64 = i;
+            while e2 > 1 && PTR_BYTE_AT(p, e2 - 1) == 47 {
+                e2 = e2 - 1;
+            }
+            return e2 as i64;
+        };
+    }
+    return -1;
+}
+
+fn sx_basename_off(p: ptr, n: u64) -> u64 {
+    let end: u64 = n;
+    while end > 1 && PTR_BYTE_AT(p, end - 1) == 47 {
+        end = end - 1;
+    }
+    let i: u64 = end;
+    while i > 0 {
+        i = i - 1;
+        if PTR_BYTE_AT(p, i) == 47 {
+            return i + 1;
+        };
+    }
+    return 0;
+}
+
+//  dir + "/" + name  outdir  dldl==1  "." 
+//  Zig "{s}/{s}"  "."  "./name"
+//  Zig  fmt "{s}/{s}"  text_dir  "."  "./x"
+//  dirname  "."
+fn sx_join2(out: &SBuf, d: ptr, dl: u64, nm: ptr, nl: u64) {
+    sb_push_span(out, d, dl);
+    sb_push_byte(out, 47);
+    sb_push_span(out, nm, nl);
+}

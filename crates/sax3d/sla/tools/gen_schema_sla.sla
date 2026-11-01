@@ -1,0 +1,507 @@
+// gen_schema_sla.sla   sax3d.sai
+// sla/src/schema_gen.slaSLA  Zig  tools/gen_schema.zig
+//  != 
+//  :
+//   gen_schema_sla <sax3d.sai> <schema_gen.sla>
+// SLA ////
+//  schema_rt.sla  arena 
+
+@import "../src/core.sla"
+
+extern "C" {
+    fn malloc(size: usize) -> *u8;
+    fn free(p: *u8);
+}
+
+struct GTok {
+    kind: i32, // 0 word, 1 string, 2 punct
+    off: i32,
+    len: i32,
+}
+
+struct GElem {
+    n_off: i32, n_len: i32, size: u64, align: u64,
+}
+
+struct GKind {
+    n_off: i32, n_len: i32, val: u64,
+}
+
+struct GField {
+    n_off: i32, n_len: i32, off: u64,
+}
+
+struct G {
+    src: SBuf,
+    toks: Vec<GTok>,
+    pos: i32,
+    failed: bool,
+    out: SBuf,
+    elems: Vec<GElem>,
+    kinds: Vec<GKind>,
+    header_size: u64,
+    rec_size: u64,
+}
+
+fn g_fail(g: &G, p: ptr, n: u64) {
+    let m = sb_new();
+    sb_push_lit(&m, STR_PTR("gen_schema_sla: "), STR_LEN("gen_schema_sla: "));
+    sb_push_span(&m, p, n);
+    sb_push_byte(&m, 10);
+    sx_err_buf(&m);
+    g.failed = true;
+}
+
+fn g_fail_span(g: &G, pre: ptr, pre_n: u64, o: i32, l: i32, post: ptr, post_n: u64) {
+    let m = sb_new();
+    sb_push_lit(&m, STR_PTR("gen_schema_sla: "), STR_LEN("gen_schema_sla: "));
+    sb_push_span(&m, pre, pre_n);
+    sb_push_span(&m, sx_ptr_add(g.src.data as ptr, o as u64), l as u64);
+    sb_push_span(&m, post, post_n);
+    sb_push_byte(&m, 10);
+    sx_err_buf(&m);
+    g.failed = true;
+}
+
+fn is_word_byte(c: u8) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95;
+}
+
+fn g_tokenize(g: &G) {
+    let p: ptr = g.src.data as ptr;
+    let n = g.src.len;
+    let i: u64 = 0;
+    while i < n {
+        let c = PTR_BYTE_AT(p, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i = i + 1;
+            continue;
+        };
+        if c == 47 && i + 1 < n && PTR_BYTE_AT(p, i + 1) == 47 {
+            while i < n && PTR_BYTE_AT(p, i) != 10 {
+                i = i + 1;
+            }
+            continue;
+        };
+        if c == 34 {
+            let s = i + 1;
+            i = i + 1;
+            while i < n && PTR_BYTE_AT(p, i) != 34 {
+                i = i + 1;
+            }
+            if i >= n {
+                g_fail(g, STR_PTR("unterminated string"), STR_LEN("unterminated string"));
+                return;
+            };
+            g.toks.push(GTok { kind: 1, off: s as i32, len: (i - s) as i32 });
+            i = i + 1;
+            continue;
+        };
+        if is_word_byte(c) {
+            let s = i;
+            while i < n && is_word_byte(PTR_BYTE_AT(p, i)) {
+                i = i + 1;
+            }
+            g.toks.push(GTok { kind: 0, off: s as i32, len: (i - s) as i32 });
+            continue;
+        };
+        g.toks.push(GTok { kind: 2, off: i as i32, len: 1 });
+        i = i + 1;
+    }
+}
+
+fn g_peek(g: &G) -> GTok {
+    if g.pos < (g.toks.len() as i32) {
+        return g.toks[g.pos as usize];
+    };
+    return GTok { kind: -1, off: 0, len: 0 };
+}
+
+fn g_next(g: &G) -> GTok {
+    let t = g_peek(g);
+    if t.kind >= 0 {
+        g.pos = g.pos + 1;
+    } else {
+        g_fail(g, STR_PTR("unexpected EOF"), STR_LEN("unexpected EOF"));
+    };
+    return t;
+}
+
+fn g_tok_eq(g: &G, t: GTok, lp: ptr, ll: u64) -> bool {
+    if t.kind < 0 || (t.len as u64) != ll {
+        return false;
+    };
+    return sx_spans_eq(sx_ptr_add(g.src.data as ptr, t.off as u64), ll, lp, ll);
+}
+
+fn g_expect(g: &G, lp: ptr, ll: u64) {
+    let t = g_next(g);
+    if g.failed {
+        return;
+    };
+    if !g_tok_eq(g, t, lp, ll) {
+        let m = sb_new();
+        sb_push_lit(&m, STR_PTR("gen_schema_sla: expected '"), STR_LEN("gen_schema_sla: expected '"));
+        sb_push_span(&m, lp, ll);
+        sb_push_lit(&m, STR_PTR("', got '"), STR_LEN("', got '"));
+        if t.kind >= 0 {
+            sb_push_span(&m, sx_ptr_add(g.src.data as ptr, t.off as u64), t.len as u64);
+        };
+        sb_push_lit(&m, STR_PTR("'\n"), STR_LEN("'\n"));
+        sx_err_buf(&m);
+        g.failed = true;
+    };
+}
+
+fn g_word(g: &G) -> GTok {
+    let t = g_next(g);
+    if t.kind != 0 {
+        g_fail(g, STR_PTR("expected word"), STR_LEN("expected word"));
+    };
+    return t;
+}
+
+fn g_num(g: &G) -> u64 {
+    let t = g_next(g);
+    if g.failed {
+        return 0;
+    };
+    let ok = malloc(8);
+    let v = sx_parse_u64(sx_ptr_add(g.src.data as ptr, t.off as u64), t.len as u64, ok as ptr);
+    if sx_cell_u64(ok as ptr) == 0 {
+        free(ok);
+        g_fail(g, STR_PTR("expected number"), STR_LEN("expected number"));
+        return 0;
+    };
+    free(ok);
+    return v;
+}
+
+fn type_size(g: &G, t: GTok) -> u64 {
+    if g_tok_eq(g, t, STR_PTR("u8"), STR_LEN("u8")) { return 1; };
+    if g_tok_eq(g, t, STR_PTR("u16"), STR_LEN("u16")) { return 2; };
+    if g_tok_eq(g, t, STR_PTR("u32"), STR_LEN("u32")) { return 4; };
+    if g_tok_eq(g, t, STR_PTR("u64"), STR_LEN("u64")) { return 8; };
+    g_fail(g, STR_PTR("bad field type"), STR_LEN("bad field type"));
+    return 0;
+}
+
+//  out -> 
+fn g_push_lower(g: &G, o: i32, l: i32) {
+    let i: i32 = 0;
+    while i < l {
+        let c = PTR_BYTE_AT(g.src.data as ptr, (o + i) as u64);
+        if c >= 65 && c <= 90 {
+            sb_push_byte(&g.out, c + 32);
+        } else {
+            sb_push_byte(&g.out, c);
+        };
+        i = i + 1;
+    }
+}
+
+fn g_span(g: &G, o: i32, l: i32) {
+    sb_push_span(&g.out, sx_ptr_add(g.src.data as ptr, o as u64), l as u64);
+}
+
+//  out schg 
+//  .sai /ASCII 
+//  SLA STR_PTR/STR_LEN
+
+fn run(sai_path_p: ptr, sai_path_n: u64, out_path_p: ptr, out_path_n: u64) -> i32 {
+    let g = G {
+        src: sb_new(), toks: Vec::new(), pos: 0, failed: false,
+        out: sb_new(), elems: Vec::new(), kinds: Vec::new(),
+        header_size: 0, rec_size: 0,
+    };
+    let st = malloc(8);
+    if !sx_read_file(sai_path_p, sai_path_n, &g.src, st as ptr) {
+        free(st);
+        g_fail(&g, STR_PTR("cannot read .sai"), STR_LEN("cannot read .sai"));
+        return 1;
+    };
+    free(st);
+    g_tokenize(&g);
+    if g.failed {
+        return 1;
+    };
+    sb_push_lit(&g.out, STR_PTR("// GENERATED from sax3d.sai by sla/tools/gen_schema_sla.sla — DO NOT EDIT.\n// Layout truth lives in sax3d.sai only; regenerate, never hand-sync.\n\n@import \"core.sla\"\n\n"), STR_LEN("// GENERATED from sax3d.sai by sla/tools/gen_schema_sla.sla — DO NOT EDIT.\n// Layout truth lives in sax3d.sai only; regenerate, never hand-sync.\n\n@import \"core.sla\"\n\n"));
+    // 
+    while g.pos < (g.toks.len() as i32) && !g.failed {
+        let t = g_peek(&g);
+        if g_tok_eq(&g, t, STR_PTR("format"), STR_LEN("format")) {
+            let _ = g_next(&g);
+            let _ = g_word(&g);
+            g_expect(&g, STR_PTR(";"), STR_LEN(";"));
+        } else {
+            if g_tok_eq(&g, t, STR_PTR("version"), STR_LEN("version")) {
+                let _ = g_next(&g);
+                let maj = g_num(&g);
+                let min = g_num(&g);
+                g_expect(&g, STR_PTR(";"), STR_LEN(";"));
+                sb_push_lit(&g.out, STR_PTR("fn schg_version_major() -> i32 { return "), STR_LEN("fn schg_version_major() -> i32 { return "));
+                sb_push_u64(&g.out, maj);
+                sb_push_lit(&g.out, STR_PTR("; }\nfn schg_version_minor() -> i32 { return "), STR_LEN("; }\nfn schg_version_minor() -> i32 { return "));
+                sb_push_u64(&g.out, min);
+                sb_push_lit(&g.out, STR_PTR("; }\n"), STR_LEN("; }\n"));
+            } else {
+                if g_tok_eq(&g, t, STR_PTR("magic"), STR_LEN("magic")) {
+                    let _ = g_next(&g);
+                    let which = g_word(&g);
+                    let val = g_next(&g);
+                    g_expect(&g, STR_PTR(";"), STR_LEN(";"));
+                    if val.len != 8 {
+                        g_fail(&g, STR_PTR("magic must be 8 bytes"), STR_LEN("magic must be 8 bytes"));
+                        return 1;
+                    };
+                    sb_push_lit(&g.out, STR_PTR("fn schg_magic_"), STR_LEN("fn schg_magic_"));
+                    if g_tok_eq(&g, which, STR_PTR("split"), STR_LEN("split")) {
+                        sb_push_lit(&g.out, STR_PTR("split"), STR_LEN("split"));
+                    } else {
+                        sb_push_lit(&g.out, STR_PTR("packed"), STR_LEN("packed"));
+                    };
+                    sb_push_lit(&g.out, STR_PTR("(b: &SBuf) {\n    sb_push_lit(b, STR_PTR(\""), STR_LEN("(b: &SBuf) {\n    sb_push_lit(b, STR_PTR(\""));
+                    g_span(&g, val.off, val.len);
+                    sb_push_lit(&g.out, STR_PTR("\"), STR_LEN(\""), STR_LEN("\"), STR_LEN(\""));
+                    g_span(&g, val.off, val.len);
+                    sb_push_lit(&g.out, STR_PTR("\"));\n}\n"), STR_LEN("\"));\n}\n"));
+                } else {
+                    if g_tok_eq(&g, t, STR_PTR("struct"), STR_LEN("struct")) {
+                        if !g_parse_struct(&g) {
+                            return 1;
+                        };
+                    } else {
+                        if g_tok_eq(&g, t, STR_PTR("enum"), STR_LEN("enum")) {
+                            if !g_parse_enum(&g) {
+                                return 1;
+                            };
+                        } else {
+                            if g_tok_eq(&g, t, STR_PTR("elem"), STR_LEN("elem")) {
+                                let _ = g_next(&g);
+                                let nm = g_word(&g);
+                                let sz = g_num(&g);
+                                let al = g_num(&g);
+                                g_expect(&g, STR_PTR(";"), STR_LEN(";"));
+                                g.elems.push(GElem { n_off: nm.off, n_len: nm.len, size: sz, align: al });
+                            } else {
+                                g_fail_span(&g, STR_PTR("unknown directive '"), STR_LEN("unknown directive '"), t.off, t.len, STR_PTR("'"), STR_LEN("'"));
+                                return 1;
+                            };
+                        };
+                    };
+                };
+            };
+        };
+    }
+    if g.failed {
+        return 1;
+    };
+    if g.header_size == 0 || g.rec_size == 0 {
+        g_fail(&g, STR_PTR("header/section-rec structs missing"), STR_LEN("header/section-rec structs missing"));
+        return 1;
+    };
+    g_emit_tables(&g);
+    if g.failed {
+        return 1;
+    };
+    let rc = sx_write_file(out_path_p, out_path_n, g.out.data as ptr, g.out.len);
+    if rc != 0 {
+        g_fail(&g, STR_PTR("cannot write output"), STR_LEN("cannot write output"));
+        return 1;
+    };
+    let m = sb_new();
+    sb_push_lit(&m, STR_PTR("gen_schema_sla: wrote "), STR_LEN("gen_schema_sla: wrote "));
+    sb_push_span(&m, out_path_p, out_path_n);
+    sb_push_lit(&m, STR_PTR(" (header "), STR_LEN(" (header "));
+    sb_push_u64(&m, g.header_size);
+    sb_push_lit(&m, STR_PTR("B, rec "), STR_LEN("B, rec "));
+    sb_push_u64(&m, g.rec_size);
+    sb_push_lit(&m, STR_PTR("B, "), STR_LEN("B, "));
+    sb_push_u64(&m, g.elems.len() as u64);
+    sb_push_lit(&m, STR_PTR(" elem types)\n"), STR_LEN(" elem types)\n"));
+    sx_err_buf(&m);
+    return 0;
+}
+
+fn g_parse_struct(g: &G) -> bool {
+    let _ = g_next(g); // struct
+    let name = g_word(g);
+    let declared = g_num(g);
+    g_expect(g, STR_PTR("{"), STR_LEN("{"));
+    let fields: Vec<GField> = Vec::new();
+    let off: u64 = 0;
+    while !g.failed {
+        let ft = g_next(g);
+        if g.failed {
+            return false;
+        };
+        if g_tok_eq(g, ft, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let fname = ft;
+        g_expect(g, STR_PTR(":"), STR_LEN(":"));
+        let fty = g_word(g);
+        let count: u64 = 1;
+        let pk = g_peek(g);
+        if g_tok_eq(g, pk, STR_PTR("["), STR_LEN("[")) {
+            let _ = g_next(g);
+            count = g_num(g);
+            g_expect(g, STR_PTR("]"), STR_LEN("]"));
+        };
+        g_expect(g, STR_PTR(";"), STR_LEN(";"));
+        fields.push(GField { n_off: fname.off, n_len: fname.len, off: off });
+        let tsz = type_size(g, fty);
+        if g.failed {
+            return false;
+        };
+        off = off + tsz * count;
+    }
+    if off != declared {
+        let m = sb_new();
+        sb_push_lit(&m, STR_PTR("gen_schema_sla: struct "), STR_LEN("gen_schema_sla: struct "));
+        sb_push_span(&m, sx_ptr_add(g.src.data as ptr, name.off as u64), name.len as u64);
+        sb_push_lit(&m, STR_PTR(" fields sum "), STR_LEN(" fields sum "));
+        sb_push_u64(&m, off);
+        sb_push_lit(&m, STR_PTR(" != declared "), STR_LEN(" != declared "));
+        sb_push_u64(&m, declared);
+        sb_push_byte(&m, 10);
+        sx_err_buf(&m);
+        g.failed = true;
+        return false;
+    };
+    //  + 
+    sb_push_lit(&g.out, STR_PTR("fn schg_"), STR_LEN("fn schg_"));
+    g_push_lower(g, name.off, name.len);
+    sb_push_lit(&g.out, STR_PTR("_size() -> i32 { return "), STR_LEN("_size() -> i32 { return "));
+    sb_push_u64(&g.out, declared);
+    sb_push_lit(&g.out, STR_PTR("; }\n"), STR_LEN("; }\n"));
+    let i: i32 = 0;
+    let nf = fields.len() as i32;
+    while i < nf {
+        let f = fields[i as usize];
+        sb_push_lit(&g.out, STR_PTR("fn schg_"), STR_LEN("fn schg_"));
+        g_push_lower(g, name.off, name.len);
+        sb_push_byte(&g.out, 95);
+        g_span(g, f.n_off, f.n_len);
+        sb_push_lit(&g.out, STR_PTR("_off() -> i32 { return "), STR_LEN("_off() -> i32 { return "));
+        sb_push_u64(&g.out, f.off);
+        sb_push_lit(&g.out, STR_PTR("; }\n"), STR_LEN("; }\n"));
+        i = i + 1;
+    }
+    if g_tok_eq(g, name, STR_PTR("Sax3dBinHeader"), STR_LEN("Sax3dBinHeader")) {
+        g.header_size = declared;
+    };
+    if g_tok_eq(g, name, STR_PTR("Sax3dSectionRec"), STR_LEN("Sax3dSectionRec")) {
+        g.rec_size = declared;
+    };
+    return true;
+}
+
+fn g_parse_enum(g: &G) -> bool {
+    let _ = g_next(g); // enum
+    let _name = g_word(g);
+    g_expect(g, STR_PTR("{"), STR_LEN("{"));
+    while !g.failed {
+        let et = g_next(g);
+        if g.failed {
+            return false;
+        };
+        if g_tok_eq(g, et, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        g_expect(g, STR_PTR("="), STR_LEN("="));
+        let v = g_num(g);
+        g_expect(g, STR_PTR(";"), STR_LEN(";"));
+        g.kinds.push(GKind { n_off: et.off, n_len: et.len, val: v });
+    }
+    return !g.failed;
+}
+
+fn g_emit_tables(g: &G) {
+    // 
+    sb_push_lit(&g.out, STR_PTR("\nfn schg_kind_count() -> i32 { return "), STR_LEN("\nfn schg_kind_count() -> i32 { return "));
+    sb_push_u64(&g.out, g.kinds.len() as u64);
+    sb_push_lit(&g.out, STR_PTR("; }\nfn schg_kind_value(i: i32) -> i32 {\n"), STR_LEN("; }\nfn schg_kind_value(i: i32) -> i32 {\n"));
+    let i: i32 = 0;
+    let nk = g.kinds.len() as i32;
+    while i < nk {
+        let kd = g.kinds[i as usize];
+        sb_push_lit(&g.out, STR_PTR("    if i == "), STR_LEN("    if i == "));
+        sb_push_u64(&g.out, i as u64);
+        sb_push_lit(&g.out, STR_PTR(" { return "), STR_LEN(" { return "));
+        sb_push_u64(&g.out, kd.val);
+        sb_push_lit(&g.out, STR_PTR("; };\n"), STR_LEN("; };\n"));
+        i = i + 1;
+    }
+    sb_push_lit(&g.out, STR_PTR("    return -1;\n}\nfn schg_kind_name(i: i32, b: &SBuf) {\n"), STR_LEN("    return -1;\n}\nfn schg_kind_name(i: i32, b: &SBuf) {\n"));
+    let j: i32 = 0;
+    while j < nk {
+        let kd = g.kinds[j as usize];
+        sb_push_lit(&g.out, STR_PTR("    if i == "), STR_LEN("    if i == "));
+        sb_push_u64(&g.out, j as u64);
+        sb_push_lit(&g.out, STR_PTR(" { sb_push_lit(b, STR_PTR(\""), STR_LEN(" { sb_push_lit(b, STR_PTR(\""));
+        g_span(g, kd.n_off, kd.n_len);
+        sb_push_lit(&g.out, STR_PTR("\"), STR_LEN(\""), STR_LEN("\"), STR_LEN(\""));
+        g_span(g, kd.n_off, kd.n_len);
+        sb_push_lit(&g.out, STR_PTR("\")); return; };\n"), STR_LEN("\")); return; };\n"));
+        j = j + 1;
+    }
+    sb_push_lit(&g.out, STR_PTR("}\n"), STR_LEN("}\n"));
+    // 
+    sb_push_lit(&g.out, STR_PTR("\nfn schg_elem_count() -> i32 { return "), STR_LEN("\nfn schg_elem_count() -> i32 { return "));
+    sb_push_u64(&g.out, g.elems.len() as u64);
+    sb_push_lit(&g.out, STR_PTR("; }\nfn schg_elem_name(i: i32, b: &SBuf) {\n"), STR_LEN("; }\nfn schg_elem_name(i: i32, b: &SBuf) {\n"));
+    let a: i32 = 0;
+    let ne = g.elems.len() as i32;
+    while a < ne {
+        let el = g.elems[a as usize];
+        sb_push_lit(&g.out, STR_PTR("    if i == "), STR_LEN("    if i == "));
+        sb_push_u64(&g.out, a as u64);
+        sb_push_lit(&g.out, STR_PTR(" { sb_push_lit(b, STR_PTR(\""), STR_LEN(" { sb_push_lit(b, STR_PTR(\""));
+        g_span(g, el.n_off, el.n_len);
+        sb_push_lit(&g.out, STR_PTR("\"), STR_LEN(\""), STR_LEN("\"), STR_LEN(\""));
+        g_span(g, el.n_off, el.n_len);
+        sb_push_lit(&g.out, STR_PTR("\")); return; };\n"), STR_LEN("\")); return; };\n"));
+        a = a + 1;
+    }
+    sb_push_lit(&g.out, STR_PTR("}\nfn schg_elem_size(i: i32) -> u64 {\n"), STR_LEN("}\nfn schg_elem_size(i: i32) -> u64 {\n"));
+    let c: i32 = 0;
+    while c < ne {
+        let el = g.elems[c as usize];
+        sb_push_lit(&g.out, STR_PTR("    if i == "), STR_LEN("    if i == "));
+        sb_push_u64(&g.out, c as u64);
+        sb_push_lit(&g.out, STR_PTR(" { return "), STR_LEN(" { return "));
+        sb_push_u64(&g.out, el.size);
+        sb_push_lit(&g.out, STR_PTR("; };\n"), STR_LEN("; };\n"));
+        c = c + 1;
+    }
+    sb_push_lit(&g.out, STR_PTR("    return 0;\n}\nfn schg_elem_align(i: i32) -> u32 {\n"), STR_LEN("    return 0;\n}\nfn schg_elem_align(i: i32) -> u32 {\n"));
+    let d: i32 = 0;
+    while d < ne {
+        let el = g.elems[d as usize];
+        sb_push_lit(&g.out, STR_PTR("    if i == "), STR_LEN("    if i == "));
+        sb_push_u64(&g.out, d as u64);
+        sb_push_lit(&g.out, STR_PTR(" { return "), STR_LEN(" { return "));
+        sb_push_u64(&g.out, el.align);
+        sb_push_lit(&g.out, STR_PTR("; };\n"), STR_LEN("; };\n"));
+        d = d + 1;
+    }
+    sb_push_lit(&g.out, STR_PTR("    return 0;\n}\n"), STR_LEN("    return 0;\n}\n"));
+}
+
+fn main() -> i32 {
+    let jh = sa_env_args_json();
+    let abuf = sb_new();
+    let aoffs: Vec<i32> = Vec::new();
+    let alens: Vec<i32> = Vec::new();
+    if !sx_parse_argv(jh, &abuf, &aoffs, &alens) {
+        sx_err_lit(STR_PTR("usage: gen_schema_sla <sax3d.sai> <out.sla>\n"), STR_LEN("usage: gen_schema_sla <sax3d.sai> <out.sla>\n"));
+        return 2;
+    };
+    if (aoffs.len() as i32) < 3 {
+        sx_err_lit(STR_PTR("usage: gen_schema_sla <sax3d.sai> <out.sla>\n"), STR_LEN("usage: gen_schema_sla <sax3d.sai> <out.sla>\n"));
+        return 2;
+    };
+    let ap: ptr = abuf.data as ptr;
+    return run(sx_ptr_add(ap, aoffs[1] as u64), alens[1] as u64, sx_ptr_add(ap, aoffs[2] as u64), alens[2] as u64);
+}

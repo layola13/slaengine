@@ -1,0 +1,290 @@
+// binio.sla — SAX3D (binio.zig port)
+// Binary read/write primitives; every offset comes from the
+// generated schema (schema_gen.sla), never hand-computed. Both forms
+// (split SAX3DBIN / packed SAX3DPAK) share the header layout.
+
+@import "layout.sla"
+
+// Parsed binary header (bn_parse_header). ok == 0 means a named
+// diagnostic was emitted and the caller must stop.
+struct BinHdr {
+    form: i32, // 0 = split, 1 = packed
+    count: i32,
+    nt_off: i32,
+    nt_len: i32,
+    ok: i32,
+}
+
+// One section record (bn_read_rec).
+struct BinRec {
+    name_off: i64, kind: i64, offset: i64, len: i64, align: i64,
+}
+
+// f32 bit pattern -> exact f64 value, with an is-nan flag via the
+// out cell (1 = NaN). Every finite f32 is exactly representable in
+// f64; infinities map to the f64 infinities via the caller's use
+// (comparisons only need ordering, and +-inf order correctly).
+fn bn_f32_val(bits: u32, nan_out: ptr) -> f64 {
+    sx_cell_put_u64(nan_out, 0);
+    let neg = (bits / 2147483648) != 0;
+    let exp = ((bits / 8388608) % 256) as i32;
+    let frac = (bits % 8388608) as i64;
+    if exp == 255 {
+        if frac != 0 {
+            sx_cell_put_u64(nan_out, 1);
+            return 0.0;
+        };
+        // +/-inf by arithmetic overflow (GAP-PORT-6: no exponent
+        // float literals in SLA; 2^1024 rounds to +inf exactly).
+        let iv = 1.0;
+        let ik: i32 = 0;
+        while ik < 1024 {
+            iv = iv * 2.0;
+            ik = ik + 1;
+        }
+        if neg {
+            return 0.0 - iv;
+        };
+        return iv;
+    };
+    let mant: f64 = 0.0;
+    let v: f64 = 0.0;
+    if exp == 0 {
+        // subnormal: frac * 2^-149
+        v = (frac as f64) / 9007199254740992.0; // / 2^53
+        let i: i32 = 0;
+        while i < 96 {
+            v = v / 2.0;
+            i = i + 1;
+        }
+        // total shift: 53 + 96 = 149
+        mant = v;
+    } else {
+        // (2^23 + frac) * 2^(exp-150)
+        v = ((8388608 + frac) as f64) / 9007199254740992.0; // / 2^53 -> [1,2)
+        let e = exp - 127;
+        if e > 0 {
+            let i: i32 = 0;
+            while i < e {
+                v = v * 2.0;
+                i = i + 1;
+            }
+        };
+        if e < 0 {
+            let i: i32 = 0;
+            while i < (0 - e) {
+                v = v / 2.0;
+                i = i + 1;
+            }
+        };
+        mant = v;
+    };
+    if neg {
+        return 0.0 - mant;
+    };
+    return mant;
+}
+
+// ------------------------------------------------------------------
+// Assemble a complete binary from x.plans + the name table in x.
+// Payloads arrive as one blob with per-plan (off, len) pairs, in
+// plan order. form: 0 = split, 1 = packed. Returns false when a
+// plan's section name is missing from the name table (Zig's
+// error.SectionNameNotInTable; the caller reports it).
+// ------------------------------------------------------------------
+
+fn bn_assemble(x: &X, form: i32, pay: &SBuf, pay_off: &Vec<i32>, pay_len: &Vec<i32>, out: &SBuf) -> bool {
+    let total = x.lay_end + (x.nt_blob.len as u64);
+    sb_clear(out);
+    sb_reserve(out, total);
+    out.len = total;
+    // zero-fill (Zig @memset)
+    let zi: u64 = 0;
+    while zi < total {
+        sx_write_byte(out.data as *u8, zi, 0);
+        zi = zi + 1;
+    }
+    // magic
+    let mg = sb_new();
+    if form == 0 {
+        schg_magic_split(&mg);
+    } else {
+        schg_magic_packed(&mg);
+    };
+    let mi: u64 = 0;
+    while mi < 8 {
+        sx_write_byte(out.data as *u8, (schg_sax3dbinheader_magic_off() as u64) + mi, PTR_BYTE_AT(mg.data as ptr, mi));
+        mi = mi + 1;
+    }
+    sx_wr_u16(out, schg_sax3dbinheader_version_major_off() as u64, schg_version_major() as u32);
+    sx_wr_u16(out, schg_sax3dbinheader_version_minor_off() as u64, schg_version_minor() as u32);
+    let n = x.plans.len() as i32;
+    sx_wr_u32(out, schg_sax3dbinheader_section_count_off() as u64, n as u32);
+    sx_wr_u32(out, schg_sax3dbinheader_flags_off() as u64, 0);
+    sx_wr_u32(out, schg_sax3dbinheader_nametab_off_off() as u64, x.lay_end as u32);
+    sx_wr_u32(out, schg_sax3dbinheader_nametab_len_off() as u64, x.nt_blob.len as u32);
+    // section records + payload bytes
+    let hsize = schg_sax3dbinheader_size() as u64;
+    let rsize = schg_sax3dsectionrec_size() as u64;
+    let i: i32 = 0;
+    while i < n {
+        if !bn_assemble_one(x, pay, pay_off, pay_len, out, hsize, rsize, i) {
+            return false;
+        };
+        i = i + 1;
+    }
+    // name table blob at payload end
+    let nb = x.nt_blob.len as u64;
+    let k2: u64 = 0;
+    while k2 < nb {
+        sx_write_byte(out.data as *u8, x.lay_end + k2, PTR_BYTE_AT(x.nt_blob.data as ptr, k2));
+        k2 = k2 + 1;
+    }
+    return true;
+}
+
+// One section record + its payload bytes (bn_assemble body,
+// extracted per the R-8 repair form: loop bodies that mix struct
+// copies, early-return branches and nested loops go through a
+// bool helper so the caller's loop stays call-tailed).
+fn bn_assemble_one(x: &X, pay: &SBuf, pay_off: &Vec<i32>, pay_len: &Vec<i32>, out: &SBuf, hsize: u64, rsize: u64, i: i32) -> bool {
+    let p = x.plans[i as usize];
+    let idx = nt_index_of(x, p.n_off, p.n_len);
+    if idx < 0 {
+        return false;
+    };
+    let base = hsize + (i as u64) * rsize;
+    let name_abs = x.lay_end + (nt_off_in_tab(x, idx) as u64);
+    sx_wr_u32(out, base + (schg_sax3dsectionrec_name_off_off() as u64), name_abs as u32);
+    sx_wr_u32(out, base + (schg_sax3dsectionrec_kind_off() as u64), p.kind as u32);
+    sx_wr_u64(out, base + (schg_sax3dsectionrec_offset_off() as u64), p.offset);
+    sx_wr_u64(out, base + (schg_sax3dsectionrec_len_off() as u64), p.len);
+    sx_wr_u32(out, base + (schg_sax3dsectionrec_align_off() as u64), p.align as u32);
+    let src = pay_off[i as usize] as u64;
+    let ln = pay_len[i as usize] as u64;
+    let od: ptr = out.data as ptr;
+    let pd: ptr = pay.data as ptr;
+    let poff = p.offset;
+    let k: u64 = 0;
+    while k < ln {
+        sx_write_byte(od as *u8, poff + k, PTR_BYTE_AT(pd, src + k));
+        k = k + 1;
+    }
+    return true;
+}
+
+// ------------------------------------------------------------------
+// Header parsing (binio.zig parseHeader / tableFits / readRec /
+// nameBlob / nameAt). File bytes live in the arena at `base`;
+// flen is the file length. Diagnostics go through mb_*/diag_commit
+// with binio.zig's exact message texts.
+// ------------------------------------------------------------------
+
+fn bn_parse_header(x: &X, base: i32, flen: i32) -> BinHdr {
+    let bad = BinHdr { form: 0, count: 0, nt_off: 0, nt_len: 0, ok: 0 };
+    if (flen as u64) < (schg_sax3dbinheader_size() as u64) {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("file is "), STR_LEN("file is "));
+        mb_u64(x, flen as u64);
+        mb_lit(x, STR_PTR("B, smaller than the 32B header"), STR_LEN("B, smaller than the 32B header"));
+        diag_commit(x, STR_PTR("Sax3dTruncatedFile"), STR_LEN("Sax3dTruncatedFile"));
+        return bad;
+    };
+    let bp = x_ptr(x, base);
+    // form by magic
+    let mg = sb_new();
+    schg_magic_split(&mg);
+    let is_split = sx_spans_eq(sx_ptr_add(bp, schg_sax3dbinheader_magic_off() as u64), 8, mg.data as ptr, 8);
+    sb_clear(&mg);
+    schg_magic_packed(&mg);
+    let is_packed = sx_spans_eq(sx_ptr_add(bp, schg_sax3dbinheader_magic_off() as u64), 8, mg.data as ptr, 8);
+    let form: i32 = 0;
+    if is_split {
+        form = 0;
+    } else {
+        if is_packed {
+            form = 1;
+        } else {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("magic is not SAX3DBIN/SAX3DPAK"), STR_LEN("magic is not SAX3DBIN/SAX3DPAK"));
+            diag_commit(x, STR_PTR("Sax3dBadMagic"), STR_LEN("Sax3dBadMagic"));
+            return bad;
+        };
+    };
+    let maj = sx_rd_u16(bp, schg_sax3dbinheader_version_major_off() as u64) as i32;
+    if maj != schg_version_major() {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("version_major "), STR_LEN("version_major "));
+        mb_u64(x, maj as u64);
+        mb_lit(x, STR_PTR(" != supported "), STR_LEN(" != supported "));
+        mb_u64(x, schg_version_major() as u64);
+        mb_lit(x, STR_PTR(" (version gate)"), STR_LEN(" (version gate)"));
+        diag_commit(x, STR_PTR("Sax3dUnsupportedVersion"), STR_LEN("Sax3dUnsupportedVersion"));
+        return bad;
+    };
+    let flags = sx_rd_u32(bp, schg_sax3dbinheader_flags_off() as u64);
+    if flags != 0 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("flags 0x"), STR_LEN("flags 0x"));
+        mb_hex32(x, flags);
+        mb_lit(x, STR_PTR(" != 0 (v1 defines no flags; nonzero is rejected)"), STR_LEN(" != 0 (v1 defines no flags; nonzero is rejected)"));
+        diag_commit(x, STR_PTR("Sax3dBadFlags"), STR_LEN("Sax3dBadFlags"));
+        return bad;
+    };
+    return BinHdr {
+        form: form,
+        count: sx_rd_u32(bp, schg_sax3dbinheader_section_count_off() as u64) as i32,
+        nt_off: sx_rd_u32(bp, schg_sax3dbinheader_nametab_off_off() as u64) as i32,
+        nt_len: sx_rd_u32(bp, schg_sax3dbinheader_nametab_len_off() as u64) as i32,
+        ok: 1,
+    };
+}
+
+fn bn_table_fits(flen: i32, count: i32) -> bool {
+    let need = (schg_sax3dbinheader_size() as u64) + (count as u64) * (schg_sax3dsectionrec_size() as u64);
+    return (flen as u64) >= need;
+}
+
+fn bn_read_rec(x: &X, base: i32, i: i32) -> BinRec {
+    let bp = x_ptr(x, base);
+    let b = (schg_sax3dbinheader_size() as u64) + (i as u64) * (schg_sax3dsectionrec_size() as u64);
+    return BinRec {
+        name_off: sx_rd_u32(bp, b + (schg_sax3dsectionrec_name_off_off() as u64)) as i64,
+        kind: sx_rd_u32(bp, b + (schg_sax3dsectionrec_kind_off() as u64)) as i64,
+        offset: sx_rd_u64(bp, b + (schg_sax3dsectionrec_offset_off() as u64)) as i64,
+        len: sx_rd_u64(bp, b + (schg_sax3dsectionrec_len_off() as u64)) as i64,
+        align: sx_rd_u32(bp, b + (schg_sax3dsectionrec_align_off() as u64)) as i64,
+    };
+}
+
+// Validate the name-table range; emits Sax3dTruncatedFile like
+// binio.zig's nameBlob on overrun. Returns true when in range.
+fn bn_name_blob_ok(x: &X, hdr: &BinHdr, flen: i32) -> bool {
+    let end = (hdr.nt_off as u64) + (hdr.nt_len as u64);
+    if end > (flen as u64) {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("name table ["), STR_LEN("name table ["));
+        mb_u64(x, hdr.nt_off as u64);
+        mb_lit(x, STR_PTR(".."), STR_LEN(".."));
+        mb_u64(x, end);
+        mb_lit(x, STR_PTR("] exceeds file size "), STR_LEN("] exceeds file size "));
+        mb_u64(x, flen as u64);
+        diag_commit(x, STR_PTR("Sax3dTruncatedFile"), STR_LEN("Sax3dTruncatedFile"));
+        return false;
+    };
+    return true;
+}
+
+// Resolve a name_off to an arena span of the NUL-terminated name.
+// Returns len = -1 when the offset is outside the name table.
+fn bn_name_at(x: &X, base: i32, flen: i32, hdr: &BinHdr, name_off: i64) -> Span2 {
+    if name_off < (hdr.nt_off as i64) || name_off >= (hdr.nt_off as i64) + (hdr.nt_len as i64) {
+        return Span2 { off: 0, len: -1 };
+    };
+    let start = name_off as i32;
+    let end = start;
+    while end < flen && x_byte(x, base + end) != 0 {
+        end = end + 1;
+    }
+    return Span2 { off: base + start, len: end - start };
+}

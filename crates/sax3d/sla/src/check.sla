@@ -1,0 +1,1749 @@
+// check.sla  SAX3D  (check.zig )
+// Resolved  x.sec_lens/x.res 
+
+@import "iface.sla"
+@import "schema_gen.sla"
+
+//  kind  ->  (  b)
+fn kind_name_into(kind_val: i32, b: &SBuf) {
+    let i: i32 = 0;
+    let n = schg_kind_count();
+    while i < n {
+        if schg_kind_value(i) == kind_val {
+            schg_kind_name(i, b);
+            return;
+        };
+        i = i + 1;
+    }
+}
+
+fn kind_value_of(x: &X, n_off: i32, n_len: i32) -> i32 {
+    let s = sb_new();
+    let i: i32 = 0;
+    let n = schg_kind_count();
+    while i < n {
+        sb_clear(&s);
+        schg_kind_name(i, &s);
+        if (s.len as i32) == n_len && sx_spans_eq(s.data as ptr, s.len, x_ptr(x, n_off), n_len as u64) {
+            return schg_kind_value(i);
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// kind ( -> )
+fn kind_of(lp: ptr, ll: u64) -> i32 {
+    let s = sb_new();
+    let i: i32 = 0;
+    let n = schg_kind_count();
+    while i < n {
+        sb_clear(&s);
+        schg_kind_name(i, &s);
+        if s.len == ll && sx_spans_eq(s.data as ptr, ll, lp, ll) {
+            return schg_kind_value(i);
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+//  ->  (-1 = )
+fn elem_find(x: &X, t_off: i32, t_len: i32) -> i32 {
+    let s = sb_new();
+    let i: i32 = 0;
+    let n = schg_elem_count();
+    while i < n {
+        sb_clear(&s);
+        schg_elem_name(i, &s);
+        if (s.len as i32) == t_len && sx_spans_eq(s.data as ptr, s.len, x_ptr(x, t_off), t_len as u64) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn elem_size_of(x: &X, l_off: i32, l_len: i32) -> u64 {
+    let s = sb_new();
+    sb_push_span(&s, x_ptr(x, l_off), l_len as u64);
+    //  x  schg 
+    let i: i32 = 0;
+    let n = schg_elem_count();
+    while i < n {
+        let t = sb_new();
+        schg_elem_name(i, &t);
+        if t.len == s.len && sx_spans_eq(t.data as ptr, t.len, s.data as ptr, s.len) {
+            return schg_elem_size(i);
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ----  ----
+
+fn chk_sec_len(x: &X, n_off: i32, n_len: i32, out: ptr) -> bool {
+    return xmap_get(x, 0, n_off, n_len, 0, out);
+}
+
+// refSection:(ok, len) Sax3dUnresolvedReference
+fn chk_ref_section(x: &X, s_off: i32, s_len: i32, ck_p: ptr, ck_n: u64, cn_off: i32, cn_len: i32, out: ptr) -> bool {
+    if chk_sec_len(x, s_off, s_len, out) {
+        return true;
+    };
+    mb_clear(x);
+    mb_lit(x, ck_p, ck_n);
+    mb_lit(x, STR_PTR(" '"), STR_LEN(" '"));
+    mb_span(x, cn_off, cn_len);
+    mb_lit(x, STR_PTR("': section '"), STR_LEN("': section '"));
+    mb_span(x, s_off, s_len);
+    mb_lit(x, STR_PTR("' not declared in binary block"), STR_LEN("' not declared in binary block"));
+    diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+    return false;
+}
+
+fn chk_use_section(x: &X, s_off: i32, s_len: i32, kind_val: i32, align_: u32) {
+    let cell = malloc(8);
+    if xmap_get(x, 1, s_off, s_len, 0, cell as ptr) {
+        let old = sx_cell_u64(cell as ptr) as i32;
+        free(cell);
+        if old != kind_val {
+            let ob = sb_new();
+            kind_name_into(old, &ob);
+            let nb = sb_new();
+            kind_name_into(kind_val, &nb);
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section '"), STR_LEN("section '"));
+            mb_span(x, s_off, s_len);
+            mb_lit(x, STR_PTR("' used as both "), STR_LEN("' used as both "));
+            mb_buf(x, &ob, 0, ob.len);
+            mb_lit(x, STR_PTR(" and "), STR_LEN(" and "));
+            mb_buf(x, &nb, 0, nb.len);
+            diag_commit(x, STR_PTR("Sax3dSectionKindConflict"), STR_LEN("Sax3dSectionKindConflict"));
+        };
+        return;
+    };
+    free(cell);
+    xmap_put(x, 1, s_off, s_len, kind_val as i64, align_ as i64);
+}
+
+// ----  ----
+
+fn find_named(count: i32, x: &X, which: i32, n_off: i32, n_len: i32) -> i32 {
+    // which: 0 shader 1 mesh 2 skeleton 3 image 4 texture 5 material 6 scene 7 clip
+    let i: i32 = 0;
+    while i < count {
+        let e_off: i32 = 0;
+        let e_len: i32 = 0;
+        if which == 0 { let d = x.shaders[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 1 { let d = x.meshes[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 2 { let d = x.skels[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 3 { let d = x.imgs[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 4 { let d = x.texs[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 5 { let d = x.mats[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 6 { let d = x.scenes[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if which == 7 { let d = x.clips[i as usize]; e_off = d.n_off; e_len = d.n_len; };
+        if e_len == n_len && x_eq(x, e_off, e_len, n_off, n_len) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn find_shader(x: &X, o: i32, l: i32) -> i32 { return find_named(x.shaders.len() as i32, x, 0, o, l); }
+fn find_mesh(x: &X, o: i32, l: i32) -> i32 { return find_named(x.meshes.len() as i32, x, 1, o, l); }
+fn find_skel(x: &X, o: i32, l: i32) -> i32 { return find_named(x.skels.len() as i32, x, 2, o, l); }
+fn find_image(x: &X, o: i32, l: i32) -> i32 { return find_named(x.imgs.len() as i32, x, 3, o, l); }
+fn find_texture(x: &X, o: i32, l: i32) -> i32 { return find_named(x.texs.len() as i32, x, 4, o, l); }
+fn find_material(x: &X, o: i32, l: i32) -> i32 { return find_named(x.mats.len() as i32, x, 5, o, l); }
+
+//  (  ,  Zig  )
+fn dup_check_list(x: &X, count: i32, which: i32, kind_p: ptr, kind_n: u64) {
+    let i: i32 = 0;
+    while i < count {
+        let j: i32 = 0;
+        while j < i {
+            //  i j  (  find_named )
+            if named_eq_at(x, which, i, j) {
+                mb_clear(x);
+                mb_lit(x, kind_p, kind_n);
+                mb_lit(x, STR_PTR(" '"), STR_LEN(" '"));
+                named_span_mb(x, which, i);
+                mb_lit(x, STR_PTR("' declared twice (names are unique per kind)"), STR_LEN("' declared twice (names are unique per kind)"));
+                diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+            };
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn named_span(x: &X, which: i32, idx: i32) -> Span2 {
+    if which == 0 { let d = x.shaders[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    if which == 1 { let d = x.meshes[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    if which == 2 { let d = x.skels[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    if which == 3 { let d = x.imgs[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    if which == 4 { let d = x.texs[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    if which == 5 { let d = x.mats[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    if which == 6 { let d = x.scenes[idx as usize]; return Span2 { off: d.n_off, len: d.n_len }; };
+    let d = x.clips[idx as usize];
+    return Span2 { off: d.n_off, len: d.n_len };
+}
+
+fn named_eq_at(x: &X, which: i32, i: i32, j: i32) -> bool {
+    let a = named_span(x, which, i);
+    let b = named_span(x, which, j);
+    return a.len == b.len && x_eq(x, a.off, a.len, b.off, b.len);
+}
+
+fn named_span_mb(x: &X, which: i32, idx: i32) {
+    let s = named_span(x, which, idx);
+    mb_span(x, s.off, s.len);
+}
+
+// ----  ----
+
+fn collect_nodes_rec(x: &X, ni: i32, p_off: i32, p_len: i32, has_p: i32, out: &Vec<NodeInfo>) {
+    out.push(NodeInfo { node: ni, has_parent: has_p, p_off: p_off, p_len: p_len });
+    let nd = x.nodes[ni as usize];
+    let ci: i32 = 0;
+    while ci < nd.ch_len {
+        let c = x.idxpool[(nd.ch_off + ci) as usize];
+        collect_nodes_rec(x, c, nd.n_off, nd.n_len, 1, out);
+        ci = ci + 1;
+    }
+}
+
+fn collect_nodes(x: &X, out: &Vec<NodeInfo>) {
+    let si: i32 = 0;
+    while si < (x.scenes.len() as i32) {
+        let sc = x.scenes[si as usize];
+        let ri: i32 = 0;
+        while ri < sc.r_len {
+            collect_nodes_rec(x, x.idxpool[(sc.r_off + ri) as usize], 0, 0, 0, out);
+            ri = ri + 1;
+        }
+        si = si + 1;
+    }
+}
+
+// ----  ----
+
+// :(  )
+fn role_type_ok(x: &X, ch: ChanD) -> i32 {
+    //  1,  0, -1 
+    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("position"), STR_LEN("position")) || x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("normal"), STR_LEN("normal")) {
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x3"), STR_LEN("f32x3")) { return 1; };
+        return 0;
+    };
+    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("tangent"), STR_LEN("tangent")) {
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x4"), STR_LEN("f32x4")) { return 1; };
+        return 0;
+    };
+    if ch.n_len >= 2 && x_eq_lit(x, ch.n_off, 2, STR_PTR("uv"), STR_LEN("uv")) {
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x2"), STR_LEN("f32x2")) { return 1; };
+        return 0;
+    };
+    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("color0"), STR_LEN("color0")) {
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x4"), STR_LEN("f32x4")) { return 1; };
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("u8x4"), STR_LEN("u8x4")) { return 1; };
+        return 0;
+    };
+    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("joints0"), STR_LEN("joints0")) {
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("u16x4"), STR_LEN("u16x4")) { return 1; };
+        return 0;
+    };
+    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("weights0"), STR_LEN("weights0")) {
+        if x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x4"), STR_LEN("f32x4")) { return 1; };
+        return 0;
+    };
+    return -1;
+}
+
+fn chk_one_channel(x: &X, m_off: i32, m_len: i32, ch: ChanD, count: u64, in_morph: bool) {
+    if ch.custom == 1 {
+        if is_canon_channel(x, ch.n_off, ch.n_len) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m_off, m_len);
+            mb_lit(x, STR_PTR("': attr name '"), STR_LEN("': attr name '"));
+            mb_span(x, ch.n_off, ch.n_len);
+            mb_lit(x, STR_PTR("' is a canonical channel name; use 'channel'"), STR_LEN("' is a canonical channel name; use 'channel'"));
+            diag_commit(x, STR_PTR("Sax3dAttrNameReserved"), STR_LEN("Sax3dAttrNameReserved"));
+        };
+    } else {
+        if !is_canon_channel(x, ch.n_off, ch.n_len) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m_off, m_len);
+            mb_lit(x, STR_PTR("': channel '"), STR_LEN("': channel '"));
+            mb_span(x, ch.n_off, ch.n_len);
+            mb_lit(x, STR_PTR("' not in canonical set (use 'attr' for custom channels)"), STR_LEN("' not in canonical set (use 'attr' for custom channels)"));
+            diag_commit(x, STR_PTR("Sax3dUnknownChannel"), STR_LEN("Sax3dUnknownChannel"));
+            return;
+        };
+        if in_morph && !x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("position"), STR_LEN("position")) && !x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("normal"), STR_LEN("normal")) && !x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("tangent"), STR_LEN("tangent")) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m_off, m_len);
+            mb_lit(x, STR_PTR("': morph channel '"), STR_LEN("': morph channel '"));
+            mb_span(x, ch.n_off, ch.n_len);
+            mb_lit(x, STR_PTR("' not a delta channel (position/normal/tangent only)"), STR_LEN("' not a delta channel (position/normal/tangent only)"));
+            diag_commit(x, STR_PTR("Sax3dMorphChannelInvalid"), STR_LEN("Sax3dMorphChannelInvalid"));
+            return;
+        };
+        let rok = role_type_ok(x, ch);
+        if rok == 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m_off, m_len);
+            mb_lit(x, STR_PTR("': channel '"), STR_LEN("': channel '"));
+            mb_span(x, ch.n_off, ch.n_len);
+            mb_lit(x, STR_PTR("' type "), STR_LEN("' type "));
+            mb_span(x, ch.t_off, ch.t_len);
+            mb_lit(x, STR_PTR(" does not fit its canonical role"), STR_LEN(" does not fit its canonical role"));
+            diag_commit(x, STR_PTR("Sax3dChannelTypeMismatch"), STR_LEN("Sax3dChannelTypeMismatch"));
+        };
+    };
+    let ei = elem_find(x, ch.t_off, ch.t_len);
+    if ei < 0 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+        mb_span(x, m_off, m_len);
+        mb_lit(x, STR_PTR("': channel '"), STR_LEN("': channel '"));
+        mb_span(x, ch.n_off, ch.n_len);
+        mb_lit(x, STR_PTR("' element type '"), STR_LEN("' element type '"));
+        mb_span(x, ch.t_off, ch.t_len);
+        mb_lit(x, STR_PTR("' not in sax3d.sai type table"), STR_LEN("' not in sax3d.sai type table"));
+        diag_commit(x, STR_PTR("Sax3dUnknownElemType"), STR_LEN("Sax3dUnknownElemType"));
+        return;
+    };
+    let cell = malloc(8);
+    if !chk_ref_section(x, ch.s_off, ch.s_len, STR_PTR("mesh channel"), STR_LEN("mesh channel"), ch.n_off, ch.n_len, cell as ptr) {
+        free(cell);
+        return;
+    };
+    let sl = sx_cell_u64(cell as ptr);
+    free(cell);
+    let esz = schg_elem_size(ei);
+    if count * esz > sl {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+        mb_span(x, m_off, m_len);
+        mb_lit(x, STR_PTR("': channel '"), STR_LEN("': channel '"));
+        mb_span(x, ch.n_off, ch.n_len);
+        mb_lit(x, STR_PTR("' needs "), STR_LEN("' needs "));
+        mb_u64(x, count);
+        mb_lit(x, STR_PTR(" x "), STR_LEN(" x "));
+        mb_u64(x, esz);
+        mb_lit(x, STR_PTR("B = "), STR_LEN("B = "));
+        mb_u64(x, count * esz);
+        mb_lit(x, STR_PTR("B > section '"), STR_LEN("B > section '"));
+        mb_span(x, ch.s_off, ch.s_len);
+        mb_lit(x, STR_PTR("' ("), STR_LEN("' ("));
+        mb_u64(x, sl);
+        mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+        diag_commit(x, STR_PTR("Sax3dSectionOverflow"), STR_LEN("Sax3dSectionOverflow"));
+    };
+    chk_use_section(x, ch.s_off, ch.s_len, kind_of(STR_PTR("channel"), STR_LEN("channel")), (schg_elem_align(ei) as u32));
+}
+
+// ---- meshes ----
+
+fn topo_ok(x: &X, o: i32, l: i32) -> bool {
+    if x_eq_lit(x, o, l, STR_PTR("triangles"), STR_LEN("triangles")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("triangle-strip"), STR_LEN("triangle-strip")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("lines"), STR_LEN("lines")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("line-strip"), STR_LEN("line-strip")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("points"), STR_LEN("points")) { return true; };
+    return false;
+}
+
+fn chk_meshes(x: &X) {
+    let mi: i32 = 0;
+    let nm = x.meshes.len() as i32;
+    while mi < nm {
+        let m = x.meshes[mi as usize];
+        if !topo_ok(x, m.topo_off, m.topo_len) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m.n_off, m.n_len);
+            mb_lit(x, STR_PTR("': topology '"), STR_LEN("': topology '"));
+            mb_span(x, m.topo_off, m.topo_len);
+            mb_lit(x, STR_PTR("' not in closed set"), STR_LEN("' not in closed set"));
+            diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+        };
+        if m.vertices == 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m.n_off, m.n_len);
+            mb_lit(x, STR_PTR("': vertices is 0 or undeclared"), STR_LEN("': vertices is 0 or undeclared"));
+            diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+        };
+        //  + 
+        let ci: i32 = 0;
+        while ci < m.ch_len {
+            let ch = x.chans[(m.ch_off + ci) as usize];
+            let cj: i32 = 0;
+            while cj < ci {
+                let o = x.chans[(m.ch_off + cj) as usize];
+                if o.n_len == ch.n_len && x_eq(x, o.n_off, o.n_len, ch.n_off, ch.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("': channel '"), STR_LEN("': channel '"));
+                    mb_span(x, ch.n_off, ch.n_len);
+                    mb_lit(x, STR_PTR("' declared twice"), STR_LEN("' declared twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                cj = cj + 1;
+            }
+            chk_one_channel(x, m.n_off, m.n_len, ch, m.vertices, false);
+            ci = ci + 1;
+        }
+        let has_j = false;
+        let has_w = false;
+        let cj2: i32 = 0;
+        while cj2 < m.ch_len {
+            let ch = x.chans[(m.ch_off + cj2) as usize];
+            if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("joints0"), STR_LEN("joints0")) { has_j = true; };
+            if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("weights0"), STR_LEN("weights0")) { has_w = true; };
+            cj2 = cj2 + 1;
+        }
+        if has_j != has_w {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m.n_off, m.n_len);
+            mb_lit(x, STR_PTR("': joints0 and weights0 must appear as a pair"), STR_LEN("': joints0 and weights0 must appear as a pair"));
+            diag_commit(x, STR_PTR("Sax3dChannelPairing"), STR_LEN("Sax3dChannelPairing"));
+        };
+        let oi: i32 = 0;
+        while oi < m.mo_len {
+            let mo = x.morphs[(m.mo_off + oi) as usize];
+            let oj: i32 = 0;
+            while oj < oi {
+                let o = x.morphs[(m.mo_off + oj) as usize];
+                if o.n_len == mo.n_len && x_eq(x, o.n_off, o.n_len, mo.n_off, mo.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("': morph '"), STR_LEN("': morph '"));
+                    mb_span(x, mo.n_off, mo.n_len);
+                    mb_lit(x, STR_PTR("' declared twice"), STR_LEN("' declared twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                oj = oj + 1;
+            }
+            let mci: i32 = 0;
+            while mci < mo.ch_len {
+                let ch = x.mchans[(mo.ch_off + mci) as usize];
+                chk_one_channel(x, m.n_off, m.n_len, ch, m.vertices, true);
+                mci = mci + 1;
+            }
+            oi = oi + 1;
+        }
+        if m.ity_len >= 0 {
+            let ity_ok = x_eq_lit(x, m.ity_off, m.ity_len, STR_PTR("u16"), STR_LEN("u16")) || x_eq_lit(x, m.ity_off, m.ity_len, STR_PTR("u32"), STR_LEN("u32"));
+            if !ity_ok {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                mb_span(x, m.n_off, m.n_len);
+                mb_lit(x, STR_PTR("': index type '"), STR_LEN("': index type '"));
+                mb_span(x, m.ity_off, m.ity_len);
+                mb_lit(x, STR_PTR("' not u16/u32"), STR_LEN("' not u16/u32"));
+                diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+            };
+            let cell = malloc(8);
+            if chk_ref_section(x, m.isec_off, m.isec_len, STR_PTR("mesh indices"), STR_LEN("mesh indices"), m.n_off, m.n_len, cell as ptr) {
+                let sl = sx_cell_u64(cell as ptr);
+                // Zig: elemType(ity).?  ity (  );SLA  (PORT_REPORT )
+                let ei = elem_find(x, m.ity_off, m.ity_len);
+                if ei >= 0 {
+                    let esz = schg_elem_size(ei);
+                    if m.icount * esz > sl {
+                        mb_clear(x);
+                        mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                        mb_span(x, m.n_off, m.n_len);
+                        mb_lit(x, STR_PTR("': indices "), STR_LEN("': indices "));
+                        mb_u64(x, m.icount);
+                        mb_lit(x, STR_PTR(" x "), STR_LEN(" x "));
+                        mb_u64(x, esz);
+                        mb_lit(x, STR_PTR("B = "), STR_LEN("B = "));
+                        mb_u64(x, m.icount * esz);
+                        mb_lit(x, STR_PTR("B > section '"), STR_LEN("B > section '"));
+                        mb_span(x, m.isec_off, m.isec_len);
+                        mb_lit(x, STR_PTR("' ("), STR_LEN("' ("));
+                        mb_u64(x, sl);
+                        mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+                        diag_commit(x, STR_PTR("Sax3dSectionOverflow"), STR_LEN("Sax3dSectionOverflow"));
+                    };
+                    chk_use_section(x, m.isec_off, m.isec_len, kind_of(STR_PTR("index"), STR_LEN("index")), schg_elem_align(ei) as u32);
+                };
+            };
+            free(cell);
+        };
+        if m.pr_len == 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+            mb_span(x, m.n_off, m.n_len);
+            mb_lit(x, STR_PTR("': no primitive declared"), STR_LEN("': no primitive declared"));
+            diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+        };
+        let pi: i32 = 0;
+        while pi < m.pr_len {
+            let pr = x.prims[(m.pr_off + pi) as usize];
+            let pj: i32 = 0;
+            while pj < pi {
+                let o = x.prims[(m.pr_off + pj) as usize];
+                if o.n_len == pr.n_len && x_eq(x, o.n_off, o.n_len, pr.n_off, pr.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("': primitive '"), STR_LEN("': primitive '"));
+                    mb_span(x, pr.n_off, pr.n_len);
+                    mb_lit(x, STR_PTR("' declared twice"), STR_LEN("' declared twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                pj = pj + 1;
+            }
+            if find_material(x, pr.m_off, pr.m_len) < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                mb_span(x, m.n_off, m.n_len);
+                mb_lit(x, STR_PTR("' primitive '"), STR_LEN("' primitive '"));
+                mb_span(x, pr.n_off, pr.n_len);
+                mb_lit(x, STR_PTR("': material '"), STR_LEN("': material '"));
+                mb_span(x, pr.m_off, pr.m_len);
+                mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+                diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+            };
+            pi = pi + 1;
+        }
+        mi = mi + 1;
+    }
+}
+
+// ---- skeletons ----
+
+fn find_joint(x: &X, sk: SkelD, n_off: i32, n_len: i32) -> i32 {
+    let i: i32 = 0;
+    while i < sk.j_len {
+        let j = x.joints[(sk.j_off + i) as usize];
+        if j.n_len == n_len && x_eq(x, j.n_off, j.n_len, n_off, n_len) {
+            return sk.j_off + i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn chk_skeletons(x: &X) {
+    let si: i32 = 0;
+    let ns = x.skels.len() as i32;
+    while si < ns {
+        let sk = x.skels[si as usize];
+        let ji: i32 = 0;
+        while ji < sk.j_len {
+            let j = x.joints[(sk.j_off + ji) as usize];
+            let jj: i32 = 0;
+            while jj < ji {
+                let o = x.joints[(sk.j_off + jj) as usize];
+                if o.n_len == j.n_len && x_eq(x, o.n_off, o.n_len, j.n_off, j.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+                    mb_span(x, sk.n_off, sk.n_len);
+                    mb_lit(x, STR_PTR("': joint '"), STR_LEN("': joint '"));
+                    mb_span(x, j.n_off, j.n_len);
+                    mb_lit(x, STR_PTR("' declared twice"), STR_LEN("' declared twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                jj = jj + 1;
+            }
+            if j.has_parent == 1 {
+                if find_joint(x, sk, j.p_off, j.p_len) < 0 {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+                    mb_span(x, sk.n_off, sk.n_len);
+                    mb_lit(x, STR_PTR("': joint '"), STR_LEN("': joint '"));
+                    mb_span(x, j.n_off, j.n_len);
+                    mb_lit(x, STR_PTR("' parent '"), STR_LEN("' parent '"));
+                    mb_span(x, j.p_off, j.p_len);
+                    mb_lit(x, STR_PTR("' not a joint of this skeleton"), STR_LEN("' not a joint of this skeleton"));
+                    diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+                };
+            };
+            // cycle walk: follow parent chain, step cap = joint count
+            let cur_has = j.has_parent;
+            let cur_off = j.p_off;
+            let cur_len = j.p_len;
+            let steps: i32 = 0;
+            while cur_has == 1 {
+                steps = steps + 1;
+                if steps > sk.j_len {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+                    mb_span(x, sk.n_off, sk.n_len);
+                    mb_lit(x, STR_PTR("': joint '"), STR_LEN("': joint '"));
+                    mb_span(x, j.n_off, j.n_len);
+                    mb_lit(x, STR_PTR("' parent chain cycles"), STR_LEN("' parent chain cycles"));
+                    diag_commit(x, STR_PTR("Sax3dJointCycle"), STR_LEN("Sax3dJointCycle"));
+                    break;
+                };
+                let jd = find_joint(x, sk, cur_off, cur_len);
+                if jd < 0 {
+                    break;
+                };
+                let jn = x.joints[jd as usize];
+                cur_has = jn.has_parent;
+                cur_off = jn.p_off;
+                cur_len = jn.p_len;
+            }
+            ji = ji + 1;
+        }
+        if sk.ib_len >= 0 {
+            let cell = malloc(8);
+            if chk_ref_section(x, sk.ib_off, sk.ib_len, STR_PTR("skeleton"), STR_LEN("skeleton"), sk.n_off, sk.n_len, cell as ptr) {
+                let sl = sx_cell_u64(cell as ptr);
+                let ei = elem_find(x, x_intern(x, STR_PTR("f32x4x4"), STR_LEN("f32x4x4")), 7);
+                if ei >= 0 {
+                    let sz2 = schg_elem_size(ei);
+                    let al2 = schg_elem_align(ei);
+                    let need = (sk.j_len as u64) * sz2;
+                    if need > sl {
+                        mb_clear(x);
+                        mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+                        mb_span(x, sk.n_off, sk.n_len);
+                        mb_lit(x, STR_PTR("': inverse_bind needs "), STR_LEN("': inverse_bind needs "));
+                        mb_u64(x, sk.j_len as u64);
+                        mb_lit(x, STR_PTR(" joints x 64B = "), STR_LEN(" joints x 64B = "));
+                        mb_u64(x, need);
+                        mb_lit(x, STR_PTR("B > section '"), STR_LEN("B > section '"));
+                        mb_span(x, sk.ib_off, sk.ib_len);
+                        mb_lit(x, STR_PTR("' ("), STR_LEN("' ("));
+                        mb_u64(x, sl);
+                        mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+                        diag_commit(x, STR_PTR("Sax3dSectionOverflow"), STR_LEN("Sax3dSectionOverflow"));
+                    };
+                    chk_use_section(x, sk.ib_off, sk.ib_len, kind_of(STR_PTR("inverse_bind"), STR_LEN("inverse_bind")), al2);
+                };
+            };
+            free(cell);
+        } else {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+            mb_span(x, sk.n_off, sk.n_len);
+            mb_lit(x, STR_PTR("': inverse_bind section missing"), STR_LEN("': inverse_bind section missing"));
+            diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+        };
+        si = si + 1;
+    }
+}
+
+// ---- images ----
+
+fn fmt_ok(x: &X, o: i32, l: i32) -> bool {
+    if x_eq_lit(x, o, l, STR_PTR("png"), STR_LEN("png")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("jpeg"), STR_LEN("jpeg")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("ktx2"), STR_LEN("ktx2")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("raw-rgba8"), STR_LEN("raw-rgba8")) { return true; };
+    if x_eq_lit(x, o, l, STR_PTR("raw-rgba16f"), STR_LEN("raw-rgba16f")) { return true; };
+    return false;
+}
+
+fn chk_images(x: &X) {
+    let ii: i32 = 0;
+    let ni = x.imgs.len() as i32;
+    while ii < ni {
+        let im = x.imgs[ii as usize];
+        if !fmt_ok(x, im.f_off, im.f_len) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("image '"), STR_LEN("image '"));
+            mb_span(x, im.n_off, im.n_len);
+            mb_lit(x, STR_PTR("': format '"), STR_LEN("': format '"));
+            mb_span(x, im.f_off, im.f_len);
+            mb_lit(x, STR_PTR("' not in closed set"), STR_LEN("' not in closed set"));
+            diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+        };
+        let cs_ok = x_eq_lit(x, im.c_off, im.c_len, STR_PTR("srgb"), STR_LEN("srgb")) || x_eq_lit(x, im.c_off, im.c_len, STR_PTR("linear"), STR_LEN("linear"));
+        if !cs_ok {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("image '"), STR_LEN("image '"));
+            mb_span(x, im.n_off, im.n_len);
+            mb_lit(x, STR_PTR("': color_space '"), STR_LEN("': color_space '"));
+            mb_span(x, im.c_off, im.c_len);
+            mb_lit(x, STR_PTR("' must be declared srgb|linear (never guessed)"), STR_LEN("' must be declared srgb|linear (never guessed)"));
+            diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+        };
+        let is_raw = im.f_len >= 4 && x_eq_lit(x, im.f_off, 4, STR_PTR("raw-"), STR_LEN("raw-"));
+        if im.kind == 0 {
+            let cell = malloc(8);
+            if chk_ref_section(x, im.s_off, im.s_len, STR_PTR("image"), STR_LEN("image"), im.n_off, im.n_len, cell as ptr) {
+                let sl = sx_cell_u64(cell as ptr);
+                if is_raw {
+                    if im.has_size == 0 {
+                        mb_clear(x);
+                        mb_lit(x, STR_PTR("image '"), STR_LEN("image '"));
+                        mb_span(x, im.n_off, im.n_len);
+                        mb_lit(x, STR_PTR("': raw format requires explicit size"), STR_LEN("': raw format requires explicit size"));
+                        diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+                        // Zig: continue ( useSection)
+                    } else {
+                        let bpp: u64 = 8;
+                        if x_eq_lit(x, im.f_off, im.f_len, STR_PTR("raw-rgba8"), STR_LEN("raw-rgba8")) {
+                            bpp = 4;
+                        };
+                        let need = im.w * im.h * bpp;
+                        if need != sl {
+                            mb_clear(x);
+                            mb_lit(x, STR_PTR("image '"), STR_LEN("image '"));
+                            mb_span(x, im.n_off, im.n_len);
+                            mb_lit(x, STR_PTR("': "), STR_LEN("': "));
+                            mb_span(x, im.f_off, im.f_len);
+                            mb_lit(x, STR_PTR(" "), STR_LEN(" "));
+                            mb_u64(x, im.w);
+                            mb_lit(x, STR_PTR("x"), STR_LEN("x"));
+                            mb_u64(x, im.h);
+                            mb_lit(x, STR_PTR(" = "), STR_LEN(" = "));
+                            mb_u64(x, need);
+                            mb_lit(x, STR_PTR("B != section '"), STR_LEN("B != section '"));
+                            mb_span(x, im.s_off, im.s_len);
+                            mb_lit(x, STR_PTR("' ("), STR_LEN("' ("));
+                            mb_u64(x, sl);
+                            mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+                            diag_commit(x, STR_PTR("Sax3dRawImageSizeMismatch"), STR_LEN("Sax3dRawImageSizeMismatch"));
+                        };
+                        chk_use_section(x, im.s_off, im.s_len, kind_of(STR_PTR("image_raw"), STR_LEN("image_raw")), 1);
+                    };
+                } else {
+                    chk_use_section(x, im.s_off, im.s_len, kind_of(STR_PTR("blob"), STR_LEN("blob")), 1);
+                };
+            };
+            free(cell);
+        };
+        ii = ii + 1;
+    }
+}
+
+// ---- textures ----
+
+fn chk_enum_field(x: &X, kind_p: ptr, kind_n: u64, n_off: i32, n_len: i32, f_p: ptr, f_n: u64, v_off: i32, v_len: i32, set_kind: i32) {
+    // set_kind: 0 filt(nearest/linear), 1 mips(none/nearest/linear), 2 wraps(clamp/repeat/mirror)
+    if v_len < 0 {
+        return; // null -> 
+    };
+    let ok = false;
+    if set_kind == 0 {
+        ok = x_eq_lit(x, v_off, v_len, STR_PTR("nearest"), STR_LEN("nearest")) || x_eq_lit(x, v_off, v_len, STR_PTR("linear"), STR_LEN("linear"));
+    };
+    if set_kind == 1 {
+        ok = x_eq_lit(x, v_off, v_len, STR_PTR("none"), STR_LEN("none")) || x_eq_lit(x, v_off, v_len, STR_PTR("nearest"), STR_LEN("nearest")) || x_eq_lit(x, v_off, v_len, STR_PTR("linear"), STR_LEN("linear"));
+    };
+    if set_kind == 2 {
+        ok = x_eq_lit(x, v_off, v_len, STR_PTR("clamp"), STR_LEN("clamp")) || x_eq_lit(x, v_off, v_len, STR_PTR("repeat"), STR_LEN("repeat")) || x_eq_lit(x, v_off, v_len, STR_PTR("mirror"), STR_LEN("mirror"));
+    };
+    if !ok {
+        mb_clear(x);
+        mb_lit(x, kind_p, kind_n);
+        mb_lit(x, STR_PTR(" '"), STR_LEN(" '"));
+        mb_span(x, n_off, n_len);
+        mb_lit(x, STR_PTR("': "), STR_LEN("': "));
+        mb_lit(x, f_p, f_n);
+        mb_lit(x, STR_PTR(" = '"), STR_LEN(" = '"));
+        mb_span(x, v_off, v_len);
+        mb_lit(x, STR_PTR("' not in closed value set"), STR_LEN("' not in closed value set"));
+        diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+    };
+}
+
+fn chk_sampler_req(x: &X, t: TexD, f_p: ptr, f_n: u64, v_len: i32) {
+    if v_len < 0 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("texture '"), STR_LEN("texture '"));
+        mb_span(x, t.n_off, t.n_len);
+        mb_lit(x, STR_PTR("': sampler field '"), STR_LEN("': sampler field '"));
+        mb_lit(x, f_p, f_n);
+        mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+        diag_commit(x, STR_PTR("Sax3dMissingSamplerState"), STR_LEN("Sax3dMissingSamplerState"));
+    };
+}
+
+fn chk_textures(x: &X) {
+    let ti: i32 = 0;
+    let nt = x.texs.len() as i32;
+    while ti < nt {
+        let t = x.texs[ti as usize];
+        if find_image(x, t.i_off, t.i_len) < 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("texture '"), STR_LEN("texture '"));
+            mb_span(x, t.n_off, t.n_len);
+            mb_lit(x, STR_PTR("': image '"), STR_LEN("': image '"));
+            mb_span(x, t.i_off, t.i_len);
+            mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+            diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+        };
+        if t.smp == 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("texture '"), STR_LEN("texture '"));
+            mb_span(x, t.n_off, t.n_len);
+            mb_lit(x, STR_PTR("': sampler block missing (sampler state is declared, never guessed)"), STR_LEN("': sampler block missing (sampler state is declared, never guessed)"));
+            diag_commit(x, STR_PTR("Sax3dMissingSamplerState"), STR_LEN("Sax3dMissingSamplerState"));
+            ti = ti + 1;
+            continue;
+        };
+        chk_sampler_req(x, t, STR_PTR("mag"), STR_LEN("mag"), t.mag_len);
+        chk_sampler_req(x, t, STR_PTR("min"), STR_LEN("min"), t.min_len);
+        chk_sampler_req(x, t, STR_PTR("mipmap"), STR_LEN("mipmap"), t.mip_len);
+        chk_sampler_req(x, t, STR_PTR("wrap_u"), STR_LEN("wrap_u"), t.wu_len);
+        chk_sampler_req(x, t, STR_PTR("wrap_v"), STR_LEN("wrap_v"), t.wv_len);
+        chk_enum_field(x, STR_PTR("texture"), STR_LEN("texture"), t.n_off, t.n_len, STR_PTR("mag"), STR_LEN("mag"), t.mag_off, t.mag_len, 0);
+        chk_enum_field(x, STR_PTR("texture"), STR_LEN("texture"), t.n_off, t.n_len, STR_PTR("min"), STR_LEN("min"), t.min_off, t.min_len, 0);
+        chk_enum_field(x, STR_PTR("texture"), STR_LEN("texture"), t.n_off, t.n_len, STR_PTR("mipmap"), STR_LEN("mipmap"), t.mip_off, t.mip_len, 1);
+        chk_enum_field(x, STR_PTR("texture"), STR_LEN("texture"), t.n_off, t.n_len, STR_PTR("wrap_u"), STR_LEN("wrap_u"), t.wu_off, t.wu_len, 2);
+        chk_enum_field(x, STR_PTR("texture"), STR_LEN("texture"), t.n_off, t.n_len, STR_PTR("wrap_v"), STR_LEN("wrap_v"), t.wv_off, t.wv_len, 2);
+        chk_enum_field(x, STR_PTR("texture"), STR_LEN("texture"), t.n_off, t.n_len, STR_PTR("wrap_w"), STR_LEN("wrap_w"), t.ww_off, t.ww_len, 2);
+        ti = ti + 1;
+    }
+}
+
+
+// Iface  (  Vec )
+fn ifparam_find_fi(x: &X, fi: i32, n_off: i32, n_len: i32) -> i32 {
+    let i: i32 = 0;
+    let n = x.ifaces[fi as usize].params.len() as i32;
+    while i < n {
+        let e = x.ifaces[fi as usize].params[i as usize];
+        if e.n_len == n_len && x_eq(x, e.n_off, e.n_len, n_off, n_len) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn iftex_find_fi(x: &X, fi: i32, n_off: i32, n_len: i32) -> i32 {
+    let i: i32 = 0;
+    let n = x.ifaces[fi as usize].texs.len() as i32;
+    while i < n {
+        let e = x.ifaces[fi as usize].texs[i as usize];
+        if e.n_len == n_len && x_eq(x, e.n_off, e.n_len, n_off, n_len) {
+            return i;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ---- materials ----
+
+fn chk_materials(x: &X) {
+    let mi: i32 = 0;
+    let nm = x.mats.len() as i32;
+    while mi < nm {
+        let mt = x.mats[mi as usize];
+        mi = mi + 1;
+        if find_shader(x, mt.sh_off, mt.sh_len) < 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+            mb_span(x, mt.n_off, mt.n_len);
+            mb_lit(x, STR_PTR("': shader '"), STR_LEN("': shader '"));
+            mb_span(x, mt.sh_off, mt.sh_len);
+            mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+            diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+            continue;
+        };
+        if mt.al_len >= 0 {
+            let al_ok = x_eq_lit(x, mt.al_off, mt.al_len, STR_PTR("opaque"), STR_LEN("opaque")) || x_eq_lit(x, mt.al_off, mt.al_len, STR_PTR("mask"), STR_LEN("mask")) || x_eq_lit(x, mt.al_off, mt.al_len, STR_PTR("blend"), STR_LEN("blend"));
+            if !al_ok {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': state alpha '"), STR_LEN("': state alpha '"));
+                mb_span(x, mt.al_off, mt.al_len);
+                mb_lit(x, STR_PTR("' not opaque|mask|blend"), STR_LEN("' not opaque|mask|blend"));
+                diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+            };
+        };
+        let fi = iface_find(x, mt.sh_off, mt.sh_len);
+        if fi < 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+            mb_span(x, mt.n_off, mt.n_len);
+            mb_lit(x, STR_PTR("': no interface-table fixture supplied for shader '"), STR_LEN("': no interface-table fixture supplied for shader '"));
+            mb_span(x, mt.sh_off, mt.sh_len);
+            mb_lit(x, STR_PTR("' (GAP-1: v1 binds against hand-specified fixtures)"), STR_LEN("' (GAP-1: v1 binds against hand-specified fixtures)"));
+            diag_commit(x, STR_PTR("Sax3dMissingInterfaceFixture"), STR_LEN("Sax3dMissingInterfaceFixture"));
+            continue;
+        };
+        // params:  +  + 
+        let pi: i32 = 0;
+        while pi < mt.pa_len {
+            let pr = x.params[(mt.pa_off + pi) as usize];
+            let pj: i32 = 0;
+            while pj < pi {
+                let o = x.params[(mt.pa_off + pj) as usize];
+                if o.n_len == pr.n_len && x_eq(x, o.n_off, o.n_len, pr.n_off, pr.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                    mb_span(x, mt.n_off, mt.n_len);
+                    mb_lit(x, STR_PTR("': param '"), STR_LEN("': param '"));
+                    mb_span(x, pr.n_off, pr.n_len);
+                    mb_lit(x, STR_PTR("' assigned twice"), STR_LEN("' assigned twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                pj = pj + 1;
+            }
+            let ip = ifparam_find_fi(x, fi, pr.n_off, pr.n_len);
+            if ip < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': param '"), STR_LEN("': param '"));
+                mb_span(x, pr.n_off, pr.n_len);
+                mb_lit(x, STR_PTR("' not in shader '"), STR_LEN("' not in shader '"));
+                mb_span(x, mt.sh_off, mt.sh_len);
+                mb_lit(x, STR_PTR("' interface params"), STR_LEN("' interface params"));
+                diag_commit(x, STR_PTR("Sax3dUndeclaredParam"), STR_LEN("Sax3dUndeclaredParam"));
+                pi = pi + 1;
+                continue;
+            };
+            let ipe = x.ifaces[fi as usize].params[ip as usize];
+            //  vs 
+            let tnb = sb_new();
+            lit_type_name(x, pr.kind, pr.v_len, &tnb);
+            if !(tnb.len == (ipe.t_len as u64) && sx_spans_eq(tnb.data as ptr, tnb.len, x_ptr(x, ipe.t_off), ipe.t_len as u64)) {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': param '"), STR_LEN("': param '"));
+                mb_span(x, pr.n_off, pr.n_len);
+                mb_lit(x, STR_PTR("' literal type "), STR_LEN("' literal type "));
+                mb_buf(x, &tnb, 0, tnb.len);
+                mb_lit(x, STR_PTR(" != interface type "), STR_LEN(" != interface type "));
+                mb_span(x, ipe.t_off, ipe.t_len);
+                diag_commit(x, STR_PTR("Sax3dParamTypeMismatch"), STR_LEN("Sax3dParamTypeMismatch"));
+            };
+            pi = pi + 1;
+        }
+        //  params  /
+        let ii: i32 = 0;
+        let np = x.ifaces[fi as usize].params.len() as i32;
+        while ii < np {
+            let e = x.ifaces[fi as usize].params[ii as usize];
+            let assigned = false;
+            let aj: i32 = 0;
+            while aj < mt.pa_len {
+                let pr = x.params[(mt.pa_off + aj) as usize];
+                if pr.n_len == e.n_len && x_eq(x, pr.n_off, pr.n_len, e.n_off, e.n_len) {
+                    assigned = true;
+                };
+                aj = aj + 1;
+            }
+            if !assigned && e.has_def == 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': interface param '"), STR_LEN("': interface param '"));
+                mb_span(x, e.n_off, e.n_len);
+                mb_lit(x, STR_PTR("' unassigned and carries no default"), STR_LEN("' unassigned and carries no default"));
+                diag_commit(x, STR_PTR("Sax3dUnboundParam"), STR_LEN("Sax3dUnboundParam"));
+            };
+            ii = ii + 1;
+        }
+        // texbinds
+        let bi: i32 = 0;
+        while bi < mt.tb_len {
+            let tb = x.tbinds[(mt.tb_off + bi) as usize];
+            let bj: i32 = 0;
+            while bj < bi {
+                let o = x.tbinds[(mt.tb_off + bj) as usize];
+                if o.n_len == tb.n_len && x_eq(x, o.n_off, o.n_len, tb.n_off, tb.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                    mb_span(x, mt.n_off, mt.n_len);
+                    mb_lit(x, STR_PTR("': texture binding '"), STR_LEN("': texture binding '"));
+                    mb_span(x, tb.n_off, tb.n_len);
+                    mb_lit(x, STR_PTR("' declared twice"), STR_LEN("' declared twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                bj = bj + 1;
+            }
+            if iftex_find_fi(x, fi, tb.n_off, tb.n_len) < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': texture binding '"), STR_LEN("': texture binding '"));
+                mb_span(x, tb.n_off, tb.n_len);
+                mb_lit(x, STR_PTR("' is not a sampler param of shader '"), STR_LEN("' is not a sampler param of shader '"));
+                mb_span(x, mt.sh_off, mt.sh_len);
+                mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+                diag_commit(x, STR_PTR("Sax3dUndeclaredTextureBinding"), STR_LEN("Sax3dUndeclaredTextureBinding"));
+            };
+            if find_texture(x, tb.t_off, tb.t_len) < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': texture '"), STR_LEN("': texture '"));
+                mb_span(x, tb.t_off, tb.t_len);
+                mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+                diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+            };
+            bi = bi + 1;
+        }
+        // tex_transforms 
+        let ti2: i32 = 0;
+        while ti2 < mt.tt_len {
+            let tt = x.ttrs[(mt.tt_off + ti2) as usize];
+            let bound = false;
+            let bj2: i32 = 0;
+            while bj2 < mt.tb_len {
+                let tb = x.tbinds[(mt.tb_off + bj2) as usize];
+                if tb.n_len == tt.n_len && x_eq(x, tb.n_off, tb.n_len, tt.n_off, tt.n_len) {
+                    bound = true;
+                };
+                bj2 = bj2 + 1;
+            }
+            if !bound {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': tex_transform targets '"), STR_LEN("': tex_transform targets '"));
+                mb_span(x, tt.n_off, tt.n_len);
+                mb_lit(x, STR_PTR("' which is not bound in this material"), STR_LEN("' which is not bound in this material"));
+                diag_commit(x, STR_PTR("Sax3dUndeclaredTextureBinding"), STR_LEN("Sax3dUndeclaredTextureBinding"));
+            };
+            ti2 = ti2 + 1;
+        }
+        //  sampler param 
+        let si2: i32 = 0;
+        let ntx = x.ifaces[fi as usize].texs.len() as i32;
+        while si2 < ntx {
+            let e = x.ifaces[fi as usize].texs[si2 as usize];
+            let bound = false;
+            let bj3: i32 = 0;
+            while bj3 < mt.tb_len {
+                let tb = x.tbinds[(mt.tb_off + bj3) as usize];
+                if tb.n_len == e.n_len && x_eq(x, tb.n_off, tb.n_len, e.n_off, e.n_len) {
+                    bound = true;
+                };
+                bj3 = bj3 + 1;
+            }
+            if !bound {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("material '"), STR_LEN("material '"));
+                mb_span(x, mt.n_off, mt.n_len);
+                mb_lit(x, STR_PTR("': shader sampler param '"), STR_LEN("': shader sampler param '"));
+                mb_span(x, e.n_off, e.n_len);
+                mb_lit(x, STR_PTR("' left unbound"), STR_LEN("' left unbound"));
+                diag_commit(x, STR_PTR("Sax3dUnboundSamplerParam"), STR_LEN("Sax3dUnboundSamplerParam"));
+            };
+            si2 = si2 + 1;
+        }
+    }
+}
+
+// ---- scenes ----
+
+fn chk_scenes(x: &X) {
+    let nodes: Vec<NodeInfo> = Vec::new();
+    collect_nodes(x, &nodes);
+    let i: i32 = 0;
+    let nn = nodes.len() as i32;
+    while i < nn {
+        let ni = nodes[i as usize];
+        let n = x.nodes[ni.node as usize];
+        let j: i32 = 0;
+        while j < i {
+            let o = nodes[j as usize];
+            let on = x.nodes[o.node as usize];
+            if on.n_len == n.n_len && x_eq(x, on.n_off, on.n_len, n.n_off, n.n_len) {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                mb_span(x, n.n_off, n.n_len);
+                mb_lit(x, STR_PTR("' declared twice (node names are global)"), STR_LEN("' declared twice (node names are global)"));
+                diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+            };
+            j = j + 1;
+        }
+        if n.has_tr == 1 && n.mtx >= 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+            mb_span(x, n.n_off, n.n_len);
+            mb_lit(x, STR_PTR("': transform (TRS) and matrix are mutually exclusive"), STR_LEN("': transform (TRS) and matrix are mutually exclusive"));
+            diag_commit(x, STR_PTR("Sax3dTransformConflict"), STR_LEN("Sax3dTransformConflict"));
+        };
+        let mesh_idx: i32 = -1;
+        if n.mesh_len >= 0 {
+            mesh_idx = find_mesh(x, n.mesh_off, n.mesh_len);
+            if mesh_idx < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                mb_span(x, n.n_off, n.n_len);
+                mb_lit(x, STR_PTR("': mesh '"), STR_LEN("': mesh '"));
+                mb_span(x, n.mesh_off, n.mesh_len);
+                mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+                diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+            };
+        };
+        if n.mat_len >= 0 {
+            if find_material(x, n.mat_off, n.mat_len) < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                mb_span(x, n.n_off, n.n_len);
+                mb_lit(x, STR_PTR("': material '"), STR_LEN("': material '"));
+                mb_span(x, n.mat_off, n.mat_len);
+                mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+                diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+            };
+            if mesh_idx >= 0 {
+                let m = x.meshes[mesh_idx as usize];
+                if m.pr_len != 1 {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                    mb_span(x, n.n_off, n.n_len);
+                    mb_lit(x, STR_PTR("': material override requires the mesh to have exactly 1 primitive, mesh '"), STR_LEN("': material override requires the mesh to have exactly 1 primitive, mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("' has "), STR_LEN("' has "));
+                    mb_u64(x, m.pr_len as u64);
+                    diag_commit(x, STR_PTR("Sax3dMaterialOverrideAmbiguous"), STR_LEN("Sax3dMaterialOverrideAmbiguous"));
+                };
+            } else {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                mb_span(x, n.n_off, n.n_len);
+                mb_lit(x, STR_PTR("': material override without a mesh"), STR_LEN("': material override without a mesh"));
+                diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+            };
+        };
+        if n.skin_len >= 0 {
+            if find_skel(x, n.skin_off, n.skin_len) < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                mb_span(x, n.n_off, n.n_len);
+                mb_lit(x, STR_PTR("': skeleton '"), STR_LEN("': skeleton '"));
+                mb_span(x, n.skin_off, n.skin_len);
+                mb_lit(x, STR_PTR("' not declared"), STR_LEN("' not declared"));
+                diag_commit(x, STR_PTR("Sax3dUnresolvedReference"), STR_LEN("Sax3dUnresolvedReference"));
+            };
+            if mesh_idx >= 0 {
+                let m = x.meshes[mesh_idx as usize];
+                let has_j = false;
+                let has_w = false;
+                let ci: i32 = 0;
+                while ci < m.ch_len {
+                    let ch = x.chans[(m.ch_off + ci) as usize];
+                    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("joints0"), STR_LEN("joints0")) { has_j = true; };
+                    if x_eq_lit(x, ch.n_off, ch.n_len, STR_PTR("weights0"), STR_LEN("weights0")) { has_w = true; };
+                    ci = ci + 1;
+                }
+                if !has_j || !has_w {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                    mb_span(x, n.n_off, n.n_len);
+                    mb_lit(x, STR_PTR("': skin '"), STR_LEN("': skin '"));
+                    mb_span(x, n.skin_off, n.skin_len);
+                    mb_lit(x, STR_PTR("' but mesh '"), STR_LEN("' but mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("' lacks joints0/weights0 channels"), STR_LEN("' lacks joints0/weights0 channels"));
+                    diag_commit(x, STR_PTR("Sax3dSkinChannelMissing"), STR_LEN("Sax3dSkinChannelMissing"));
+                };
+            } else {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("node '"), STR_LEN("node '"));
+                mb_span(x, n.n_off, n.n_len);
+                mb_lit(x, STR_PTR("': skin without a mesh"), STR_LEN("': skin without a mesh"));
+                diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+            };
+        };
+        i = i + 1;
+    }
+}
+
+// ---- skeleton x scene ----
+
+struct PanRes {
+    found: i32,
+    has: i32,
+    off: i32,
+    len: i32,
+}
+
+fn node_parent_of(x: &X, nodes: &Vec<NodeInfo>, n_off: i32, n_len: i32) -> PanRes {
+    let i: i32 = 0;
+    let nn = nodes.len() as i32;
+    while i < nn {
+        let ni = nodes[i as usize];
+        let nd = x.nodes[ni.node as usize];
+        if nd.n_len == n_len && x_eq(x, nd.n_off, nd.n_len, n_off, n_len) {
+            return PanRes { found: 1, has: ni.has_parent, off: ni.p_off, len: ni.p_len };
+        };
+        i = i + 1;
+    }
+    return PanRes { found: 0, has: 0, off: 0, len: 0 };
+}
+
+fn chk_cross(x: &X) {
+    let nodes: Vec<NodeInfo> = Vec::new();
+    collect_nodes(x, &nodes);
+    let nn = nodes.len() as i32;
+    let si: i32 = 0;
+    let ns = x.skels.len() as i32;
+    while si < ns {
+        let sk = x.skels[si as usize];
+        let ji: i32 = 0;
+        while ji < sk.j_len {
+            let j = x.joints[(sk.j_off + ji) as usize];
+            ji = ji + 1;
+            //  node
+            let found = false;
+            let fi2: i32 = 0;
+            while fi2 < nn {
+                let ni = nodes[fi2 as usize];
+                let nd = x.nodes[ni.node as usize];
+                if nd.n_len == j.n_len && x_eq(x, nd.n_off, nd.n_len, j.n_off, j.n_len) {
+                    found = true;
+                };
+                fi2 = fi2 + 1;
+            }
+            if !found {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+                mb_span(x, sk.n_off, sk.n_len);
+                mb_lit(x, STR_PTR("': joint '"), STR_LEN("': joint '"));
+                mb_span(x, j.n_off, j.n_len);
+                mb_lit(x, STR_PTR("' has no same-named node in any scene"), STR_LEN("' has no same-named node in any scene"));
+                diag_commit(x, STR_PTR("Sax3dSkinJointNotNode"), STR_LEN("Sax3dSkinJointNotNode"));
+                continue;
+            };
+            let anc = node_parent_of(x, &nodes, j.n_off, j.n_len);
+            let nearest_found = false;
+            let nr_off: i32 = 0;
+            let nr_len: i32 = 0;
+            let guard: i32 = 0;
+            while anc.found == 1 {
+                guard = guard + 1;
+                if guard > nn + 1 {
+                    break;
+                };
+                if anc.has == 0 {
+                    break;
+                };
+                if find_joint(x, sk, anc.off, anc.len) >= 0 {
+                    nearest_found = true;
+                    nr_off = anc.off;
+                    nr_len = anc.len;
+                    break;
+                };
+                anc = node_parent_of(x, &nodes, anc.off, anc.len);
+            }
+            let ok = false;
+            if j.has_parent == 0 && !nearest_found {
+                ok = true;
+            };
+            if j.has_parent == 1 && nearest_found && j.p_len == nr_len && x_eq(x, j.p_off, j.p_len, nr_off, nr_len) {
+                ok = true;
+            };
+            if !ok {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("skeleton '"), STR_LEN("skeleton '"));
+                mb_span(x, sk.n_off, sk.n_len);
+                mb_lit(x, STR_PTR("': joint '"), STR_LEN("': joint '"));
+                mb_span(x, j.n_off, j.n_len);
+                mb_lit(x, STR_PTR("' declares parent '"), STR_LEN("' declares parent '"));
+                if j.has_parent == 1 {
+                    mb_span(x, j.p_off, j.p_len);
+                } else {
+                    mb_lit(x, STR_PTR("none"), STR_LEN("none"));
+                };
+                mb_lit(x, STR_PTR("' but nearest joint ancestor in scene is '"), STR_LEN("' but nearest joint ancestor in scene is '"));
+                if nearest_found {
+                    mb_span(x, nr_off, nr_len);
+                } else {
+                    mb_lit(x, STR_PTR("none"), STR_LEN("none"));
+                };
+                mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+                diag_commit(x, STR_PTR("Sax3dJointParentMismatch"), STR_LEN("Sax3dJointParentMismatch"));
+            };
+        }
+        si = si + 1;
+    }
+}
+
+// ---- clips ----
+
+fn chk_clips(x: &X) {
+    let nodes: Vec<NodeInfo> = Vec::new();
+    collect_nodes(x, &nodes);
+    let ci: i32 = 0;
+    let nc = x.clips.len() as i32;
+    while ci < nc {
+        let c = x.clips[ci as usize];
+        ci = ci + 1;
+        let si: i32 = 0;
+        while si < c.sa_len {
+            let s = x.samps[(c.sa_off + si) as usize];
+            let sj: i32 = 0;
+            while sj < si {
+                let o = x.samps[(c.sa_off + sj) as usize];
+                if o.n_len == s.n_len && x_eq(x, o.n_off, o.n_len, s.n_off, s.n_len) {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                    mb_span(x, c.n_off, c.n_len);
+                    mb_lit(x, STR_PTR("': sampler '"), STR_LEN("': sampler '"));
+                    mb_span(x, s.n_off, s.n_len);
+                    mb_lit(x, STR_PTR("' declared twice"), STR_LEN("' declared twice"));
+                    diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+                };
+                sj = sj + 1;
+            }
+            if !x_eq_lit(x, s.it_off, s.it_len, STR_PTR("f32"), STR_LEN("f32")) {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("' sampler '"), STR_LEN("' sampler '"));
+                mb_span(x, s.n_off, s.n_len);
+                mb_lit(x, STR_PTR("': input type '"), STR_LEN("': input type '"));
+                mb_span(x, s.it_off, s.it_len);
+                mb_lit(x, STR_PTR("' is not f32 (time axis)"), STR_LEN("' is not f32 (time axis)"));
+                diag_commit(x, STR_PTR("Sax3dChannelTypeMismatch"), STR_LEN("Sax3dChannelTypeMismatch"));
+            };
+            let cell = malloc(8);
+            if chk_ref_section(x, s.is_off, s.is_len, STR_PTR("clip sampler input"), STR_LEN("clip sampler input"), s.n_off, s.n_len, cell as ptr) {
+                let sl = sx_cell_u64(cell as ptr);
+                if s.icnt * 4 > sl {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                    mb_span(x, c.n_off, c.n_len);
+                    mb_lit(x, STR_PTR("' sampler '"), STR_LEN("' sampler '"));
+                    mb_span(x, s.n_off, s.n_len);
+                    mb_lit(x, STR_PTR("': input "), STR_LEN("': input "));
+                    mb_u64(x, s.icnt);
+                    mb_lit(x, STR_PTR(" x 4B = "), STR_LEN(" x 4B = "));
+                    mb_u64(x, s.icnt * 4);
+                    mb_lit(x, STR_PTR("B > section '"), STR_LEN("B > section '"));
+                    mb_span(x, s.is_off, s.is_len);
+                    mb_lit(x, STR_PTR("' ("), STR_LEN("' ("));
+                    mb_u64(x, sl);
+                    mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+                    diag_commit(x, STR_PTR("Sax3dSectionOverflow"), STR_LEN("Sax3dSectionOverflow"));
+                };
+                chk_use_section(x, s.is_off, s.is_len, kind_of(STR_PTR("anim_input"), STR_LEN("anim_input")), 4);
+            };
+            let oei = elem_find(x, s.ot_off, s.ot_len);
+            if oei < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("' sampler '"), STR_LEN("' sampler '"));
+                mb_span(x, s.n_off, s.n_len);
+                mb_lit(x, STR_PTR("': output type '"), STR_LEN("': output type '"));
+                mb_span(x, s.ot_off, s.ot_len);
+                mb_lit(x, STR_PTR("' not in sax3d.sai type table"), STR_LEN("' not in sax3d.sai type table"));
+                diag_commit(x, STR_PTR("Sax3dUnknownElemType"), STR_LEN("Sax3dUnknownElemType"));
+                free(cell);
+                si = si + 1;
+                continue;
+            };
+            if chk_ref_section(x, s.os_off, s.os_len, STR_PTR("clip sampler output"), STR_LEN("clip sampler output"), s.n_off, s.n_len, cell as ptr) {
+                let sl = sx_cell_u64(cell as ptr);
+                let esz = schg_elem_size(oei);
+                if s.ocnt * esz > sl {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                    mb_span(x, c.n_off, c.n_len);
+                    mb_lit(x, STR_PTR("' sampler '"), STR_LEN("' sampler '"));
+                    mb_span(x, s.n_off, s.n_len);
+                    mb_lit(x, STR_PTR("': output "), STR_LEN("': output "));
+                    mb_u64(x, s.ocnt);
+                    mb_lit(x, STR_PTR(" x "), STR_LEN(" x "));
+                    mb_u64(x, esz);
+                    mb_lit(x, STR_PTR("B = "), STR_LEN("B = "));
+                    mb_u64(x, s.ocnt * esz);
+                    mb_lit(x, STR_PTR("B > section '"), STR_LEN("B > section '"));
+                    mb_span(x, s.os_off, s.os_len);
+                    mb_lit(x, STR_PTR("' ("), STR_LEN("' ("));
+                    mb_u64(x, sl);
+                    mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+                    diag_commit(x, STR_PTR("Sax3dSectionOverflow"), STR_LEN("Sax3dSectionOverflow"));
+                };
+                chk_use_section(x, s.os_off, s.os_len, kind_of(STR_PTR("anim_output"), STR_LEN("anim_output")), schg_elem_align(oei) as u32);
+            };
+            free(cell);
+            let iok = x_eq_lit(x, s.ip_off, s.ip_len, STR_PTR("step"), STR_LEN("step")) || x_eq_lit(x, s.ip_off, s.ip_len, STR_PTR("linear"), STR_LEN("linear")) || x_eq_lit(x, s.ip_off, s.ip_len, STR_PTR("cubic-spline"), STR_LEN("cubic-spline"));
+            if !iok {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("' sampler '"), STR_LEN("' sampler '"));
+                mb_span(x, s.n_off, s.n_len);
+                mb_lit(x, STR_PTR("': interpolation '"), STR_LEN("': interpolation '"));
+                mb_span(x, s.ip_off, s.ip_len);
+                mb_lit(x, STR_PTR("' not in closed set"), STR_LEN("' not in closed set"));
+                diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+            };
+            si = si + 1;
+        }
+        // channels
+        let hi: i32 = 0;
+        while hi < c.ch_len {
+            let ch = x.cchs[(c.ch_off + hi) as usize];
+            hi = hi + 1;
+            // node: 
+            let node_idx: i32 = -1;
+            let ni2: i32 = 0;
+            let nn2 = nodes.len() as i32;
+            while ni2 < nn2 {
+                let ni = nodes[ni2 as usize];
+                let nd = x.nodes[ni.node as usize];
+                if nd.n_len == ch.nd_len && x_eq(x, nd.n_off, nd.n_len, ch.nd_off, ch.nd_len) {
+                    node_idx = ni.node;
+                };
+                ni2 = ni2 + 1;
+            }
+            if node_idx < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("': channel targets node '"), STR_LEN("': channel targets node '"));
+                mb_span(x, ch.nd_off, ch.nd_len);
+                mb_lit(x, STR_PTR("' which is not in any scene"), STR_LEN("' which is not in any scene"));
+                diag_commit(x, STR_PTR("Sax3dClipTargetMissing"), STR_LEN("Sax3dClipTargetMissing"));
+                continue;
+            };
+            // sampler: 
+            let smp_idx: i32 = -1;
+            let sj2: i32 = 0;
+            while sj2 < c.sa_len {
+                let s2 = x.samps[(c.sa_off + sj2) as usize];
+                if s2.n_len == ch.sa_len && x_eq(x, s2.n_off, s2.n_len, ch.sa_off, ch.sa_len) {
+                    smp_idx = c.sa_off + sj2;
+                };
+                sj2 = sj2 + 1;
+            }
+            if smp_idx < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("': channel references sampler '"), STR_LEN("': channel references sampler '"));
+                mb_span(x, ch.sa_off, ch.sa_len);
+                mb_lit(x, STR_PTR("' not declared in this clip"), STR_LEN("' not declared in this clip"));
+                diag_commit(x, STR_PTR("Sax3dClipSamplerMissing"), STR_LEN("Sax3dClipSamplerMissing"));
+                continue;
+            };
+            let s = x.samps[smp_idx as usize];
+            let nd = x.nodes[node_idx as usize];
+            let pok = x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("translation"), STR_LEN("translation")) || x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("rotation"), STR_LEN("rotation")) || x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("scale"), STR_LEN("scale")) || x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("weights"), STR_LEN("weights"));
+            if !pok {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("': channel path '"), STR_LEN("': channel path '"));
+                mb_span(x, ch.pa_off, ch.pa_len);
+                mb_lit(x, STR_PTR("' not in closed set"), STR_LEN("' not in closed set"));
+                diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+                continue;
+            };
+            // want_ty
+            let is_tr = x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("translation"), STR_LEN("translation"));
+            let is_sc = x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("scale"), STR_LEN("scale"));
+            let is_rot = x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("rotation"), STR_LEN("rotation"));
+            let is_w = x_eq_lit(x, ch.pa_off, ch.pa_len, STR_PTR("weights"), STR_LEN("weights"));
+            let want_ok = false;
+            let want_p: ptr = STR_PTR("f32");
+            let want_n: u64 = STR_LEN("f32");
+            if is_tr || is_sc {
+                want_p = STR_PTR("f32x3");
+                want_n = STR_LEN("f32x3");
+                want_ok = x_eq_lit(x, s.ot_off, s.ot_len, want_p, want_n);
+            } else {
+                if is_rot {
+                    want_p = STR_PTR("quat");
+                    want_n = STR_LEN("quat");
+                    want_ok = x_eq_lit(x, s.ot_off, s.ot_len, want_p, want_n) || x_eq_lit(x, s.ot_off, s.ot_len, STR_PTR("f32x4"), STR_LEN("f32x4"));
+                } else {
+                    want_ok = x_eq_lit(x, s.ot_off, s.ot_len, want_p, want_n);
+                };
+            };
+            if !want_ok {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("': channel path '"), STR_LEN("': channel path '"));
+                mb_span(x, ch.pa_off, ch.pa_len);
+                mb_lit(x, STR_PTR("' needs output type "), STR_LEN("' needs output type "));
+                mb_lit(x, want_p, want_n);
+                mb_lit(x, STR_PTR(", sampler '"), STR_LEN(", sampler '"));
+                mb_span(x, s.n_off, s.n_len);
+                mb_lit(x, STR_PTR("' has "), STR_LEN("' has "));
+                mb_span(x, s.ot_off, s.ot_len);
+                diag_commit(x, STR_PTR("Sax3dChannelTypeMismatch"), STR_LEN("Sax3dChannelTypeMismatch"));
+            };
+            let per_key: u64 = 1;
+            if is_w {
+                let midx: i32 = -1;
+                if nd.mesh_len >= 0 {
+                    midx = find_mesh(x, nd.mesh_off, nd.mesh_len);
+                };
+                if midx < 0 {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                    mb_span(x, c.n_off, c.n_len);
+                    mb_lit(x, STR_PTR("': weights channel targets node '"), STR_LEN("': weights channel targets node '"));
+                    mb_span(x, ch.nd_off, ch.nd_len);
+                    mb_lit(x, STR_PTR("' whose mesh has no morph targets"), STR_LEN("' whose mesh has no morph targets"));
+                    diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+                    continue;
+                };
+                let mm = x.meshes[midx as usize];
+                if mm.mo_len == 0 {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                    mb_span(x, c.n_off, c.n_len);
+                    mb_lit(x, STR_PTR("': weights channel targets node '"), STR_LEN("': weights channel targets node '"));
+                    mb_span(x, ch.nd_off, ch.nd_len);
+                    mb_lit(x, STR_PTR("' whose mesh has no morph targets"), STR_LEN("' whose mesh has no morph targets"));
+                    diag_commit(x, STR_PTR("Sax3dInvalidValue"), STR_LEN("Sax3dInvalidValue"));
+                    continue;
+                };
+                per_key = mm.mo_len as u64;
+            };
+            let factor: u64 = 1;
+            if x_eq_lit(x, s.ip_off, s.ip_len, STR_PTR("cubic-spline"), STR_LEN("cubic-spline")) {
+                factor = 3;
+            };
+            if s.ocnt != s.icnt * per_key * factor {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("clip '"), STR_LEN("clip '"));
+                mb_span(x, c.n_off, c.n_len);
+                mb_lit(x, STR_PTR("' sampler '"), STR_LEN("' sampler '"));
+                mb_span(x, s.n_off, s.n_len);
+                mb_lit(x, STR_PTR("': output count "), STR_LEN("': output count "));
+                mb_u64(x, s.ocnt);
+                mb_lit(x, STR_PTR(" != input "), STR_LEN(" != input "));
+                mb_u64(x, s.icnt);
+                mb_lit(x, STR_PTR(" x per-key "), STR_LEN(" x per-key "));
+                mb_u64(x, per_key);
+                mb_lit(x, STR_PTR(" x interp factor "), STR_LEN(" x interp factor "));
+                mb_u64(x, factor);
+                diag_commit(x, STR_PTR("Sax3dAnimCountMismatch"), STR_LEN("Sax3dAnimCountMismatch"));
+            };
+        }
+    }
+}
+
+// ---- input coverage ----
+
+fn chk_input_coverage(x: &X) {
+    let mi: i32 = 0;
+    let nm = x.meshes.len() as i32;
+    while mi < nm {
+        let m = x.meshes[mi as usize];
+        mi = mi + 1;
+        let seen_off: Vec<i32> = Vec::new();
+        let seen_len: Vec<i32> = Vec::new();
+        let pi: i32 = 0;
+        while pi < m.pr_len {
+            let pr = x.prims[(m.pr_off + pi) as usize];
+            pi = pi + 1;
+            let mtidx = find_material(x, pr.m_off, pr.m_len);
+            if mtidx < 0 {
+                continue;
+            };
+            let mt = x.mats[mtidx as usize];
+            let fi = iface_find(x, mt.sh_off, mt.sh_len);
+            if fi < 0 {
+                continue;
+            };
+            let dup = false;
+            let si3: i32 = 0;
+            while si3 < (seen_off.len() as i32) {
+                if seen_len[si3 as usize] == mt.sh_len && x_eq(x, seen_off[si3 as usize], mt.sh_len, mt.sh_off, mt.sh_len) {
+                    dup = true;
+                };
+                si3 = si3 + 1;
+            }
+            if dup {
+                continue;
+            };
+            seen_off.push(mt.sh_off);
+            seen_len.push(mt.sh_len);
+            //  inputs (  :  )
+            let ii: i32 = 0;
+            let n_in = x.ifaces[fi as usize].inputs.len() as i32;
+            while ii < n_in {
+                let e = x.ifaces[fi as usize].inputs[ii as usize];
+                ii = ii + 1;
+                // feeder:  
+                let feeder: i32 = -1;
+                let fi2: i32 = 0;
+                while fi2 < m.ch_len {
+                    let ch = x.chans[(m.ch_off + fi2) as usize];
+                    fi2 = fi2 + 1;
+                    if ch.custom == 1 {
+                        continue;
+                    };
+                    let mapped = sb_new();
+                    if !channel_input_name(x, ch.n_off, ch.n_len, &mapped) {
+                        continue;
+                    };
+                    if (mapped.len as i32) == e.n_len && sx_spans_eq(mapped.data as ptr, mapped.len, x_ptr(x, e.n_off), e.n_len as u64) {
+                        feeder = (m.ch_off + fi2 - 1);
+                    };
+                }
+                if feeder < 0 {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("': no channel feeds shader '"), STR_LEN("': no channel feeds shader '"));
+                    mb_span(x, mt.sh_off, mt.sh_len);
+                    mb_lit(x, STR_PTR("' input '"), STR_LEN("' input '"));
+                    mb_span(x, e.n_off, e.n_len);
+                    mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+                    diag_commit(x, STR_PTR("Sax3dInputNotFed"), STR_LEN("Sax3dInputNotFed"));
+                    continue;
+                };
+                let ch = x.chans[feeder as usize];
+                // canonical type
+                let want_p: ptr = STR_PTR("");
+                let want_n: u64 = 0;
+                let has_want = true;
+                if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("position"), STR_LEN("position")) || x_eq_lit(x, e.n_off, e.n_len, STR_PTR("normal"), STR_LEN("normal")) {
+                    want_p = STR_PTR("vec3");
+                    want_n = STR_LEN("vec3");
+                } else {
+                    if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("tangent"), STR_LEN("tangent")) {
+                        want_p = STR_PTR("vec4");
+                        want_n = STR_LEN("vec4");
+                    } else {
+                        if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("uv"), STR_LEN("uv")) || (e.n_len >= 2 && x_eq_lit(x, e.n_off, 2, STR_PTR("uv"), STR_LEN("uv"))) {
+                            want_p = STR_PTR("vec2");
+                            want_n = STR_LEN("vec2");
+                        } else {
+                            if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("color"), STR_LEN("color")) {
+                                want_p = STR_PTR("vec4");
+                                want_n = STR_LEN("vec4");
+                            } else {
+                                if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("joints"), STR_LEN("joints")) {
+                                    want_p = STR_PTR("uvec4");
+                                    want_n = STR_LEN("uvec4");
+                                } else {
+                                    if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("weights"), STR_LEN("weights")) {
+                                        want_p = STR_PTR("vec4");
+                                        want_n = STR_LEN("vec4");
+                                    } else {
+                                        has_want = false;
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+                if has_want {
+                    if !(e.t_len as u64 == want_n && sx_spans_eq(x_ptr(x, e.t_off), e.t_len as u64, want_p, want_n)) {
+                        mb_clear(x);
+                        mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                        mb_span(x, m.n_off, m.n_len);
+                        mb_lit(x, STR_PTR("': shader '"), STR_LEN("': shader '"));
+                        mb_span(x, mt.sh_off, mt.sh_len);
+                        mb_lit(x, STR_PTR("' input '"), STR_LEN("' input '"));
+                        mb_span(x, e.n_off, e.n_len);
+                        mb_lit(x, STR_PTR("' has type "), STR_LEN("' has type "));
+                        mb_span(x, e.t_off, e.t_len);
+                        mb_lit(x, STR_PTR(", format canonical type is "), STR_LEN(", format canonical type is "));
+                        mb_lit(x, want_p, want_n);
+                        diag_commit(x, STR_PTR("Sax3dChannelTypeMismatch"), STR_LEN("Sax3dChannelTypeMismatch"));
+                    };
+                };
+                // compat
+                let ok = false;
+                if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("position"), STR_LEN("position")) || x_eq_lit(x, e.n_off, e.n_len, STR_PTR("normal"), STR_LEN("normal")) {
+                    ok = x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x3"), STR_LEN("f32x3"));
+                } else {
+                    if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("tangent"), STR_LEN("tangent")) || x_eq_lit(x, e.n_off, e.n_len, STR_PTR("weights"), STR_LEN("weights")) {
+                        ok = x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x4"), STR_LEN("f32x4"));
+                    } else {
+                        if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("color"), STR_LEN("color")) {
+                            ok = x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x4"), STR_LEN("f32x4")) || x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("u8x4"), STR_LEN("u8x4"));
+                        } else {
+                            if x_eq_lit(x, e.n_off, e.n_len, STR_PTR("joints"), STR_LEN("joints")) {
+                                ok = x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("u16x4"), STR_LEN("u16x4"));
+                            } else {
+                                ok = x_eq_lit(x, ch.t_off, ch.t_len, STR_PTR("f32x2"), STR_LEN("f32x2"));
+                            };
+                        };
+                    };
+                };
+                if !ok {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("mesh '"), STR_LEN("mesh '"));
+                    mb_span(x, m.n_off, m.n_len);
+                    mb_lit(x, STR_PTR("': channel '"), STR_LEN("': channel '"));
+                    mb_span(x, ch.n_off, ch.n_len);
+                    mb_lit(x, STR_PTR("' type "), STR_LEN("' type "));
+                    mb_span(x, ch.t_off, ch.t_len);
+                    mb_lit(x, STR_PTR(" cannot feed shader input '"), STR_LEN(" cannot feed shader input '"));
+                    mb_span(x, e.n_off, e.n_len);
+                    mb_lit(x, STR_PTR(": "), STR_LEN(": "));
+                    mb_span(x, e.t_off, e.t_len);
+                    mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+                    diag_commit(x, STR_PTR("Sax3dChannelTypeMismatch"), STR_LEN("Sax3dChannelTypeMismatch"));
+                };
+            }
+        }
+    }
+}
+
+// ---- check  ----
+
+fn check_asset(x: &X) {
+    if x.a_has_binary == 1 {
+        // Zig builds a fresh section map per check run; the port's
+        // registry is x.sec_lens, so rebuild it from scratch or a
+        // second check_asset on the same X (pack post-transform)
+        // reports every section as a duplicate.
+        x.sec_lens = Vec::new();
+        let si: i32 = 0;
+        let nsec = x.secs.len() as i32;
+        while si < nsec {
+            let s = x.secs[si as usize];
+            if xmap_has(x, 0, s.n_off, s.n_len) {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("section '"), STR_LEN("section '"));
+                mb_span(x, s.n_off, s.n_len);
+                mb_lit(x, STR_PTR("' declared twice in binary block"), STR_LEN("' declared twice in binary block"));
+                diag_commit(x, STR_PTR("Sax3dDuplicateName"), STR_LEN("Sax3dDuplicateName"));
+            };
+            xmap_put(x, 0, s.n_off, s.n_len, s.len as i64, 0);
+            si = si + 1;
+        }
+    };
+    dup_check_list(x, x.shaders.len() as i32, 0, STR_PTR("shader"), STR_LEN("shader"));
+    dup_check_list(x, x.meshes.len() as i32, 1, STR_PTR("mesh"), STR_LEN("mesh"));
+    dup_check_list(x, x.skels.len() as i32, 2, STR_PTR("skeleton"), STR_LEN("skeleton"));
+    dup_check_list(x, x.imgs.len() as i32, 3, STR_PTR("image"), STR_LEN("image"));
+    dup_check_list(x, x.texs.len() as i32, 4, STR_PTR("texture"), STR_LEN("texture"));
+    dup_check_list(x, x.mats.len() as i32, 5, STR_PTR("material"), STR_LEN("material"));
+    dup_check_list(x, x.scenes.len() as i32, 6, STR_PTR("scene"), STR_LEN("scene"));
+    dup_check_list(x, x.clips.len() as i32, 7, STR_PTR("clip"), STR_LEN("clip"));
+    chk_meshes(x);
+    chk_skeletons(x);
+    chk_images(x);
+    chk_textures(x);
+    chk_materials(x);
+    chk_scenes(x);
+    chk_cross(x);
+    chk_clips(x);
+    chk_input_coverage(x);
+    if x.a_has_binary == 1 {
+        let si: i32 = 0;
+        let nsec = x.secs.len() as i32;
+        while si < nsec {
+            let s = x.secs[si as usize];
+            if !xmap_has(x, 1, s.n_off, s.n_len) {
+                xmap_put(x, 1, s.n_off, s.n_len, kind_of(STR_PTR("blob"), STR_LEN("blob")) as i64, 1);
+            };
+            si = si + 1;
+        }
+    };
+}

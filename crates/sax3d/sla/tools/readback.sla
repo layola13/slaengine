@@ -1,0 +1,642 @@
+// readback.sla - verifier + digest printer for sax3dc binaries; the SLA
+// port of tools/readback.zig. Split mode re-checks the text asset and
+// verifies a .saxb3d against the canonical layout rebuilt from it;
+// packed mode parses the embedded assembly in compiled mode and
+// verifies a .sax3dp against the layout planned from its own table.
+// Digests go to stdout, diagnostics and the verdict to stderr.
+// Mirrors the Zig control flow and diagnostic texts one-to-one.
+
+@import "../src/parse.sla"
+@import "../src/check.sla"
+@import "../src/binio.sla"
+@import "../src/layout.sla"
+@import "sa_std/net.sai"
+
+extern "C" {
+    fn malloc(size: usize) -> *u8;
+    fn free(p: *u8);
+}
+
+fn rb_diag_lit(x: &X, code_p: ptr, code_n: u64, msg_p: ptr, msg_n: u64) {
+    mb_clear(x);
+    mb_lit(x, msg_p, msg_n);
+    diag_commit(x, code_p, code_n);
+}
+
+fn rb_diag_suffix(x: &X, code_p: ptr, code_n: u64, suf_p: ptr, suf_n: u64) {
+    mb_lit(x, suf_p, suf_n);
+    diag_commit(x, code_p, code_n);
+}
+
+fn rb_read(x: &X, pp: ptr, plen: u64, out_data: &SBuf, out_len: ptr) -> bool {
+    let cell = malloc(8);
+    let okf = sx_read_file(pp, plen, out_data, cell as ptr);
+    if okf == false {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("cannot read '"), STR_LEN("cannot read '"));
+        sb_push_span(&x.msg, pp, plen);
+        mb_lit(x, STR_PTR("': "), STR_LEN("': "));
+        sx_io_err_name(sx_cell_u64(cell as ptr), &x.msg);
+        diag_commit(x, STR_PTR("Sax3dIoError"), STR_LEN("Sax3dIoError"));
+        free(cell);
+        return false;
+    };
+    PTR_WRITE_U64(out_len, out_data.len);
+    free(cell);
+    return true;
+}
+
+fn rb_flush(out: &SBuf) {
+    let h = sa_io_stdout();
+    sa_io_write_all(h, out.data as ptr, out.len);
+}
+
+fn rb_verdict(x: &X, out: &SBuf) -> i32 {
+    rb_flush(out);
+    if diag_count(x) > 0 {
+        diag_print_all(x);
+        let vb = sb_new();
+        sb_push_lit(&vb, STR_PTR("READBACK FAILED: "), STR_LEN("READBACK FAILED: "));
+        sb_push_i64(&vb, diag_count(x) as i64);
+        sb_push_lit(&vb, STR_PTR(" error(s)\n"), STR_LEN(" error(s)\n"));
+        sx_err_buf(&vb);
+        return 1;
+    };
+    sx_err_lit(STR_PTR("READBACK OK\n"), STR_LEN("READBACK OK\n"));
+    return 0;
+}
+
+fn rb_hex_into(out: &SBuf, data: ptr, len: u64) {
+    let cell = malloc(72);
+    let lcell = malloc(8);
+    sa_std_net_sha256_hex(data, len, cell as ptr, 64, lcell as ptr);
+    let hlen = PTR_READ_U64(lcell as ptr);
+    sb_push_span(out, cell as ptr, hlen as u64);
+    free(cell);
+    free(lcell);
+}
+
+fn rb_digest_section(x: &X, out: &SBuf, n_off: i32, n_len: i32, kind: i32, data: ptr, len: u64) {
+    sb_push_lit(out, STR_PTR("digest-section "), STR_LEN("digest-section "));
+    sb_push_span(out, x_ptr(x, n_off), n_len as u64);
+    sb_push_byte(out, 32);
+    let kn = sb_new();
+    kind_name_into(kind, &kn);
+    sb_push_span(out, kn.data as ptr, kn.len);
+    sb_push_byte(out, 32);
+    sb_push_u64(out, len);
+    sb_push_byte(out, 32);
+    rb_hex_into(out, data, len);
+    sb_push_byte(out, 10);
+}
+
+fn rb_digest_decl(out: &SBuf, kind_lit: ptr, kind_len: u64, idx: i32, nptr: ptr, nlen: i32) {
+    sb_push_lit(out, STR_PTR("digest-decl "), STR_LEN("digest-decl "));
+    sb_push_lit(out, kind_lit, kind_len);
+    sb_push_byte(out, 32);
+    sb_push_u64(out, idx as u64);
+    sb_push_byte(out, 32);
+    sb_push_span(out, nptr, nlen as u64);
+    sb_push_byte(out, 10);
+}
+
+fn rb_digest_decls(x: &X, out: &SBuf) {
+    let i: i32 = 0;
+    while i < (x.shaders.len() as i32) {
+        let d = x.shaders[i as u64];
+        rb_digest_decl(out, STR_PTR("shader"), STR_LEN("shader"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+    i = 0;
+    while i < (x.meshes.len() as i32) {
+        let d = x.meshes[i as u64];
+        rb_digest_decl(out, STR_PTR("mesh"), STR_LEN("mesh"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+    i = 0;
+    while i < (x.skels.len() as i32) {
+        let d = x.skels[i as u64];
+        rb_digest_decl(out, STR_PTR("skeleton"), STR_LEN("skeleton"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+    i = 0;
+    while i < (x.imgs.len() as i32) {
+        let d = x.imgs[i as u64];
+        rb_digest_decl(out, STR_PTR("image"), STR_LEN("image"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+    i = 0;
+    while i < (x.texs.len() as i32) {
+        let d = x.texs[i as u64];
+        rb_digest_decl(out, STR_PTR("texture"), STR_LEN("texture"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+    i = 0;
+    while i < (x.mats.len() as i32) {
+        let d = x.mats[i as u64];
+        rb_digest_decl(out, STR_PTR("material"), STR_LEN("material"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+    let nodes: Vec<NodeInfo> = Vec::new();
+    collect_nodes(x, &nodes);
+    i = 0;
+    while i < (nodes.len() as i32) {
+        let ni = nodes[i as u64];
+        let nd = x.nodes[ni.node as u64];
+        rb_digest_decl(out, STR_PTR("node"), STR_LEN("node"), i, x_ptr(x, nd.n_off), nd.n_len);
+        i = i + 1;
+    }
+    i = 0;
+    while i < (x.clips.len() as i32) {
+        let d = x.clips[i as u64];
+        rb_digest_decl(out, STR_PTR("clip"), STR_LEN("clip"), i, x_ptr(x, d.n_off), d.n_len);
+        i = i + 1;
+    }
+}
+
+// verifySections: header fields, canonical name table, per-record
+// name/kind/offset/len/name_off against the plan in x.plans.
+fn rb_verify(x: &X, base: i32, flen: i32, hdr: &BinHdr) {
+    if hdr.count != (x.plans.len() as i32) {
+        let nplans = x.plans.len();
+        mb_clear(x);
+        mb_lit(x, STR_PTR("header section_count "), STR_LEN("header section_count "));
+        mb_i64(x, hdr.count as i64);
+        mb_lit(x, STR_PTR(" != expected "), STR_LEN(" != expected "));
+        mb_u64(x, nplans);
+        diag_commit(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"));
+        return;
+    };
+    if hdr.nt_off != x.lay_end {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("header nametab_off "), STR_LEN("header nametab_off "));
+        mb_i64(x, hdr.nt_off as i64);
+        mb_lit(x, STR_PTR(" != payload end "), STR_LEN(" != payload end "));
+        mb_i64(x, x.lay_end as i64);
+        diag_commit(x, STR_PTR("Sax3dNameTableMismatch"), STR_LEN("Sax3dNameTableMismatch"));
+    };
+    if hdr.nt_len != (x.nt_blob.len as i32) {
+        let ntl = x.nt_blob.len;
+        mb_clear(x);
+        mb_lit(x, STR_PTR("header nametab_len "), STR_LEN("header nametab_len "));
+        mb_i64(x, hdr.nt_len as i64);
+        mb_lit(x, STR_PTR(" != canonical table "), STR_LEN(" != canonical table "));
+        mb_u64(x, ntl);
+        mb_lit(x, STR_PTR("B"), STR_LEN("B"));
+        diag_commit(x, STR_PTR("Sax3dNameTableMismatch"), STR_LEN("Sax3dNameTableMismatch"));
+    };
+    let blob_ok = bn_name_blob_ok(x, hdr, flen);
+    let bytes_eq = false;
+    if blob_ok && (hdr.nt_len == (x.nt_blob.len as i32)) {
+        bytes_eq = true;
+        let boff = base + hdr.nt_off;
+        let bi: i32 = 0;
+        while bi < hdr.nt_len {
+            let nb: u8 = PTR_BYTE_AT(x.nt_blob.data as ptr, bi as u64);
+            if x_byte(x, boff + bi) != nb { bytes_eq = false; };
+            bi = bi + 1;
+        }
+    };
+    if blob_ok && (bytes_eq == false) {
+        rb_diag_lit(x, STR_PTR("Sax3dNameTableMismatch"), STR_LEN("Sax3dNameTableMismatch"), STR_PTR("name table bytes differ from canonical rebuild"), STR_LEN("name table bytes differ from canonical rebuild"));
+    };
+    let i: i32 = 0;
+    while i < hdr.count {
+        let plan = x.plans[i as u64];
+        let rec = bn_read_rec(x, base, i);
+        let nm = bn_name_at(x, base, flen, hdr, rec.name_off as i32);
+        if nm.len < 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section "), STR_LEN("section "));
+            mb_i64(x, i as i64);
+            mb_lit(x, STR_PTR(": name_off "), STR_LEN(": name_off "));
+            mb_i64(x, rec.name_off);
+            mb_lit(x, STR_PTR(" unresolvable"), STR_LEN(" unresolvable"));
+            diag_commit(x, STR_PTR("Sax3dNameTableMismatch"), STR_LEN("Sax3dNameTableMismatch"));
+            i = i + 1;
+            continue;
+        };
+        if x_eq(x, plan.n_off, plan.n_len, nm.off, nm.len) == false {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section "), STR_LEN("section "));
+            mb_i64(x, i as i64);
+            mb_lit(x, STR_PTR(": name '"), STR_LEN(": name '"));
+            mb_span(x, nm.off, nm.len);
+            mb_lit(x, STR_PTR("' != expected '"), STR_LEN("' != expected '"));
+            mb_span(x, plan.n_off, plan.n_len);
+            mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+            diag_commit(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"));
+        };
+        if rec.kind != (plan.kind as i64) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section '"), STR_LEN("section '"));
+            mb_span(x, plan.n_off, plan.n_len);
+            mb_lit(x, STR_PTR("': kind "), STR_LEN("': kind "));
+            mb_i64(x, rec.kind);
+            mb_lit(x, STR_PTR(" != expected "), STR_LEN(" != expected "));
+            mb_i64(x, plan.kind as i64);
+            mb_lit(x, STR_PTR(" ("), STR_LEN(" ("));
+            let kn = sb_new();
+            kind_name_into(plan.kind, &kn);
+            mb_lit(x, kn.data as ptr, kn.len);
+            mb_lit(x, STR_PTR(")"), STR_LEN(")"));
+            diag_commit(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"));
+        };
+        if (rec.offset != (plan.offset as i64)) || (rec.len != (plan.len as i64)) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section '"), STR_LEN("section '"));
+            mb_span(x, plan.n_off, plan.n_len);
+            mb_lit(x, STR_PTR("': (offset "), STR_LEN("': (offset "));
+            mb_i64(x, rec.offset);
+            mb_lit(x, STR_PTR(", len "), STR_LEN(", len "));
+            mb_i64(x, rec.len);
+            mb_lit(x, STR_PTR(") != planned ("), STR_LEN(") != planned ("));
+            mb_i64(x, plan.offset as i64);
+            mb_lit(x, STR_PTR(", "), STR_LEN(", "));
+            mb_i64(x, plan.len as i64);
+            mb_lit(x, STR_PTR(")"), STR_LEN(")"));
+            diag_commit(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"));
+        };
+        if (rec.offset + rec.len) > (flen as i64) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section '"), STR_LEN("section '"));
+            mb_span(x, plan.n_off, plan.n_len);
+            mb_lit(x, STR_PTR("' overruns file ("), STR_LEN("' overruns file ("));
+            mb_i64(x, flen as i64);
+            mb_lit(x, STR_PTR("B)"), STR_LEN("B)"));
+            diag_commit(x, STR_PTR("Sax3dTruncatedFile"), STR_LEN("Sax3dTruncatedFile"));
+        };
+        let idx = nt_index_of(x, plan.n_off, plan.n_len);
+        let want = x.lay_end + nt_off_in_tab(x, idx);
+        if rec.name_off != (want as i64) {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section '"), STR_LEN("section '"));
+            mb_span(x, plan.n_off, plan.n_len);
+            mb_lit(x, STR_PTR("': name_off "), STR_LEN("': name_off "));
+            mb_i64(x, rec.name_off);
+            mb_lit(x, STR_PTR(" != canonical "), STR_LEN(" != canonical "));
+            mb_i64(x, want as i64);
+            diag_commit(x, STR_PTR("Sax3dNameTableMismatch"), STR_LEN("Sax3dNameTableMismatch"));
+        };
+        i = i + 1;
+    }
+}
+
+fn rb_parse_check(x: &X, src_off: i32, src_len: u64) -> bool {
+    let pp = p_new(0);
+    parse_asset(x, &pp, src_off, src_len);
+    if pp.fail {
+        return false;
+    };
+    check_asset(x);
+    return diag_count(x) == 0;
+}
+
+fn rb_mode_split(x: &X, out: &SBuf, tp: ptr, tl: u64, bp: ptr, bl: u64) -> i32 {
+    let tdata = sb_new();
+    let tcell = malloc(8);
+    let tok = rb_read(x, tp, tl, &tdata, tcell as ptr);
+    if tok == false {
+        free(tcell);
+        return rb_verdict(x, out);
+    };
+    let tlen = PTR_READ_U64(tcell as ptr);
+    free(tcell);
+    let toff = x_intern(x, tdata.data as ptr, tlen as u64);
+    let assets_ok = rb_parse_check(x, toff, tlen as u64);
+    if assets_ok == false {
+        return rb_verdict(x, out);
+    };
+    let fdata = sb_new();
+    let fcell = malloc(8);
+    let fok = rb_read(x, bp, bl, &fdata, fcell as ptr);
+    if fok == false {
+        free(fcell);
+        return rb_verdict(x, out);
+    };
+    let flen64 = PTR_READ_U64(fcell as ptr);
+    free(fcell);
+    let flen = flen64 as i32;
+    let foff = x_intern(x, fdata.data as ptr, flen64 as u64);
+    let hdr = bn_parse_header(x, foff, flen);
+    if hdr.ok == 0 {
+        return rb_verdict(x, out);
+    };
+    if bn_table_fits(flen, hdr.count) == false {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("file is "), STR_LEN("file is "));
+        mb_i64(x, flen as i64);
+        mb_lit(x, STR_PTR("B, section table of "), STR_LEN("B, section table of "));
+        mb_i64(x, hdr.count as i64);
+        mb_lit(x, STR_PTR(" records does not fit"), STR_LEN(" records does not fit"));
+        diag_commit(x, STR_PTR("Sax3dTruncatedFile"), STR_LEN("Sax3dTruncatedFile"));
+        return rb_verdict(x, out);
+    };
+    if hdr.form != 0 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+        sb_push_span(&x.msg, bp, bl);
+        rb_diag_suffix(x, STR_PTR("Sax3dBadMagic"), STR_LEN("Sax3dBadMagic"), STR_PTR("' is not a split-form binary"), STR_LEN("' is not a split-form binary"));
+        return rb_verdict(x, out);
+    };
+    lay_plan(x, -1);
+    nt_build_sections(x);
+    rb_verify(x, foff, flen, &hdr);
+    if diag_count(x) > 0 {
+        return rb_verdict(x, out);
+    };
+    let fbp = x_ptr(x, foff);
+    let i: i32 = 0;
+    while i < (x.plans.len() as i32) {
+        let plan = x.plans[i as u64];
+        rb_digest_section(x, out, plan.n_off, plan.n_len, plan.kind, sx_ptr_add(fbp, plan.offset as u64), plan.len as u64);
+        i = i + 1;
+    }
+    // path-kind images: pseudo-sections in declaration order
+    let slash = sx_last_index_of_byte(tp, tl, 47);
+    let dir = sb_new();
+    if slash < 0 {
+        sb_push_lit(&dir, STR_PTR("."), STR_LEN("."));
+    } else {
+        sb_push_span(&dir, tp, slash as u64);
+    };
+    i = 0;
+    while i < (x.imgs.len() as i32) {
+        let im = x.imgs[i as u64];
+        if im.kind == 1 {
+            let full = sb_new();
+            sb_push_span(&full, dir.data as ptr, dir.len);
+            sb_push_byte(&full, 47);
+            sb_push_span(&full, x_ptr(x, im.s_off), im.s_len as u64);
+            let idata = sb_new();
+            let icell = malloc(8);
+            let iok = sx_read_file(full.data as ptr, full.len, &idata, icell as ptr);
+            if iok == false {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("cannot read image file '"), STR_LEN("cannot read image file '"));
+                mb_lit(x, full.data as ptr, full.len);
+                mb_lit(x, STR_PTR("': "), STR_LEN("': "));
+                sx_io_err_name(sx_cell_u64(icell as ptr), &x.msg);
+                diag_commit(x, STR_PTR("Sax3dIoError"), STR_LEN("Sax3dIoError"));
+                free(icell);
+                return rb_verdict(x, out);
+            };
+            let ilen = idata.len;
+            free(icell);
+            let kind: i32 = 7;
+            if (im.f_len >= 4) && x_eq_lit(x, im.f_off, 4, STR_PTR("raw-"), STR_LEN("raw-")) { kind = 3; };
+            rb_digest_section(x, out, im.n_off, im.n_len, kind, idata.data as ptr, ilen as u64);
+        };
+        i = i + 1;
+    }
+    rb_digest_decls(x, out);
+    return rb_verdict(x, out);
+}
+
+fn rb_plan_records(x: &X, rn_off: &Vec<i32>, rn_len: &Vec<i32>, rlens: &Vec<i64>, rcount: i32) {
+    x.plans = Vec::new();
+    let cell = malloc(16);
+    let base = (schg_sax3dbinheader_size() as i64) + ((rcount as i64) * (schg_sax3dsectionrec_size() as i64));
+    let cur = base;
+    let i: i32 = 0;
+    while i < rcount {
+        let rno = rn_off[i as u64];
+        let rnl = rn_len[i as u64];
+        let kind: i32 = 7;
+        let align: i32 = 1;
+        if xmap_get(x, 1, rno, rnl, 0, cell as ptr) { kind = sx_cell_u64(cell as ptr) as i32; };
+        if xmap_get(x, 1, rno, rnl, 1, cell as ptr) { align = sx_cell_u64(cell as ptr) as i32; };
+        x.plans.push(PlanRec { n_off: rno, n_len: rnl, kind: kind, align: align, len: rlens[i as u64] as u64, offset: cur as u64 });
+        cur = cur + rlens[i as u64];
+        i = i + 1;
+    }
+    x.lay_end = cur as i32;
+    free(cell);
+}
+
+fn rb_mode_packed(x: &X, out: &SBuf, bp: ptr, bl: u64) -> i32 {
+    let fdata = sb_new();
+    let fcell = malloc(8);
+    let fok = rb_read(x, bp, bl, &fdata, fcell as ptr);
+    if fok == false {
+        free(fcell);
+        return rb_verdict(x, out);
+    };
+    let flen64 = PTR_READ_U64(fcell as ptr);
+    free(fcell);
+    let flen = flen64 as i32;
+    let foff = x_intern(x, fdata.data as ptr, flen64 as u64);
+    let hdr = bn_parse_header(x, foff, flen);
+    if hdr.ok == 0 {
+        return rb_verdict(x, out);
+    };
+    if bn_table_fits(flen, hdr.count) == false {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("file is "), STR_LEN("file is "));
+        mb_i64(x, flen as i64);
+        mb_lit(x, STR_PTR("B, section table of "), STR_LEN("B, section table of "));
+        mb_i64(x, hdr.count as i64);
+        mb_lit(x, STR_PTR(" records does not fit"), STR_LEN(" records does not fit"));
+        diag_commit(x, STR_PTR("Sax3dTruncatedFile"), STR_LEN("Sax3dTruncatedFile"));
+        return rb_verdict(x, out);
+    };
+    if hdr.form != 1 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+        sb_push_span(&x.msg, bp, bl);
+        rb_diag_suffix(x, STR_PTR("Sax3dBadMagic"), STR_LEN("Sax3dBadMagic"), STR_PTR("' is not a packed-form binary"), STR_LEN("' is not a packed-form binary"));
+        return rb_verdict(x, out);
+    };
+    let blob_ok = bn_name_blob_ok(x, &hdr, flen);
+    if blob_ok == false {
+        return rb_verdict(x, out);
+    };
+    // split the name blob into spans for the compiled-mode parser;
+    // record names are collected per-record below (the blob also
+    // carries declaration names, which are not section names)
+    let pn_off: Vec<i32> = Vec::new();
+    let pn_len: Vec<i32> = Vec::new();
+    let start = foff + hdr.nt_off;
+    let pos = start;
+    let blob_end = start + hdr.nt_len;
+    while pos < blob_end {
+        let z = pos;
+        while (z < blob_end) && (x_byte(x, z) != 0) { z = z + 1; }
+        pn_off.push(pos);
+        pn_len.push(z - pos);
+        pos = z + 1;
+    }
+    // read records; an unresolvable name ends the run at once
+    let rn_off: Vec<i32> = Vec::new();
+    let rn_len: Vec<i32> = Vec::new();
+    let rlens: Vec<i64> = Vec::new();
+    let asm_row: i32 = -1;
+    let asm_off: i64 = 0;
+    let asm_len: i64 = 0;
+    let i: i32 = 0;
+    while i < hdr.count {
+        let rec = bn_read_rec(x, foff, i);
+        let nm = bn_name_at(x, foff, flen, &hdr, rec.name_off as i32);
+        if nm.len < 0 {
+            mb_clear(x);
+            mb_lit(x, STR_PTR("section "), STR_LEN("section "));
+            mb_i64(x, i as i64);
+            mb_lit(x, STR_PTR(": name_off "), STR_LEN(": name_off "));
+            mb_i64(x, rec.name_off);
+            mb_lit(x, STR_PTR(" unresolvable"), STR_LEN(" unresolvable"));
+            diag_commit(x, STR_PTR("Sax3dNameTableMismatch"), STR_LEN("Sax3dNameTableMismatch"));
+            return rb_verdict(x, out);
+        };
+        rn_off.push(nm.off);
+        rn_len.push(nm.len);
+        rlens.push(rec.len);
+        if rec.kind == 8 {
+            if (rec.offset + rec.len) > (flen as i64) {
+                rb_diag_lit(x, STR_PTR("Sax3dTruncatedFile"), STR_LEN("Sax3dTruncatedFile"), STR_PTR("assembly section overruns file"), STR_LEN("assembly section overruns file"));
+                return rb_verdict(x, out);
+            };
+            asm_row = i;
+            asm_off = rec.offset;
+            asm_len = rec.len;
+        };
+        i = i + 1;
+    }
+    if asm_row < 0 {
+        rb_diag_lit(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"), STR_PTR("packed file has no assembly section"), STR_LEN("packed file has no assembly section"));
+        return rb_verdict(x, out);
+    };
+    // parse the embedded assembly in compiled mode
+    let pp = p_new(1);
+    pp.names_off = pn_off;
+    pp.names_len = pn_len;
+    parse_asset(x, &pp, foff + (asm_off as i32), asm_len as u64);
+    if pp.fail {
+        return rb_verdict(x, out);
+    };
+    // backfill binary-block section payload lengths from the table
+    if x.a_has_binary != 0 {
+        let si: i32 = 0;
+        while si < (x.secs.len() as i32) {
+            let s = x.secs[si as u64];
+            let found: i64 = -1;
+            let ri: i32 = 0;
+            while ri < (rn_off.len() as i32) {
+                if x_eq(x, rn_off[ri as u64], rn_len[ri as u64], s.n_off, s.n_len) { found = rlens[ri as u64]; };
+                ri = ri + 1;
+            }
+            if found < 0 {
+                mb_clear(x);
+                mb_lit(x, STR_PTR("assembly lists section '"), STR_LEN("assembly lists section '"));
+                mb_span(x, s.n_off, s.n_len);
+                rb_diag_suffix(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"), STR_PTR("' absent from section table"), STR_LEN("' absent from section table"));
+                return rb_verdict(x, out);
+            };
+            x.secs[si as u64] = SecD { n_off: s.n_off, n_len: s.n_len, len: found as u64 };
+            si = si + 1;
+        }
+        let ri2: i32 = 0;
+        while ri2 < (rn_off.len() as i32) {
+            let ro = rn_off[ri2 as u64];
+            let rl = rn_len[ri2 as u64];
+            if x_eq_lit(x, ro, rl, STR_PTR("assembly"), STR_LEN("assembly")) == false {
+                let listed = false;
+                let sj: i32 = 0;
+                while sj < (x.secs.len() as i32) {
+                    let s2 = x.secs[sj as u64];
+                    if x_eq(x, ro, rl, s2.n_off, s2.n_len) { listed = true; };
+                    sj = sj + 1;
+                }
+                if listed == false {
+                    mb_clear(x);
+                    mb_lit(x, STR_PTR("section table carries '"), STR_LEN("section table carries '"));
+                    mb_span(x, ro, rl);
+                    rb_diag_suffix(x, STR_PTR("Sax3dSectionMismatch"), STR_LEN("Sax3dSectionMismatch"), STR_PTR("' not listed in assembly"), STR_LEN("' not listed in assembly"));
+                    return rb_verdict(x, out);
+                };
+            };
+            ri2 = ri2 + 1;
+        }
+    };
+    check_asset(x);
+    if diag_count(x) > 0 {
+        return rb_verdict(x, out);
+    };
+    // register the assembly record and plan from the table's own order
+    let aoff = rn_off[asm_row as u64];
+    let alen = rn_len[asm_row as u64];
+    xmap_put(x, 1, aoff, alen, 8, 1);
+    rb_plan_records(x, &rn_off, &rn_len, &rlens, hdr.count);
+    nt_build_full(x, true);
+    rb_verify(x, foff, flen, &hdr);
+    if diag_count(x) > 0 {
+        return rb_verdict(x, out);
+    };
+    let fbp = x_ptr(x, foff);
+    i = 0;
+    while i < (x.plans.len() as i32) {
+        let plan = x.plans[i as u64];
+        if x_eq_lit(x, plan.n_off, plan.n_len, STR_PTR("assembly"), STR_LEN("assembly")) == false {
+            rb_digest_section(x, out, plan.n_off, plan.n_len, plan.kind, sx_ptr_add(fbp, plan.offset as u64), plan.len as u64);
+        };
+        i = i + 1;
+    }
+    rb_digest_decls(x, out);
+    return rb_verdict(x, out);
+}
+
+fn rb_arg_eq(ap: ptr, off: i32, len: i32, lp: ptr, ll: u64) -> bool {
+    return sx_spans_eq(sx_ptr_add(ap, off as u64), len as u64, lp, ll);
+}
+
+fn main() -> i32 {
+    let jh = sa_env_args_json();
+    let abuf = sb_new();
+    let aoffs: Vec<i32> = Vec::new();
+    let alens: Vec<i32> = Vec::new();
+    if !sx_parse_argv(jh, &abuf, &aoffs, &alens) {
+        return 2;
+    };
+    let argc = aoffs.len() as i32;
+    if argc < 3 {
+        sx_err_lit(STR_PTR("usage: readback <split <asset.sax3d> <file.saxb3d>|packed <file.sax3dp>> [--iface <Shader>=<file>]...\n"), STR_LEN("usage: readback <split <asset.sax3d> <file.saxb3d>|packed <file.sax3dp>> [--iface <Shader>=<file>]...\n"));
+        return 2;
+    };
+    let ap: ptr = abuf.data as ptr;
+    let x = x_new();
+    // interface fixtures: --iface pairs anywhere after argv[0];
+    // an unreadable spec file is skipped silently (readback.zig)
+    let sii: i32 = 2;
+    while sii + 1 < argc {
+        if rb_arg_eq(ap, aoffs[sii as usize], alens[sii as usize], STR_PTR("--iface"), STR_LEN("--iface")) {
+            let sp = sx_ptr_add(ap, aoffs[(sii + 1) as usize] as u64);
+            let sl = alens[(sii + 1) as usize] as u64;
+            let eq = sx_index_of_byte(sp, sl, 61);
+            if eq >= 0 {
+                let fdata = sb_new();
+                let fcell = malloc(8);
+                let fok = sx_read_file(sx_ptr_add(sp, (eq + 1) as u64), sl - (eq as u64) - 1, &fdata, fcell as ptr);
+                if fok {
+                    let sh_off = x_intern(&x, sp, eq as u64);
+                    let f_off = x_intern(&x, fdata.data as ptr, fdata.len);
+                    iface_parse(&x, f_off, fdata.len, sh_off, eq as i32);
+                };
+                free(fcell);
+            };
+        };
+        sii = sii + 1;
+    }
+    let out = sb_new();
+    let rc: i32 = 2;
+    let p2 = sx_ptr_add(ap, aoffs[2] as u64);
+    let l2 = alens[2] as u64;
+    if rb_arg_eq(ap, aoffs[1], alens[1], STR_PTR("split"), STR_LEN("split")) && (argc >= 4) {
+        rc = rb_mode_split(&x, &out, p2, l2, sx_ptr_add(ap, aoffs[3] as u64), alens[3] as u64);
+    } else {
+        if rb_arg_eq(ap, aoffs[1], alens[1], STR_PTR("packed"), STR_LEN("packed")) {
+            rc = rb_mode_packed(&x, &out, p2, l2);
+        } else {
+            sx_err_lit(STR_PTR("bad readback invocation\n"), STR_LEN("bad readback invocation\n"));
+        };
+    };
+    return rc;
+}

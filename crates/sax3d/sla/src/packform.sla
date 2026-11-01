@@ -1,0 +1,527 @@
+// packform.sla — SAX3D (packform.zig port)
+// Compiled-form emitter: same grammar as the authoring form, but
+// every declaration/reference name is replaced by its name-table
+// index #<n> (names live only in the table). Field order and
+// whitespace are fully normalised: same AST, same bytes.
+// D-4: node indent is emitted unbounded (Zig's fixed 32-byte indent
+// buffer panics at depth >= 16; the port takes the non-panic path).
+
+@import "layout.sla"
+
+// A name as the compiled form writes it: #<idx> when the name is in
+// the table, the literal name otherwise (Zig refText fallback).
+fn pf_ref(x: &X, out: &SBuf, o: i32, l: i32) {
+    let idx = nt_index_of(x, o, l);
+    if idx >= 0 {
+        sb_push_byte(out, 35); // '#'
+        sb_push_i64(out, idx as i64);
+        return;
+    };
+    if l > 0 {
+        sb_push_span(out, x_ptr(x, o), l as u64);
+    };
+}
+
+fn pf_span(x: &X, out: &SBuf, o: i32, l: i32) {
+    if l > 0 {
+        sb_push_span(out, x_ptr(x, o), l as u64);
+    };
+}
+
+fn pf_num(out: &SBuf, v: f64) {
+    nf_push_f64(out, v);
+}
+
+// Vector from the value pool: [v, v, ...] with ", " separators.
+fn pf_vec(x: &X, out: &SBuf, start: i32, count: i32) {
+    sb_push_byte(out, 91); // '['
+    let i: i32 = 0;
+    while i < count {
+        if i > 0 {
+            sb_push_lit(out, STR_PTR(", "), STR_LEN(", "));
+        };
+        pf_num(out, nf_f64_from_bits(x.vecpool[(start + i) as usize]));
+        i = i + 1;
+    }
+    sb_push_byte(out, 93); // ']'
+}
+
+fn pf_lit(x: &X, out: &SBuf, kind: i32, val: f64, v_off: i32, v_len: i32, bval: i32) {
+    if kind == 0 {
+        pf_num(out, val);
+        return;
+    };
+    if kind == 2 {
+        if bval != 0 {
+            sb_push_lit(out, STR_PTR("true"), STR_LEN("true"));
+        } else {
+            sb_push_lit(out, STR_PTR("false"), STR_LEN("false"));
+        };
+        return;
+    };
+    pf_vec(x, out, v_off, v_len);
+}
+
+fn pf_channel(x: &X, out: &SBuf, ch: &ChanD, ind: ptr, indn: u64) {
+    sb_push_span(out, ind, indn);
+    if ch.custom != 0 {
+        sb_push_lit(out, STR_PTR("attr "), STR_LEN("attr "));
+        pf_ref(x, out, ch.n_off, ch.n_len);
+    } else {
+        sb_push_lit(out, STR_PTR("channel "), STR_LEN("channel "));
+        pf_span(x, out, ch.n_off, ch.n_len);
+    };
+    sb_push_lit(out, STR_PTR(" : "), STR_LEN(" : "));
+    pf_span(x, out, ch.t_off, ch.t_len);
+    sb_push_lit(out, STR_PTR(" @ "), STR_LEN(" @ "));
+    pf_ref(x, out, ch.s_off, ch.s_len);
+    sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+}
+
+fn pf_mesh(x: &X, out: &SBuf, mi: i32) {
+    let m = x.meshes[mi as usize];
+    sb_push_lit(out, STR_PTR("mesh "), STR_LEN("mesh "));
+    pf_ref(x, out, m.n_off, m.n_len);
+    sb_push_lit(out, STR_PTR(" {\n  topology: "), STR_LEN(" {\n  topology: "));
+    pf_span(x, out, m.topo_off, m.topo_len);
+    sb_push_lit(out, STR_PTR(";\n  vertices "), STR_LEN(";\n  vertices "));
+    sb_push_u64(out, m.vertices);
+    sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    if m.has_bounds != 0 {
+        sb_push_lit(out, STR_PTR("  bounds { min: "), STR_LEN("  bounds { min: "));
+        pf_vec(x, out, m.bmin, 3);
+        sb_push_lit(out, STR_PTR("; max: "), STR_LEN("; max: "));
+        pf_vec(x, out, m.bmax, 3);
+        sb_push_lit(out, STR_PTR("; }\n"), STR_LEN("; }\n"));
+    };
+    let ci: i32 = 0;
+    while ci < m.ch_len {
+        let ch = x.chans[(m.ch_off + ci) as usize];
+        pf_channel(x, out, &ch, STR_PTR("  "), STR_LEN("  "));
+        ci = ci + 1;
+    }
+    let oi: i32 = 0;
+    while oi < m.mo_len {
+        let mo = x.morphs[(m.mo_off + oi) as usize];
+        sb_push_lit(out, STR_PTR("  morph "), STR_LEN("  morph "));
+        pf_ref(x, out, mo.n_off, mo.n_len);
+        sb_push_lit(out, STR_PTR(" {\n"), STR_LEN(" {\n"));
+        let cj: i32 = 0;
+        while cj < mo.ch_len {
+            let ch2 = x.mchans[(mo.ch_off + cj) as usize];
+            pf_channel(x, out, &ch2, STR_PTR("    "), STR_LEN("    "));
+            cj = cj + 1;
+        }
+        sb_push_lit(out, STR_PTR("  }\n"), STR_LEN("  }\n"));
+        oi = oi + 1;
+    }
+    if m.ity_len >= 0 {
+        sb_push_lit(out, STR_PTR("  indices "), STR_LEN("  indices "));
+        pf_span(x, out, m.ity_off, m.ity_len);
+        sb_push_lit(out, STR_PTR(" @ "), STR_LEN(" @ "));
+        pf_ref(x, out, m.isec_off, m.isec_len);
+        sb_push_lit(out, STR_PTR(" count "), STR_LEN(" count "));
+        sb_push_u64(out, m.icount);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    let pi: i32 = 0;
+    while pi < m.pr_len {
+        let pr = x.prims[(m.pr_off + pi) as usize];
+        sb_push_lit(out, STR_PTR("  primitive "), STR_LEN("  primitive "));
+        pf_ref(x, out, pr.n_off, pr.n_len);
+        sb_push_lit(out, STR_PTR(" { material: "), STR_LEN(" { material: "));
+        pf_ref(x, out, pr.m_off, pr.m_len);
+        sb_push_lit(out, STR_PTR("; }\n"), STR_LEN("; }\n"));
+        pi = pi + 1;
+    }
+    sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+}
+
+fn pf_skeleton(x: &X, out: &SBuf, ki: i32) {
+    let sk = x.skels[ki as usize];
+    sb_push_lit(out, STR_PTR("skeleton "), STR_LEN("skeleton "));
+    pf_ref(x, out, sk.n_off, sk.n_len);
+    sb_push_lit(out, STR_PTR(" {\n"), STR_LEN(" {\n"));
+    let ji: i32 = 0;
+    while ji < sk.j_len {
+        let j = x.joints[(sk.j_off + ji) as usize];
+        sb_push_lit(out, STR_PTR("  joint "), STR_LEN("  joint "));
+        pf_ref(x, out, j.n_off, j.n_len);
+        sb_push_lit(out, STR_PTR(" {"), STR_LEN(" {"));
+        if j.has_parent != 0 {
+            sb_push_lit(out, STR_PTR(" parent: "), STR_LEN(" parent: "));
+            pf_ref(x, out, j.p_off, j.p_len);
+            sb_push_byte(out, 59); // ';'
+        } else {
+            sb_push_lit(out, STR_PTR(" parent: none;"), STR_LEN(" parent: none;"));
+        };
+        if j.has_bind != 0 {
+            sb_push_lit(out, STR_PTR(" bind: {"), STR_LEN(" bind: {"));
+            if j.bt >= 0 {
+                sb_push_lit(out, STR_PTR(" t: "), STR_LEN(" t: "));
+                pf_vec(x, out, j.bt, 3);
+                sb_push_byte(out, 59);
+            };
+            if j.br >= 0 {
+                sb_push_lit(out, STR_PTR(" r: "), STR_LEN(" r: "));
+                pf_vec(x, out, j.br, 4);
+                sb_push_byte(out, 59);
+            };
+            if j.bs >= 0 {
+                sb_push_lit(out, STR_PTR(" s: "), STR_LEN(" s: "));
+                pf_vec(x, out, j.bs, 3);
+                sb_push_byte(out, 59);
+            };
+            sb_push_lit(out, STR_PTR(" }"), STR_LEN(" }"));
+        };
+        sb_push_lit(out, STR_PTR(" }\n"), STR_LEN(" }\n"));
+        ji = ji + 1;
+    }
+    if sk.ib_len >= 0 {
+        sb_push_lit(out, STR_PTR("  inverse_bind @ "), STR_LEN("  inverse_bind @ "));
+        pf_ref(x, out, sk.ib_off, sk.ib_len);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+}
+
+fn pf_image(x: &X, out: &SBuf, gi: i32) {
+    let im = x.imgs[gi as usize];
+    sb_push_lit(out, STR_PTR("image "), STR_LEN("image "));
+    pf_ref(x, out, im.n_off, im.n_len);
+    sb_push_lit(out, STR_PTR(" {\n  source @ "), STR_LEN(" {\n  source @ "));
+    pf_ref(x, out, im.s_off, im.s_len);
+    sb_push_lit(out, STR_PTR(";\n  format "), STR_LEN(";\n  format "));
+    pf_span(x, out, im.f_off, im.f_len);
+    sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    if im.has_size != 0 {
+        sb_push_lit(out, STR_PTR("  size "), STR_LEN("  size "));
+        sb_push_u64(out, im.w);
+        sb_push_byte(out, 32);
+        sb_push_u64(out, im.h);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    sb_push_lit(out, STR_PTR("  color_space "), STR_LEN("  color_space "));
+    pf_span(x, out, im.c_off, im.c_len);
+    sb_push_lit(out, STR_PTR(";\n}\n"), STR_LEN(";\n}\n"));
+}
+
+fn pf_tex_field(x: &X, out: &SBuf, label: ptr, labeln: u64, o: i32, l: i32) {
+    if l >= 0 {
+        sb_push_byte(out, 32);
+        sb_push_span(out, label, labeln);
+        sb_push_lit(out, STR_PTR(": "), STR_LEN(": "));
+        pf_span(x, out, o, l);
+        sb_push_byte(out, 59); // ';'
+    };
+}
+
+fn pf_texture(x: &X, out: &SBuf, ti: i32) {
+    let t = x.texs[ti as usize];
+    sb_push_lit(out, STR_PTR("texture "), STR_LEN("texture "));
+    pf_ref(x, out, t.n_off, t.n_len);
+    sb_push_lit(out, STR_PTR(" {\n  image: "), STR_LEN(" {\n  image: "));
+    pf_ref(x, out, t.i_off, t.i_len);
+    sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    if t.smp != 0 {
+        sb_push_lit(out, STR_PTR("  sampler {"), STR_LEN("  sampler {"));
+        pf_tex_field(x, out, STR_PTR("mag"), STR_LEN("mag"), t.mag_off, t.mag_len);
+        pf_tex_field(x, out, STR_PTR("min"), STR_LEN("min"), t.min_off, t.min_len);
+        pf_tex_field(x, out, STR_PTR("mipmap"), STR_LEN("mipmap"), t.mip_off, t.mip_len);
+        pf_tex_field(x, out, STR_PTR("wrap_u"), STR_LEN("wrap_u"), t.wu_off, t.wu_len);
+        pf_tex_field(x, out, STR_PTR("wrap_v"), STR_LEN("wrap_v"), t.wv_off, t.wv_len);
+        pf_tex_field(x, out, STR_PTR("wrap_w"), STR_LEN("wrap_w"), t.ww_off, t.ww_len);
+        sb_push_lit(out, STR_PTR(" }\n"), STR_LEN(" }\n"));
+    };
+    sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+}
+
+fn pf_material(x: &X, out: &SBuf, ai: i32) {
+    let mt = x.mats[ai as usize];
+    sb_push_lit(out, STR_PTR("material "), STR_LEN("material "));
+    pf_ref(x, out, mt.n_off, mt.n_len);
+    sb_push_lit(out, STR_PTR(" {\n  shader: "), STR_LEN(" {\n  shader: "));
+    pf_ref(x, out, mt.sh_off, mt.sh_len);
+    sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    let pi: i32 = 0;
+    while pi < mt.pa_len {
+        let pr = x.params[(mt.pa_off + pi) as usize];
+        sb_push_lit(out, STR_PTR("  param "), STR_LEN("  param "));
+        pf_span(x, out, pr.n_off, pr.n_len); // interface name: literal
+        sb_push_lit(out, STR_PTR(" = "), STR_LEN(" = "));
+        pf_lit(x, out, pr.kind, pr.val, pr.v_off, pr.v_len, pr.bval);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+        pi = pi + 1;
+    }
+    let bi: i32 = 0;
+    while bi < mt.tb_len {
+        let tb = x.tbinds[(mt.tb_off + bi) as usize];
+        sb_push_lit(out, STR_PTR("  texture "), STR_LEN("  texture "));
+        pf_span(x, out, tb.n_off, tb.n_len); // binding name: literal
+        sb_push_lit(out, STR_PTR(": "), STR_LEN(": "));
+        pf_ref(x, out, tb.t_off, tb.t_len);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+        bi = bi + 1;
+    }
+    let tti: i32 = 0;
+    while tti < mt.tt_len {
+        let tt = x.ttrs[(mt.tt_off + tti) as usize];
+        sb_push_lit(out, STR_PTR("  tex_transform "), STR_LEN("  tex_transform "));
+        pf_span(x, out, tt.n_off, tt.n_len);
+        sb_push_lit(out, STR_PTR(" {"), STR_LEN(" {"));
+        if tt.off_v >= 0 {
+            sb_push_lit(out, STR_PTR(" offset: "), STR_LEN(" offset: "));
+            pf_vec(x, out, tt.off_v, 2);
+            sb_push_byte(out, 59);
+        };
+        if tt.scl_v >= 0 {
+            sb_push_lit(out, STR_PTR(" scale: "), STR_LEN(" scale: "));
+            pf_vec(x, out, tt.scl_v, 2);
+            sb_push_byte(out, 59);
+        };
+        if tt.has_rot != 0 {
+            sb_push_lit(out, STR_PTR(" rotation: "), STR_LEN(" rotation: "));
+            pf_num(out, tt.rot);
+            sb_push_byte(out, 59);
+        };
+        sb_push_lit(out, STR_PTR(" }\n"), STR_LEN(" }\n"));
+        tti = tti + 1;
+    }
+    if mt.al_len >= 0 || mt.has_cut != 0 || mt.ds >= 0 || mt.dw >= 0 {
+        sb_push_lit(out, STR_PTR("  state {"), STR_LEN("  state {"));
+        if mt.al_len >= 0 {
+            sb_push_lit(out, STR_PTR(" alpha: "), STR_LEN(" alpha: "));
+            pf_span(x, out, mt.al_off, mt.al_len);
+            sb_push_byte(out, 59);
+        };
+        if mt.has_cut != 0 {
+            sb_push_lit(out, STR_PTR(" cutoff: "), STR_LEN(" cutoff: "));
+            pf_num(out, mt.cut);
+            sb_push_byte(out, 59);
+        };
+        if mt.ds >= 0 {
+            sb_push_lit(out, STR_PTR(" double_sided: "), STR_LEN(" double_sided: "));
+            if mt.ds != 0 {
+                sb_push_lit(out, STR_PTR("true"), STR_LEN("true"));
+            } else {
+                sb_push_lit(out, STR_PTR("false"), STR_LEN("false"));
+            };
+            sb_push_byte(out, 59);
+        };
+        if mt.dw >= 0 {
+            sb_push_lit(out, STR_PTR(" depth_write: "), STR_LEN(" depth_write: "));
+            if mt.dw != 0 {
+                sb_push_lit(out, STR_PTR("true"), STR_LEN("true"));
+            } else {
+                sb_push_lit(out, STR_PTR("false"), STR_LEN("false"));
+            };
+            sb_push_byte(out, 59);
+        };
+        sb_push_lit(out, STR_PTR(" }\n"), STR_LEN(" }\n"));
+    };
+    sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+}
+
+fn pf_node(x: &X, out: &SBuf, ni: i32, depth: i32) {
+    let nd = x.nodes[ni as usize];
+    let sp: i32 = 0;
+    while sp < depth * 2 {
+        sb_push_byte(out, 32);
+        sp = sp + 1;
+    }
+    sb_push_lit(out, STR_PTR("node "), STR_LEN("node "));
+    pf_ref(x, out, nd.n_off, nd.n_len);
+    sb_push_lit(out, STR_PTR(" {\n"), STR_LEN(" {\n"));
+    if nd.has_tr != 0 {
+        let sp2: i32 = 0;
+        while sp2 < depth * 2 {
+            sb_push_byte(out, 32);
+            sp2 = sp2 + 1;
+        }
+        sb_push_lit(out, STR_PTR("  transform {"), STR_LEN("  transform {"));
+        if nd.tt >= 0 {
+            sb_push_lit(out, STR_PTR(" t: "), STR_LEN(" t: "));
+            pf_vec(x, out, nd.tt, 3);
+            sb_push_byte(out, 59);
+        };
+        if nd.tr >= 0 {
+            sb_push_lit(out, STR_PTR(" r: "), STR_LEN(" r: "));
+            pf_vec(x, out, nd.tr, 4);
+            sb_push_byte(out, 59);
+        };
+        if nd.ts >= 0 {
+            sb_push_lit(out, STR_PTR(" s: "), STR_LEN(" s: "));
+            pf_vec(x, out, nd.ts, 3);
+            sb_push_byte(out, 59);
+        };
+        sb_push_lit(out, STR_PTR(" }\n"), STR_LEN(" }\n"));
+    };
+    if nd.mtx >= 0 {
+        let sp3: i32 = 0;
+        while sp3 < depth * 2 {
+            sb_push_byte(out, 32);
+            sp3 = sp3 + 1;
+        }
+        sb_push_lit(out, STR_PTR("  matrix: "), STR_LEN("  matrix: "));
+        pf_vec(x, out, nd.mtx, 16);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    if nd.mesh_len >= 0 {
+        let sp4: i32 = 0;
+        while sp4 < depth * 2 {
+            sb_push_byte(out, 32);
+            sp4 = sp4 + 1;
+        }
+        sb_push_lit(out, STR_PTR("  mesh: "), STR_LEN("  mesh: "));
+        pf_ref(x, out, nd.mesh_off, nd.mesh_len);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    if nd.mat_len >= 0 {
+        let sp5: i32 = 0;
+        while sp5 < depth * 2 {
+            sb_push_byte(out, 32);
+            sp5 = sp5 + 1;
+        }
+        sb_push_lit(out, STR_PTR("  material: "), STR_LEN("  material: "));
+        pf_ref(x, out, nd.mat_off, nd.mat_len);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    if nd.skin_len >= 0 {
+        let sp6: i32 = 0;
+        while sp6 < depth * 2 {
+            sb_push_byte(out, 32);
+            sp6 = sp6 + 1;
+        }
+        sb_push_lit(out, STR_PTR("  skin: "), STR_LEN("  skin: "));
+        pf_ref(x, out, nd.skin_off, nd.skin_len);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    };
+    let ci: i32 = 0;
+    while ci < nd.ch_len {
+        pf_node(x, out, x.idxpool[(nd.ch_off + ci) as usize], depth + 1);
+        ci = ci + 1;
+    }
+    let sp7: i32 = 0;
+    while sp7 < depth * 2 {
+        sb_push_byte(out, 32);
+        sp7 = sp7 + 1;
+    }
+    sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+}
+
+fn pf_clip(x: &X, out: &SBuf, li: i32) {
+    let c = x.clips[li as usize];
+    sb_push_lit(out, STR_PTR("clip "), STR_LEN("clip "));
+    pf_ref(x, out, c.n_off, c.n_len);
+    sb_push_lit(out, STR_PTR(" {\n"), STR_LEN(" {\n"));
+    let si: i32 = 0;
+    while si < c.sa_len {
+        let s = x.samps[(c.sa_off + si) as usize];
+        sb_push_lit(out, STR_PTR("  sampler "), STR_LEN("  sampler "));
+        pf_ref(x, out, s.n_off, s.n_len);
+        sb_push_lit(out, STR_PTR(" {\n    input: "), STR_LEN(" {\n    input: "));
+        pf_span(x, out, s.it_off, s.it_len);
+        sb_push_lit(out, STR_PTR(" @ "), STR_LEN(" @ "));
+        pf_ref(x, out, s.is_off, s.is_len);
+        sb_push_lit(out, STR_PTR(" count "), STR_LEN(" count "));
+        sb_push_u64(out, s.icnt);
+        sb_push_lit(out, STR_PTR(";\n    output: "), STR_LEN(";\n    output: "));
+        pf_span(x, out, s.ot_off, s.ot_len);
+        sb_push_lit(out, STR_PTR(" @ "), STR_LEN(" @ "));
+        pf_ref(x, out, s.os_off, s.os_len);
+        sb_push_lit(out, STR_PTR(" count "), STR_LEN(" count "));
+        sb_push_u64(out, s.ocnt);
+        sb_push_lit(out, STR_PTR(";\n    interpolation: "), STR_LEN(";\n    interpolation: "));
+        pf_span(x, out, s.ip_off, s.ip_len);
+        sb_push_lit(out, STR_PTR(";\n  }\n"), STR_LEN(";\n  }\n"));
+        si = si + 1;
+    }
+    let ci: i32 = 0;
+    while ci < c.ch_len {
+        let ch = x.cchs[(c.ch_off + ci) as usize];
+        sb_push_lit(out, STR_PTR("  channel { node: "), STR_LEN("  channel { node: "));
+        pf_ref(x, out, ch.nd_off, ch.nd_len);
+        sb_push_lit(out, STR_PTR("; path: "), STR_LEN("; path: "));
+        pf_span(x, out, ch.pa_off, ch.pa_len);
+        sb_push_lit(out, STR_PTR("; sampler: "), STR_LEN("; sampler: "));
+        pf_ref(x, out, ch.sa_off, ch.sa_len);
+        sb_push_lit(out, STR_PTR("; }\n"), STR_LEN("; }\n"));
+        ci = ci + 1;
+    }
+    sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+}
+
+// Emit the whole asset in compiled form. The name table must
+// already be built (nt_build_full) — refs resolve against it.
+fn pf_emit(x: &X, out: &SBuf) {
+    sb_push_lit(out, STR_PTR("asset "), STR_LEN("asset "));
+    pf_ref(x, out, x.a_name_off, x.a_name_len);
+    sb_push_lit(out, STR_PTR(" version "), STR_LEN(" version "));
+    sb_push_u64(out, x.a_version);
+    sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+    if x.a_has_binary == 1 {
+        sb_push_lit(out, STR_PTR("binary {\n"), STR_LEN("binary {\n"));
+        let i: i32 = 0;
+        let n = x.secs.len() as i32;
+        while i < n {
+            let s = x.secs[i as usize];
+            sb_push_lit(out, STR_PTR("  section "), STR_LEN("  section "));
+            pf_ref(x, out, s.n_off, s.n_len);
+            sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+            i = i + 1;
+        }
+        sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+    };
+    let si: i32 = 0;
+    while si < (x.shaders.len() as i32) {
+        let s = x.shaders[si as usize];
+        sb_push_lit(out, STR_PTR("shader "), STR_LEN("shader "));
+        pf_ref(x, out, s.n_off, s.n_len);
+        sb_push_lit(out, STR_PTR(";\n"), STR_LEN(";\n"));
+        si = si + 1;
+    }
+    let mi: i32 = 0;
+    while mi < (x.meshes.len() as i32) {
+        pf_mesh(x, out, mi);
+        mi = mi + 1;
+    }
+    let ki: i32 = 0;
+    while ki < (x.skels.len() as i32) {
+        pf_skeleton(x, out, ki);
+        ki = ki + 1;
+    }
+    let gi: i32 = 0;
+    while gi < (x.imgs.len() as i32) {
+        pf_image(x, out, gi);
+        gi = gi + 1;
+    }
+    let ti: i32 = 0;
+    while ti < (x.texs.len() as i32) {
+        pf_texture(x, out, ti);
+        ti = ti + 1;
+    }
+    let ai: i32 = 0;
+    while ai < (x.mats.len() as i32) {
+        pf_material(x, out, ai);
+        ai = ai + 1;
+    }
+    let ci2: i32 = 0;
+    while ci2 < (x.scenes.len() as i32) {
+        let sc = x.scenes[ci2 as usize];
+        sb_push_lit(out, STR_PTR("scene "), STR_LEN("scene "));
+        pf_ref(x, out, sc.n_off, sc.n_len);
+        sb_push_lit(out, STR_PTR(" {\n"), STR_LEN(" {\n"));
+        let ri: i32 = 0;
+        while ri < sc.r_len {
+            pf_node(x, out, x.idxpool[(sc.r_off + ri) as usize], 1);
+            ri = ri + 1;
+        }
+        sb_push_lit(out, STR_PTR("}\n"), STR_LEN("}\n"));
+        ci2 = ci2 + 1;
+    }
+    let li: i32 = 0;
+    while li < (x.clips.len() as i32) {
+        pf_clip(x, out, li);
+        li = li + 1;
+    }
+}

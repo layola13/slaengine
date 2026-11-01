@@ -1,0 +1,1608 @@
+// parse.sla — SAX3D (parse.zig )
+// :.authoring ident;.compiled #<idx>
+// fail flag ;512 "?"
+// Sax3dParseError
+
+@import "lexer.sla"
+
+struct P {
+    toks: Vec<Tok>,
+    pos: i32,
+    mode: i32, // 0 authoring, 1 compiled
+    names_off: Vec<i32>,
+    names_len: Vec<i32>,
+    saw_asset: i32,
+    fail: bool,
+    w: SBuf, // fail "what"
+}
+
+fn p_new(mode: i32) -> P {
+    return P {
+        toks: Vec::new(), pos: 0, mode: mode,
+        names_off: Vec::new(), names_len: Vec::new(),
+        saw_asset: 0, fail: false, w: sb_new(),
+    };
+}
+
+fn p_peek(p: &P) -> Tok {
+    if p.pos < (p.toks.len() as i32) {
+        return p.toks[p.pos as usize];
+    };
+    return Tok { kind: -1, off: 0, len: 0, line: 0, col: 0 };
+}
+
+fn p_next(p: &P) -> Tok {
+    let t = p_peek(p);
+    if t.kind >= 0 {
+        p.pos = p.pos + 1;
+    };
+    return t;
+}
+
+fn p_at(x: &X, p: &P, lp: ptr, ll: u64) -> bool {
+    let t = p_peek(p);
+    if t.kind < 0 {
+        return false;
+    };
+    return x_eq_lit(x, t.off, t.len, lp, ll);
+}
+
+fn p_eat(x: &X, p: &P, lp: ptr, ll: u64) -> bool {
+    if p_at(x, p, lp, ll) {
+        p.pos = p.pos + 1;
+        return true;
+    };
+    return false;
+}
+
+// fail():x.msg "{line}:{col}: {what}" Sax3dParseError
+// what  512 "?"
+fn p_fail(x: &X, p: &P) {
+    let t = p_peek(p);
+    mb_clear(x);
+    mb_u64(x, t.line as u64);
+    mb_lit(x, STR_PTR(":"), STR_LEN(":"));
+    mb_u64(x, t.col as u64);
+    mb_lit(x, STR_PTR(": "), STR_LEN(": "));
+    if p.w.len > 512 {
+        mb_lit(x, STR_PTR("?"), STR_LEN("?"));
+    } else {
+        mb_buf(x, &p.w, 0, p.w.len);
+    };
+    diag_commit(x, STR_PTR("Sax3dParseError"), STR_LEN("Sax3dParseError"));
+    sb_clear(&p.w);
+    p.fail = true;
+}
+
+fn pw_lit(p: &P, lp: ptr, ll: u64) {
+    sb_push_span(&p.w, lp, ll);
+}
+
+fn pw_span(x: &X, p: &P, off: i32, len: i32) {
+    if len > 0 {
+        sb_push_span(&p.w, x_ptr(x, off), len as u64);
+    };
+}
+
+fn pw_u64(p: &P, v: u64) {
+    sb_push_u64(&p.w, v);
+}
+
+fn p_expect(x: &X, p: &P, lp: ptr, ll: u64) {
+    if p.fail {
+        return;
+    };
+    if !p_eat(x, p, lp, ll) {
+        pw_lit(p, STR_PTR("expected '"), STR_LEN("expected '"));
+        pw_lit(p, lp, ll);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+    };
+}
+
+fn p_ident(x: &X, p: &P) -> Span2 {
+    let t = p_next(p);
+    if t.kind < 0 {
+        pw_lit(p, STR_PTR("expected identifier, got EOF"), STR_LEN("expected identifier, got EOF"));
+        p_fail(x, p);
+        return Span2 { off: 0, len: 0 };
+    };
+    if t.kind != 0 {
+        pw_lit(p, STR_PTR("expected identifier, got '"), STR_LEN("expected identifier, got '"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return Span2 { off: 0, len: 0 };
+    };
+    return Span2 { off: t.off, len: t.len };
+}
+
+fn p_name(x: &X, p: &P) -> Span2 {
+    let t = p_next(p);
+    if t.kind < 0 {
+        pw_lit(p, STR_PTR("expected name, got EOF"), STR_LEN("expected name, got EOF"));
+        p_fail(x, p);
+        return Span2 { off: 0, len: 0 };
+    };
+    if p.mode == 0 {
+        if t.kind != 0 {
+            pw_lit(p, STR_PTR("expected name, got '"), STR_LEN("expected name, got '"));
+            pw_span(x, p, t.off, t.len);
+            pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+            p_fail(x, p);
+            return Span2 { off: 0, len: 0 };
+        };
+        return Span2 { off: t.off, len: t.len };
+    };
+    if t.kind != 3 {
+        pw_lit(p, STR_PTR("expected #<name-index> in compiled form, got '"), STR_LEN("expected #<name-index> in compiled form, got '"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return Span2 { off: 0, len: 0 };
+    };
+    let okc = malloc(8);
+    let idx = sx_parse_u64(x_ptr(x, t.off), t.len as u64, okc as ptr);
+    let good = sx_cell_u64(okc as ptr) != 0;
+    free(okc);
+    if !good {
+        pw_lit(p, STR_PTR("bad name index '#"), STR_LEN("bad name index '#"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return Span2 { off: 0, len: 0 };
+    };
+    if idx >= (p.names_off.len() as u64) {
+        mb_clear(x);
+        mb_u64(x, t.line as u64);
+        mb_lit(x, STR_PTR(":"), STR_LEN(":"));
+        mb_u64(x, t.col as u64);
+        mb_lit(x, STR_PTR(": name index #"), STR_LEN(": name index #"));
+        mb_u64(x, idx);
+        mb_lit(x, STR_PTR(" out of range (table has "), STR_LEN(" out of range (table has "));
+        mb_u64(x, p.names_off.len() as u64);
+        mb_lit(x, STR_PTR(")"), STR_LEN(")"));
+        diag_commit(x, STR_PTR("Sax3dCompiledNameRef"), STR_LEN("Sax3dCompiledNameRef"));
+        p.fail = true;
+        return Span2 { off: 0, len: 0 };
+    };
+    return Span2 { off: p.names_off[idx as usize], len: p.names_len[idx as usize] };
+}
+
+fn p_u64num(x: &X, p: &P) -> u64 {
+    let t = p_next(p);
+    if t.kind < 0 {
+        pw_lit(p, STR_PTR("expected integer, got EOF"), STR_LEN("expected integer, got EOF"));
+        p_fail(x, p);
+        return 0;
+    };
+    if t.kind != 1 {
+        pw_lit(p, STR_PTR("expected integer, got '"), STR_LEN("expected integer, got '"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return 0;
+    };
+    let okc = malloc(8);
+    let v = sx_parse_u64(x_ptr(x, t.off), t.len as u64, okc as ptr);
+    let good = sx_cell_u64(okc as ptr) != 0;
+    free(okc);
+    if !good {
+        pw_lit(p, STR_PTR("expected non-negative integer, got '"), STR_LEN("expected non-negative integer, got '"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return 0;
+    };
+    return v;
+}
+
+fn p_f64from(x: &X, p: &P, t: Tok) -> f64 {
+    let okc = malloc(8);
+    let v = nf_parse_f64_span(x_ptr(x, t.off), t.len as u64, okc as ptr);
+    let good = sx_cell_u64(okc as ptr) != 0;
+    free(okc);
+    if !good {
+        p.fail = true; // silent: f64From adds no diag (generic fires at top level)
+        return 0.0;
+    };
+    return v;
+}
+
+fn p_f64num(x: &X, p: &P) -> f64 {
+    let t = p_next(p);
+    if t.kind < 0 {
+        pw_lit(p, STR_PTR("expected number, got EOF"), STR_LEN("expected number, got EOF"));
+        p_fail(x, p);
+        return 0.0;
+    };
+    if t.kind != 1 {
+        pw_lit(p, STR_PTR("expected number, got '"), STR_LEN("expected number, got '"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return 0.0;
+    };
+    let okc = malloc(8);
+    let v = nf_parse_f64_span(x_ptr(x, t.off), t.len as u64, okc as ptr);
+    let good = sx_cell_u64(okc as ptr) != 0;
+    free(okc);
+    if !good {
+        pw_lit(p, STR_PTR("bad number '"), STR_LEN("bad number '"));
+        pw_span(x, p, t.off, t.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return 0.0;
+    };
+    return v;
+}
+
+fn p_literal(x: &X, p: &P) -> Lit {
+    let t = p_peek(p);
+    if t.kind < 0 {
+        pw_lit(p, STR_PTR("expected literal, got EOF"), STR_LEN("expected literal, got EOF"));
+        p_fail(x, p);
+        return Lit { kind: 0, val: 0.0, v_off: -1, v_len: 0, bval: 0 };
+    };
+    if t.kind == 1 {
+        let _ = p_next(p);
+        let v = p_f64from(x, p, t);
+        return Lit { kind: 0, val: v, v_off: -1, v_len: 0, bval: 0 };
+    };
+    if t.kind == 0 && (tok_eq(x, t, STR_PTR("true"), STR_LEN("true")) || tok_eq(x, t, STR_PTR("false"), STR_LEN("false"))) {
+        let _ = p_next(p);
+        if tok_eq(x, t, STR_PTR("true"), STR_LEN("true")) {
+            return Lit { kind: 2, val: 0.0, v_off: -1, v_len: 0, bval: 1 };
+        };
+        return Lit { kind: 2, val: 0.0, v_off: -1, v_len: 0, bval: 0 };
+    };
+    if p_eat(x, p, STR_PTR("["), STR_LEN("[")) {
+        let start = x.vecpool.len() as i32;
+        let cnt: i32 = 0;
+        while !p_eat(x, p, STR_PTR("]"), STR_LEN("]")) {
+            if p.fail {
+                return Lit { kind: 1, val: 0.0, v_off: start, v_len: cnt, bval: 0 };
+            };
+            let v = p_f64num(x, p);
+            if p.fail {
+                return Lit { kind: 1, val: 0.0, v_off: start, v_len: cnt, bval: 0 };
+            };
+            x.vecpool.push(nf_f64_bits(v)); // bits, GAP-PORT-7
+            cnt = cnt + 1;
+            let _ = p_eat(x, p, STR_PTR(","), STR_LEN(","));
+        }
+        return Lit { kind: 1, val: 0.0, v_off: start, v_len: cnt, bval: 0 };
+    };
+    pw_lit(p, STR_PTR("expected literal"), STR_LEN("expected literal"));
+    p_fail(x, p);
+    return Lit { kind: 0, val: 0.0, v_off: -1, v_len: 0, bval: 0 };
+}
+
+fn p_vec_literal(x: &X, p: &P) -> Span2 {
+    let lit = p_literal(x, p);
+    if p.fail {
+        return Span2 { off: -1, len: 0 };
+    };
+    if lit.kind != 1 {
+        pw_lit(p, STR_PTR("expected [..] vector literal"), STR_LEN("expected [..] vector literal"));
+        p_fail(x, p);
+        return Span2 { off: -1, len: 0 };
+    };
+    return Span2 { off: lit.v_off, len: lit.v_len };
+}
+
+fn p_is_top_keyword(x: &X, off: i32, len: i32) -> bool {
+    if x_eq_lit(x, off, len, STR_PTR("asset"), STR_LEN("asset")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("binary"), STR_LEN("binary")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("mesh"), STR_LEN("mesh")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("skeleton"), STR_LEN("skeleton")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("image"), STR_LEN("image")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("texture"), STR_LEN("texture")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("shader"), STR_LEN("shader")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("material"), STR_LEN("material")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("scene"), STR_LEN("scene")) { return true; };
+    if x_eq_lit(x, off, len, STR_PTR("clip"), STR_LEN("clip")) { return true; };
+    return false;
+}
+
+fn p_resync(x: &X, p: &P) {
+    let depth: i32 = 0;
+    while true {
+        let t = p_peek(p);
+        if t.kind < 0 {
+            return;
+        };
+        if x_eq_lit(x, t.off, t.len, STR_PTR("{"), STR_LEN("{")) {
+            depth = depth + 1;
+        };
+        if x_eq_lit(x, t.off, t.len, STR_PTR("}"), STR_LEN("}")) {
+            if depth == 0 {
+                let _ = p_next(p);
+                continue;
+            };
+            depth = depth - 1;
+        };
+        if depth == 0 && t.kind == 0 && p_is_top_keyword(x, t.off, t.len) {
+            return;
+        };
+        let _ = p_next(p);
+    }
+}
+
+// ------------------------------------------------------------------
+// 
+// ------------------------------------------------------------------
+
+// Returns the parsed channel (valid only when !p.fail). The caller pushes
+// it: passing &x and &x.chans in one call is a BorrowConflict.
+fn p_channel(x: &X, p: &P) -> ChanD {
+    let kw = p_ident(x, p);
+    if p.fail {
+        return ChanD { n_off: 0, n_len: 0, t_off: 0, t_len: 0, s_off: 0, s_len: 0, custom: 0 };
+    };
+    let is_attr = x_eq_lit(x, kw.off, kw.len, STR_PTR("attr"), STR_LEN("attr"));
+    if is_attr {
+        let s = p_name(x, p);
+        if p.fail {
+            return ChanD { n_off: 0, n_len: 0, t_off: 0, t_len: 0, s_off: 0, s_len: 0, custom: 0 };
+        };
+        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+        let ty = p_ident(x, p);
+        p_expect(x, p, STR_PTR("@"), STR_LEN("@"));
+        let sec = p_name(x, p);
+        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        if p.fail {
+            return ChanD { n_off: 0, n_len: 0, t_off: 0, t_len: 0, s_off: 0, s_len: 0, custom: 0 };
+        };
+        return ChanD { n_off: s.off, n_len: s.len, t_off: ty.off, t_len: ty.len, s_off: sec.off, s_len: sec.len, custom: 1 };
+    };
+    let s2 = p_ident(x, p);
+    if p.fail {
+        return ChanD { n_off: 0, n_len: 0, t_off: 0, t_len: 0, s_off: 0, s_len: 0, custom: 0 };
+    };
+    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+    let ty2 = p_ident(x, p);
+    p_expect(x, p, STR_PTR("@"), STR_LEN("@"));
+    let sec2 = p_name(x, p);
+    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+    if p.fail {
+        return ChanD { n_off: 0, n_len: 0, t_off: 0, t_len: 0, s_off: 0, s_len: 0, custom: 0 };
+    };
+    return ChanD { n_off: s2.off, n_len: s2.len, t_off: ty2.off, t_len: ty2.len, s_off: sec2.off, s_len: sec2.len, custom: 0 };
+}
+
+fn p_unknown_item(x: &X, p: &P, pre: ptr, pre_n: u64, name: Span2, mid: ptr, mid_n: u64, item: Span2, post: ptr, post_n: u64) {
+    pw_lit(p, pre, pre_n);
+    pw_span(x, p, name.off, name.len);
+    pw_lit(p, mid, mid_n);
+    pw_span(x, p, item.off, item.len);
+    pw_lit(p, post, post_n);
+    p_fail(x, p);
+}
+
+fn p_parse_mesh(x: &X, p: &P) {
+    let _ = p_next(p); // mesh
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let ch_start = x.chans.len() as i32;
+    let mo_start = x.morphs.len() as i32;
+    let pr_start = x.prims.len() as i32;
+    let md = MeshD {
+        n_off: nm.off, n_len: nm.len,
+        topo_off: 0, topo_len: 0, vertices: 0,
+        has_bounds: 0, bmin: -1, bmax: -1,
+        ch_off: ch_start, ch_len: 0,
+        mo_off: mo_start, mo_len: 0,
+        pr_off: pr_start, pr_len: 0,
+        ity_off: 0, ity_len: -1, isec_off: 0, isec_len: -1, icount: 0,
+    };
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("vertices"), STR_LEN("vertices")) {
+            md.vertices = p_u64num(x, p);
+            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("topology"), STR_LEN("topology")) {
+                p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                let tv = p_ident(x, p);
+                md.topo_off = tv.off;
+                md.topo_len = tv.len;
+                p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+            } else {
+                if x_eq_lit(x, k.off, k.len, STR_PTR("channel"), STR_LEN("channel")) || x_eq_lit(x, k.off, k.len, STR_PTR("attr"), STR_LEN("attr")) {
+                    p.pos = p.pos - 1;
+                    let chd = p_channel(x, p);
+                    if !p.fail {
+                        x.chans.push(chd);
+                        x.chans[((x.chans.len() as i32) - 1) as usize] = ChanD { n_off: chd.n_off, n_len: chd.n_len, t_off: chd.t_off, t_len: chd.t_len, s_off: chd.s_off, s_len: chd.s_len, custom: chd.custom };
+                    };
+                } else {
+                    if x_eq_lit(x, k.off, k.len, STR_PTR("indices"), STR_LEN("indices")) {
+                        let ity = p_ident(x, p);
+                        md.ity_off = ity.off;
+                        md.ity_len = ity.len;
+                        p_expect(x, p, STR_PTR("@"), STR_LEN("@"));
+                        let isec = p_name(x, p);
+                        md.isec_off = isec.off;
+                        md.isec_len = isec.len;
+                        p_expect(x, p, STR_PTR("count"), STR_LEN("count"));
+                        md.icount = p_u64num(x, p);
+                        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                    } else {
+                        if x_eq_lit(x, k.off, k.len, STR_PTR("primitive"), STR_LEN("primitive")) {
+                            let pn = p_name(x, p);
+                            p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                            p_expect(x, p, STR_PTR("material"), STR_LEN("material"));
+                            p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                            let mat = p_name(x, p);
+                            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                            p_expect(x, p, STR_PTR("}"), STR_LEN("}"));
+                            if p.fail {
+                                return;
+                            };
+                            x.prims.push(PrimD { n_off: pn.off, n_len: pn.len, m_off: mat.off, m_len: mat.len });
+                        } else {
+                            if x_eq_lit(x, k.off, k.len, STR_PTR("morph"), STR_LEN("morph")) {
+                                let mon = p_name(x, p);
+                                let mch_start = x.mchans.len() as i32;
+                                p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                                while true {
+                                    if p.fail {
+                                        return;
+                                    };
+                                    if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                                        break;
+                                    };
+                                    let chd = p_channel(x, p);
+                    if !p.fail {
+                        x.mchans.push(chd);
+                        x.mchans[((x.mchans.len() as i32) - 1) as usize] = ChanD { n_off: chd.n_off, n_len: chd.n_len, t_off: chd.t_off, t_len: chd.t_len, s_off: chd.s_off, s_len: chd.s_len, custom: chd.custom };
+                    };
+                                }
+                                x.morphs.push(MorphD { n_off: mon.off, n_len: mon.len, ch_off: mch_start, ch_len: (x.mchans.len() as i32) - mch_start });
+                            } else {
+                                if x_eq_lit(x, k.off, k.len, STR_PTR("bounds"), STR_LEN("bounds")) {
+                                    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                                    while true {
+                                        if p.fail {
+                                            return;
+                                        };
+                                        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                                            break;
+                                        };
+                                        let bk = p_ident(x, p);
+                                        if p.fail {
+                                            return;
+                                        };
+                                        let is_min = x_eq_lit(x, bk.off, bk.len, STR_PTR("min"), STR_LEN("min"));
+                                        let is_max = x_eq_lit(x, bk.off, bk.len, STR_PTR("max"), STR_LEN("max"));
+                                        if !is_min && !is_max {
+                                            pw_lit(p, STR_PTR("bounds: unknown field '"), STR_LEN("bounds: unknown field '"));
+                                            pw_span(x, p, bk.off, bk.len);
+                                            pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+                                            p_fail(x, p);
+                                            return;
+                                        };
+                                        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                        let v = p_vec_literal(x, p);
+                                        if p.fail {
+                                            return;
+                                        };
+                                        if v.len != 3 {
+                                            pw_lit(p, STR_PTR("bounds "), STR_LEN("bounds "));
+                                            pw_span(x, p, bk.off, bk.len);
+                                            pw_lit(p, STR_PTR(" needs 3 components"), STR_LEN(" needs 3 components"));
+                                            p_fail(x, p);
+                                            return;
+                                        };
+                                        if is_min {
+                                            md.bmin = v.off;
+                                        } else {
+                                            md.bmax = v.off;
+                                        };
+                                        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                                    }
+                                    md.has_bounds = 1;
+                                } else {
+                                    p_unknown_item(x, p, STR_PTR("mesh "), STR_LEN("mesh "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                                    return;
+                                };
+                            };
+                        };
+                    };
+                };
+            };
+        };
+    }
+    if p.fail {
+        return;
+    };
+    md.ch_len = (x.chans.len() as i32) - ch_start;
+    md.mo_len = (x.morphs.len() as i32) - mo_start;
+    md.pr_len = (x.prims.len() as i32) - pr_start;
+    // Zig model default: topology = "triangles" when the item is absent.
+    // Materialise the default as an interned span so every later phase
+    // (check/layout/pack) observes exactly the Zig value.
+    if md.topo_len == 0 {
+        md.topo_off = x_intern_lit(x, STR_PTR("triangles"), STR_LEN("triangles"));
+        md.topo_len = STR_LEN("triangles") as i32;
+    };
+    x.meshes.push(md);
+    x.meshes[((x.meshes.len() as i32) - 1) as usize] = MeshD { n_off: md.n_off, n_len: md.n_len, topo_off: md.topo_off, topo_len: md.topo_len, vertices: md.vertices, has_bounds: md.has_bounds, bmin: md.bmin, bmax: md.bmax, ch_off: md.ch_off, ch_len: md.ch_len, mo_off: md.mo_off, mo_len: md.mo_len, pr_off: md.pr_off, pr_len: md.pr_len, ity_off: md.ity_off, ity_len: md.ity_len, isec_off: md.isec_off, isec_len: md.isec_len, icount: md.icount };
+}
+
+// joint item dispatch (parent / bind / unknown); false -> caller returns.
+// Extracted from p_parse_skeleton's joint loop: the inline if/else chain
+// mixed call-tailed and loop-tailed branches into one merge, which the SA
+// verifier rejects (PhiStateConflict on the &X borrow, probe v_phi_c).
+fn p_joint_item(x: &X, p: &P, jd: &JointD, jk: Span2) -> bool {
+    if x_eq_lit(x, jk.off, jk.len, STR_PTR("parent"), STR_LEN("parent")) {
+        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+        let t = p_peek(p);
+        if t.kind < 0 {
+            pw_lit(p, STR_PTR("joint parent: EOF"), STR_LEN("joint parent: EOF"));
+            p_fail(x, p);
+            return false;
+        };
+        if t.kind == 0 && x_eq_lit(x, t.off, t.len, STR_PTR("none"), STR_LEN("none")) {
+            let _ = p_next(p);
+            jd.has_parent = 0;
+        } else {
+            let pv = p_name(x, p);
+            jd.has_parent = 1;
+            jd.p_off = pv.off;
+            jd.p_len = pv.len;
+        };
+        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        return true;
+    };
+    if x_eq_lit(x, jk.off, jk.len, STR_PTR("bind"), STR_LEN("bind")) {
+        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+        p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+        while true {
+            if p.fail {
+                return false;
+            };
+            if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                break;
+            };
+            let bk = p_ident(x, p);
+            if p.fail {
+                return false;
+            };
+            let want: i32 = 3;
+            if x_eq_lit(x, bk.off, bk.len, STR_PTR("r"), STR_LEN("r")) {
+                // want = 4
+                if !p_bind_field(x, p, jd, bk, 4) {
+                    return false;
+                };
+                continue;
+            };
+            if x_eq_lit(x, bk.off, bk.len, STR_PTR("t"), STR_LEN("t")) || x_eq_lit(x, bk.off, bk.len, STR_PTR("s"), STR_LEN("s")) {
+                if !p_bind_field(x, p, jd, bk, want) {
+                    return false;
+                };
+                continue;
+            };
+            pw_lit(p, STR_PTR("bind: unknown field '"), STR_LEN("bind: unknown field '"));
+            pw_span(x, p, bk.off, bk.len);
+            pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+            p_fail(x, p);
+            return false;
+        }
+        jd.has_bind = 1;
+        return true;
+    };
+    p_unknown_item(x, p, STR_PTR("joint "), STR_LEN("joint "), Span2 { off: jd.n_off, len: jd.n_len }, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), jk, STR_PTR("'"), STR_LEN("'"));
+    return false;
+}
+
+
+fn p_parse_skeleton(x: &X, p: &P) {
+    let _ = p_next(p); // skeleton
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let j_start = x.joints.len() as i32;
+    let sk = SkelD { n_off: nm.off, n_len: nm.len, j_off: j_start, j_len: 0, ib_off: 0, ib_len: -1 };
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("joint"), STR_LEN("joint")) {
+            let jn = p_name(x, p);
+            let jd = JointD { n_off: jn.off, n_len: jn.len, has_parent: 0, p_off: 0, p_len: 0, has_bind: 0, bt: -1, br: -1, bs: -1 };
+            p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+            while true {
+                if p.fail {
+                    return;
+                };
+                if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                    break;
+                };
+                let jk = p_ident(x, p);
+                if p.fail {
+                    return;
+                };
+                if !p_joint_item(x, p, &jd, jk) {
+                    return;
+                };
+            }
+            x.joints.push(jd);
+            x.joints[((x.joints.len() as i32) - 1) as usize] = JointD { n_off: jd.n_off, n_len: jd.n_len, has_parent: jd.has_parent, p_off: jd.p_off, p_len: jd.p_len, has_bind: jd.has_bind, bt: jd.bt, br: jd.br, bs: jd.bs };
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("inverse_bind"), STR_LEN("inverse_bind")) {
+                p_expect(x, p, STR_PTR("@"), STR_LEN("@"));
+                let ib = p_name(x, p);
+                sk.ib_off = ib.off;
+                sk.ib_len = ib.len;
+                p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+            } else {
+                p_unknown_item(x, p, STR_PTR("skeleton "), STR_LEN("skeleton "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                return;
+            };
+        };
+    }
+    if p.fail {
+        return;
+    };
+    sk.j_len = (x.joints.len() as i32) - j_start;
+    x.skels.push(sk);
+    x.skels[((x.skels.len() as i32) - 1) as usize] = SkelD { n_off: sk.n_off, n_len: sk.n_len, j_off: sk.j_off, j_len: sk.j_len, ib_off: sk.ib_off, ib_len: sk.ib_len };
+}
+
+// bind t/r/s ; false
+fn p_bind_field(x: &X, p: &P, jd: &JointD, bk: Span2, want: i32) -> bool {
+    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+    let v = p_vec_literal(x, p);
+    if p.fail {
+        return false;
+    };
+    if v.len != want {
+        pw_lit(p, STR_PTR("bind "), STR_LEN("bind "));
+        pw_span(x, p, bk.off, bk.len);
+        pw_lit(p, STR_PTR(" needs "), STR_LEN(" needs "));
+        pw_u64(p, want as u64);
+        pw_lit(p, STR_PTR(" components"), STR_LEN(" components"));
+        p_fail(x, p);
+        return false;
+    };
+    if x_eq_lit(x, bk.off, bk.len, STR_PTR("t"), STR_LEN("t")) {
+        jd.bt = v.off;
+    };
+    if x_eq_lit(x, bk.off, bk.len, STR_PTR("r"), STR_LEN("r")) {
+        jd.br = v.off;
+    };
+    if x_eq_lit(x, bk.off, bk.len, STR_PTR("s"), STR_LEN("s")) {
+        jd.bs = v.off;
+    };
+    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+    return !p.fail;
+}
+
+fn p_parse_image(x: &X, p: &P) {
+    let _ = p_next(p); // image
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let im = ImgD {
+        n_off: nm.off, n_len: nm.len, kind: 0,
+        s_off: 0, s_len: 0, f_off: 0, f_len: 0,
+        has_size: 0, w: 0, h: 0, c_off: 0, c_len: 0,
+    };
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("source"), STR_LEN("source")) {
+            if p_eat(x, p, STR_PTR("@"), STR_LEN("@")) {
+                im.kind = 0;
+                let sv = p_name(x, p);
+                im.s_off = sv.off;
+                im.s_len = sv.len;
+            } else {
+                let t = p_next(p);
+                if t.kind < 0 {
+                    pw_lit(p, STR_PTR("image source: EOF"), STR_LEN("image source: EOF"));
+                    p_fail(x, p);
+                    return;
+                };
+                if t.kind != 2 {
+                    pw_lit(p, STR_PTR("image source: expected path string or @section"), STR_LEN("image source: expected path string or @section"));
+                    p_fail(x, p);
+                    return;
+                };
+                im.kind = 1;
+                im.s_off = t.off;
+                im.s_len = t.len;
+            };
+            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("format"), STR_LEN("format")) {
+                let fv = p_ident(x, p);
+                im.f_off = fv.off;
+                im.f_len = fv.len;
+                p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+            } else {
+                if x_eq_lit(x, k.off, k.len, STR_PTR("size"), STR_LEN("size")) {
+                    im.w = p_u64num(x, p);
+                    im.h = p_u64num(x, p);
+                    im.has_size = 1;
+                    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                } else {
+                    if x_eq_lit(x, k.off, k.len, STR_PTR("color_space"), STR_LEN("color_space")) {
+                        let cv = p_ident(x, p);
+                        im.c_off = cv.off;
+                        im.c_len = cv.len;
+                        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                    } else {
+                        p_unknown_item(x, p, STR_PTR("image "), STR_LEN("image "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                        return;
+                    };
+                };
+            };
+        };
+    }
+    if p.fail {
+        return;
+    };
+    x.imgs.push(im);
+    x.imgs[((x.imgs.len() as i32) - 1) as usize] = ImgD { n_off: im.n_off, n_len: im.n_len, kind: im.kind, s_off: im.s_off, s_len: im.s_len, f_off: im.f_off, f_len: im.f_len, has_size: im.has_size, w: im.w, h: im.h, c_off: im.c_off, c_len: im.c_len };
+}
+
+// texture sampler block; false -> caller returns. Extracted from
+// p_parse_texture: the inline branch ended in a while statement while its
+// sibling branch ended in a call, splitting the &X borrow state at the
+// merge (PhiStateConflict, probe v_phi_c pattern).
+fn p_tex_sampler(x: &X, p: &P, td: &TexD) -> bool {
+    td.smp = 1;
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return false;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let sk = p_ident(x, p);
+        if p.fail {
+            return false;
+        };
+        if x_eq_lit(x, sk.off, sk.len, STR_PTR("mag"), STR_LEN("mag")) {
+            // slot 0
+            if !p_sampler_field(x, p, td, 0) { return false; };
+            continue;
+        };
+        if x_eq_lit(x, sk.off, sk.len, STR_PTR("min"), STR_LEN("min")) {
+            if !p_sampler_field(x, p, td, 1) { return false; };
+            continue;
+        };
+        if x_eq_lit(x, sk.off, sk.len, STR_PTR("mipmap"), STR_LEN("mipmap")) {
+            if !p_sampler_field(x, p, td, 2) { return false; };
+            continue;
+        };
+        if x_eq_lit(x, sk.off, sk.len, STR_PTR("wrap_u"), STR_LEN("wrap_u")) {
+            if !p_sampler_field(x, p, td, 3) { return false; };
+            continue;
+        };
+        if x_eq_lit(x, sk.off, sk.len, STR_PTR("wrap_v"), STR_LEN("wrap_v")) {
+            if !p_sampler_field(x, p, td, 4) { return false; };
+            continue;
+        };
+        if x_eq_lit(x, sk.off, sk.len, STR_PTR("wrap_w"), STR_LEN("wrap_w")) {
+            if !p_sampler_field(x, p, td, 5) { return false; };
+            continue;
+        };
+        pw_lit(p, STR_PTR("sampler: unknown field '"), STR_LEN("sampler: unknown field '"));
+        pw_span(x, p, sk.off, sk.len);
+        pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+        p_fail(x, p);
+        return false;
+    }
+    return true;
+}
+
+
+fn p_parse_texture(x: &X, p: &P) {
+    let _ = p_next(p); // texture
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let td = TexD {
+        n_off: nm.off, n_len: nm.len, i_off: 0, i_len: 0, smp: 0,
+        mag_off: 0, mag_len: -1, min_off: 0, min_len: -1, mip_off: 0, mip_len: -1,
+        wu_off: 0, wu_len: -1, wv_off: 0, wv_len: -1, ww_off: 0, ww_len: -1,
+    };
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("image"), STR_LEN("image")) {
+            p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+            let iv = p_name(x, p);
+            td.i_off = iv.off;
+            td.i_len = iv.len;
+            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("sampler"), STR_LEN("sampler")) {
+                if !p_tex_sampler(x, p, &td) {
+                    return;
+                };
+            } else {
+                p_unknown_item(x, p, STR_PTR("texture "), STR_LEN("texture "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                return;
+            };
+        };
+    }
+    if p.fail {
+        return;
+    };
+    x.texs.push(td);
+    x.texs[((x.texs.len() as i32) - 1) as usize] = TexD { n_off: td.n_off, n_len: td.n_len, i_off: td.i_off, i_len: td.i_len, smp: td.smp, mag_off: td.mag_off, mag_len: td.mag_len, min_off: td.min_off, min_len: td.min_len, mip_off: td.mip_off, mip_len: td.mip_len, wu_off: td.wu_off, wu_len: td.wu_len, wv_off: td.wv_off, wv_len: td.wv_len, ww_off: td.ww_off, ww_len: td.ww_len };
+}
+
+fn p_sampler_field(x: &X, p: &P, td: &TexD, slot: i32) -> bool {
+    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+    let v = p_ident(x, p);
+    if slot == 0 { td.mag_off = v.off; td.mag_len = v.len; };
+    if slot == 1 { td.min_off = v.off; td.min_len = v.len; };
+    if slot == 2 { td.mip_off = v.off; td.mip_len = v.len; };
+    if slot == 3 { td.wu_off = v.off; td.wu_len = v.len; };
+    if slot == 4 { td.wv_off = v.off; td.wv_len = v.len; };
+    if slot == 5 { td.ww_off = v.off; td.ww_len = v.len; };
+    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+    return !p.fail;
+}
+
+fn p_parse_shader(x: &X, p: &P) {
+    let _ = p_next(p); // shader
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let sh = ShaderD { n_off: nm.off, n_len: nm.len, p_off: 0, p_len: 0 };
+    if p.mode == 0 {
+        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+        let kind = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if !x_eq_lit(x, kind.off, kind.len, STR_PTR("slasl"), STR_LEN("slasl")) {
+            pw_lit(p, STR_PTR("shader "), STR_LEN("shader "));
+            pw_span(x, p, nm.off, nm.len);
+            pw_lit(p, STR_PTR(": only 'slasl' references in v1, got '"), STR_LEN(": only 'slasl' references in v1, got '"));
+            pw_span(x, p, kind.off, kind.len);
+            pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+            p_fail(x, p);
+            return;
+        };
+        let t = p_next(p);
+        if t.kind < 0 {
+            pw_lit(p, STR_PTR("shader path: EOF"), STR_LEN("shader path: EOF"));
+            p_fail(x, p);
+            return;
+        };
+        if t.kind != 2 {
+            pw_lit(p, STR_PTR("shader "), STR_LEN("shader "));
+            pw_span(x, p, nm.off, nm.len);
+            pw_lit(p, STR_PTR(": expected .slasl path string"), STR_LEN(": expected .slasl path string"));
+            p_fail(x, p);
+            return;
+        };
+        sh.p_off = t.off;
+        sh.p_len = t.len;
+    };
+    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+    if p.fail {
+        return;
+    };
+    x.shaders.push(sh);
+    x.shaders[((x.shaders.len() as i32) - 1) as usize] = ShaderD { n_off: sh.n_off, n_len: sh.n_len, p_off: sh.p_off, p_len: sh.p_len };
+}
+
+fn p_parse_material(x: &X, p: &P) {
+    let _ = p_next(p); // material
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let pa_start = x.params.len() as i32;
+    let tb_start = x.tbinds.len() as i32;
+    let tt_start = x.ttrs.len() as i32;
+    let mt = MatD {
+        n_off: nm.off, n_len: nm.len, sh_off: 0, sh_len: 0,
+        pa_off: pa_start, pa_len: 0, tb_off: tb_start, tb_len: 0, tt_off: tt_start, tt_len: 0,
+        al_off: 0, al_len: -1, has_cut: 0, cut: 0.0, ds: -1, dw: -1,
+    };
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("shader"), STR_LEN("shader")) {
+            p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+            let sv = p_name(x, p);
+            mt.sh_off = sv.off;
+            mt.sh_len = sv.len;
+            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("param"), STR_LEN("param")) {
+                let pn = p_ident(x, p);
+                p_expect(x, p, STR_PTR("="), STR_LEN("="));
+                let lit = p_literal(x, p);
+                p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                if p.fail {
+                    return;
+                };
+                x.params.push(ParamA { n_off: pn.off, n_len: pn.len, kind: lit.kind, val: lit.val, v_off: lit.v_off, v_len: lit.v_len, bval: lit.bval });
+            } else {
+                if x_eq_lit(x, k.off, k.len, STR_PTR("texture"), STR_LEN("texture")) {
+                    let bn = p_ident(x, p);
+                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                    let tv = p_name(x, p);
+                    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                    if p.fail {
+                        return;
+                    };
+                    x.tbinds.push(TBindD { n_off: bn.off, n_len: bn.len, t_off: tv.off, t_len: tv.len });
+                } else {
+                    if x_eq_lit(x, k.off, k.len, STR_PTR("tex_transform"), STR_LEN("tex_transform")) {
+                        let tn = p_ident(x, p);
+                        let tt = TTrD { n_off: tn.off, n_len: tn.len, off_v: -1, scl_v: -1, has_rot: 0, rot: 0.0 };
+                        p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                        while true {
+                            if p.fail {
+                                return;
+                            };
+                            if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                                break;
+                            };
+                            let tk = p_ident(x, p);
+                            if p.fail {
+                                return;
+                            };
+                            if x_eq_lit(x, tk.off, tk.len, STR_PTR("offset"), STR_LEN("offset")) || x_eq_lit(x, tk.off, tk.len, STR_PTR("scale"), STR_LEN("scale")) {
+                                p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                let v = p_vec_literal(x, p);
+                                if p.fail {
+                                    return;
+                                };
+                                if v.len != 2 {
+                                    pw_lit(p, STR_PTR("tex_transform "), STR_LEN("tex_transform "));
+                                    pw_span(x, p, tk.off, tk.len);
+                                    pw_lit(p, STR_PTR(" needs 2 components"), STR_LEN(" needs 2 components"));
+                                    p_fail(x, p);
+                                    return;
+                                };
+                                if x_eq_lit(x, tk.off, tk.len, STR_PTR("offset"), STR_LEN("offset")) {
+                                    tt.off_v = v.off;
+                                } else {
+                                    tt.scl_v = v.off;
+                                };
+                            } else {
+                                if x_eq_lit(x, tk.off, tk.len, STR_PTR("rotation"), STR_LEN("rotation")) {
+                                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                    tt.rot = p_f64num(x, p);
+                                    tt.has_rot = 1;
+                                } else {
+                                    pw_lit(p, STR_PTR("tex_transform: unknown field '"), STR_LEN("tex_transform: unknown field '"));
+                                    pw_span(x, p, tk.off, tk.len);
+                                    pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+                                    p_fail(x, p);
+                                    return;
+                                };
+                            };
+                            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                        }
+                        x.ttrs.push(tt);
+                        x.ttrs[((x.ttrs.len() as i32) - 1) as usize] = TTrD { n_off: tt.n_off, n_len: tt.n_len, off_v: tt.off_v, scl_v: tt.scl_v, has_rot: tt.has_rot, rot: tt.rot };
+                    } else {
+                        if x_eq_lit(x, k.off, k.len, STR_PTR("state"), STR_LEN("state")) {
+                            p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                            while true {
+                                if p.fail {
+                                    return;
+                                };
+                                if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                                    break;
+                                };
+                                let sk = p_ident(x, p);
+                                if p.fail {
+                                    return;
+                                };
+                                if x_eq_lit(x, sk.off, sk.len, STR_PTR("alpha"), STR_LEN("alpha")) {
+                                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                    let av = p_ident(x, p);
+                                    mt.al_off = av.off;
+                                    mt.al_len = av.len;
+                                } else {
+                                    if x_eq_lit(x, sk.off, sk.len, STR_PTR("cutoff"), STR_LEN("cutoff")) {
+                                        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                        mt.cut = p_f64num(x, p);
+                                        mt.has_cut = 1;
+                                    } else {
+                                        if x_eq_lit(x, sk.off, sk.len, STR_PTR("double_sided"), STR_LEN("double_sided")) || x_eq_lit(x, sk.off, sk.len, STR_PTR("depth_write"), STR_LEN("depth_write")) {
+                                            p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                            let b = p_literal(x, p);
+                                            if p.fail {
+                                                return;
+                                            };
+                                            if b.kind != 2 {
+                                                if x_eq_lit(x, sk.off, sk.len, STR_PTR("double_sided"), STR_LEN("double_sided")) {
+                                                    pw_lit(p, STR_PTR("double_sided needs bool"), STR_LEN("double_sided needs bool"));
+                                                } else {
+                                                    pw_lit(p, STR_PTR("depth_write needs bool"), STR_LEN("depth_write needs bool"));
+                                                };
+                                                p_fail(x, p);
+                                                return;
+                                            };
+                                            if x_eq_lit(x, sk.off, sk.len, STR_PTR("double_sided"), STR_LEN("double_sided")) {
+                                                mt.ds = b.bval;
+                                            } else {
+                                                mt.dw = b.bval;
+                                            };
+                                        } else {
+                                            pw_lit(p, STR_PTR("state: unknown field '"), STR_LEN("state: unknown field '"));
+                                            pw_span(x, p, sk.off, sk.len);
+                                            pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+                                            p_fail(x, p);
+                                            return;
+                                        };
+                                    };
+                                };
+                                p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                            }
+                        } else {
+                            p_unknown_item(x, p, STR_PTR("material "), STR_LEN("material "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                            return;
+                        };
+                    };
+                };
+            };
+        };
+    }
+    if p.fail {
+        return;
+    };
+    mt.pa_len = (x.params.len() as i32) - pa_start;
+    mt.tb_len = (x.tbinds.len() as i32) - tb_start;
+    mt.tt_len = (x.ttrs.len() as i32) - tt_start;
+    x.mats.push(mt);
+    x.mats[((x.mats.len() as i32) - 1) as usize] = MatD { n_off: mt.n_off, n_len: mt.n_len, sh_off: mt.sh_off, sh_len: mt.sh_len, pa_off: mt.pa_off, pa_len: mt.pa_len, tb_off: mt.tb_off, tb_len: mt.tb_len, tt_off: mt.tt_off, tt_len: mt.tt_len, al_off: mt.al_off, al_len: mt.al_len, has_cut: mt.has_cut, cut: mt.cut, ds: mt.ds, dw: mt.dw };
+}
+
+fn p_parse_node(x: &X, p: &P) -> i32 {
+    let _ = p_next(p); // node
+    let nm = p_name(x, p);
+    if p.fail {
+        return -1;
+    };
+    let children: Vec<i32> = Vec::new();
+    let nd = NodeD {
+        n_off: nm.off, n_len: nm.len,
+        has_tr: 0, tt: -1, tr: -1, ts: -1, mtx: -1,
+        mesh_off: 0, mesh_len: -1, mat_off: 0, mat_len: -1, skin_off: 0, skin_len: -1,
+        ch_off: 0, ch_len: 0,
+    };
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return -1;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return -1;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("node"), STR_LEN("node")) {
+            p.pos = p.pos - 1;
+            let c = p_parse_node(x, p);
+            if p.fail {
+                return -1;
+            };
+            children.push(c);
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("transform"), STR_LEN("transform")) {
+                p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                while true {
+                    if p.fail {
+                        return -1;
+                    };
+                    if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                        break;
+                    };
+                    let tk = p_ident(x, p);
+                    if p.fail {
+                        return -1;
+                    };
+                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                    let v = p_vec_literal(x, p);
+                    if p.fail {
+                        return -1;
+                    };
+                    if x_eq_lit(x, tk.off, tk.len, STR_PTR("t"), STR_LEN("t")) {
+                        if v.len != 3 {
+                            pw_lit(p, STR_PTR("transform t needs 3"), STR_LEN("transform t needs 3"));
+                            p_fail(x, p);
+                            return -1;
+                        };
+                        nd.tt = v.off;
+                    } else {
+                        if x_eq_lit(x, tk.off, tk.len, STR_PTR("r"), STR_LEN("r")) {
+                            if v.len != 4 {
+                                pw_lit(p, STR_PTR("transform r needs 4"), STR_LEN("transform r needs 4"));
+                                p_fail(x, p);
+                                return -1;
+                            };
+                            nd.tr = v.off;
+                        } else {
+                            if x_eq_lit(x, tk.off, tk.len, STR_PTR("s"), STR_LEN("s")) {
+                                if v.len != 3 {
+                                    pw_lit(p, STR_PTR("transform s needs 3"), STR_LEN("transform s needs 3"));
+                                    p_fail(x, p);
+                                    return -1;
+                                };
+                                nd.ts = v.off;
+                            } else {
+                                pw_lit(p, STR_PTR("transform: unknown field '"), STR_LEN("transform: unknown field '"));
+                                pw_span(x, p, tk.off, tk.len);
+                                pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+                                p_fail(x, p);
+                                return -1;
+                            };
+                        };
+                    };
+                    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                }
+                nd.has_tr = 1;
+            } else {
+                if x_eq_lit(x, k.off, k.len, STR_PTR("matrix"), STR_LEN("matrix")) {
+                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                    let v = p_vec_literal(x, p);
+                    if p.fail {
+                        return -1;
+                    };
+                    if v.len != 16 {
+                        pw_lit(p, STR_PTR("matrix needs 16 components"), STR_LEN("matrix needs 16 components"));
+                        p_fail(x, p);
+                        return -1;
+                    };
+                    nd.mtx = v.off;
+                    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                } else {
+                    if x_eq_lit(x, k.off, k.len, STR_PTR("mesh"), STR_LEN("mesh")) {
+                        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                        let mv = p_name(x, p);
+                        nd.mesh_off = mv.off;
+                        nd.mesh_len = mv.len;
+                        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                    } else {
+                        if x_eq_lit(x, k.off, k.len, STR_PTR("material"), STR_LEN("material")) {
+                            p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                            let mv = p_name(x, p);
+                            nd.mat_off = mv.off;
+                            nd.mat_len = mv.len;
+                            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                        } else {
+                            if x_eq_lit(x, k.off, k.len, STR_PTR("skin"), STR_LEN("skin")) {
+                                p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                                let sv = p_name(x, p);
+                                nd.skin_off = sv.off;
+                                nd.skin_len = sv.len;
+                                p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                            } else {
+                                p_unknown_item(x, p, STR_PTR("node "), STR_LEN("node "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                                return -1;
+                            };
+                        };
+                    };
+                };
+            };
+        };
+    }
+    if p.fail {
+        return -1;
+    };
+    let idx = x.nodes.len() as i32;
+    nd.ch_off = x.idxpool.len() as i32;
+    nd.ch_len = children.len() as i32;
+    let ci: i32 = 0;
+    while ci < (children.len() as i32) {
+        x.idxpool.push(children[ci as usize]);
+        ci = ci + 1;
+    }
+    x.nodes.push(nd);
+    x.nodes[((x.nodes.len() as i32) - 1) as usize] = NodeD { n_off: nd.n_off, n_len: nd.n_len, has_tr: nd.has_tr, tt: nd.tt, tr: nd.tr, ts: nd.ts, mtx: nd.mtx, mesh_off: nd.mesh_off, mesh_len: nd.mesh_len, mat_off: nd.mat_off, mat_len: nd.mat_len, skin_off: nd.skin_off, skin_len: nd.skin_len, ch_off: nd.ch_off, ch_len: nd.ch_len };
+    return idx;
+}
+
+fn p_parse_scene(x: &X, p: &P) {
+    let _ = p_next(p); // scene
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let roots: Vec<i32> = Vec::new();
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if !x_eq_lit(x, k.off, k.len, STR_PTR("node"), STR_LEN("node")) {
+            p_unknown_item(x, p, STR_PTR("scene "), STR_LEN("scene "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("' (v1 payload: nodes only)"), STR_LEN("' (v1 payload: nodes only)"));
+            return;
+        };
+        p.pos = p.pos - 1;
+        let r = p_parse_node(x, p);
+        if p.fail {
+            return;
+        };
+        roots.push(r);
+    }
+    // GAP-PORT-4: literal inlined into push (named-local form read back
+    // garbage after this fn returned; probe v_scn/v_scnw1).
+    let r_off = x.idxpool.len() as i32;
+    let ci: i32 = 0;
+    while ci < (roots.len() as i32) {
+        x.idxpool.push(roots[ci as usize]);
+        ci = ci + 1;
+    }
+    x.scenes.push(SceneD { n_off: nm.off, n_len: nm.len, r_off: r_off, r_len: roots.len() as i32 });
+}
+
+fn p_parse_clip(x: &X, p: &P) {
+    let _ = p_next(p); // clip
+    let nm = p_name(x, p);
+    if p.fail {
+        return;
+    };
+    let sa_start = x.samps.len() as i32;
+    let ch_start = x.cchs.len() as i32;
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        let k = p_ident(x, p);
+        if p.fail {
+            return;
+        };
+        if x_eq_lit(x, k.off, k.len, STR_PTR("sampler"), STR_LEN("sampler")) {
+            let sn = p_name(x, p);
+            let sd = SampD {
+                n_off: sn.off, n_len: sn.len,
+                it_off: 0, it_len: 0, is_off: 0, is_len: 0, icnt: 0,
+                ot_off: 0, ot_len: 0, os_off: 0, os_len: 0, ocnt: 0,
+                ip_off: 0, ip_len: 0,
+            };
+            p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+            while true {
+                if p.fail {
+                    return;
+                };
+                if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                    break;
+                };
+                let sk = p_ident(x, p);
+                if p.fail {
+                    return;
+                };
+                if x_eq_lit(x, sk.off, sk.len, STR_PTR("input"), STR_LEN("input")) {
+                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                    let tv = p_ident(x, p);
+                    sd.it_off = tv.off;
+                    sd.it_len = tv.len;
+                    p_expect(x, p, STR_PTR("@"), STR_LEN("@"));
+                    let sv = p_name(x, p);
+                    sd.is_off = sv.off;
+                    sd.is_len = sv.len;
+                    p_expect(x, p, STR_PTR("count"), STR_LEN("count"));
+                    sd.icnt = p_u64num(x, p);
+                    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                } else {
+                    if x_eq_lit(x, sk.off, sk.len, STR_PTR("output"), STR_LEN("output")) {
+                        p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                        let tv = p_ident(x, p);
+                        sd.ot_off = tv.off;
+                        sd.ot_len = tv.len;
+                        p_expect(x, p, STR_PTR("@"), STR_LEN("@"));
+                        let sv = p_name(x, p);
+                        sd.os_off = sv.off;
+                        sd.os_len = sv.len;
+                        p_expect(x, p, STR_PTR("count"), STR_LEN("count"));
+                        sd.ocnt = p_u64num(x, p);
+                        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                    } else {
+                        if x_eq_lit(x, sk.off, sk.len, STR_PTR("interpolation"), STR_LEN("interpolation")) {
+                            p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                            let iv = p_ident(x, p);
+                            sd.ip_off = iv.off;
+                            sd.ip_len = iv.len;
+                            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                        } else {
+                            pw_lit(p, STR_PTR("clip sampler: unknown item '"), STR_LEN("clip sampler: unknown item '"));
+                            pw_span(x, p, sk.off, sk.len);
+                            pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+                            p_fail(x, p);
+                            return;
+                        };
+                    };
+                };
+            }
+            // Zig model default: interpolation = "linear" when absent
+            // (materialised as an interned span, as with mesh topology).
+            if sd.ip_len == 0 {
+                sd.ip_off = x_intern_lit(x, STR_PTR("linear"), STR_LEN("linear"));
+                sd.ip_len = STR_LEN("linear") as i32;
+            };
+            x.samps.push(sd);
+            x.samps[((x.samps.len() as i32) - 1) as usize] = SampD { n_off: sd.n_off, n_len: sd.n_len, it_off: sd.it_off, it_len: sd.it_len, is_off: sd.is_off, is_len: sd.is_len, icnt: sd.icnt, ot_off: sd.ot_off, ot_len: sd.ot_len, os_off: sd.os_off, os_len: sd.os_len, ocnt: sd.ocnt, ip_off: sd.ip_off, ip_len: sd.ip_len };
+        } else {
+            if x_eq_lit(x, k.off, k.len, STR_PTR("channel"), STR_LEN("channel")) {
+                let cd = CChD { nd_off: 0, nd_len: 0, pa_off: 0, pa_len: 0, sa_off: 0, sa_len: 0 };
+                p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+                while true {
+                    if p.fail {
+                        return;
+                    };
+                    if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+                        break;
+                    };
+                    let ck = p_ident(x, p);
+                    p_expect(x, p, STR_PTR(":"), STR_LEN(":"));
+                    if p.fail {
+                        return;
+                    };
+                    if x_eq_lit(x, ck.off, ck.len, STR_PTR("node"), STR_LEN("node")) {
+                        let nv = p_name(x, p);
+                        cd.nd_off = nv.off;
+                        cd.nd_len = nv.len;
+                    } else {
+                        if x_eq_lit(x, ck.off, ck.len, STR_PTR("path"), STR_LEN("path")) {
+                            let pv = p_ident(x, p);
+                            cd.pa_off = pv.off;
+                            cd.pa_len = pv.len;
+                        } else {
+                            if x_eq_lit(x, ck.off, ck.len, STR_PTR("sampler"), STR_LEN("sampler")) {
+                                let sv = p_name(x, p);
+                                cd.sa_off = sv.off;
+                                cd.sa_len = sv.len;
+                            } else {
+                                pw_lit(p, STR_PTR("clip channel: unknown field '"), STR_LEN("clip channel: unknown field '"));
+                                pw_span(x, p, ck.off, ck.len);
+                                pw_lit(p, STR_PTR("'"), STR_LEN("'"));
+                                p_fail(x, p);
+                                return;
+                            };
+                        };
+                    };
+                    p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+                }
+                x.cchs.push(cd);
+                x.cchs[((x.cchs.len() as i32) - 1) as usize] = CChD { nd_off: cd.nd_off, nd_len: cd.nd_len, pa_off: cd.pa_off, pa_len: cd.pa_len, sa_off: cd.sa_off, sa_len: cd.sa_len };
+            } else {
+                p_unknown_item(x, p, STR_PTR("clip "), STR_LEN("clip "), nm, STR_PTR(": unknown item '"), STR_LEN(": unknown item '"), k, STR_PTR("'"), STR_LEN("'"));
+                return;
+            };
+        };
+    }
+    if p.fail {
+        return;
+    };
+    x.clips.push(ClipD { n_off: nm.off, n_len: nm.len, sa_off: sa_start, sa_len: (x.samps.len() as i32) - sa_start, ch_off: ch_start, ch_len: (x.cchs.len() as i32) - ch_start });
+}
+
+fn p_parse_top(x: &X, p: &P, kw: Tok) {
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("asset"), STR_LEN("asset")) {
+        let _ = p_next(p);
+        if p.saw_asset == 1 {
+            pw_lit(p, STR_PTR("duplicate 'asset' header (exactly one per file)"), STR_LEN("duplicate 'asset' header (exactly one per file)"));
+            p_fail(x, p);
+            return;
+        };
+        p.saw_asset = 1;
+        let nm = p_name(x, p);
+        p_expect(x, p, STR_PTR("version"), STR_LEN("version"));
+        let ver = p_u64num(x, p);
+        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        if p.fail {
+            return;
+        };
+        x.a_name_off = nm.off;
+        x.a_name_len = nm.len;
+        x.a_version = ver;
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("binary"), STR_LEN("binary")) {
+        let _ = p_next(p);
+        let t2 = p_peek(p);
+        if t2.kind == 2 {
+            let _ = p_next(p);
+            // file = t2 span (build decl below from locals)
+            p_parse_binary_rest(x, p, t2.off, t2.len);
+            return;
+        };
+        p_parse_binary_rest(x, p, 0, 0);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("mesh"), STR_LEN("mesh")) {
+        p_parse_mesh(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("skeleton"), STR_LEN("skeleton")) {
+        p_parse_skeleton(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("image"), STR_LEN("image")) {
+        p_parse_image(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("texture"), STR_LEN("texture")) {
+        p_parse_texture(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("shader"), STR_LEN("shader")) {
+        p_parse_shader(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("material"), STR_LEN("material")) {
+        p_parse_material(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("scene"), STR_LEN("scene")) {
+        p_parse_scene(x, p);
+        return;
+    };
+    if x_eq_lit(x, kw.off, kw.len, STR_PTR("clip"), STR_LEN("clip")) {
+        p_parse_clip(x, p);
+        return;
+    };
+    // unknown top-level declaration
+    mb_clear(x);
+    mb_u64(x, kw.line as u64);
+    mb_lit(x, STR_PTR(":"), STR_LEN(":"));
+    mb_u64(x, kw.col as u64);
+    mb_lit(x, STR_PTR(": unknown top-level declaration '"), STR_LEN(": unknown top-level declaration '"));
+    mb_span(x, kw.off, kw.len);
+    mb_lit(x, STR_PTR("' (closed vocabulary)"), STR_LEN("' (closed vocabulary)"));
+    diag_commit(x, STR_PTR("Sax3dUnknownDeclaration"), STR_LEN("Sax3dUnknownDeclaration"));
+    let _ = p_next(p);
+    p.fail = true;
+}
+
+fn p_parse_binary_rest(x: &X, p: &P, f_off: i32, f_len: i32) {
+    let locals: Vec<SecD> = Vec::new();
+    p_expect(x, p, STR_PTR("{"), STR_LEN("{"));
+    while true {
+        if p.fail {
+            return;
+        };
+        if p_eat(x, p, STR_PTR("}"), STR_LEN("}")) {
+            break;
+        };
+        p_expect(x, p, STR_PTR("section"), STR_LEN("section"));
+        let nm = p_name(x, p);
+        let slen: u64 = 0;
+        if p.mode == 0 {
+            // len = u64num
+            let v = p_u64num(x, p);
+            p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+            if p.fail {
+                return;
+            };
+            locals.push(SecD { n_off: nm.off, n_len: nm.len, len: v });
+            continue;
+        };
+        p_expect(x, p, STR_PTR(";"), STR_LEN(";"));
+        if p.fail {
+            return;
+        };
+        locals.push(SecD { n_off: nm.off, n_len: nm.len, len: slen });
+    }
+    if p.fail {
+        return;
+    };
+    x.a_has_binary = 1;
+    x.a_binfile_off = f_off;
+    x.a_binfile_len = f_len;
+    let i: i32 = 0;
+    while i < (locals.len() as i32) {
+        x.secs.push(locals[i as usize]);
+        i = i + 1;
+    }
+}
+
+fn parse_asset(x: &X, p: &P, src_off: i32, src_len: i32) {
+    p.toks = lex_tokenize(x, src_off, src_len);
+    while true {
+        let t = p_peek(p);
+        if t.kind < 0 {
+            break;
+        };
+        if t.kind != 0 {
+            let _ = p_next(p);
+            continue;
+        };
+        let kw = t;
+        let before = diag_count(x);
+        p.fail = false;
+        p_parse_top(x, p, kw);
+        if p.fail {
+            if diag_count(x) == before {
+                mb_clear(x);
+                mb_u64(x, kw.line as u64);
+                mb_lit(x, STR_PTR(":"), STR_LEN(":"));
+                mb_u64(x, kw.col as u64);
+                mb_lit(x, STR_PTR(": cannot parse declaration starting '"), STR_LEN(": cannot parse declaration starting '"));
+                mb_span(x, kw.off, kw.len);
+                mb_lit(x, STR_PTR("'"), STR_LEN("'"));
+                diag_commit(x, STR_PTR("Sax3dParseError"), STR_LEN("Sax3dParseError"));
+            };
+            p_resync(x, p);
+            p.fail = false;
+        };
+    }
+    if p.saw_asset == 0 {
+        mb_clear(x);
+        mb_lit(x, STR_PTR("missing 'asset <Name> version <n>;' header (exactly one required)"), STR_LEN("missing 'asset <Name> version <n>;' header (exactly one required)"));
+        diag_commit(x, STR_PTR("Sax3dParseError"), STR_LEN("Sax3dParseError"));
+    };
+}

@@ -1,0 +1,85 @@
+// genpayload.sla — SLA port of tools/genpayload.zig (test payload
+// generator; acceptance-only, not a shipped tool).
+// Usage: genpayload <outdir> <name:size> [<name:size> ...]
+// Writes <outdir>/<name>.bin zero-filled; one stderr line per file.
+
+@import "../src/core.sla"
+
+extern "C" {
+    fn malloc(size: usize) -> *u8;
+    fn free(p: *u8);
+}
+
+fn gp_err(p: ptr, n: u64) {
+    let b = sb_new();
+    sb_push_span(&b, p, n);
+    sx_err_buf(&b);
+}
+
+fn main() -> i32 {
+    let jh = sa_env_args_json();
+    let abuf = sb_new();
+    let aoffs: Vec<i32> = Vec::new();
+    let alens: Vec<i32> = Vec::new();
+    if !sx_parse_argv(jh, &abuf, &aoffs, &alens) {
+        return 1;
+    };
+    let argc = aoffs.len() as i32;
+    if argc < 3 {
+        gp_err(STR_PTR("usage: genpayload <outdir> <name:size>...\n"), STR_LEN("usage: genpayload <outdir> <name:size>...\n"));
+        return 1;
+    };
+    let ap: ptr = abuf.data as ptr;
+    let dirp: ptr = sx_ptr_add(ap, aoffs[1] as u64);
+    let dirl: u64 = alens[1] as u64;
+    let _ = sa_fs_mkdir_p(dirp, dirl);
+    let ai: i32 = 2;
+    while ai < argc {
+        let sp: ptr = sx_ptr_add(ap, aoffs[ai as usize] as u64);
+        let sl: u64 = alens[ai as usize] as u64;
+        let colon = sx_index_of_byte(sp, sl, 58); // ':'
+        if colon < 0 {
+            return 1;
+        };
+        // decimal size after the colon; any non-digit fails (Zig try)
+        let size: u64 = 0;
+        let ndig: i32 = 0;
+        let ci: u64 = (colon as u64) + 1;
+        while ci < sl {
+            let c = PTR_BYTE_AT(sp, ci);
+            if c < 48 || c > 57 {
+                return 1;
+            };
+            size = size * 10 + (c - 48) as u64;
+            ndig = ndig + 1;
+            ci = ci + 1;
+        }
+        if ndig == 0 {
+            return 1;
+        };
+        let data = sb_new();
+        let zi: u64 = 0;
+        while zi < size {
+            sb_push_byte(&data, 0);
+            zi = zi + 1;
+        }
+        let path = sb_new();
+        sb_push_span(&path, dirp, dirl);
+        sb_push_byte(&path, 47); // '/'
+        sb_push_span(&path, sp, colon as u64);
+        sb_push_lit(&path, STR_PTR(".bin"), STR_LEN(".bin"));
+        let st = sx_write_file(path.data as ptr, path.len, data.data as ptr, data.len);
+        if st != 0 {
+            return 1;
+        };
+        let lb = sb_new();
+        sb_push_lit(&lb, STR_PTR("genpayload: "), STR_LEN("genpayload: "));
+        sb_push_span(&lb, path.data as ptr, path.len);
+        sb_push_lit(&lb, STR_PTR(" ("), STR_LEN(" ("));
+        sb_push_u64(&lb, size);
+        sb_push_lit(&lb, STR_PTR("B)\n"), STR_LEN("B)\n"));
+        sx_err_buf(&lb);
+        ai = ai + 1;
+    }
+    return 0;
+}

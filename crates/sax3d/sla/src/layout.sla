@@ -1,0 +1,234 @@
+// layout.sla — SAX3D (layout.zig port)
+// Section layout planning + name table construction. Layout law:
+// header + section table, then payloads packed tightly in declaration
+// order (no padding); the name table sits at the end of the file and
+// each distinct name appears exactly once.
+
+@import "model.sla"
+@import "schema_gen.sla"
+
+// ------------------------------------------------------------------
+// Planning. Sections are x.secs in declaration order; kind/align come
+// from the checker resolution (x.res: v0=kind, v1=align), defaulting
+// to blob/1 exactly like layout.zig's `orelse`. When assembly_len >= 0
+// a final "assembly" plan (the packform emission) is appended.
+// ------------------------------------------------------------------
+
+fn lay_plan(x: &X, assembly_len: i64) {
+    let cell = malloc(8);
+    let nsec = x.secs.len() as i32;
+    let extra: i32 = 0;
+    if assembly_len >= 0 {
+        extra = 1;
+    };
+    let base = (schg_sax3dbinheader_size() as u64) + ((nsec + extra) as u64) * (schg_sax3dsectionrec_size() as u64);
+    let off: u64 = base;
+    let i: i32 = 0;
+    while i < nsec {
+        let s = x.secs[i as usize];
+        let kind: i32 = 7; // blob
+        let al: i32 = 1;
+        if xmap_get(x, 1, s.n_off, s.n_len, 0, cell as ptr) {
+            kind = sx_cell_u64(cell as ptr) as i32;
+        };
+        if xmap_get(x, 1, s.n_off, s.n_len, 1, cell as ptr) {
+            al = sx_cell_u64(cell as ptr) as i32;
+        };
+        x.plans.push(PlanRec { n_off: s.n_off, n_len: s.n_len, kind: kind, align: al, len: s.len, offset: off });
+        off = off + s.len;
+        i = i + 1;
+    }
+    if assembly_len >= 0 {
+        let a_off = x_intern_lit(x, STR_PTR("assembly"), STR_LEN("assembly"));
+        x.plans.push(PlanRec { n_off: a_off, n_len: STR_LEN("assembly") as i32, kind: 8, align: 1, len: assembly_len as u64, offset: off });
+        off = off + (assembly_len as u64);
+    };
+    x.lay_end = off;
+    free(cell);
+}
+
+// ------------------------------------------------------------------
+// Name table. Canonical build order (layout.zig): section names in
+// final table order first (full form: asset name before them), then
+// declaration names in canonical kind order, each declaration
+// followed by its local names. A repeated string reuses its first
+// entry.
+// ------------------------------------------------------------------
+
+fn nt_find(x: &X, o: i32, l: i32) -> i32 {
+    let i: i32 = 0;
+    let n = x.nt_map.len() as i32;
+    while i < n {
+        let e = x.nt_map[i as usize];
+        if e.n_len == l && x_eq(x, e.n_off, e.n_len, o, l) {
+            return e.v0 as i32;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn nt_add(x: &X, o: i32, l: i32) {
+    if nt_find(x, o, l) >= 0 {
+        return;
+    };
+    let idx = x.nt_noff.len() as i32;
+    x.nt_noff.push(o);
+    x.nt_nlen.push(l);
+    x.nt_map.push(MapEnt { n_off: o, n_len: l, v0: idx as i64, v1: 0 });
+}
+
+fn nt_finish(x: &X) {
+    sb_clear(&x.nt_blob);
+    let off: i64 = 0;
+    let i: i32 = 0;
+    let n = x.nt_noff.len() as i32;
+    while i < n {
+        let e = x.nt_map[i as usize];
+        x.nt_map[i as usize] = MapEnt { n_off: e.n_off, n_len: e.n_len, v0: e.v0, v1: off };
+        sb_push_span(&x.nt_blob, x_ptr(x, x.nt_noff[i as usize]), x.nt_nlen[i as usize] as u64);
+        sb_push_byte(&x.nt_blob, 0);
+        off = off + (x.nt_nlen[i as usize] as i64) + 1;
+        i = i + 1;
+    }
+}
+
+fn nt_index_of(x: &X, o: i32, l: i32) -> i32 {
+    return nt_find(x, o, l);
+}
+
+fn nt_off_in_tab(x: &X, idx: i32) -> i32 {
+    let e = x.nt_map[idx as usize];
+    return e.v1 as i32;
+}
+
+// Split form: section names only.
+fn nt_build_sections(x: &X) {
+    let i: i32 = 0;
+    let n = x.secs.len() as i32;
+    while i < n {
+        let s = x.secs[i as usize];
+        nt_add(x, s.n_off, s.n_len);
+        i = i + 1;
+    }
+    nt_finish(x);
+}
+
+fn nt_add_node(x: &X, ni: i32) {
+    let nd = x.nodes[ni as usize];
+    nt_add(x, nd.n_off, nd.n_len);
+    let ci: i32 = 0;
+    while ci < nd.ch_len {
+        nt_add_node(x, x.idxpool[(nd.ch_off + ci) as usize]);
+        ci = ci + 1;
+    }
+}
+
+// Full (packed) form: asset name, section names in final order
+// (declared sections, then "assembly" when present), then all
+// declaration names with their local names.
+fn nt_build_full(x: &X, with_assembly: bool) {
+    if x.a_name_len > 0 {
+        nt_add(x, x.a_name_off, x.a_name_len);
+    };
+    let i: i32 = 0;
+    let n = x.secs.len() as i32;
+    while i < n {
+        let s = x.secs[i as usize];
+        nt_add(x, s.n_off, s.n_len);
+        i = i + 1;
+    }
+    if with_assembly {
+        let a_off = x_intern_lit(x, STR_PTR("assembly"), STR_LEN("assembly"));
+        nt_add(x, a_off, STR_LEN("assembly") as i32);
+    };
+    let si: i32 = 0;
+    while si < (x.shaders.len() as i32) {
+        let s = x.shaders[si as usize];
+        nt_add(x, s.n_off, s.n_len);
+        si = si + 1;
+    }
+    let mi: i32 = 0;
+    while mi < (x.meshes.len() as i32) {
+        let m = x.meshes[mi as usize];
+        nt_add(x, m.n_off, m.n_len);
+        let pi: i32 = 0;
+        while pi < m.pr_len {
+            let pr = x.prims[(m.pr_off + pi) as usize];
+            nt_add(x, pr.n_off, pr.n_len);
+            pi = pi + 1;
+        }
+        let oi: i32 = 0;
+        while oi < m.mo_len {
+            let mo = x.morphs[(m.mo_off + oi) as usize];
+            nt_add(x, mo.n_off, mo.n_len);
+            oi = oi + 1;
+        }
+        let ci: i32 = 0;
+        while ci < m.ch_len {
+            let ch = x.chans[(m.ch_off + ci) as usize];
+            if ch.custom != 0 {
+                nt_add(x, ch.n_off, ch.n_len);
+            };
+            ci = ci + 1;
+        }
+        // NOTE: morph channel names are NOT added (layout.zig only
+        // walks the mesh's own channels); packform's ref() falls back
+        // to the literal name for them, exactly as in Zig.
+        mi = mi + 1;
+    }
+    let ki: i32 = 0;
+    while ki < (x.skels.len() as i32) {
+        let sk = x.skels[ki as usize];
+        nt_add(x, sk.n_off, sk.n_len);
+        let ji: i32 = 0;
+        while ji < sk.j_len {
+            let j = x.joints[(sk.j_off + ji) as usize];
+            nt_add(x, j.n_off, j.n_len);
+            ji = ji + 1;
+        }
+        ki = ki + 1;
+    }
+    let gi: i32 = 0;
+    while gi < (x.imgs.len() as i32) {
+        let im = x.imgs[gi as usize];
+        nt_add(x, im.n_off, im.n_len);
+        gi = gi + 1;
+    }
+    let ti: i32 = 0;
+    while ti < (x.texs.len() as i32) {
+        let t = x.texs[ti as usize];
+        nt_add(x, t.n_off, t.n_len);
+        ti = ti + 1;
+    }
+    let ai: i32 = 0;
+    while ai < (x.mats.len() as i32) {
+        let mt = x.mats[ai as usize];
+        nt_add(x, mt.n_off, mt.n_len);
+        ai = ai + 1;
+    }
+    let ci2: i32 = 0;
+    while ci2 < (x.scenes.len() as i32) {
+        let sc = x.scenes[ci2 as usize];
+        nt_add(x, sc.n_off, sc.n_len);
+        let ri: i32 = 0;
+        while ri < sc.r_len {
+            nt_add_node(x, x.idxpool[(sc.r_off + ri) as usize]);
+            ri = ri + 1;
+        }
+        ci2 = ci2 + 1;
+    }
+    let li: i32 = 0;
+    while li < (x.clips.len() as i32) {
+        let c = x.clips[li as usize];
+        nt_add(x, c.n_off, c.n_len);
+        let ai2: i32 = 0;
+        while ai2 < c.sa_len {
+            let s = x.samps[(c.sa_off + ai2) as usize];
+            nt_add(x, s.n_off, s.n_len);
+            ai2 = ai2 + 1;
+        }
+        li = li + 1;
+    }
+    nt_finish(x);
+}

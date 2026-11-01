@@ -1,0 +1,271 @@
+// genref.sla — SLA port of tools/genref.zig (acceptance reference
+// generator). Builds equivalent-content glTF (.gltf+.bin) and GLB
+// references for the cube example from the same payload bytes and
+// prints the size table line to stderr.
+// Usage: genref <payload-dir> <out-dir>
+
+@import "../src/core.sla"
+
+extern "C" {
+    fn malloc(size: usize) -> *u8;
+    fn free(p: *u8);
+}
+
+fn gr_crc32(data: ptr, len: u64) -> u64 {
+    let crc: u64 = 4294967295;
+    let i: u64 = 0;
+    while i < len {
+        let cb: u8 = PTR_BYTE_AT(data, i);
+        crc = crc ^ (cb as u64);
+        let k: i32 = 0;
+        while k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 3988292384;
+            } else {
+                crc = crc >> 1;
+            };
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc ^ 4294967295;
+}
+
+fn gr_adler32(data: ptr, len: u64) -> u64 {
+    let a: u64 = 1;
+    let b: u64 = 0;
+    let i: u64 = 0;
+    while i < len {
+        let ab: u8 = PTR_BYTE_AT(data, i);
+        a = (a + (ab as u64)) % 65521;
+        b = (b + a) % 65521;
+        i = i + 1;
+    }
+    return (b << 16) | a;
+}
+
+fn gr_wr32be(out: &SBuf, v: u64) {
+    sb_push_byte(out, ((v >> 24) & 255) as u8);
+    sb_push_byte(out, ((v >> 16) & 255) as u8);
+    sb_push_byte(out, ((v >> 8) & 255) as u8);
+    sb_push_byte(out, (v & 255) as u8);
+}
+
+fn gr_wr32le(out: &SBuf, v: u64) {
+    sb_push_byte(out, (v & 255) as u8);
+    sb_push_byte(out, ((v >> 8) & 255) as u8);
+    sb_push_byte(out, ((v >> 16) & 255) as u8);
+    sb_push_byte(out, ((v >> 24) & 255) as u8);
+}
+
+// PNG chunk: len(BE) + type + data + crc32(type ++ data)(BE)
+fn gr_chunk(out: &SBuf, tp: ptr, data: ptr, dlen: u64) {
+    gr_wr32be(out, dlen);
+    let crcb = sb_new();
+    sb_push_span(&crcb, tp, 4);
+    sb_push_span(&crcb, data, dlen);
+    sb_push_span(out, tp, 4);
+    sb_push_span(out, data, dlen);
+    gr_wr32be(out, gr_crc32(crcb.data as ptr, crcb.len));
+}
+
+fn gr_build_png(out: &SBuf) {
+    let sig: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+    let si: i32 = 0;
+    while si < 8 {
+        sb_push_byte(out, sig[si as usize]);
+        si = si + 1;
+    }
+    let ihdr = sb_new();
+    gr_wr32be(&ihdr, 2);
+    gr_wr32be(&ihdr, 2);
+    sb_push_byte(&ihdr, 8); // bit depth
+    sb_push_byte(&ihdr, 6); // color type RGBA
+    sb_push_byte(&ihdr, 0);
+    sb_push_byte(&ihdr, 0);
+    sb_push_byte(&ihdr, 0);
+    gr_chunk(out, STR_PTR("IHDR"), ihdr.data as ptr, ihdr.len);
+    // zlib stored block over 18 zero bytes (2 rows x (filter 0 + 8B))
+    let raw = sb_new();
+    let ri: i32 = 0;
+    while ri < 18 {
+        sb_push_byte(&raw, 0);
+        ri = ri + 1;
+    }
+    let idat = sb_new();
+    sb_push_byte(&idat, 120); // 0x78
+    sb_push_byte(&idat, 1);   // 0x01
+    sb_push_byte(&idat, 1);   // stored, final
+    sb_push_byte(&idat, 18);  // len u16 LE
+    sb_push_byte(&idat, 0);
+    sb_push_byte(&idat, 237); // ~18 u16 LE = 0xFFED
+    sb_push_byte(&idat, 255);
+    sb_push_span(&idat, raw.data as ptr, raw.len);
+    gr_wr32be(&idat, gr_adler32(raw.data as ptr, raw.len));
+    gr_chunk(out, STR_PTR("IDAT"), idat.data as ptr, idat.len);
+    gr_chunk(out, STR_PTR("IEND"), raw.data as ptr, 0);
+}
+
+fn main() -> i32 {
+    let jh = sa_env_args_json();
+    let abuf = sb_new();
+    let aoffs: Vec<i32> = Vec::new();
+    let alens: Vec<i32> = Vec::new();
+    if !sx_parse_argv(jh, &abuf, &aoffs, &alens) {
+        return 1;
+    };
+    let argc = aoffs.len() as i32;
+    if argc < 3 {
+        let b = sb_new();
+        sb_push_lit(&b, STR_PTR("usage: genref <payload-dir> <out-dir>\n"), STR_LEN("usage: genref <payload-dir> <out-dir>\n"));
+        sx_err_buf(&b);
+        return 1;
+    };
+    let ap: ptr = abuf.data as ptr;
+    let pdir: ptr = sx_ptr_add(ap, aoffs[1] as u64);
+    let pdirl: u64 = alens[1] as u64;
+    let odir: ptr = sx_ptr_add(ap, aoffs[2] as u64);
+    let odirl: u64 = alens[2] as u64;
+    let _ = sa_fs_mkdir_p(odir, odirl);
+    // read the six payload parts
+    let names: [u8; 64] = [0; 64];
+    let parts: Vec<SBuf> = Vec::new();
+    let part_names = sb_new();
+    sb_push_lit(&part_names, STR_PTR("positions\0normals\0uvs\0indices\0spin_times\0spin_rots\0"), STR_LEN("positions\0normals\0uvs\0indices\0spin_times\0spin_rots\0"));
+    let offs: Vec<u64> = Vec::new();
+    let ni: i32 = 0;
+    let name_starts: [i32; 6] = [0, 10, 18, 22, 30, 41];
+    let name_lens: [i32; 6] = [9, 7, 3, 7, 10, 9];
+    while ni < 6 {
+        let path = sb_new();
+        sb_push_span(&path, pdir, pdirl);
+        sb_push_byte(&path, 47); // '/'
+        sb_push_span(&path, sx_ptr_add(part_names.data as ptr, name_starts[ni as usize] as u64), name_lens[ni as usize] as u64);
+        sb_push_lit(&path, STR_PTR(".bin"), STR_LEN(".bin"));
+        let data = sb_new();
+        let cell = malloc(8);
+        let okf = sx_read_file(path.data as ptr, path.len, &data, cell as ptr);
+        free(cell);
+        if !okf {
+            return 1;
+        };
+        parts.push(data);
+        ni = ni + 1;
+    }
+    let png = sb_new();
+    gr_build_png(&png);
+    // .bin layout (bufferView order): pos, nrm, uv, idx, image(PNG), times, rots
+    let bin = sb_new();
+    let order: [i32; 7] = [0, 1, 2, 3, 999, 4, 5];
+    let oi: i32 = 0;
+    while oi < 7 {
+        offs.push(bin.len);
+        let o = order[oi as usize];
+        if o == 999 {
+            sb_push_span(&bin, png.data as ptr, png.len);
+        } else {
+            let part = parts[o as usize];
+            sb_push_span(&bin, part.data as ptr, part.len);
+        };
+        oi = oi + 1;
+    }
+    let bin_len = bin.len;
+    // JSON
+    let json = sb_new();
+    sb_push_lit(&json, STR_PTR("{\"asset\":{\"version\":\"2.0\",\"generator\":\"sax3d-genref\"},\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"name\":\"CubeNode\",\"mesh\":0}],\"meshes\":[{\"name\":\"Cube\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}],\"materials\":[{\"name\":\"RedPlastic\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.8,0.1,0.1,1.0],\"baseColorTexture\":{\"index\":0},\"roughnessFactor\":0.6,\"metallicFactor\":0.0}}],\"textures\":[{\"source\":0,\"sampler\":0}],\"samplers\":[{\"magFilter\":9729,\"minFilter\":9729,\"wrapS\":10497,\"wrapT\":10497}],\"images\":[{\"name\":\"CheckerImg\",\"bufferView\":4,\"mimeType\":\"image/png\"}],\"animations\":[{\"name\":\"Spin\",\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":5,\"interpolation\":\"LINEAR\",\"output\":6}]}],\"bufferViews\":["), STR_LEN("{\"asset\":{\"version\":\"2.0\",\"generator\":\"sax3d-genref\"},\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"name\":\"CubeNode\",\"mesh\":0}],\"meshes\":[{\"name\":\"Cube\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}],\"materials\":[{\"name\":\"RedPlastic\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.8,0.1,0.1,1.0],\"baseColorTexture\":{\"index\":0},\"roughnessFactor\":0.6,\"metallicFactor\":0.0}}],\"textures\":[{\"source\":0,\"sampler\":0}],\"samplers\":[{\"magFilter\":9729,\"minFilter\":9729,\"wrapS\":10497,\"wrapT\":10497}],\"images\":[{\"name\":\"CheckerImg\",\"bufferView\":4,\"mimeType\":\"image/png\"}],\"animations\":[{\"name\":\"Spin\",\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":5,\"interpolation\":\"LINEAR\",\"output\":6}]}],\"bufferViews\":["));
+    let bi: i32 = 0;
+    while bi < 7 {
+        if bi > 0 {
+            sb_push_byte(&json, 44); // ','
+        };
+        let blen: u64 = 0;
+        if bi == 4 {
+            blen = png.len;
+        } else {
+            if bi == 5 {
+                let p4 = parts[4];
+                blen = p4.len;
+            } else {
+                if bi == 6 {
+                    let p5 = parts[5];
+                    blen = p5.len;
+                } else {
+                    let pb = parts[bi as usize];
+                    blen = pb.len;
+                };
+            };
+        };
+        sb_push_lit(&json, STR_PTR("{\"buffer\":0,\"byteOffset\":"), STR_LEN("{\"buffer\":0,\"byteOffset\":"));
+        sb_push_u64(&json, offs[bi as usize]);
+        sb_push_lit(&json, STR_PTR(",\"byteLength\":"), STR_LEN(",\"byteLength\":"));
+        sb_push_u64(&json, blen);
+        if bi == 0 || bi == 1 || bi == 2 {
+            sb_push_lit(&json, STR_PTR(",\"target\":34962"), STR_LEN(",\"target\":34962"));
+        };
+        if bi == 3 {
+            sb_push_lit(&json, STR_PTR(",\"target\":34963"), STR_LEN(",\"target\":34963"));
+        };
+        sb_push_byte(&json, 125); // '}'
+        bi = bi + 1;
+    }
+    sb_push_lit(&json, STR_PTR("],\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},{\"bufferView\":1,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},{\"bufferView\":2,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},{\"bufferView\":3,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},{\"bufferView\":5,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}],\"buffers\":[{\"byteLength\":"), STR_LEN("],\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},{\"bufferView\":1,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},{\"bufferView\":2,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},{\"bufferView\":3,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},{\"bufferView\":5,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}],\"buffers\":[{\"byteLength\":"));
+    sb_push_u64(&json, bin_len);
+    sb_push_lit(&json, STR_PTR("}]}"), STR_LEN("}]}"));
+    // write cube.gltf + cube.bin
+    let gp = sb_new();
+    sb_push_span(&gp, odir, odirl);
+    sb_push_lit(&gp, STR_PTR("/cube.gltf"), STR_LEN("/cube.gltf"));
+    if sx_write_file(gp.data as ptr, gp.len, json.data as ptr, json.len) != 0 {
+        return 1;
+    };
+    let bp = sb_new();
+    sb_push_span(&bp, odir, odirl);
+    sb_push_lit(&bp, STR_PTR("/cube.bin"), STR_LEN("/cube.bin"));
+    if sx_write_file(bp.data as ptr, bp.len, bin.data as ptr, bin.len) != 0 {
+        return 1;
+    };
+    // GLB
+    let json_pad = (4 - (json.len % 4)) % 4;
+    let bin_pad = (4 - (bin_len % 4)) % 4;
+    let total = 12 + 8 + json.len + json_pad + 8 + bin_len + bin_pad;
+    let glb = sb_new();
+    gr_wr32le(&glb, 1179937895); // 0x46546C67 'glTF'
+    gr_wr32le(&glb, 2);
+    gr_wr32le(&glb, total);
+    gr_wr32le(&glb, json.len + json_pad);
+    gr_wr32le(&glb, 1313821514); // 0x4E4F534A 'JSON'
+    sb_push_span(&glb, json.data as ptr, json.len);
+    let pi2: u64 = 0;
+    while pi2 < json_pad {
+        sb_push_byte(&glb, 32); // ' '
+        pi2 = pi2 + 1;
+    }
+    gr_wr32le(&glb, bin_len + bin_pad);
+    gr_wr32le(&glb, 5130562); // 0x004E4942 'BIN\0'
+    sb_push_span(&glb, bin.data as ptr, bin.len);
+    let pi3: u64 = 0;
+    while pi3 < bin_pad {
+        sb_push_byte(&glb, 0);
+        pi3 = pi3 + 1;
+    }
+    let lp = sb_new();
+    sb_push_span(&lp, odir, odirl);
+    sb_push_lit(&lp, STR_PTR("/cube.glb"), STR_LEN("/cube.glb"));
+    if sx_write_file(lp.data as ptr, lp.len, glb.data as ptr, glb.len) != 0 {
+        return 1;
+    };
+    let rb = sb_new();
+    sb_push_lit(&rb, STR_PTR("REF json_len="), STR_LEN("REF json_len="));
+    sb_push_u64(&rb, json.len);
+    sb_push_lit(&rb, STR_PTR(" bin_len="), STR_LEN(" bin_len="));
+    sb_push_u64(&rb, bin_len);
+    sb_push_lit(&rb, STR_PTR(" png_len="), STR_LEN(" png_len="));
+    sb_push_u64(&rb, png.len);
+    sb_push_lit(&rb, STR_PTR(" glb_total="), STR_LEN(" glb_total="));
+    sb_push_u64(&rb, total);
+    sb_push_lit(&rb, STR_PTR(" json_chunk_padded="), STR_LEN(" json_chunk_padded="));
+    sb_push_u64(&rb, json.len + json_pad);
+    sb_push_byte(&rb, 10);
+    sx_err_buf(&rb);
+    return 0;
+}
