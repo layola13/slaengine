@@ -50,11 +50,13 @@
 
 ## 未证面 / 缺口
 
-1. **SPIR-V 未产出**：任务清单列有 SPIR-V，但 DESIGN §14 将其列入 P4（与 compute、F-3 结构化输出同批）；本线按「范围按 DESIGN 二期定义」执行到 P2+P3 全量，SPIR-V 未开工。**任务清单与 DESIGN 分期的口径冲突留待主会话裁决**，不静默当作已覆盖。
+1. **SPIR-V 未产出**：任务清单列有 SPIR-V，但 DESIGN §14 将其列入 P4（与 compute、F-3 结构化输出同批）；本线执行范围为 P2 全部 + P3 的发射目标（msl/unity/blender/unreal-global），SPIR-V 未开工。**任务清单与 DESIGN 分期的口径冲突留待主会话裁决**，不静默当作已覆盖。（订正：原稿此处称「执行到 P2+P3 全量」不成立——P3 含导入方向，见缺口 6；经独立复核指出后于 2026-11-01 订正。）
 2. **无目标语言编译器验证**：两盒均无 glslangValidator / dxc / tint / Metal 工具链；GLSL/HLSL/WGSL/MSL 产物只过黄金对拍 + 结构目检（WGSL 反射清单另过 JSON 解析验证）。Unity/Unreal/Blender 宿主不在盒上，其验收按 DESIGN 证据分级为黄金 + 静态结构对账，非引擎内编译。
 3. **约定面样本面窄**：msl/unity/blender/unreal 发射器只在 base+tint 代表样本上冻结了黄金；mat3、整型/无符号路径、多组多采样器、@global 单例等打印层已实现但未逐目标黄金覆盖。
 4. **DESIGN §5「源码内平台细节」**：未知 @qualifier 已命名拒绝；裸平台记号（如 `#version`、register 语法）只在词法/语法层以 unexpected token 失败，无专用命名诊断——与 DESIGN 字面要求有差，登记为缺口。
 5. **工具链缺陷（a121c04c，非本线代码）**：实现期间以探针实证（探针存 work/）：① 大函数内 Vec&lt;Struct&gt; push 元素损坏（语料 test_unit_vec_index_assign.sla 在该头上本身失败，属已知坏家族）——工具以 arena+槽位写绕开；② 标量元组返回传输损坏——工具全部改 out-param/结构体返回；③ String 字面量按值传参在 build-exe 下 StackEscape——工具全程 (ptr,len) span、零 String 值。这些是上游缺陷证据，建议主会话转 DEF 分诊，本线未修编译器。
+6. **Shadertoy importer 子集未交付**：DESIGN §14 的 P3 含导入方向开启（Shadertoy importer 子集 1，J-8 的 importer 面）；本期未交付、原稿亦未列入本清单（仅 notes/PLAN.md 以「as capacity allows」顺序隐含排除），经独立复核（VERIFY_REPORT §1 第 13 项）指出后于 2026-11-01 补登记为显式缺口。导入方向（Shadertoy/Blender/Unreal importer）整体未开工。
+7. **Unity 变体数审计旁注缺失**：DESIGN §9.1/§7.5 要求 unity 发射前做变体数审计并旁注产物；现 merged.shader 内无逐目标变体审计旁注，仅 bundle 级 variants.txt 记录 @const 取值。经独立复核（VERIFY_REPORT §1 第 14 项）登记，原稿未声称亦未登记，2026-11-01 补入。
 
 ## staging 提交清单（本地，未推送）
 

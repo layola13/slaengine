@@ -16,6 +16,7 @@ src/slaengine.sla       umbrella entry: App-layer host (skeleton)
 crates/
   slasl/                shader compiler (SLA tool)            [active]
   sax3d/                3D asset format + toolchain (Zig)     [active]
+  sla_asset/            asset bridge seat (Jev F5)            [reserved]
   sla_ecs/              ECS embed seat                        [reserved]
   sla_3d/               sa_plugin_3dengines port seat         [reserved]
   sla_webgl/            render backend seat, priority 1       [reserved]
