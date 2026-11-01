@@ -33,7 +33,7 @@
 | indices u16/u32 | 采 | 采 | |
 | indices u8 | **近似**（拓宽 u16，进台账） | — | |
 | 无 indices（非索引绘制） | 采（mesh 无 indices 声明） | 采 | |
-| primitive mode（拓扑） | 采（0/1/3/4/5/6 ↔ points/lines/line-strip/triangles/triangle-strip/triangle-fan） | 采 | mode 2 (line loop) → 不支持 |
+| primitive mode（拓扑） | 采（0/1/3/4/5 ↔ points/lines/line-strip/triangles/triangle-strip）；mode 6 (triangle fan) → **展开**为 triangles（注 1） | 采（0/1/3/4/5）；**永不产出 mode 6**：输入若现 triangle-fan（格式闭集外）按同一展开处置并进台账（注 1） | mode 2 (line loop) → 不支持 |
 | 多 primitive（属性集/索引集全同） | 采（一 mesh 多 primitive） | 采 | |
 | 多 primitive（属性集或索引不同） | **近似**（按 primitive 拆 mesh，名加后缀，进台账） | — | SAX3D 一 mesh 一通道集/一索引段 |
 | SAX3D 多 primitive → glTF | — | **近似**（SAX3D primitive 无索引范围，各 primitive 共用整索引段会重叠绘制，进台账响亮标注） | v1 格式事实，非转换器可补 |
@@ -42,6 +42,22 @@
 | accessor.byteStride 交错 | 采（解交错为独立紧密段，见 §5） | —（出口恒紧密） | |
 | accessor.sparse | 不支持（`CvtSparseAccessor`） | — | |
 | accessor 归一化 POSITION 等非常规组合 | 不支持 | — | |
+
+**注 1（triangle fan 展开，SPEC §11 D-9 订正，2026-11-01）**：
+SAX3D topology 闭集无 fan（文从码，Jev 裁决 text_follows_code
+0.99）。展开规则：扇序 [i0, i1, …, i_{n−1}] → 三角形列表
+(i0,i1,i2), (i0,i2,i3), …, (i0,i_{n−2},i_{n−1})，逐三角形与原
+扇严格同形、无损。索引增长口径：n 个扇索引（或非索引扇的 n 个
+顶点）→ 3(n−2) 个三角形索引；元素宽保持（u16 仍 u16、u32 仍
+u32）；顶点数据零改动。入向：索引按上式改写后落段（不再借源
+accessor 去重段）、topology 写 triangles；非索引扇则合成索引
+缓冲后同样展开。n < 3 的扇展开为空集——响亮拒绝
+`CvtUnsupportedTopology`，不静默产空网格。出向：mode 恒为
+TRIANGLES(4)，永不写出 6；输入文本若声明 triangle-fan，先经
+裁判以 `Sax3dInvalidValue` 拒绝（闭集义务在转换器之前），
+转换器内部 mesh 处理另按同一展开兜底并进台账（APPROX 行，
+注明无损与索引前后计数），保证任何路径都不产 fan。展开逐
+mesh 进台账，计数可对账。
 
 ## 2. 材质与 shader（核心映射，shader 槽处置在此定版）
 

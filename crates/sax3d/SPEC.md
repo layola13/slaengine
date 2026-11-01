@@ -145,7 +145,7 @@ binary "<file>.saxb3d" { section <name> <len>; ... }
 
 ```
 mesh <Name> {
-  topology: triangles|triangle-strip|triangle-fan|lines|line-strip|points;  // 省略=triangles
+  topology: triangles|triangle-strip|lines|line-strip|points;  // 省略=triangles；无 triangle-fan（D-9 订正，文从码）
   vertices <n>;
   bounds { min: [x,y,z]; max: [x,y,z]; }              // 可选
   channel <role> : <elem> @ <section>;                // 逻辑通道
@@ -188,7 +188,10 @@ texture <Name> {
 raw 格式：声明 size 必须与段长逐字相等（w×h×bpp）。sampler 块 v1
 **必填**、五字段（mag/min/mipmap/wrap_u/wrap_v）必填（§11 D-4）；
 滤波值集 {nearest, linear}（mipmap 另容 none），环绕值集
-{clamp, repeat, mirror}。格式层永不解码图像内容（编解码缺口 GAP-2）。
+{clamp, repeat, mirror}。文法行所列 `wrap_w` 为可选字段（不在
+五字段必填内——2D 纹理无 W 轴），出现时同样验环绕值集（规则 9；
+此口径与校验器实现一致，2026-11-01 订正批澄清，见 RECOVERY
+D-文码-4 收口）。格式层永不解码图像内容（编解码缺口 GAP-2）。
 
 ### 5.5 shader / material
 
@@ -281,8 +284,9 @@ compiled 模式读回，同一校验器复检——两形同裁判由此是结�
    动画 input = count × 4、output = count × 元素长），不足 →
    `Sax3dSectionOverflow`。raw 图像段为例外：逐字相等（规则 9）。
 4. 封闭值集：一切枚举与定值字段出闭集即 `Sax3dInvalidValue`——
-   mesh topology（校验器闭集与 §5.2 文法有一处出入，见恢复说明
-   文件差异表 D-文码-1，本批不裁）、vertices 为 0 或未声明、indices
+   mesh topology（闭集与 §5.2 文法一致；triangle-fan 不在集内，
+   原 §5.2 文法误列已按 D-9 订正删除——文从码）、vertices 为 0
+   或未声明、indices
    类型非 u16/u32、mesh 无 primitive、image format 出闭集、
    color_space 非 srgb/linear（必填、永不猜测）、sampler 各字段
    值集（§5.4）、material state alpha 非 opaque/mask/blend、
@@ -443,6 +447,19 @@ v1 处置（GAP-1）：真实接口表 artefact 格式未定形前，以手工
   数值本体，不再「只跳过不校验」。
 - D-8 动画时间轴单调性归 build 数据级检查（§10.2）：
   声明级校验器无载荷数据，单调性在 build 读载荷后验。
+- D-9 topology 值集订正（2026-11-01 订正批，**文从码**）：
+  §5.2 文法原列 `triangle-fan`，与校验器闭集 {triangles,
+  triangle-strip, lines, line-strip, points} 矛盾（声明即
+  `Sax3dInvalidValue`），而转换器双向产/收之——转换产物过不了
+  自家裁判。恢复批登记为 D-文码-1 后，Jev 裁决
+  text_follows_code（0.99，置信 0.98，2026-11-01）定版：
+  §5.2 删 triangle-fan，格式值集以校验器闭集为准；转换器
+  改行为——入向遇 glTF TRIANGLE_FAN 展开为三角形列表
+  （索引按扇展开、无损，计数口径见 CONVERTER_MAP §1 注），
+  出向永不产出 fan（扇形输入按同一展开处置并进台账）。
+  本条为订正非扩展：格式接纳面不变（fan 从未合法过）。
+  同批顺修：§5.4 wrap_w 口径澄清（D-文码-4 收口，文从码，
+  义务不变）。
 
 ## 恢复说明（2026-11-01 文档修复批，非格式内容）
 

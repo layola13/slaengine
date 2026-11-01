@@ -110,11 +110,11 @@ CvtUnsupportedTopology（tools/convert.zig）。
 
 | # | 方向 | 差异 | 处置 |
 |---|---|---|---|
-| D-文码-1 | 文有码拒 | 存续 §5.2 文法 topology 值集含 `triangle-fan`；check.zig 校验器闭集 {triangles, triangle-strip, lines, line-strip, points} 不含之——声明 triangle-fan 的 mesh 会被判 Sax3dInvalidValue。而转换器双向均产/收 triangle-fan（convert.zig 796/1400 行 mode 6） | **只登记、不裁**：本批为文档恢复，无权改格式亦无权改码；§7 规则 4 已加注指向本项。候主会话裁决（补校验器闭集 或 修 §5.2） |
+| D-文码-1 | 文有码拒 | 存续 §5.2 文法 topology 值集含 `triangle-fan`；check.zig 校验器闭集 {triangles, triangle-strip, lines, line-strip, points} 不含之——声明 triangle-fan 的 mesh 会被判 Sax3dInvalidValue。而转换器双向均产/收 triangle-fan（convert.zig 796/1400 行 mode 6） | **已订正（2026-11-01 订正批）**：恢复批原处置为只登记、不裁，候主会话裁决；Jev 裁决 text_follows_code（0.99，置信 0.98，2026-11-01）定版**文从码**——SPEC §5.2 删 triangle-fan 并入 §11 D-9、§7 规则 4 注记同步收口；转换器入向展开 fan 为三角形列表、出向永不产 fan（CONVERTER_MAP §1 注）。订正证据见 FANFIX_REPORT.md |
 | D-文码-2 | 码有文外 | Sax3dIoError 为工具 IO 面诊断（文件读写失败），非格式规则 | 映射表登记为工具面；恢复 §10 未将其列为格式义务 |
 | D-文码-3 | 码有文外（已归位） | Sax3dFixtureError 属 v1 夹具文件格式面 | 恢复入 §9 夹具形态 + 规则 14 |
-| D-文码-4 | 文码细差 | 存续 §5.4 文法行列 wrap_w、必填口径称「五字段」；代码对 wrap_w 出现时验值集、不强制必填 | 恢复规则 9 按代码实情写「出现时同样验值集」；与 §5.4 不冲突（未禁第六字段），不改 §5.4 |
-| D-文码-5 | 码注与节号出入 | check.zig 注释称通道白名单为「SPEC §6.1 定形」，存续正文实为 §5.2 钉死表（§6.1 是编译形组装） | 只登记（代码注释陈旧），本批不动代码 |
+| D-文码-4 | 文码细差 | 存续 §5.4 文法行列 wrap_w、必填口径称「五字段」；代码对 wrap_w 出现时验值集、不强制必填 | 恢复规则 9 按代码实情写「出现时同样验值集」；与 §5.4 不冲突（未禁第六字段），不改 §5.4。**收口（2026-11-01 订正批）**：逐项判读后定**文从码**——§5.4 补一句澄清「wrap_w 为可选字段、不在五字段必填内、出现时同样验环绕值集」，义务不变、代码不改；依据 = D-4 必填收严刻意只列五字段、check.zig 对 wrap_w 仅在出现时验值集（checkEnum 空值即过）、全部存量合法资产均未声明 wrap_w（改码必填将使存量非法）。见 FANFIX_REPORT.md |
+| D-文码-5 | 码注与节号出入 | check.zig 注释称通道白名单为「SPEC §6.1 定形」，存续正文实为 §5.2 钉死表（§6.1 是编译形组装） | **已订正（2026-11-01 订正批）**：恢复批原处置为只登记不动代码；订正批已将 check.zig 注释改引 §5.2 |
 | — | 文已名码已行（无差异对账） | 存续正文点名的 SectionKindConflict（§4.3）、UnknownChannel（§5.2）、PackNameCollision（§6.2）、UnresolvedReference / ClipTargetMissing / ClipSamplerMissing（§7 规则 2）六码，代码同名实现逐一对位一致 | 无动作 |
 
 ## 5. 存疑清单（证据不足以定字句，已按恢复纪律标注）

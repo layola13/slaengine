@@ -130,6 +130,56 @@ grep -q "LEDGER SYNTH name for node\[1\] sanitised/deduped 'Bone' -> 'Bone_2'" "
 grep -q "joint Bone_2 { parent: Bone; }" "$W/skindup/SkinDup.sax3d" && ok skindup-joint-renamed || bad skindup-joint-renamed
 grep -q "channel { node: Bone_2; path: rotation" "$W/skindup/SkinDup.sax3d" && ok skindup-channel-renamed || bad skindup-channel-renamed
 
+echo "== E. triangle fan 订正 (SPEC D-9, 文从码): 入向展开 + 出向永不产 fan =="
+python3 tests/gen_fan.py "$W/fansrc" >/dev/null 2>&1
+# E1 索引扇: glTF(mode 6) -> SAX3D(triangles + 展开索引) -> 裁判 -> glTF(mode 4)
+"$B/convert" to-sax3d "$W/fansrc/FanQuad.gltf" "$W/fanquad" --fixtures-dir $FIX >"$W/fanquad.log" 2>"$W/fanquad.err"
+[ $? -eq 0 ] && ok fanquad-import || bad fanquad-import
+grep -q "LEDGER APPROX mesh 'FanMesh': TRIANGLE_FAN expanded to triangle list (lossless, SPEC D-9)" "$W/fanquad.log" && ok fanquad-ledger-expand || bad fanquad-ledger-expand
+grep -q "topology: triangles;" "$W/fanquad/FanQuad.sax3d" && ! grep -q "triangle-fan" "$W/fanquad/FanQuad.sax3d" && ok fanquad-topology || bad fanquad-topology
+"$B/sax3dc" build "$W/fanquad/FanQuad.sax3d" --payload-dir "$W/fanquad/payload" --out "$W/fanquad/FanQuad.saxb3d" \
+  --iface StdPbrNtNu=$FIX/std_pbr_nt_nu.iface.txt >"$W/fanquad_build.log" 2>&1
+[ $? -eq 0 ] && ok fanquad-referee-build || bad fanquad-referee-build
+"$B/convert" to-gltf "$W/fanquad/FanQuad.sax3d" "$W/fanquad/FanQuad.saxb3d" "$W/fanquad-back" \
+  --iface StdPbrNtNu=$FIX/std_pbr_nt_nu.iface.txt >"$W/fanquad_back.log" 2>"$W/fanquad_back.err"
+[ $? -eq 0 ] && ok fanquad-export || bad fanquad-export
+python3 tests/fan_equiv.py "$W/fansrc/FanQuad.gltf" "$W/fansrc/FanQuad.bin" "$W/fanquad" FanQuad indexed \
+  "$W/fanquad-back/FanQuad.gltf" "$W/fanquad-back/FanQuad.bin" >"$W/fanquad_equiv.log" 2>&1
+[ $? -eq 0 ] && ok fanquad-equiv || bad fanquad-equiv
+# E2 非索引扇: 合成索引缓冲后同样展开
+"$B/convert" to-sax3d "$W/fansrc/FanFree.gltf" "$W/fanfree" --fixtures-dir $FIX >"$W/fanfree.log" 2>"$W/fanfree.err"
+[ $? -eq 0 ] && ok fanfree-import || bad fanfree-import
+python3 tests/fan_equiv.py "$W/fansrc/FanFree.gltf" "$W/fansrc/FanFree.bin" "$W/fanfree" FanFree free >"$W/fanfree_equiv.log" 2>&1
+[ $? -eq 0 ] && ok fanfree-equiv || bad fanfree-equiv
+"$B/sax3dc" build "$W/fanfree/FanFree.sax3d" --payload-dir "$W/fanfree/payload" --out "$W/fanfree/FanFree.saxb3d" \
+  --iface StdPbrNtNu=$FIX/std_pbr_nt_nu.iface.txt >"$W/fanfree_build.log" 2>&1
+[ $? -eq 0 ] && ok fanfree-referee-build || bad fanfree-referee-build
+# E3 出向守门: 声明 triangle-fan 的 SAX3D 在裁判处以 Sax3dInvalidValue 被拒, 不产出
+"$B/genpayload" "$W/ctrl" pos:36 uv:24 idx:12 img:16 times:8 rots:32 ib:64 >/dev/null 2>&1
+"$B/sax3dc" build tests/valid_control.sax3d --payload-dir "$W/ctrl" --out "$W/ctrl.saxb3d" --iface S=tests/neg.iface.txt >/dev/null 2>&1
+sed 's/^mesh M {/mesh M {\n    topology: triangle-fan;/' tests/valid_control.sax3d > "$W/ctrl_fan.sax3d"
+"$B/convert" to-gltf "$W/ctrl_fan.sax3d" "$W/ctrl.saxb3d" "$W/ctrl-fan-out" --iface S=tests/neg.iface.txt >"$W/ctrl_fan.log" 2>&1
+[ $? -ne 0 ] && grep -q "Sax3dInvalidValue" "$W/ctrl_fan.log" && grep -q "topology 'triangle-fan' not in closed set" "$W/ctrl_fan.log" && ok fan-export-refused || bad fan-export-refused
+# E4 出向产物值集扫描: 本套件全部出口产物 primitive mode 不得含 6
+python3 -c "
+import json, struct
+files = ['$W/fox-back/Fox.glb', '$W/cube-gltf/CubeDemo.gltf', '$W/hero-gltf/HeroDemo.gltf', '$W/fanquad-back/FanQuad.gltf']
+modes = set()
+for f in files:
+    d = open(f, 'rb').read()
+    if d[:4] == b'glTF':
+        jl, = struct.unpack('<I', d[12:16]); j = json.loads(d[20:20+jl])
+    else:
+        j = json.loads(d)
+    for m in j.get('meshes', []):
+        for p in m.get('primitives', []):
+            modes.add(p.get('mode', 4))
+assert modes, 'no primitives scanned'
+assert 6 not in modes, 'TRIANGLE_FAN (mode 6) found in export products'
+print('export modes seen:', sorted(modes))
+" >"$W/nofan_scan.log" 2>&1
+[ $? -eq 0 ] && ok nofan-scan || bad nofan-scan
+
 echo
 echo "RESULT: $PASS passed; FAILED SET:${FAILED:- (empty)}"
 [ -z "$FAILED" ]

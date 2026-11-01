@@ -292,6 +292,42 @@ fn deriveNormals(ctx: *Ctx, pos: []const u8, idx: ?[]const u8, idx_is_u32: bool)
     return out.items;
 }
 
+// 三角扇展开（SPEC §11 D-9 / CONVERTER_MAP §1 注 1）：SAX3D topology
+// 闭集无 triangle-fan（文从码），转换器双向共用本展开——扇序
+// [i0, i1, …, i_{n−1}] → (i0,i1,i2), (i0,i2,i3), …, (i0,i_{n−2},i_{n−1})，
+// 逐三角形与原扇严格同形、无损；输出 3(n−2) 个索引，元素宽保持。
+// n < 3 时返回空表（调用方必须响亮拒绝，不得静默交付空网格）。
+fn readIdxAt(bytes: []const u8, i: usize, is32: bool) u32 {
+    return if (is32) std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little)
+    else std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+}
+fn writeIdxTo(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, v: u32, is32: bool) void {
+    if (is32) { var b: [4]u8 = undefined; std.mem.writeInt(u32, &b, v, .little); buf.appendSlice(alloc, &b) catch {}; }
+    else { var b: [2]u8 = undefined; std.mem.writeInt(u16, &b, @intCast(v), .little); buf.appendSlice(alloc, &b) catch {}; }
+}
+fn expandFanIndices(alloc: std.mem.Allocator, bytes: []const u8, is32: bool) ![]u8 {
+    const esz: usize = if (is32) @as(usize, 4) else 2;
+    const n = bytes.len / esz;
+    var out: std.ArrayList(u8) = .empty;
+    if (n < 3) return out.items;
+    const first = readIdxAt(bytes, 0, is32);
+    var k: usize = 1;
+    while (k + 1 < n) : (k += 1) {
+        writeIdxTo(&out, alloc, first, is32);
+        writeIdxTo(&out, alloc, readIdxAt(bytes, k, is32), is32);
+        writeIdxTo(&out, alloc, readIdxAt(bytes, k + 1, is32), is32);
+    }
+    return out.items;
+}
+// 非索引扇：先合成恒等索引序 0..n−1 再展开（宽按最大索引值选 u16/u32）。
+fn expandFanSequential(alloc: std.mem.Allocator, vcount: usize) !struct { bytes: []u8, is32: bool } {
+    const is32 = vcount > 65536;
+    var seq: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < vcount) : (i += 1) writeIdxTo(&seq, alloc, @intCast(i), is32);
+    return .{ .bytes = try expandFanIndices(alloc, seq.items, is32), .is32 = is32 };
+}
+
 // ---------------- to-sax3d ----------------
 const SectionOut = struct { name: []const u8, bytes: []const u8 };
 const Conv1 = struct {
@@ -792,9 +828,34 @@ fn convMeshes(ctx: *Ctx, c: *Conv1) !void {
                 } else return ctx.fail("CvtUnsupportedElemType", "mesh {d}: indices componentType {d} unsupported", .{ mi, iinfo.comp });
             }
             var body: std.ArrayList(u8) = .empty;
+            var idx_expanded = false;
             const mode = ji(jg(rep, "mode") orelse .{ .integer = 4 }) orelse 4;
-            const topo: []const u8 = switch (mode) { 0 => "points", 1 => "lines", 3 => "line-strip", 4 => "triangles", 5 => "triangle-strip", 6 => "triangle-fan",
+            const topo: []const u8 = switch (mode) { 0 => "points", 1 => "lines", 3 => "line-strip", 4 => "triangles", 5 => "triangle-strip", 6 => "triangles",
                 else => return ctx.fail("CvtUnsupportedTopology", "mesh {d}: primitive mode {d} (line-loop etc.) unsupported", .{ mi, mode }) };
+            if (mode == 6) {
+                // TRIANGLE_FAN（SPEC D-9，文从码）：SAX3D 闭集无 fan，
+                // 入向一律展开为三角形列表（无损）。展开置于法线派生与
+                // indices 发射之前，下游只见三角形索引；n<3 响亮拒绝。
+                if (idx_bytes) |ib| {
+                    if (idx_count < 3) return ctx.fail("CvtUnsupportedTopology", "mesh '{s}': triangle fan of {d} indices expands to zero triangles; refusing (loud, not a silent empty mesh)", .{ mesh_name, idx_count });
+                    const esz: usize = if (idx_is32) @as(usize, 4) else 2;
+                    const expanded = try expandFanIndices(ctx.alloc, ib, idx_is32);
+                    idx_bytes = expanded;
+                    idx_count = expanded.len / esz;
+                    idx_expanded = true;
+                    ctx.ledger.add("APPROX", "mesh '{s}': TRIANGLE_FAN expanded to triangle list (lossless, SPEC D-9): fan indices -> {d} triangle indices", .{ mesh_name, idx_count });
+                } else {
+                    if (vcount < 3) return ctx.fail("CvtUnsupportedTopology", "mesh '{s}': non-indexed triangle fan of {d} vertices expands to zero triangles; refusing (loud, not a silent empty mesh)", .{ mesh_name, vcount });
+                    const ex = try expandFanSequential(ctx.alloc, vcount);
+                    const esz: usize = if (ex.is32) @as(usize, 4) else 2;
+                    idx_bytes = ex.bytes;
+                    idx_is32 = ex.is32;
+                    idx_elem = if (ex.is32) "u32" else "u16";
+                    idx_count = ex.bytes.len / esz;
+                    idx_expanded = true;
+                    ctx.ledger.add("APPROX", "mesh '{s}': non-indexed TRIANGLE_FAN expanded to triangle list (lossless, SPEC D-9): index buffer synthesized, {d} vertices -> {d} triangle indices", .{ mesh_name, vcount, idx_count });
+                }
+            }
             put(ctx.alloc, &body, "mesh {s} {{\n  topology: {s};\n  vertices {d};\n", .{ mesh_name, topo, vcount });
             var has_uv = false;
             var has_skin = false;
@@ -906,9 +967,11 @@ fn convMeshes(ctx: *Ctx, c: *Conv1) !void {
                     }
                 }
             }
-            // indices 行
+            // indices 行（扇展开后的字节已非源 accessor 数据，
+            // 禁止 accSection 去重复用——同 accessor 另作他用时字节不同）
             if (idx_bytes) |ib| {
-                const sec = if (idx_acc_idx) |ia2| c.accSection(ia2, std.fmt.allocPrint(ctx.alloc, "{s}_idx", .{mesh_name}) catch unreachable, ib) else c.addSection(std.fmt.allocPrint(ctx.alloc, "{s}_idx", .{mesh_name}) catch unreachable, ib);
+                const sec_name = std.fmt.allocPrint(ctx.alloc, "{s}_idx", .{mesh_name}) catch unreachable;
+                const sec = if (idx_acc_idx != null and !idx_expanded) c.accSection(idx_acc_idx.?, sec_name, ib) else c.addSection(sec_name, ib);
                 put(ctx.alloc, &body, "  indices {s} @ {s} count {d};\n", .{ idx_elem, sec, idx_count });
             }
             // primitives
@@ -1393,11 +1456,31 @@ fn toGltf(ctx: *Ctx, text_path: []const u8, bin_path: []const u8, outdir: []cons
                 }
             }
         }
+        const is_fan = std.mem.eql(u8, m.topology, "triangle-fan");
         var idx_acc: ?usize = null;
-        if (m.idx_ty) |ity| {
+        if (is_fan) {
+            // 扇形输入兜底（SPEC D-9）：合法输入先经裁判以
+            // Sax3dInvalidValue 拒绝（见 toGltf 入口），本分支保证
+            // 即便模型内现 fan 也不产出 mode 6——按与入向同一展开
+            // 改写索引、写 TRIANGLES，响亮进台账、绝不静默。
+            if (m.idx_ty) |ity| {
+                const is32 = !std.mem.eql(u8, ity, "u16");
+                const raw = try go.sectionBytes(m.idx_section);
+                const expanded = try expandFanIndices(alloc, raw, is32);
+                const esz: usize = if (is32) @as(usize, 4) else 2;
+                const key = std.fmt.allocPrint(alloc, "{s}#fanexp", .{m.idx_section}) catch unreachable;
+                idx_acc = go.addAccessor(key, expanded, if (is32) @as(u32, 5125) else 5123, "SCALAR", false);
+                ctx.ledger.add("APPROX", "mesh '{s}': topology 'triangle-fan' (outside the SAX3D closed set, SPEC D-9) expanded to triangle list (lossless): {d} -> {d} indices; glTF TRIANGLES written, fan never emitted", .{ m.name, raw.len / esz, expanded.len / esz });
+            } else {
+                const ex = try expandFanSequential(alloc, @intCast(m.vertices));
+                const key = std.fmt.allocPrint(alloc, "{s}#fanexp", .{m.name}) catch unreachable;
+                idx_acc = go.addAccessor(key, ex.bytes, if (ex.is32) @as(u32, 5125) else 5123, "SCALAR", false);
+                ctx.ledger.add("APPROX", "mesh '{s}': non-indexed topology 'triangle-fan' (outside the SAX3D closed set, SPEC D-9) expanded to triangle list (lossless): index buffer synthesized for {d} vertices; glTF TRIANGLES written, fan never emitted", .{ m.name, m.vertices });
+            }
+        } else if (m.idx_ty) |ity| {
             idx_acc = go.addAccessor(m.idx_section, try go.sectionBytes(m.idx_section), if (std.mem.eql(u8, ity, "u16")) 5123 else 5125, "SCALAR", false);
         }
-        const mode: u32 = if (std.mem.eql(u8, m.topology, "points")) 0 else if (std.mem.eql(u8, m.topology, "lines")) 1 else if (std.mem.eql(u8, m.topology, "line-strip")) 3 else if (std.mem.eql(u8, m.topology, "triangle-strip")) 5 else if (std.mem.eql(u8, m.topology, "triangle-fan")) 6 else 4;
+        const mode: u32 = if (std.mem.eql(u8, m.topology, "points")) 0 else if (std.mem.eql(u8, m.topology, "lines")) 1 else if (std.mem.eql(u8, m.topology, "line-strip")) 3 else if (std.mem.eql(u8, m.topology, "triangle-strip")) 5 else 4;
         // morph 目标（全部 primitive 共享同一 targets 集）
         var targets_frag: []const u8 = "";
         if (m.morphs.items.len > 0) {

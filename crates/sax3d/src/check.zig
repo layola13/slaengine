@@ -102,7 +102,7 @@ pub fn check(alloc: std.mem.Allocator, a: *const model.Asset, ifaces: *const std
 
 // ---------- 几何层 ----------
 fn chanRoleType(chan: []const u8) ?[]const []const u8 {
-    // 规范通道的元素类型白名单（SPEC §6.1 定形）
+    // 规范通道的元素类型白名单（SPEC §5.2 定形）
     if (std.mem.eql(u8, chan, "position") or std.mem.eql(u8, chan, "normal")) return &.{ "f32x3" };
     if (std.mem.eql(u8, chan, "tangent")) return &.{ "f32x4" };
     if (std.mem.startsWith(u8, chan, "uv")) return &.{ "f32x2" };
