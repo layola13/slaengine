@@ -1,5 +1,12 @@
 const std = @import("std");
 
+const saasm_abi = @import("saasm_abi.zig");
+const plugin_shim = saasm_abi.Plugin("3d_math");
+pub const saasm_plugin_descriptor_v1 = plugin_shim.saasm_plugin_descriptor_v1;
+pub const saasm_plugin_descriptor_v1_fn = plugin_shim.saasm_plugin_descriptor_v1_fn;
+comptime {
+    _ = plugin_shim;
+}
 
 pub const Vec2f = extern struct {
     x: f32,

@@ -24,6 +24,19 @@ built by `build.zig`, then `sa test` per domain with
 without it). math's i32 fixed-point smoke path exists only inside its
 test corpus, not as API (plan §4.3).
 
+The kernels register with the host through `native/saasm_abi.zig`, a
+crate-local ABI shim: the SA host loads a dev-mode `.so` only when it
+exports the plugin descriptor symbols (sci `plugins.zig`
+loadDescriptor/validateDescriptor check abi_version and
+descriptor_size), and the layout tests resolve their extern selftest
+entry points through that loading. The shim keeps only the
+descriptor identity (abi_version, size, the domain's plugin name;
+`handle_command` null, no skills) — the source framework's CLI
+command handler and skill registry retire with the framework, as do
+its 3 framework unit tests; the kernels' own unit tests all migrate.
+Per the engine language doctrine the native kernels are an auxiliary
+surface behind this ABI; the behaviour layer is the `.sal`.
+
 ## Pending, on record
 
 - **Batch B (P1)**: geometry, camera, camera_controller, image,

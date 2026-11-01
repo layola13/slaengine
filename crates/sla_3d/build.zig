@@ -2,8 +2,9 @@ const std = @import("std");
 
 // sla_3d native support libraries (Jev ruling F2): the batch-A modules'
 // Zig kernels, migrated from the sa_plugin_3dengines plugin hosts with
-// only the plugin-framework glue lines removed (see native/ provenance
-// in crate.toml). The domains' SA layout tests load these libraries via
+// the plugin-framework glue lines replaced by registration against
+// the crate-local ABI shim native/saasm_abi.zig (see native/
+// provenance in crate.toml). The domains' SA layout tests load these libraries via
 // SA_PLUGINS_PATH, exactly as in the source family; `zig build test`
 // also runs the unit tests embedded in the kernel sources.
 pub fn build(b: *std.Build) void {

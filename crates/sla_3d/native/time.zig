@@ -1,5 +1,12 @@
 const std = @import("std");
 
+const saasm_abi = @import("saasm_abi.zig");
+const plugin_shim = saasm_abi.Plugin("3d_time");
+pub const saasm_plugin_descriptor_v1 = plugin_shim.saasm_plugin_descriptor_v1;
+pub const saasm_plugin_descriptor_v1_fn = plugin_shim.saasm_plugin_descriptor_v1_fn;
+comptime {
+    _ = plugin_shim;
+}
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 const DEFAULT_WRAP_PERIOD_NS: u64 = 3600 * NS_PER_SEC;
