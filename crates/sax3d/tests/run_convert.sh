@@ -115,6 +115,21 @@ H1=$(sha256sum examples/hero_tex.png | cut -d' ' -f1)
 H2=$(sha256sum "$W/hero-back/payload/HeroTexImg_data.bin" | cut -d' ' -f1)
 [ "$H1" = "$H2" ] && ok hero-image-bytes-preserved || bad hero-image-bytes-preserved
 
+echo "== D. 同名对应约定 (BLENDER.md B1): 关节名 == 节点名 == 通道目标名 =="
+python3 tests/gen_same_name.py "$W/samename" >/dev/null 2>&1
+"$B/convert" to-sax3d "$W/samename/SkinMin.gltf" "$W/skinmin" --fixtures-dir $FIX >"$W/skinmin.log" 2>"$W/skinmin.err"
+[ $? -eq 0 ] && ok skinmin-import || bad skinmin-import
+grep -q "joint Knee { parent: Hip; }" "$W/skinmin/SkinMin.sax3d" && ok skinmin-joint-parent || bad skinmin-joint-parent
+grep -q "channel { node: Knee; path: rotation" "$W/skinmin/SkinMin.sax3d" && ok skinmin-channel-target || bad skinmin-channel-target
+"$B/sax3dc" build "$W/skinmin/SkinMin.sax3d" --payload-dir "$W/skinmin/payload" --out "$W/skinmin/SkinMin.saxb3d" \
+  --iface StdPbrSkinnedNt=$FIX/std_pbr_skinned_nt.iface.txt >"$W/skinmin_build.log" 2>&1
+[ $? -eq 0 ] && ok skinmin-referee-build || bad skinmin-referee-build
+"$B/convert" to-sax3d "$W/samename/SkinDup.gltf" "$W/skindup" --fixtures-dir $FIX >"$W/skindup.log" 2>"$W/skindup.err"
+[ $? -eq 0 ] && ok skindup-import || bad skindup-import
+grep -q "LEDGER SYNTH name for node\[1\] sanitised/deduped 'Bone' -> 'Bone_2'" "$W/skindup.log" && ok skindup-ledger-dedupe || bad skindup-ledger-dedupe
+grep -q "joint Bone_2 { parent: Bone; }" "$W/skindup/SkinDup.sax3d" && ok skindup-joint-renamed || bad skindup-joint-renamed
+grep -q "channel { node: Bone_2; path: rotation" "$W/skindup/SkinDup.sax3d" && ok skindup-channel-renamed || bad skindup-channel-renamed
+
 echo
 echo "RESULT: $PASS passed; FAILED SET:${FAILED:- (empty)}"
 [ -z "$FAILED" ]

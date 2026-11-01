@@ -121,3 +121,28 @@ shader 的接口是同一语义面的两种记法，绑定不是捏造而是补�
 `CvtNameSanitized`（台账级，非致命）、`CvtInternalInvariant`
 （转换器自检失败，如产出过不了自家裁判——进口产出强制过 sax3dc 裁判，
 过不了即此码，绝不交付带病资产）。
+
+## 附录 B. Blender 专册（保真台账，TODO §7.1 ⑤）
+
+约定本体见 BLENDER.md（B1 同名对应 / B2 集合实例 / B3 Principled
+型廓 / B4 贴图管线）；本册只记 Blender 来源特有的转换保真行，
+等级口径从 §0。Blender 经官方 glTF 导出器中转时，下表「来源构造」
+指 Blender 构造，其 glTF 形态再走 §1–§6 主表。
+
+| 来源构造 | 等级 | 说明 |
+|---|---|---|
+| 骨骼名（含 `.001` 等后缀/空格/非 ASCII） | SYNTH | 清洗/去重改名入账（BLENDER.md B1）；对应以 claimed 名为准，joint 与 clip 通道同步 |
+| 跨 armature 同名骨骼 | SYNTH | 去重改名入账；禁止合并为一根骨骼 |
+| 集合（Collection）层级 | SYNTH | 压平为 node 父子（组 node），集合组织语义不入资产 |
+| 集合实例 / 关联复制 | 精确 | 展开为多 node 引同一 mesh（BLENDER.md B2）；实例数入账 |
+| GPU 实例化（几何节点/粒子） | 近似（展开）或响亮拒绝 | v1 无逐实例矩阵面（GAP-B5 候裁）；展开须入账 SYNTH 行数，禁止静默截断 |
+| Principled：Base Color/Metallic/Roughness/Alpha 常量与 Base Color 贴图 | 精确 | B3 型廓表（与 slasl 同表） |
+| Principled：IOR / Specular | 近似 | F0 固定 0.04（B3 偏差声明），IOR 不入参 |
+| Principled：Emission / Subsurface / Sheen / Coat / Transmission / 法线贴图 / 粗糙金属贴图 | 不支持（响亮） | StdPbr v1 型廓外，入账；不许并入 base_color 或静默丢弃 |
+| Principled 输入由节点网络驱动 | 近似 | 导出烘焙贴图/常数，网络本身不入资产（节点面归 slasl 定形） |
+| 图像色彩空间 sRGB / Non-Color / Linear | 精确 | 映射 srgb / linear / linear（B4 表） |
+| 图像色彩空间其余档（ACES 等） | 不支持（响亮） | 二值枚举装不下；拒绝并指路改设，禁止就近归一 |
+| Mapping 节点变换 | 近似 | Y 方向翻转换算后写 tex_transform，入账 APPROX（B4） |
+| 图像插值/扩展无对应档位 | 近似 | 入账 APPROX，不许默认 Repeat 掩盖 |
+| 相机 / 灯光 / 世界环境 / 自定义属性 | 不支持（响亮） | SPEC §5.6 F-7 排除，GAP-B1…B4 候裁；导出方须明示丢弃清单 |
+| 修改器（镜像/阵列等） | 精确（应用后） | 参数化语义丢弃入账 |
