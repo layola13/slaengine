@@ -59,11 +59,14 @@ TODO.md「Python 相处」设计点已标注**已确认采纳（2026-11-01 主�
 1. **SPEC.md 文件完整性缺口（停条性登记，回主会话）**：slaengine 仓内
    `crates/sax3d/SPEC.md` 在 §7 规则 3 中途截断，文件尾有字面截断
    标记 `...[truncated 10203 chars]`，规则 4 起与正文引用的 §9 不在
-   文件内。slaengine-local 与本工地两副本 sha256 恒等
-   （76f72952d3ad…），本机全域检索未见第三份 sax3d SPEC.md。本批硬
+   文件内。本机五份副本（sax3d-impl-local 源工地与 slaengine-local /
+   slaengine-p0-local / 本工地 / slaengine-saxport-local）sha256
+   全部恒等（76f72952d3ad…）、全部同样截断——截断在 sax3d 实现线
+   工地即已存在、先于 slaengine 复制。本批硬
    约束 SPEC 零改动，**未修复**；影响面 = 本批约定只能引 §§4–6 与
    §7 规则 1–3（五条约定所需规则均在此范围内，未受阻）。修复建议：
-   从 sax3d 源仓取全文、与现文件逐节 diff 后单独成批订正。
+   先查 sax3d-impl-local 的 git 历史有无截断前版本；若无，须以
+   §§4–6 既有规则与校验器实现反推补写 §7 余下规则，单独成批订正。
 2. **候选 DEF（slasl 检查器，未修）**：target=glsl-es100 时跨组
    @global 字段重名不被检查器拦（AST 层按组作用域合法），落驱动层
    才报错。建议规则：es100 发射前以 ShaderDuplicateName 拒绝。本批
