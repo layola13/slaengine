@@ -1,0 +1,458 @@
+@import "../../src/transform/3d_transform.sal"
+
+@extern sa3d_transform_selftest() -> i32
+
+@test "3d_transform node layout"():
+L_ENTRY:
+    node = alloc SA3D_TRANSFORM_NODE_SIZE
+    store node+SA3D_TRANSFORM_NODE_entity, 41 as i64
+    store node+SA3D_TRANSFORM_NODE_parent, 7 as i64
+    store node+SA3D_TRANSFORM_NODE_local, 1065353216 as i32
+    store node+144, 1 as i64
+    entity = load node+0 as i64
+    parent = load node+8 as i64
+    local_x = load node+32 as i32
+    dirty = load node+144 as i64
+    entity_ok = eq entity, 41
+    parent_ok = eq parent, 7
+    local_ok = eq local_x, 1065353216
+    dirty_ok = eq dirty, 1
+    pair1 = and entity_ok, parent_ok
+    pair2 = and local_ok, dirty_ok
+    ok = and pair1, pair2
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !node
+    return
+
+L_ERR:
+    !node
+    panic(3010)
+
+@test "3d_transform identity and matrix update"():
+L_ENTRY:
+    transform = alloc SA3D_TRANSFORM3D_SIZE
+    mat = alloc SA3D_MAT4_SIZE
+    call @sa3d_transform3d_identity(&transform)
+    translation0 = ptr_add transform, SA3D_TRANSFORM3D_translation
+    rotation0 = ptr_add transform, SA3D_TRANSFORM3D_rotation
+    scale0 = ptr_add transform, SA3D_TRANSFORM3D_scale
+    tx0 = load translation0+SA3D_VEC3_x as i32
+    qw = load rotation0+SA3D_QUAT_w as i32
+    sx0 = load scale0+SA3D_VEC3_x as i32
+    call @sa3d_transform3d_set_translation(&transform, 1065353216, 1073741824, 1077936128)
+    call @sa3d_transform3d_set_scale(&transform, 1073741824, 1077936128, 1082130432)
+    call @sa3d_transform3d_to_matrix(&mat, &transform)
+    m00 = load mat+0 as i32
+    m11 = load mat+20 as i32
+    m22 = load mat+40 as i32
+    m30 = load mat+48 as i32
+    m31 = load mat+52 as i32
+    m32 = load mat+56 as i32
+    m33 = load mat+60 as i32
+    tx0_ok = eq tx0, SA3D_F32_ZERO_BITS
+    qw_ok = eq qw, SA3D_F32_ONE_BITS
+    sx0_ok = eq sx0, SA3D_F32_ONE_BITS
+    m00_ok = eq m00, 1073741824
+    m11_ok = eq m11, 1077936128
+    m22_ok = eq m22, 1082130432
+    m30_ok = eq m30, 1065353216
+    m31_ok = eq m31, 1073741824
+    m32_ok = eq m32, 1077936128
+    m33_ok = eq m33, SA3D_F32_ONE_BITS
+    p1 = and tx0_ok, qw_ok
+    p2 = and sx0_ok, m00_ok
+    p3 = and m11_ok, m22_ok
+    p4 = and m30_ok, m31_ok
+    p5 = and m32_ok, m33_ok
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and q1, q2
+    ok = and q3, p5
+    br ok -> L_TRANSFORM_OK, L_TRANSFORM_ERR
+
+L_TRANSFORM_OK:
+    !scale0
+    !rotation0
+    !translation0
+    !mat
+    !transform
+    return
+
+L_TRANSFORM_ERR:
+    !scale0
+    !rotation0
+    !translation0
+    !mat
+    !transform
+    panic(3011)
+
+@test "3d_transform Bevy from_matrix decomposes translation scale rotation"():
+L_ENTRY:
+    mat = alloc SA3D_MAT4_SIZE
+    transform = alloc SA3D_TRANSFORM3D_SIZE
+    call @sa3d_mat4_identity(&mat)
+    store mat+0, 2.0 as f32
+    store mat+20, 3.0 as f32
+    store mat+40, 4.0 as f32
+    store mat+48, 1.0 as f32
+    store mat+52, 2.0 as f32
+    store mat+56, 3.0 as f32
+    call @sa3d_transform3d_from_matrix(&transform, &mat)
+    translation = ptr_add transform, SA3D_TRANSFORM3D_translation
+    rotation = ptr_add transform, SA3D_TRANSFORM3D_rotation
+    scale = ptr_add transform, SA3D_TRANSFORM3D_scale
+    tx = load translation+SA3D_VEC3_x as i32
+    ty = load translation+SA3D_VEC3_y as i32
+    tz = load translation+SA3D_VEC3_z as i32
+    rx = load rotation+SA3D_QUAT_x as f32
+    ry = load rotation+SA3D_QUAT_y as f32
+    rz = load rotation+SA3D_QUAT_z as f32
+    rw = load rotation+SA3D_QUAT_w as f32
+    sx = load scale+SA3D_VEC3_x as i32
+    sy = load scale+SA3D_VEC3_y as i32
+    sz = load scale+SA3D_VEC3_z as i32
+    tx_ok = eq tx, SA3D_F32_ONE_BITS
+    ty_ok = eq ty, 1073741824
+    tz_ok = eq tz, 1077936128
+    rx_low = fcmp_gt rx, -0.001
+    rx_high = fcmp_lt rx, 0.001
+    ry_low = fcmp_gt ry, -0.001
+    ry_high = fcmp_lt ry, 0.001
+    rz_low = fcmp_gt rz, -0.001
+    rz_high = fcmp_lt rz, 0.001
+    rw_low = fcmp_gt rw, 0.999
+    rw_high = fcmp_lt rw, 1.001
+    sx_ok = eq sx, 1073741824
+    sy_ok = eq sy, 1077936128
+    sz_ok = eq sz, 1082130432
+    p0 = and tx_ok, ty_ok
+    p1 = and tz_ok, rx_low
+    p2 = and rx_high, ry_low
+    p3 = and ry_high, rz_low
+    p4 = and rz_high, rw_low
+    p5 = and rw_high, sx_ok
+    p6 = and sy_ok, sz_ok
+    q0 = and p0, p1
+    q1 = and p2, p3
+    q2 = and p4, p5
+    r0 = and q0, q1
+    r1 = and q2, p6
+    ok = and r0, r1
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !scale
+    !rotation
+    !translation
+    !transform
+    !mat
+    return
+
+L_ERR:
+    !scale
+    !rotation
+    !translation
+    !transform
+    !mat
+    panic(3016)
+
+@test "3d_transform node dirty world lifecycle"():
+L_ENTRY:
+    node = alloc SA3D_TRANSFORM_NODE_SIZE
+    call @sa3d_transform_node_init(&node, 55, 7)
+    entity = load node+SA3D_TRANSFORM_NODE_entity as i64
+    parent = load node+SA3D_TRANSFORM_NODE_parent as i64
+    local = ptr_add node, SA3D_TRANSFORM_NODE_local
+    world = ptr_add node, SA3D_TRANSFORM_NODE_world
+    world_matrix = ptr_add world, SA3D_WORLD_TRANSFORM_matrix
+    dirty0_raw = load world+SA3D_WORLD_TRANSFORM_dirty as i64
+    store node+32, 1065353216 as i32
+    store node+36, 1073741824 as i32
+    store node+40, 1077936128 as i32
+    store node+64, 1073741824 as i32
+    store node+68, 1077936128 as i32
+    store node+72, 1082130432 as i32
+    call @sa3d_transform_node_update_local_world(&node)
+    dirty1_raw = load world+SA3D_WORLD_TRANSFORM_dirty as i64
+    m00 = load world_matrix+0 as i32
+    m30 = load world_matrix+48 as i32
+    m31 = load world_matrix+52 as i32
+    dirty_slot = load world+SA3D_WORLD_TRANSFORM_dirty as i64
+    entity_ok = eq entity, 55
+    parent_ok = eq parent, 7
+    dirty0_ok = eq dirty0_raw, 1
+    dirty1_ok = eq dirty1_raw, 0
+    m00_ok = eq m00, 1073741824
+    m30_ok = eq m30, 1065353216
+    m31_ok = eq m31, 1073741824
+    dirty_slot_ok = eq dirty_slot, 0
+    p1 = and entity_ok, parent_ok
+    p2 = and dirty0_ok, dirty1_ok
+    p3 = and m00_ok, m30_ok
+    p4 = and m31_ok, dirty_slot_ok
+    q1 = and p1, p2
+    q2 = and p3, p4
+    ok = and q1, q2
+    br ok -> L_NODE_OK, L_NODE_ERR
+
+L_NODE_OK:
+    !dirty1_raw
+    !dirty0_raw
+    !world_matrix
+    !world
+    !local
+    !node
+    return
+
+L_NODE_ERR:
+    !dirty1_raw
+    !dirty0_raw
+    !world_matrix
+    !world
+    !local
+    !node
+    panic(3012)
+
+@test "3d_transform parent child propagation"():
+L_ENTRY:
+    parent = alloc SA3D_TRANSFORM_NODE_SIZE
+    child = alloc SA3D_TRANSFORM_NODE_SIZE
+    copied_world = alloc SA3D_WORLD_TRANSFORM_SIZE
+    call @sa3d_transform_node_init(&parent, 100, 0)
+    call @sa3d_transform_node_init(&child, 200, 0)
+    parent_local = ptr_add parent, SA3D_TRANSFORM_NODE_local
+    child_local = ptr_add child, SA3D_TRANSFORM_NODE_local
+    parent_world = ptr_add parent, SA3D_TRANSFORM_NODE_world
+    child_world = ptr_add child, SA3D_TRANSFORM_NODE_world
+    child_matrix = ptr_add child_world, SA3D_WORLD_TRANSFORM_matrix
+    call @sa3d_transform_node_link_child(&parent, &child)
+    linked_parent = load child+SA3D_TRANSFORM_NODE_parent as i64
+    first_child = load parent+SA3D_TRANSFORM_NODE_first_child as i64
+    call @sa3d_transform3d_set_translation(&parent_local, 1084227584, 1086324736, 1088421888)
+    call @sa3d_transform3d_set_scale(&parent_local, 1073741824, 1077936128, 1082130432)
+    call @sa3d_transform3d_set_translation(&child_local, 1065353216, 1073741824, 1077936128)
+    call @sa3d_transform3d_set_scale(&child_local, 1065353216, 1065353216, 1065353216)
+    call @sa3d_transform_node_update_local_world(&parent)
+    call @sa3d_transform_node_update_world_from_parent(&child, &parent)
+    m00 = load child_matrix+0 as i32
+    m11 = load child_matrix+20 as i32
+    m22 = load child_matrix+40 as i32
+    tx = load child_matrix+48 as i32
+    ty = load child_matrix+52 as i32
+    tz = load child_matrix+56 as i32
+    dirty = call @sa3d_world_transform_is_dirty(&child_world)
+    call @sa3d_world_transform_copy_matrix(&copied_world, &child_matrix)
+    copied_matrix = ptr_add copied_world, SA3D_WORLD_TRANSFORM_matrix
+    copied_tx = load copied_matrix+48 as i32
+    copied_dirty = call @sa3d_world_transform_is_dirty(&copied_world)
+    call @sa3d_transform_node_set_parent(&child, 300)
+    new_parent = load child+SA3D_TRANSFORM_NODE_parent as i64
+    dirty_after_reparent = call @sa3d_world_transform_is_dirty(&child_world)
+    linked_parent_ok = eq linked_parent, 100
+    first_child_ok = eq first_child, 200
+    m00_ok = eq m00, 1073741824
+    m11_ok = eq m11, 1077936128
+    m22_ok = eq m22, 1082130432
+    tx_ok = eq tx, 1088421888
+    ty_ok = eq ty, 1094713344
+    tz_ok = eq tz, 1100480512
+    dirty_ok = eq dirty, 0
+    copied_tx_ok = eq copied_tx, 1088421888
+    copied_dirty_ok = eq copied_dirty, 0
+    new_parent_ok = eq new_parent, 300
+    dirty_after_reparent_ok = eq dirty_after_reparent, 1
+    p1 = and linked_parent_ok, first_child_ok
+    p2 = and m00_ok, m11_ok
+    p3 = and m22_ok, tx_ok
+    p4 = and ty_ok, tz_ok
+    p5 = and dirty_ok, copied_tx_ok
+    p6 = and copied_dirty_ok, new_parent_ok
+    p7 = and dirty_after_reparent_ok, p6
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, p7
+    r1 = and q1, q2
+    ok = and r1, q3
+    br ok -> L_PROP_OK, L_PROP_ERR
+
+L_PROP_OK:
+    !copied_matrix
+    !child_matrix
+    !child_world
+    !parent_world
+    !child_local
+    !parent_local
+    !copied_world
+    !child
+    !parent
+    return
+
+L_PROP_ERR:
+    !copied_matrix
+    !child_matrix
+    !child_world
+    !parent_world
+    !child_local
+    !parent_local
+    !copied_world
+    !child
+    !parent
+    panic(3013)
+
+@test "3d_transform bevy backed native selftest"():
+L_ENTRY:
+    status = call @sa3d_transform_selftest()
+    ok = eq status, 0
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !status
+    !ok
+    return
+
+L_ERR:
+    !status
+    !ok
+    panic(3014)
+
+@test "3d_transform Bevy Transform methods in SA"():
+L_ENTRY:
+    parent = alloc SA3D_TRANSFORM3D_SIZE
+    child = alloc SA3D_TRANSFORM3D_SIZE
+    combined = alloc SA3D_TRANSFORM3D_SIZE
+    point = alloc SA3D_VEC3_SIZE
+    out = alloc SA3D_VEC3_SIZE
+    axis = alloc SA3D_VEC3_SIZE
+    around = alloc SA3D_TRANSFORM3D_SIZE
+    origin = alloc SA3D_VEC3_SIZE
+    half_turn_y = alloc SA3D_QUAT_SIZE
+    scale = alloc SA3D_VEC3_SIZE
+    call @sa3d_transform3d_from_xyz(&parent, 1.0, 2.0, 3.0)
+    call @sa3d_transform3d_set_scale(&parent, 1073741824, 1077936128, 1082130432)
+    call @sa3d_transform3d_set_rotation(&parent, 0.0, 1.0, 0.0, 0.0)
+    store point+SA3D_VEC3_x, 1.0 as f32
+    store point+SA3D_VEC3_y, 1.0 as f32
+    store point+SA3D_VEC3_z, 1.0 as f32
+    call @sa3d_transform3d_transform_point(&out, &parent, &point)
+    ox = load out+SA3D_VEC3_x as f32
+    oy = load out+SA3D_VEC3_y as f32
+    oz = load out+SA3D_VEC3_z as f32
+    call @sa3d_transform3d_local_x(&axis, &parent)
+    ax = load axis+SA3D_VEC3_x as f32
+    call @sa3d_transform3d_local_z(&axis, &parent)
+    az = load axis+SA3D_VEC3_z as f32
+    call @sa3d_transform3d_forward(&axis, &parent)
+    fz = load axis+SA3D_VEC3_z as f32
+    call @sa3d_transform3d_from_xyz(&child, 1.0, 0.0, 0.0)
+    call @sa3d_transform3d_mul_transform(&combined, &parent, &child)
+    combined_translation = ptr_add combined, SA3D_TRANSFORM3D_translation
+    ctx = load combined_translation+SA3D_VEC3_x as f32
+    cty = load combined_translation+SA3D_VEC3_y as f32
+    ctz = load combined_translation+SA3D_VEC3_z as f32
+    call @sa3d_transform3d_identity(&around)
+    call @sa3d_transform3d_from_xyz(&around, 1.0, 0.0, 0.0)
+    store origin+SA3D_VEC3_x, 0.0 as f32
+    store origin+SA3D_VEC3_y, 0.0 as f32
+    store origin+SA3D_VEC3_z, 0.0 as f32
+    store half_turn_y+SA3D_QUAT_x, 0.0 as f32
+    store half_turn_y+SA3D_QUAT_y, 1.0 as f32
+    store half_turn_y+SA3D_QUAT_z, 0.0 as f32
+    store half_turn_y+SA3D_QUAT_w, 0.0 as f32
+    call @sa3d_transform3d_translate_around(&around, &origin, &half_turn_y)
+    around_translation = ptr_add around, SA3D_TRANSFORM3D_translation
+    atx = load around_translation+SA3D_VEC3_x as f32
+    call @sa3d_transform3d_rotate_around(&around, &origin, &half_turn_y)
+    around_rotation = ptr_add around, SA3D_TRANSFORM3D_rotation
+    ary = load around_rotation+SA3D_QUAT_y as f32
+    finite1 = call @sa3d_transform3d_is_finite(&around)
+    around_scale = ptr_add around, SA3D_TRANSFORM3D_scale
+    store around_scale+SA3D_VEC3_x, 2139095040 as i32
+    finite2 = call @sa3d_transform3d_is_finite(&around)
+    store scale+SA3D_VEC3_x, 5.0 as f32
+    store scale+SA3D_VEC3_y, 6.0 as f32
+    store scale+SA3D_VEC3_z, 7.0 as f32
+    call @sa3d_transform3d_from_scale(&child, &scale)
+    child_scale = ptr_add child, SA3D_TRANSFORM3D_scale
+    csx = load child_scale+SA3D_VEC3_x as f32
+    x_ok = fcmp_gt ox, -1.01
+    x_ok2 = fcmp_lt ox, -0.99
+    y_ok = fcmp_gt oy, 4.99
+    y_ok2 = fcmp_lt oy, 5.01
+    z_ok = fcmp_gt oz, -1.01
+    z_ok2 = fcmp_lt oz, -0.99
+    ax_ok = fcmp_lt ax, -0.99
+    az_ok = fcmp_lt az, -0.99
+    fz_ok = fcmp_gt fz, 0.99
+    ctx_ok = fcmp_gt ctx, -1.01
+    ctx_ok2 = fcmp_lt ctx, -0.99
+    cty_ok = fcmp_gt cty, 1.99
+    cty_ok2 = fcmp_lt cty, 2.01
+    ctz_ok = fcmp_gt ctz, 2.99
+    ctz_ok2 = fcmp_lt ctz, 3.01
+    atx_ok = fcmp_lt atx, -0.99
+    ary_ok = fcmp_gt ary, 0.99
+    ary_ok2 = fcmp_lt ary, 1.01
+    finite1_ok = eq finite1, 1
+    finite2_ok = eq finite2, 0
+    csx_ok = fcmp_gt csx, 4.99
+    csx_ok2 = fcmp_lt csx, 5.01
+    p1 = and x_ok, x_ok2
+    p2 = and y_ok, y_ok2
+    p3 = and z_ok, z_ok2
+    p4 = and ax_ok, az_ok
+    p5 = and fz_ok, ctx_ok
+    p6 = and ctx_ok2, cty_ok
+    p7 = and cty_ok2, ctz_ok
+    p8 = and ctz_ok2, atx_ok
+    p9 = and ary_ok, ary_ok2
+    p10 = and finite1_ok, finite2_ok
+    p11 = and csx_ok, csx_ok2
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, p6
+    q4 = and p7, p8
+    q5 = and p9, p10
+    r1 = and q1, q2
+    r2 = and q3, q4
+    r3 = and q5, p11
+    s1 = and r1, r2
+    ok = and s1, r3
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !child_scale
+    !around_scale
+    !around_rotation
+    !around_translation
+    !combined_translation
+    !scale
+    !half_turn_y
+    !origin
+    !around
+    !axis
+    !out
+    !point
+    !combined
+    !child
+    !parent
+    return
+
+L_ERR:
+    !child_scale
+    !around_scale
+    !around_rotation
+    !around_translation
+    !combined_translation
+    !scale
+    !half_turn_y
+    !origin
+    !around
+    !axis
+    !out
+    !point
+    !combined
+    !child
+    !parent
+    panic(3015)

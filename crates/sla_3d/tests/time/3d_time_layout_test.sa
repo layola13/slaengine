@@ -1,0 +1,680 @@
+@import "../../src/time/3d_time.sal"
+
+@extern sa3d_time_selftest() -> i32
+
+@test "3d_time frame and timer layouts"():
+L_ENTRY:
+    frame = alloc SA3D_TIME_FRAME_SIZE
+    timer = alloc SA3D_TIMER_STATE_SIZE
+    store frame+SA3D_TIME_FRAME_now_ms, 1000 as i64
+    store frame+SA3D_TIME_FRAME_delta_ms, 16 as i64
+    store frame+SA3D_TIME_FRAME_elapsed_ms, 5000 as i64
+    store frame+SA3D_TIME_FRAME_frame_index, 42 as i64
+    store frame+SA3D_TIME_FRAME_step_mode, SA3D_TIME_STEP_FIXED as i32
+    store timer+SA3D_TIMER_STATE_duration_ms, 250 as i64
+    store timer+SA3D_TIMER_STATE_elapsed_ms, 125 as i64
+    store timer+SA3D_TIMER_STATE_mode, SA3D_TIMER_REPEATING as i32
+    store timer+SA3D_TIMER_STATE_finished, 1 as i32
+    store timer+SA3D_TIMER_STATE_times_finished_this_tick, 2 as i64
+    store timer+SA3D_TIMER_STATE_paused, 0 as i32
+    now = load frame+0 as i64
+    delta = load frame+8 as i64
+    elapsed = load frame+16 as i64
+    frame_index = load frame+24 as i64
+    step = load frame+32 as i32
+    duration = load timer+0 as i64
+    timer_elapsed = load timer+8 as i64
+    mode = load timer+16 as i32
+    finished = load timer+20 as i32
+    times = load timer+24 as i64
+    paused = load timer+32 as i32
+    now_ok = eq now, 1000
+    delta_ok = eq delta, 16
+    elapsed_ok = eq elapsed, 5000
+    frame_ok = eq frame_index, 42
+    step_ok = eq step, 1
+    duration_ok = eq duration, 250
+    timer_elapsed_ok = eq timer_elapsed, 125
+    mode_ok = eq mode, 1
+    finished_ok = eq finished, 1
+    times_ok = eq times, 2
+    paused_ok = eq paused, 0
+    frame_size_ok = eq SA3D_TIME_FRAME_SIZE, 40
+    timer_size_ok = eq SA3D_TIMER_STATE_SIZE, 40
+    pair1 = and now_ok, delta_ok
+    pair2 = and elapsed_ok, frame_ok
+    pair3 = and step_ok, duration_ok
+    pair4 = and timer_elapsed_ok, mode_ok
+    pair5 = and finished_ok, times_ok
+    pair6 = and paused_ok, frame_size_ok
+    pair7 = and timer_size_ok, pair6
+    ok1 = and pair1, pair2
+    ok2 = and pair3, pair4
+    ok3 = and ok1, ok2
+    ok4 = and pair5, pair7
+    ok = and ok3, ok4
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !timer
+    !frame
+    return
+
+L_ERR:
+    !timer
+    !frame
+    panic(3105)
+
+@test "3d_time frame advance updates clock state"():
+L_ENTRY:
+    frame = alloc SA3D_TIME_FRAME_SIZE
+    call @sa3d_time_frame_reset(&frame)
+    call @sa3d_time_frame_advance(&frame, 16, SA3D_TIME_STEP_FIXED)
+    call @sa3d_time_frame_advance(&frame, 17, SA3D_TIME_STEP_FIXED)
+    now = load frame+SA3D_TIME_FRAME_now_ms as i64
+    delta = load frame+SA3D_TIME_FRAME_delta_ms as i64
+    elapsed = load frame+SA3D_TIME_FRAME_elapsed_ms as i64
+    frame_index = load frame+SA3D_TIME_FRAME_frame_index as i64
+    step = load frame+SA3D_TIME_FRAME_step_mode as i32
+    alpha = load frame+SA3D_TIME_FRAME_alpha as i32
+    now_ok = eq now, 33
+    delta_ok = eq delta, 17
+    elapsed_ok = eq elapsed, 33
+    frame_ok = eq frame_index, 2
+    step_ok = eq step, SA3D_TIME_STEP_FIXED
+    alpha_ok = eq alpha, 0
+    pair1 = and now_ok, delta_ok
+    pair2 = and elapsed_ok, frame_ok
+    pair3 = and step_ok, alpha_ok
+    ok1 = and pair1, pair2
+    ok = and ok1, pair3
+    br ok -> L_FRAME_OK, L_FRAME_ERR
+
+L_FRAME_OK:
+    !frame
+    return
+
+L_FRAME_ERR:
+    !frame
+    panic(3106)
+
+@test "3d_time timer tick follows Bevy once and repeating semantics"():
+L_ENTRY:
+    once = alloc SA3D_TIMER_STATE_SIZE
+    repeat = alloc SA3D_TIMER_STATE_SIZE
+    call @sa3d_timer_init(&once, 250, SA3D_TIMER_ONCE)
+    tick0 = call @sa3d_timer_tick(&once, 100)
+    once_elapsed0 = load once+SA3D_TIMER_STATE_elapsed_ms as i64
+    once_finished0 = call @sa3d_timer_is_finished(&once)
+    once_just0 = call @sa3d_timer_just_finished(&once)
+    tick1 = call @sa3d_timer_tick(&once, 200)
+    once_elapsed1 = load once+SA3D_TIMER_STATE_elapsed_ms as i64
+    once_finished1 = call @sa3d_timer_is_finished(&once)
+    once_just1 = call @sa3d_timer_just_finished(&once)
+    tick2 = call @sa3d_timer_tick(&once, 50)
+    once_elapsed2 = load once+SA3D_TIMER_STATE_elapsed_ms as i64
+    once_just2 = call @sa3d_timer_just_finished(&once)
+
+    call @sa3d_timer_init(&repeat, 250, SA3D_TIMER_REPEATING)
+    repeat_tick0 = call @sa3d_timer_tick(&repeat, 550)
+    repeat_elapsed0 = load repeat+SA3D_TIMER_STATE_elapsed_ms as i64
+    repeat_finished0 = call @sa3d_timer_is_finished(&repeat)
+    repeat_just0 = call @sa3d_timer_just_finished(&repeat)
+    repeat_tick1 = call @sa3d_timer_tick(&repeat, 100)
+    repeat_elapsed1 = load repeat+SA3D_TIMER_STATE_elapsed_ms as i64
+    repeat_finished1 = call @sa3d_timer_is_finished(&repeat)
+    call @sa3d_timer_pause(&repeat)
+    repeat_tick_paused = call @sa3d_timer_tick(&repeat, 500)
+    repeat_elapsed_paused = load repeat+SA3D_TIMER_STATE_elapsed_ms as i64
+    call @sa3d_timer_unpause(&repeat)
+    repeat_tick2 = call @sa3d_timer_tick(&repeat, 100)
+    repeat_elapsed2 = load repeat+SA3D_TIMER_STATE_elapsed_ms as i64
+
+    once_tick0_ok = eq tick0, 0
+    once_elapsed0_ok = eq once_elapsed0, 100
+    once_finished0_ok = eq once_finished0, 0
+    once_just0_ok = eq once_just0, 0
+    once_tick1_ok = eq tick1, 1
+    once_elapsed1_ok = eq once_elapsed1, 250
+    once_finished1_ok = eq once_finished1, 1
+    once_just1_ok = eq once_just1, 1
+    once_tick2_ok = eq tick2, 0
+    once_elapsed2_ok = eq once_elapsed2, 250
+    once_just2_ok = eq once_just2, 0
+
+    repeat_tick0_ok = eq repeat_tick0, 2
+    repeat_elapsed0_ok = eq repeat_elapsed0, 50
+    repeat_finished0_ok = eq repeat_finished0, 1
+    repeat_just0_ok = eq repeat_just0, 1
+    repeat_tick1_ok = eq repeat_tick1, 0
+    repeat_elapsed1_ok = eq repeat_elapsed1, 150
+    repeat_finished1_ok = eq repeat_finished1, 0
+    repeat_paused_tick_ok = eq repeat_tick_paused, 0
+    repeat_paused_elapsed_ok = eq repeat_elapsed_paused, 150
+    repeat_tick2_ok = eq repeat_tick2, 1
+    repeat_elapsed2_ok = eq repeat_elapsed2, 0
+
+    once_pair1 = and once_tick0_ok, once_elapsed0_ok
+    once_pair2 = and once_finished0_ok, once_just0_ok
+    once_pair3 = and once_tick1_ok, once_elapsed1_ok
+    once_pair4 = and once_finished1_ok, once_just1_ok
+    once_pair5 = and once_tick2_ok, once_elapsed2_ok
+    once_pair6 = and once_just2_ok, once_pair5
+    once_ok1 = and once_pair1, once_pair2
+    once_ok2 = and once_pair3, once_pair4
+    once_ok3 = and once_ok1, once_ok2
+    once_ok = and once_ok3, once_pair6
+
+    repeat_pair1 = and repeat_tick0_ok, repeat_elapsed0_ok
+    repeat_pair2 = and repeat_finished0_ok, repeat_just0_ok
+    repeat_pair3 = and repeat_tick1_ok, repeat_elapsed1_ok
+    repeat_pair4 = and repeat_finished1_ok, repeat_paused_tick_ok
+    repeat_pair5 = and repeat_paused_elapsed_ok, repeat_tick2_ok
+    repeat_pair6 = and repeat_elapsed2_ok, repeat_pair5
+    repeat_ok1 = and repeat_pair1, repeat_pair2
+    repeat_ok2 = and repeat_pair3, repeat_pair4
+    repeat_ok3 = and repeat_ok1, repeat_ok2
+    repeat_ok = and repeat_ok3, repeat_pair6
+
+    ok = and once_ok, repeat_ok
+    br ok -> L_TIMER_OK, L_TIMER_ERR
+
+L_TIMER_OK:
+    !repeat
+    !once
+    return
+
+L_TIMER_ERR:
+    !repeat
+    !once
+    panic(3107)
+
+@test "3d_time fixed timestep accumulator"():
+L_ENTRY:
+    fixed = alloc SA3D_FIXED_TIME_STATE_SIZE
+    call @sa3d_fixed_time_init(&fixed, 16)
+    steps0 = call @sa3d_fixed_time_accumulate(&fixed, 10)
+    over0 = load fixed+SA3D_FIXED_TIME_STATE_overstep_ms as i64
+    alpha0 = load fixed+SA3D_FIXED_TIME_STATE_alpha as i32
+    steps1 = call @sa3d_fixed_time_accumulate(&fixed, 10)
+    over1 = load fixed+SA3D_FIXED_TIME_STATE_overstep_ms as i64
+    alpha1 = load fixed+SA3D_FIXED_TIME_STATE_alpha as i32
+    queued1 = load fixed+SA3D_FIXED_TIME_STATE_steps_last_frame as i32
+    consumed0 = call @sa3d_fixed_time_consume_step(&fixed)
+    consumed1 = call @sa3d_fixed_time_consume_step(&fixed)
+    elapsed1 = load fixed+SA3D_FIXED_TIME_STATE_elapsed_ms as i64
+    index1 = load fixed+SA3D_FIXED_TIME_STATE_step_index as i64
+    queued_after = load fixed+SA3D_FIXED_TIME_STATE_steps_last_frame as i32
+    steps2 = call @sa3d_fixed_time_accumulate(&fixed, 40)
+    over2 = load fixed+SA3D_FIXED_TIME_STATE_overstep_ms as i64
+    alpha2_call = call @sa3d_fixed_time_alpha_per_mille(&fixed)
+    c20 = call @sa3d_fixed_time_consume_step(&fixed)
+    c21 = call @sa3d_fixed_time_consume_step(&fixed)
+    c22 = call @sa3d_fixed_time_consume_step(&fixed)
+    elapsed2 = load fixed+SA3D_FIXED_TIME_STATE_elapsed_ms as i64
+    index2 = load fixed+SA3D_FIXED_TIME_STATE_step_index as i64
+    call @sa3d_fixed_time_set_timestep(&fixed, 20)
+    step_new = load fixed+SA3D_FIXED_TIME_STATE_timestep_ms as i64
+    call @sa3d_fixed_time_set_timestep(&fixed, 0)
+    step_kept = load fixed+SA3D_FIXED_TIME_STATE_timestep_ms as i64
+    steps0_ok = eq steps0, 0
+    over0_ok = eq over0, 10
+    alpha0_ok = eq alpha0, 625
+    steps1_ok = eq steps1, 1
+    over1_ok = eq over1, 4
+    alpha1_ok = eq alpha1, 250
+    queued1_ok = eq queued1, 1
+    consumed0_ok = eq consumed0, 1
+    consumed1_ok = eq consumed1, 0
+    elapsed1_ok = eq elapsed1, 16
+    index1_ok = eq index1, 1
+    queued_after_ok = eq queued_after, 0
+    steps2_ok = eq steps2, 2
+    over2_ok = eq over2, 12
+    alpha2_ok = eq alpha2_call, 750
+    c20_ok = eq c20, 1
+    c21_ok = eq c21, 1
+    c22_ok = eq c22, 0
+    elapsed2_ok = eq elapsed2, 48
+    index2_ok = eq index2, 3
+    step_new_ok = eq step_new, 20
+    step_kept_ok = eq step_kept, 20
+    p1 = and steps0_ok, over0_ok
+    p2 = and alpha0_ok, steps1_ok
+    p3 = and over1_ok, alpha1_ok
+    p4 = and queued1_ok, consumed0_ok
+    p5 = and consumed1_ok, elapsed1_ok
+    p6 = and index1_ok, queued_after_ok
+    p7 = and steps2_ok, over2_ok
+    p8 = and alpha2_ok, c20_ok
+    p9 = and c21_ok, c22_ok
+    p10 = and elapsed2_ok, index2_ok
+    p11 = and step_new_ok, step_kept_ok
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, p6
+    q4 = and p7, p8
+    q5 = and p9, p10
+    r1 = and q1, q2
+    r2 = and q3, q4
+    r3 = and q5, p11
+    s1 = and r1, r2
+    ok = and s1, r3
+    br ok -> L_FIXED_OK, L_FIXED_ERR
+
+L_FIXED_OK:
+    !fixed
+    return
+
+L_FIXED_ERR:
+    !fixed
+    panic(3108)
+
+@test "3d_time fixed timestep default for invalid init"():
+L_ENTRY:
+    fixed = alloc SA3D_FIXED_TIME_STATE_SIZE
+    call @sa3d_fixed_time_init(&fixed, 0)
+    timestep = load fixed+SA3D_FIXED_TIME_STATE_timestep_ms as i64
+    steps = call @sa3d_fixed_time_accumulate(&fixed, 32)
+    over = load fixed+SA3D_FIXED_TIME_STATE_overstep_ms as i64
+    alpha = load fixed+SA3D_FIXED_TIME_STATE_alpha as i32
+    timestep_ok = eq timestep, 16
+    steps_ok = eq steps, 2
+    over_ok = eq over, 0
+    alpha_ok = eq alpha, 0
+    p1 = and timestep_ok, steps_ok
+    p2 = and over_ok, alpha_ok
+    ok = and p1, p2
+    br ok -> L_FIXED_DEFAULT_OK, L_FIXED_DEFAULT_ERR
+
+L_FIXED_DEFAULT_OK:
+    !fixed
+    return
+
+L_FIXED_DEFAULT_ERR:
+    !fixed
+    panic(3109)
+
+@test "3d_time bevy backed native selftest"():
+L_ENTRY:
+    status = call @sa3d_time_selftest()
+    ok = eq status, 0
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !status
+    !ok
+    return
+
+L_ERR:
+    !status
+    !ok
+    panic(3110)
+
+@test "3d_time SA native clock matches Bevy Time wrapping"():
+L_ENTRY:
+    clock = alloc SA3D_TIME_CLOCK_SIZE
+    call @sa3d_time_clock_init_sa(&clock)
+    wrap0 = load clock+SA3D_TIME_CLOCK_wrap_period_ns as i64
+    set_status = call @sa3d_time_clock_set_wrap_period_sa(&clock, 3000000000)
+    call @sa3d_time_clock_advance_by_sa(&clock, 2000000000)
+    elapsed0 = load clock+SA3D_TIME_CLOCK_elapsed_ns as i64
+    wrapped0 = load clock+SA3D_TIME_CLOCK_elapsed_wrapped_ns as i64
+    call @sa3d_time_clock_advance_by_sa(&clock, 2000000000)
+    delta1 = load clock+SA3D_TIME_CLOCK_delta_ns as i64
+    elapsed1 = load clock+SA3D_TIME_CLOCK_elapsed_ns as i64
+    wrapped1 = load clock+SA3D_TIME_CLOCK_elapsed_wrapped_ns as i64
+    back_status = call @sa3d_time_clock_advance_to_sa(&clock, 3000000000)
+    fwd_status = call @sa3d_time_clock_advance_to_sa(&clock, 5000000000)
+    elapsed2 = load clock+SA3D_TIME_CLOCK_elapsed_ns as i64
+    wrapped2 = load clock+SA3D_TIME_CLOCK_elapsed_wrapped_ns as i64
+    wrap0_ok = eq wrap0, SA3D_TIME_DEFAULT_WRAP_PERIOD_NS
+    set_ok = eq set_status, 0
+    elapsed0_ok = eq elapsed0, 2000000000
+    wrapped0_ok = eq wrapped0, 2000000000
+    delta1_ok = eq delta1, 2000000000
+    elapsed1_ok = eq elapsed1, 4000000000
+    wrapped1_ok = eq wrapped1, 1000000000
+    back_ok = eq back_status, 1
+    fwd_ok = eq fwd_status, 0
+    elapsed2_ok = eq elapsed2, 5000000000
+    wrapped2_ok = eq wrapped2, 2000000000
+    p1 = and wrap0_ok, set_ok
+    p2 = and elapsed0_ok, wrapped0_ok
+    p3 = and delta1_ok, elapsed1_ok
+    p4 = and wrapped1_ok, back_ok
+    p5 = and fwd_ok, elapsed2_ok
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, wrapped2_ok
+    r1 = and q1, q2
+    ok = and r1, q3
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !clock
+    return
+
+L_ERR:
+    !clock
+    panic(3111)
+
+@test "3d_time SA native timer matches Bevy timer semantics"():
+L_ENTRY:
+    once = alloc SA3D_TIMER_NATIVE_SIZE
+    repeat = alloc SA3D_TIMER_NATIVE_SIZE
+    zero = alloc SA3D_TIMER_NATIVE_SIZE
+    call @sa3d_timer_native_init_sa(&once, 1000000000, SA3D_TIMER_ONCE)
+    once_tick0 = call @sa3d_timer_native_tick_sa(&once, 250000000)
+    once_elapsed0 = load once+SA3D_TIMER_NATIVE_elapsed_ns as i64
+    once_finished0 = load once+SA3D_TIMER_NATIVE_finished as i32
+    once_tick1 = call @sa3d_timer_native_tick_sa(&once, 2000000000)
+    once_elapsed1 = load once+SA3D_TIMER_NATIVE_elapsed_ns as i64
+    once_finished1 = load once+SA3D_TIMER_NATIVE_finished as i32
+    once_tick2 = call @sa3d_timer_native_tick_sa(&once, 1)
+    once_elapsed2 = load once+SA3D_TIMER_NATIVE_elapsed_ns as i64
+
+    call @sa3d_timer_native_init_sa(&repeat, 1000000000, SA3D_TIMER_REPEATING)
+    repeat_tick0 = call @sa3d_timer_native_tick_sa(&repeat, 3500000000)
+    repeat_elapsed0 = load repeat+SA3D_TIMER_NATIVE_elapsed_ns as i64
+    repeat_finished0 = load repeat+SA3D_TIMER_NATIVE_finished as i32
+    repeat_tick1 = call @sa3d_timer_native_tick_sa(&repeat, 200000000)
+    repeat_elapsed1 = load repeat+SA3D_TIMER_NATIVE_elapsed_ns as i64
+    repeat_finished1 = load repeat+SA3D_TIMER_NATIVE_finished as i32
+    call @sa3d_timer_native_pause_sa(&repeat)
+    repeat_tick_paused = call @sa3d_timer_native_tick_sa(&repeat, 2000000000)
+    repeat_elapsed_paused = load repeat+SA3D_TIMER_NATIVE_elapsed_ns as i64
+    repeat_finished_paused = load repeat+SA3D_TIMER_NATIVE_finished as i32
+
+    call @sa3d_timer_native_init_sa(&zero, 0, SA3D_TIMER_REPEATING)
+    zero_tick = call @sa3d_timer_native_tick_sa(&zero, 1000000000)
+    zero_elapsed = load zero+SA3D_TIMER_NATIVE_elapsed_ns as i64
+    zero_finished = load zero+SA3D_TIMER_NATIVE_finished as i32
+    zero_times = load zero+SA3D_TIMER_NATIVE_times_finished_this_tick as i32
+
+    once_tick0_ok = eq once_tick0, 0
+    once_elapsed0_ok = eq once_elapsed0, 250000000
+    once_finished0_ok = eq once_finished0, 0
+    once_tick1_ok = eq once_tick1, 1
+    once_elapsed1_ok = eq once_elapsed1, 1000000000
+    once_finished1_ok = eq once_finished1, 1
+    once_tick2_ok = eq once_tick2, 0
+    once_elapsed2_ok = eq once_elapsed2, 1000000000
+
+    repeat_tick0_ok = eq repeat_tick0, 3
+    repeat_elapsed0_ok = eq repeat_elapsed0, 500000000
+    repeat_finished0_ok = eq repeat_finished0, 1
+    repeat_tick1_ok = eq repeat_tick1, 0
+    repeat_elapsed1_ok = eq repeat_elapsed1, 700000000
+    repeat_finished1_ok = eq repeat_finished1, 0
+    repeat_tick_paused_ok = eq repeat_tick_paused, 0
+    repeat_elapsed_paused_ok = eq repeat_elapsed_paused, 700000000
+    repeat_finished_paused_ok = eq repeat_finished_paused, 0
+
+    zero_tick_ok = eq zero_tick, -1
+    zero_elapsed_ok = eq zero_elapsed, 0
+    zero_finished_ok = eq zero_finished, 1
+    zero_times_ok = eq zero_times, -1
+
+    p1 = and once_tick0_ok, once_elapsed0_ok
+    p2 = and once_finished0_ok, once_tick1_ok
+    p3 = and once_elapsed1_ok, once_finished1_ok
+    p4 = and once_tick2_ok, once_elapsed2_ok
+    p5 = and repeat_tick0_ok, repeat_elapsed0_ok
+    p6 = and repeat_finished0_ok, repeat_tick1_ok
+    p7 = and repeat_elapsed1_ok, repeat_finished1_ok
+    p8 = and repeat_tick_paused_ok, repeat_elapsed_paused_ok
+    p9 = and repeat_finished_paused_ok, zero_tick_ok
+    p10 = and zero_elapsed_ok, zero_finished_ok
+    p11 = and zero_times_ok, p10
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, p6
+    q4 = and p7, p8
+    q5 = and p9, p11
+    r1 = and q1, q2
+    r2 = and q3, q4
+    r3 = and r1, r2
+    ok = and r3, q5
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !zero
+    !repeat
+    !once
+    return
+
+L_ERR:
+    !zero
+    !repeat
+    !once
+    panic(3112)
+
+@test "3d_time SA native timer utility methods match Bevy Timer"():
+L_ENTRY:
+    timer = alloc SA3D_TIMER_NATIVE_SIZE
+    call @sa3d_timer_native_init_sa(&timer, 2000000000, SA3D_TIMER_ONCE)
+    duration0 = call @sa3d_timer_native_duration_sa(&timer)
+    elapsed0 = call @sa3d_timer_native_elapsed_sa(&timer)
+    remaining0 = call @sa3d_timer_native_remaining_sa(&timer)
+    fraction0 = call @sa3d_timer_native_fraction_sa(&timer)
+    remaining_fraction0 = call @sa3d_timer_native_fraction_remaining_sa(&timer)
+    call @sa3d_timer_native_set_duration_sa(&timer, 4000000000)
+    call @sa3d_timer_native_set_elapsed_sa(&timer, 1000000000)
+    duration1 = call @sa3d_timer_native_duration_sa(&timer)
+    elapsed1 = call @sa3d_timer_native_elapsed_sa(&timer)
+    remaining1 = call @sa3d_timer_native_remaining_sa(&timer)
+    fraction1 = call @sa3d_timer_native_fraction_sa(&timer)
+    remaining_fraction1 = call @sa3d_timer_native_fraction_remaining_sa(&timer)
+    call @sa3d_timer_native_almost_finish_sa(&timer)
+    almost_elapsed = call @sa3d_timer_native_elapsed_sa(&timer)
+    almost_remaining = call @sa3d_timer_native_remaining_sa(&timer)
+    almost_finished = load timer+SA3D_TIMER_NATIVE_finished as i32
+    almost_times = load timer+SA3D_TIMER_NATIVE_times_finished_this_tick as i32
+    call @sa3d_timer_native_finish_sa(&timer)
+    finish_elapsed = call @sa3d_timer_native_elapsed_sa(&timer)
+    finish_remaining = call @sa3d_timer_native_remaining_sa(&timer)
+    finish_fraction = call @sa3d_timer_native_fraction_sa(&timer)
+    finish_remaining_fraction = call @sa3d_timer_native_fraction_remaining_sa(&timer)
+    finish_finished = load timer+SA3D_TIMER_NATIVE_finished as i32
+    finish_times = load timer+SA3D_TIMER_NATIVE_times_finished_this_tick as i32
+    duration0_ok = eq duration0, 2000000000
+    elapsed0_ok = eq elapsed0, 0
+    remaining0_ok = eq remaining0, 2000000000
+    fraction0_ok = fcmp_eq fraction0, 0.0
+    remaining_fraction0_ok = fcmp_eq remaining_fraction0, 1.0
+    duration1_ok = eq duration1, 4000000000
+    elapsed1_ok = eq elapsed1, 1000000000
+    remaining1_ok = eq remaining1, 3000000000
+    fraction1_low = fcmp_gt fraction1, 0.249
+    fraction1_high = fcmp_lt fraction1, 0.251
+    fraction1_ok = and fraction1_low, fraction1_high
+    remaining_fraction1_low = fcmp_gt remaining_fraction1, 0.749
+    remaining_fraction1_high = fcmp_lt remaining_fraction1, 0.751
+    remaining_fraction1_ok = and remaining_fraction1_low, remaining_fraction1_high
+    almost_elapsed_ok = eq almost_elapsed, 3999999999
+    almost_remaining_ok = eq almost_remaining, 1
+    almost_finished_ok = eq almost_finished, 0
+    almost_times_ok = eq almost_times, 0
+    finish_elapsed_ok = eq finish_elapsed, 4000000000
+    finish_remaining_ok = eq finish_remaining, 0
+    finish_fraction_ok = fcmp_eq finish_fraction, 1.0
+    finish_remaining_fraction_ok = fcmp_eq finish_remaining_fraction, 0.0
+    finish_finished_ok = eq finish_finished, 1
+    finish_times_ok = eq finish_times, 1
+    p1 = and duration0_ok, elapsed0_ok
+    p2 = and remaining0_ok, fraction0_ok
+    p3 = and remaining_fraction0_ok, duration1_ok
+    p4 = and elapsed1_ok, remaining1_ok
+    p5 = and fraction1_ok, remaining_fraction1_ok
+    p6 = and almost_elapsed_ok, almost_remaining_ok
+    p7 = and almost_finished_ok, almost_times_ok
+    p8 = and finish_elapsed_ok, finish_remaining_ok
+    p9 = and finish_fraction_ok, finish_remaining_fraction_ok
+    p10 = and finish_finished_ok, finish_times_ok
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, p6
+    q4 = and p7, p8
+    q5 = and p9, p10
+    r1 = and q1, q2
+    r2 = and q3, q4
+    r3 = and r1, r2
+    ok = and r3, q5
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !timer
+    return
+
+L_ERR:
+    !timer
+    br duration0_ok -> L_D1, L_E0
+L_E0:
+    panic(3114)
+L_D1:
+    br elapsed0_ok -> L_D2, L_E1
+L_E1:
+    panic(3115)
+L_D2:
+    br remaining0_ok -> L_D3, L_E2
+L_E2:
+    panic(3116)
+L_D3:
+    br fraction0_ok -> L_D4, L_E3
+L_E3:
+    panic(3117)
+L_D4:
+    br remaining_fraction0_ok -> L_D5, L_E4
+L_E4:
+    panic(3118)
+L_D5:
+    br duration1_ok -> L_D6, L_E5
+L_E5:
+    panic(3119)
+L_D6:
+    br elapsed1_ok -> L_D7, L_E6
+L_E6:
+    panic(3120)
+L_D7:
+    br remaining1_ok -> L_D8, L_E7
+L_E7:
+    panic(3121)
+L_D8:
+    br fraction1_ok -> L_D9, L_E8
+L_E8:
+    panic(3122)
+L_D9:
+    br remaining_fraction1_ok -> L_D10, L_E9
+L_E9:
+    panic(3123)
+L_D10:
+    br almost_elapsed_ok -> L_D11, L_E10
+L_E10:
+    panic(3124)
+L_D11:
+    br almost_remaining_ok -> L_D12, L_E11
+L_E11:
+    panic(3125)
+L_D12:
+    br almost_finished_ok -> L_D13, L_E12
+L_E12:
+    panic(3126)
+L_D13:
+    br almost_times_ok -> L_D14, L_E13
+L_E13:
+    panic(3127)
+L_D14:
+    br finish_elapsed_ok -> L_D15, L_E14
+L_E14:
+    panic(3128)
+L_D15:
+    br finish_remaining_ok -> L_D16, L_E15
+L_E15:
+    panic(3129)
+L_D16:
+    br finish_fraction_ok -> L_D17, L_E16
+L_E16:
+    panic(3130)
+L_D17:
+    br finish_remaining_fraction_ok -> L_D18, L_E17
+L_E17:
+    panic(3131)
+L_D18:
+    br finish_finished_ok -> L_D19, L_E18
+L_E18:
+    panic(3132)
+L_D19:
+    br finish_times_ok -> L_E_UNKNOWN, L_E19
+L_E19:
+    panic(3133)
+L_E_UNKNOWN:
+    panic(3134)
+
+@test "3d_time SA native fixed timestep matches Bevy Fixed default"():
+L_ENTRY:
+    fixed = alloc SA3D_FIXED_TIME_NATIVE_SIZE
+    call @sa3d_fixed_time_native_init_sa(&fixed, 0)
+    default_step = load fixed+SA3D_FIXED_TIME_NATIVE_timestep_ns as i64
+    set_status = call @sa3d_fixed_time_native_set_timestep_sa(&fixed, 2000000000)
+    set_step = load fixed+SA3D_FIXED_TIME_NATIVE_timestep_ns as i64
+    call @sa3d_fixed_time_native_accumulate_sa(&fixed, 7000000000)
+    c0 = call @sa3d_fixed_time_native_expend_sa(&fixed)
+    elapsed0 = load fixed+SA3D_FIXED_TIME_NATIVE_elapsed_ns as i64
+    over0 = load fixed+SA3D_FIXED_TIME_NATIVE_overstep_ns as i64
+    index0 = load fixed+SA3D_FIXED_TIME_NATIVE_step_index as i64
+    c1 = call @sa3d_fixed_time_native_expend_sa(&fixed)
+    elapsed1 = load fixed+SA3D_FIXED_TIME_NATIVE_elapsed_ns as i64
+    over1 = load fixed+SA3D_FIXED_TIME_NATIVE_overstep_ns as i64
+    c2 = call @sa3d_fixed_time_native_expend_sa(&fixed)
+    elapsed2 = load fixed+SA3D_FIXED_TIME_NATIVE_elapsed_ns as i64
+    over2 = load fixed+SA3D_FIXED_TIME_NATIVE_overstep_ns as i64
+    c3 = call @sa3d_fixed_time_native_expend_sa(&fixed)
+    elapsed3 = load fixed+SA3D_FIXED_TIME_NATIVE_elapsed_ns as i64
+    over3 = load fixed+SA3D_FIXED_TIME_NATIVE_overstep_ns as i64
+    index3 = load fixed+SA3D_FIXED_TIME_NATIVE_step_index as i64
+    delta3 = load fixed+SA3D_FIXED_TIME_NATIVE_delta_ns as i64
+    default_ok = eq default_step, SA3D_FIXED_DEFAULT_TIMESTEP_NS
+    set_status_ok = eq set_status, 0
+    set_step_ok = eq set_step, 2000000000
+    c0_ok = eq c0, 1
+    elapsed0_ok = eq elapsed0, 2000000000
+    over0_ok = eq over0, 5000000000
+    index0_ok = eq index0, 1
+    c1_ok = eq c1, 1
+    elapsed1_ok = eq elapsed1, 4000000000
+    over1_ok = eq over1, 3000000000
+    c2_ok = eq c2, 1
+    elapsed2_ok = eq elapsed2, 6000000000
+    over2_ok = eq over2, 1000000000
+    c3_ok = eq c3, 0
+    elapsed3_ok = eq elapsed3, 6000000000
+    over3_ok = eq over3, 1000000000
+    index3_ok = eq index3, 3
+    delta3_ok = eq delta3, 2000000000
+    p1 = and default_ok, set_status_ok
+    p2 = and set_step_ok, c0_ok
+    p3 = and elapsed0_ok, over0_ok
+    p4 = and index0_ok, c1_ok
+    p5 = and elapsed1_ok, over1_ok
+    p6 = and c2_ok, elapsed2_ok
+    p7 = and over2_ok, c3_ok
+    p8 = and elapsed3_ok, over3_ok
+    p9 = and index3_ok, delta3_ok
+    q1 = and p1, p2
+    q2 = and p3, p4
+    q3 = and p5, p6
+    q4 = and p7, p8
+    r1 = and q1, q2
+    r2 = and q3, q4
+    r3 = and r1, r2
+    ok = and r3, p9
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !fixed
+    return
+
+L_ERR:
+    !fixed
+    panic(3113)
