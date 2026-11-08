@@ -23,8 +23,8 @@ GoldSrc 的联网模型是预测-对账制（同一份移动代码在客户端�
 
 ## 4. 红警参考存档
 
-- EA 官方 GPL 源码发布：Remastered 合集仓（含红色警戒 1 与泰伯利亚黎明源码，2020）、Tiberian Sun 独立仓（2025）。
-- Chronodivide：红色警戒 2 的 TypeScript 浏览器重写（社区项目）。
+- EA 官方 GPL 源码发布：红色警戒 1 与泰伯利亚黎明源码（2020 Remastered 合集仓；2025 年另有红警 1 原始恢复版独立仓）。更正（2026-11-08 红警线实测核查）：Tiberian Sun 与红警 2 的本体源码并未开源——electronicarts 组织全量清单无此仓，2025 发布批次为泰伯利亚黎明、红警、Renegade、Generals & Zero Hour；TS 相关官方开源只有任务编辑器（FinalSun / FinalAlert 2）。本节先前版本关于 TS 独立仓的记述有误，特此订正。
+- Chronodivide（Chrono Divide）：红色警戒 2 的 TypeScript 浏览器重写（社区项目）；实测其客户端引擎本体未开源，公开仓只有 mod-sdk、game-api-playground、pvpgn-server。另已取现代实现作对照：Vanilla-Conquer（C++）、rust-alert/ra2.exe 与 vera20k（Rust）、OpenRA（C#）——全量清单与代际对照见本地参考区 MANIFEST / INVENTORY。
 - OpenRA：社区开源重写（C#），本轮只登记、未取材。
 - 以上素材存于本地参考区（清单见该区 MANIFEST）。
 
